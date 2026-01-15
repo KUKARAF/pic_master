@@ -16,6 +16,11 @@ def main():
     add.add_argument('path', help='Directory to scan')
     add.add_argument('-r', '--recursive', action='store_true', default=True, help='Scan recursively')
 
+    # media hash <path> - hash file/dir
+    hash_cmd = sub.add_parser('hash', help='Hash a file or directory (only unhashed items)')
+    hash_cmd.add_argument('path', help='File or directory to hash')
+    hash_cmd.add_argument('-r', '--recursive', action='store_true', default=True, help='Process recursively')
+
     # media commit - hash unhashed files
     commit = sub.add_parser('commit', help='Create hashes for unscanned files')
     commit.add_argument('--batch-size', type=int, default=100, help='Number of files to hash at once')
@@ -57,6 +62,13 @@ def main():
         try:
             m.start_scan(args.path, recursive=args.recursive)
             print("Scan done")
+        finally:
+            m.close()
+    elif args.cmd == 'hash':
+        m = MediaManager()
+        try:
+            count = m.hash_path(args.path, recursive=args.recursive)
+            print(f"Hashed {count} files")
         finally:
             m.close()
     elif args.cmd == 'commit':
