@@ -27,8 +27,10 @@ def main():
         m = MediaManager()
         try:
             files = m.get_unhashed_files(limit=args.limit)
+            # The database returns tuples: (id, path, size, modified_time, checksum, last_hashed)
+            # We want the path which is at index 1
             for file_info in files:
-                print(file_info['path'])
+                print(file_info[1])
         finally:
             m.close()
     else:
