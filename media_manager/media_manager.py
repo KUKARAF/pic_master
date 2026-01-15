@@ -26,5 +26,11 @@ class MediaManager:
     def get_file_info(self, path):
         return self.db.get_file_by_path(path)
 
+    def get_unhashed_files(self, limit=100):
+        """
+        Get database entries for files without a hash.
+        """
+        return self.db.get_files_without_hash(limit)
+
     def close(self):
         self.db.close()

@@ -6,21 +6,34 @@ from media_manager import MediaManager
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='cmd')
+    
     scan = sub.add_parser('scan')
     scan.add_argument('path')
     scan.add_argument('-r', '--recursive', action='store_true', default=True)
+
+    unhashed = sub.add_parser('unhashed')
+    unhashed.add_argument('--limit', type=int, default=100, help='Number of files to list')
+
     args = parser.parse_args()
 
-    if args.cmd != 'scan':
-        print("Only 'scan' supported")
+    if args.cmd == 'scan':
+        m = MediaManager()
+        try:
+            m.start_scan(args.path, recursive=args.recursive)
+            print("Scan done")
+        finally:
+            m.close()
+    elif args.cmd == 'unhashed':
+        m = MediaManager()
+        try:
+            files = m.get_unhashed_files(limit=args.limit)
+            for file_info in files:
+                print(file_info['path'])
+        finally:
+            m.close()
+    else:
+        print("Only 'scan' and 'unhashed' supported")
         return 1
-
-    m = MediaManager()
-    try:
-        m.start_scan(args.path, recursive=args.recursive)
-        print("Scan done")
-    finally:
-        m.close()
 
 if __name__ == '__main__':
     sys.exit(main())
