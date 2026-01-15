@@ -8,6 +8,9 @@ def main():
     parser = argparse.ArgumentParser(description='Media manager - like git for your media files')
     sub = parser.add_subparsers(dest='cmd')
     
+    # media init - create .media folder
+    init = sub.add_parser('init', help='Initialize a media repository')
+    
     # media add <path> - scan directory
     add = sub.add_parser('add', help='Scan a directory for media files')
     add.add_argument('path', help='Directory to scan')
@@ -23,7 +26,23 @@ def main():
 
     args = parser.parse_args()
 
-    if args.cmd == 'add':
+    if args.cmd == 'init':
+        media_dir = os.path.join(os.getcwd(), '.media')
+        if os.path.exists(media_dir):
+            print("Media repository already exists")
+            return 1
+        
+        os.makedirs(media_dir, exist_ok=True)
+        db_path = os.path.join(media_dir, 'media.db')
+        
+        # Initialize the database
+        temp_manager = MediaManager(db_path=db_path)
+        temp_manager.close()
+        
+        print(f"Initialized media repository in {os.getcwd()}")
+        return 0
+        
+    elif args.cmd == 'add':
         m = MediaManager()
         try:
             m.start_scan(args.path, recursive=args.recursive)
@@ -46,7 +65,7 @@ def main():
         finally:
             m.close()
     else:
-        print("Available commands: add, commit, status")
+        print("Available commands: init, add, commit, status")
         return 1
 
     return 0
