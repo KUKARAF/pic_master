@@ -7,6 +7,7 @@ import time
 class Database:
     def __init__(self, db_path="media.db"):
         self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row  # Enable column access by name
         self.create_tables()
 
     def create_tables(self):
@@ -51,25 +52,57 @@ class Database:
         cursor.execute('SELECT * FROM files WHERE path = ?', (path,))
         row = cursor.fetchone()
         if row:
-            return {
-                'id': row[0],
-                'path': row[1],
-                'size': row[2],
-                'modified_time': row[3],
-                'checksum': row[4],
-                'last_hashed': row[5]
-            }
+            return row
         return None
 
     def get_files_without_hash(self, limit=100):
         """Return a list of files that have NULL checksum."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT id, path, size, modified_time
+            SELECT id, path, size, modified_time, checksum, last_hashed
             FROM files
             WHERE checksum IS NULL
             LIMIT ?
         ''', (limit,))
+        return cursor.fetchall()
+
+    def get_files_with_hash(self, limit=100):
+        """Return files that have been hashed."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT id, path, size, modified_time, checksum, last_hashed
+            FROM files
+            WHERE checksum IS NOT NULL
+            LIMIT ?
+        ''', (limit,))
+        return cursor.fetchall()
+
+    def list_files(self, limit=100, hashed_only=False, unhashed_only=False):
+        """
+        List files with optional filtering.
+        Returns tuples of file records: (id, path, size, modified_time, checksum, last_hashed)
+        """
+        cursor = self.conn.cursor()
+        if hashed_only:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files 
+                WHERE checksum IS NOT NULL 
+                LIMIT ?
+            ''', (limit,))
+        elif unhashed_only:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files 
+                WHERE checksum IS NULL 
+                LIMIT ?
+            ''', (limit,))
+        else:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files 
+                LIMIT ?
+            ''', (limit,))
         return cursor.fetchall()
 
     def update_file_hash(self, file_id, checksum):
