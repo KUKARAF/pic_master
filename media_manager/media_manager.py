@@ -54,5 +54,17 @@ class MediaManager:
         """
         return self.db.get_files_without_hash(limit)
 
+    def get_hashed_files(self, limit=100):
+        """
+        Get database entries for files with hashes.
+        """
+        return self.db.get_files_with_hash(limit)
+
+    def list_files(self, limit=100, hashed_only=False, unhashed_only=False):
+        """
+        List all files with optional filtering.
+        """
+        return self.db.list_files(limit=limit, hashed_only=hashed_only, unhashed_only=unhashed_only)
+
     def close(self):
         self.db.close()

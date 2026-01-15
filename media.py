@@ -24,6 +24,16 @@ def main():
     status = sub.add_parser('status', help='Show files without hashes')
     status.add_argument('--limit', type=int, default=100, help='Number of files to list')
 
+    # media ls - list all files
+    ls = sub.add_parser('ls', help='List all tracked files')
+    ls.add_argument('--limit', type=int, default=100, help='Number of files to list')
+    ls.add_argument('--hashed', action='store_true', help='Only show hashed files')
+    ls.add_argument('--unhashed', action='store_true', help='Only show unhashed files')
+
+    # media hashes - show files with hashes
+    hashes = sub.add_parser('hashes', help='Show files with hashes')
+    hashes.add_argument('--limit', type=int, default=100, help='Number of files to list')
+
     args = parser.parse_args()
 
     if args.cmd == 'init':
@@ -64,8 +74,36 @@ def main():
                 print(file_info[1])
         finally:
             m.close()
+    elif args.cmd == 'ls':
+        m = MediaManager()
+        try:
+            files = m.list_files(
+                limit=args.limit, 
+                hashed_only=args.hashed, 
+                unhashed_only=args.unhashed
+            )
+            for file_info in files:
+                # Format: path [size] [hash_status]
+                path = file_info[1]
+                size = file_info[2]
+                checksum = file_info[4]
+                hash_status = "✓" if checksum else "✗"
+                print(f"{path} [{size} bytes] [{hash_status}]")
+        finally:
+            m.close()
+    elif args.cmd == 'hashes':
+        m = MediaManager()
+        try:
+            files = m.get_hashed_files(limit=args.limit)
+            for file_info in files:
+                # Format: path checksum
+                path = file_info[1]
+                checksum = file_info[4]
+                print(f"{path} {checksum}")
+        finally:
+            m.close()
     else:
-        print("Available commands: init, add, commit, status")
+        print("Available commands: init, add, commit, status, ls, hashes")
         return 1
 
     return 0
