@@ -97,5 +97,54 @@ class MediaManager:
                 break
         return out
 
+    def record_move(self, src, dst):
+        """
+        Update the DB so the file historically at <src> is now at <dst>.
+        Filesystem is *not* touched; caller must rename the actual file.
+        Returns True if successful, False if src does not exist.
+        """
+        info = self.db.get_file_by_path(src)
+        if not info:
+            return False
+        # insert new row
+        self.db.insert_or_update_file(
+            path=dst,
+            size=info['size'],
+            modified_time=info['modified_time'],
+            checksum=info['checksum'],
+            last_hashed=info['last_hashed']
+        )
+        # remove old row
+        cursor = self.db.conn.cursor()
+        cursor.execute('DELETE FROM files WHERE path = ?', (src,))
+        self.db.conn.commit()
+        return True
+
+    def find_moved_candidates(self, limit=20):
+        """
+        Return [(old_path, new_path, checksum), ...] for files that
+        - exist in the DB but not at their recorded path
+        - have the same size+checksum as another file that *does* exist somewhere else
+        Limit caps the result set.
+        """
+        moved = []
+        cursor = self.db.conn.cursor()
+
+        cursor.execute('SELECT path, size, checksum FROM files WHERE checksum IS NOT NULL')
+        for row in cursor.fetchall():
+            path, size, chksum = row
+            if not os.path.exists(os.path.join(self.data_root, path)):
+                cursor.execute('''
+                    SELECT path FROM files
+                    WHERE size=? AND checksum=? AND path!=?
+                    LIMIT 1
+                ''', (size, chksum, path))
+                twin = cursor.fetchone()
+                if twin:
+                    moved.append((path, twin[0], chksum))
+                    if len(moved) >= limit:
+                        break
+        return moved
+
     def close(self):
         self.db.close()

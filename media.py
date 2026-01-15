@@ -21,12 +21,17 @@ def main():
     hash_cmd.add_argument('path', help='File or directory')
     hash_cmd.add_argument('-r', '--recursive', action='store_true', default=False, help='List hashes for all files under the directory')
 
+    # media mv <src> <dst>
+    mv = sub.add_parser('mv', help='Record a file move (rename) in the database')
+    mv.add_argument('src', help='Old path (relative to repo root)')
+    mv.add_argument('dst', help='New path (relative to repo root)')
+
     # media commit - hash unhashed files
     commit = sub.add_parser('commit', help='Create hashes for unscanned files')
     commit.add_argument('--batch-size', type=int, default=100, help='Number of files to hash at once')
 
-    # media status - show unhashed files
-    status = sub.add_parser('status', help='Show files without hashes')
+    # media status - show unhashed files and detect moved files
+    status = sub.add_parser('status', help='Show files without hashes and detect moved files')
     status.add_argument('--limit', type=int, default=100, help='Number of files to list')
 
     # media ls - list all files
@@ -75,6 +80,16 @@ def main():
                 print(f"{path}\t{digest}")
         finally:
             m.close()
+    elif args.cmd == 'mv':
+        m = MediaManager()
+        try:
+            ok = m.record_move(args.src, args.dst)
+            if not ok:
+                print(f"'{args.src}' not tracked (or DB error)", file=sys.stderr)
+                return 1
+            print(f"Recorded move: {args.src} -> {args.dst}")
+        finally:
+            m.close()
     elif args.cmd == 'commit':
         m = MediaManager()
         try:
@@ -85,9 +100,14 @@ def main():
     elif args.cmd == 'status':
         m = MediaManager()
         try:
+            # 1. unhashed list
             files = m.get_unhashed_files(limit=args.limit)
             for file_info in files:
-                print(file_info[1])
+                print(f"unhashed\t{file_info[1]}")
+            # 2. moved candidates
+            moved = m.find_moved_candidates(limit=args.limit)
+            for old, new, chksum in moved:
+                print(f"moved\t{old} -> {new}")
         finally:
             m.close()
     elif args.cmd == 'ls':
@@ -119,7 +139,7 @@ def main():
         finally:
             m.close()
     else:
-        print("Available commands: init, add, commit, status, ls, hashes")
+        print("Available commands: init, add, hash, mv, commit, status, ls, hashes")
         return 1
 
     return 0
