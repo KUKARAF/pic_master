@@ -9,9 +9,9 @@ from .hasher import FileHasher
 class MediaManager:
     def __init__(self, db_path=None):
         if db_path is None:
-            # Find the .data directory by walking up the directory tree
-            self.data_root = self._find_data_root()
-            db_path = os.path.join(self.data_root, '.data', 'media.db')
+            # Find the .media directory by walking up the directory tree
+            self.data_root = self._find_media_root()
+            db_path = os.path.join(self.data_root, '.media', 'media.db')
         else:
             # If db_path is specified, derive data_root from it
             self.data_root = os.path.dirname(os.path.dirname(db_path))
@@ -20,24 +20,24 @@ class MediaManager:
         self.scanner = FileScanner(self.db, self.data_root)
         self.hasher = FileHasher(self.db)
 
-    def _find_data_root(self):
-        """Find the .data directory by walking up the directory tree."""
+    def _find_media_root(self):
+        """Find the .media directory by walking up the directory tree."""
         current = os.getcwd()
         while current != os.path.dirname(current):  # Stop at root
-            data_dir = os.path.join(current, '.data')
-            if os.path.isdir(data_dir):
+            media_dir = os.path.join(current, '.media')
+            if os.path.isdir(media_dir):
                 return current
             current = os.path.dirname(current)
         
-        # If no .data found, create it in current directory
-        data_dir = os.path.join(os.getcwd(), '.data')
-        os.makedirs(data_dir, exist_ok=True)
+        # If no .media found, create it in current directory
+        media_dir = os.path.join(os.getcwd(), '.media')
+        os.makedirs(media_dir, exist_ok=True)
         return os.getcwd()
 
     def start_scan(self, path, recursive=True):
         """
         Scan a directory and store file metadata (without hashes).
-        Path is relative to data_root
+        Path is relative to media_root
         """
         abs_path = os.path.join(self.data_root, path)
         return self.scanner.scan_directory(abs_path, recursive)
