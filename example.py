@@ -12,12 +12,21 @@ def main():
     print("====================")
     
     # Example: Start scanning a directory
+    # Uncomment the line below and provide a real path
     # manager.start_scan("/path/to/your/media/folder")
     
     # Example: Process hashes
-    # manager.hash_files(batch_size=50)
+    # processed = manager.hash_files(batch_size=50)
+    # print(f"Hashed {processed} files")
+    
+    # Example: Retrieve file info
+    # info = manager.get_file_info("/some/file.txt")
+    # print(info)
     
     print("See TODO.md for implementation details")
+    
+    # Close the database connection when done
+    manager.close()
 
 if __name__ == "__main__":
     main()

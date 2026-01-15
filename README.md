@@ -6,7 +6,7 @@ A Python-based media management system for scanning directories and generating f
 
 - Fast file discovery without immediate hashing
 - On-demand and batch hashing capabilities
-- Scan session tracking with pause/resume functionality
+- Track last hashed timestamp for each file
 - File integrity verification
 - Support for multiple hash algorithms
 
@@ -35,7 +35,7 @@ media_manager/
 ├── scanner.py            # FileScanner class (discovers files, no hashing)
 ├── hasher.py             # FileHasher class (generates hashes on demand)
 ├── database.py           # Database schema and operations
-└── models.py             # Data models (File, ScanSession, etc.)
+└── models.py             # Data models (File, etc.)
 ```
 
 ## Development
