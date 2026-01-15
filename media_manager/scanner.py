@@ -2,7 +2,6 @@
 FileScanner class for discovering files without hashing.
 """
 import os
-import time
 
 class FileScanner:
     def __init__(self, database):
