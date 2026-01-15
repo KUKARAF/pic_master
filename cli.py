@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import os
 from media_manager import MediaManager
 
 def main():
@@ -27,8 +28,6 @@ def main():
         m = MediaManager()
         try:
             files = m.get_unhashed_files(limit=args.limit)
-            # The database returns tuples: (id, path, size, modified_time, checksum, last_hashed)
-            # We want the path which is at index 1
             for file_info in files:
                 print(file_info[1])
         finally:
