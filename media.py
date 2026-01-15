@@ -16,10 +16,10 @@ def main():
     add.add_argument('path', help='Directory to scan')
     add.add_argument('-r', '--recursive', action='store_true', default=True, help='Scan recursively')
 
-    # media hash <path> - hash file/dir
-    hash_cmd = sub.add_parser('hash', help='Hash a file or directory (only unhashed items)')
-    hash_cmd.add_argument('path', help='File or directory to hash')
-    hash_cmd.add_argument('-r', '--recursive', action='store_true', default=True, help='Process recursively')
+    # media hash <path> - show stored hash
+    hash_cmd = sub.add_parser('hash', help='Print the stored hash for a file or directory')
+    hash_cmd.add_argument('path', help='File or directory')
+    hash_cmd.add_argument('-r', '--recursive', action='store_true', default=False, help='List hashes for all files under the directory')
 
     # media commit - hash unhashed files
     commit = sub.add_parser('commit', help='Create hashes for unscanned files')
@@ -67,8 +67,12 @@ def main():
     elif args.cmd == 'hash':
         m = MediaManager()
         try:
-            count = m.hash_path(args.path, recursive=args.recursive)
-            print(f"Hashed {count} files")
+            files = m.get_hash_list(args.path, recursive=args.recursive)
+            if not files:
+                print("No hashes found", file=sys.stderr)
+                return 1
+            for path, digest in files:
+                print(f"{path}\t{digest}")
         finally:
             m.close()
     elif args.cmd == 'commit':

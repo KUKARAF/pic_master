@@ -66,32 +66,36 @@ class MediaManager:
         """
         return self.db.list_files(limit=limit, hashed_only=hashed_only, unhashed_only=unhashed_only)
 
-    def hash_path(self, path, recursive=True, batch_size=100):
+    def get_hash_for_file(self, path):
+        """Return the stored hash for a single file (or None)."""
+        info = self.get_file_info(path)
+        return info['checksum'] if info else None
+
+    def get_hash_list(self, path, recursive=False):
         """
-        Hash a single file or all files under a directory that are not yet hashed.
-        Returns number of files newly hashed.
+        Return a list of (relative_path, checksum) tuples.
+        If path is a file: single item if it has a hash.
+        If path is a dir: all *hashed* files under it (respects recursive flag).
         """
         abs_path = os.path.join(self.data_root, path)
+        out = []
         if os.path.isfile(abs_path):
-            file_info = self.db.get_file_by_path(os.path.relpath(abs_path, self.data_root))
-            if file_info and not file_info['checksum']:
-                self.hasher.update_file_hash(file_info['id'], abs_path)
-                return 1
-            return 0
+            digest = self.get_hash_for_file(os.path.relpath(abs_path, self.data_root))
+            if digest:
+                out.append((os.path.relpath(abs_path, self.data_root), digest))
+            return out
 
-        # directory case
-        count = 0
+        # directory
         for root, _, files in os.walk(abs_path):
             for fname in files:
                 full = os.path.join(root, fname)
                 rel = os.path.relpath(full, self.data_root)
-                info = self.db.get_file_by_path(rel)
-                if info and not info['checksum']:
-                    self.hasher.update_file_hash(info['id'], full)
-                    count += 1
+                digest = self.get_hash_for_file(rel)
+                if digest:
+                    out.append((rel, digest))
             if not recursive:
                 break
-        return count
+        return out
 
     def close(self):
         self.db.close()
