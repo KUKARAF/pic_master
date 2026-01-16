@@ -44,6 +44,12 @@ def main():
     hashes = sub.add_parser('hashes', help='Show files with hashes')
     hashes.add_argument('--limit', type=int, default=100, help='Number of files to list')
 
+    # media count - count files in repo
+    count = sub.add_parser('count', help='Count tracked files matching criteria')
+    count.add_argument('--hashed',   action='store_true', help='Count only hashed files')
+    count.add_argument('--unhashed', action='store_true', help='Count only unhashed files')
+    count.add_argument('--limit',  type=int, default=None, help='Maximum rows to count')
+
     args = parser.parse_args()
 
     if args.cmd == 'init':
@@ -81,4 +87,78 @@ def main():
         finally:
             m.close()
     elif args.cmd == 'mv':
-        m = MediaManager
+        m = MediaManager()
+        try:
+            ok = m.record_move(args.src, args.dst)
+            if not ok:
+                print(f"'{args.src}' not tracked (or DB error)", file=sys.stderr)
+                return 1
+            print(f"Recorded move: {args.src} -> {args.dst}")
+        finally:
+            m.close()
+    elif args.cmd == 'commit':
+        m = MediaManager()
+        try:
+            processed = m.hash_files(batch_size=args.batch_size)
+            print(f"Processed {processed} files")
+        finally:
+            m.close()
+    elif args.cmd == 'status':
+        m = MediaManager()
+        try:
+            # 1. unhashed list
+            files = m.get_unhashed_files(limit=args.limit)
+            for file_info in files:
+                print(f"unhashed\t{file_info[1]}")
+            # 2. moved candidates
+            moved = m.find_moved_candidates(limit=args.limit)
+            for old, new, chksum in moved:
+                print(f"moved\t{old} -> {new}")
+        finally:
+            m.close()
+    elif args.cmd == 'ls':
+        m = MediaManager()
+        try:
+            files = m.list_files(
+                limit=args.limit, 
+                hashed_only=args.hashed, 
+                unhashed_only=args.unhashed
+            )
+            for file_info in files:
+                # Format: path [size] [hash_status]
+                path = file_info[1]
+                size = file_info[2]
+                checksum = file_info[4]
+                hash_status = "✓" if checksum else "✗"
+                print(f"{path} [{size} bytes] [{hash_status}]")
+        finally:
+            m.close()
+    elif args.cmd == 'hashes':
+        m = MediaManager()
+        try:
+            files = m.get_hashed_files(limit=args.limit)
+            for file_info in files:
+                # Format: path checksum
+                path = file_info[1]
+                checksum = file_info[4]
+                print(f"{path} {checksum}")
+        finally:
+            m.close()
+    elif args.cmd == 'count':
+        m = MediaManager()
+        try:
+            total = m.count_files(hashed_only=args.hashed,
+                                 unhashed_only=args.unhashed,
+                                 limit=args.limit)
+            print(total)
+        finally:
+            m.close()
+        return 0
+    else:
+        print("Available commands: init, add, hash, mv, commit, status, ls, hashes, count")
+        return 1
+
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())
