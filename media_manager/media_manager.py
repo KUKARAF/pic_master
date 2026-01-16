@@ -5,6 +5,7 @@ import os
 from .database import Database
 from .hasher import FileHasher
 from .fast_scan import fast_scan
+from .hash_estimator import HashEstimator
 
 class MediaManager:
     def __init__(self, db_path=None):
@@ -43,7 +44,30 @@ class MediaManager:
         return count
 
     def hash_files(self, batch_size=100):
-        return self.hasher.process_null_hashes(batch_size)
+        # wrap the low-level hasher call with live estimator
+        return self._hash_with_progress(batch_size)
+
+    def _hash_with_progress(self, batch_size):
+        """
+        Hash unhashed files while printing live progress.
+        """
+        unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
+        total = len(unhashed)
+        if total == 0:
+            print("Nothing to hash.")
+            return 0
+
+        with HashEstimator(total=total) as est:
+            processed = 0
+            for row in unhashed:
+                file_id, path, *_ = row
+                abs_path = os.path.join(self.data_root, path)
+                # update hash
+                self.hasher.update_file_hash(file_id, abs_path)
+                processed += 1
+                est.update(done=1)
+
+        return processed
 
     def get_file_info(self, path):
         return self.db.get_file_by_path(path)
