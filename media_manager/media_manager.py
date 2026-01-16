@@ -54,7 +54,7 @@ class MediaManager:
         unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
         total = len(unhashed)
         if total == 0:
-            print("Nothing to hash.")
+            print("Skipped – nothing to hash.")
             return 0
 
         COMMIT_EVERY = 5000
