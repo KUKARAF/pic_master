@@ -40,11 +40,7 @@ class MediaManager:
         Path is relative to media_root – uses fast GNU find backend
         """
         abs_path = os.path.join(self.data_root, path)
-        try:
-            return fast_scan(abs_path, self.db.conn, self.data_root, recursive)
-        except RuntimeError as e:
-            print(f"Scan failed: {e}", file=sys.stderr)
-            return 0
+        return fast_scan(abs_path, self.db.conn, self.data_root, recursive)
 
     def hash_files(self, batch_size=100):
         # wrap the low-level hasher call with live estimator
