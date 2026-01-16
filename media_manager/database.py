@@ -58,23 +58,37 @@ class Database:
     def get_files_without_hash(self, limit=100):
         """Return a list of files that have NULL checksum."""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT id, path, size, modified_time, checksum, last_hashed
-            FROM files
-            WHERE checksum IS NULL
-            LIMIT ?
-        ''', (limit,))
+        if limit is None:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files
+                WHERE checksum IS NULL
+            ''')
+        else:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files
+                WHERE checksum IS NULL
+                LIMIT ?
+            ''', (limit,))
         return cursor.fetchall()
 
     def get_files_with_hash(self, limit=100):
         """Return files that have been hashed."""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT id, path, size, modified_time, checksum, last_hashed
-            FROM files
-            WHERE checksum IS NOT NULL
-            LIMIT ?
-        ''', (limit,))
+        if limit is None:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files
+                WHERE checksum IS NOT NULL
+            ''')
+        else:
+            cursor.execute('''
+                SELECT id, path, size, modified_time, checksum, last_hashed
+                FROM files
+                WHERE checksum IS NOT NULL
+                LIMIT ?
+            ''', (limit,))
         return cursor.fetchall()
 
     def list_files(self, limit=100, hashed_only=False, unhashed_only=False):
