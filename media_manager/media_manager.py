@@ -50,6 +50,7 @@ class MediaManager:
     def _hash_with_progress(self, batch_size):
         """
         Hash unhashed files while printing live progress.
+        Commits every 5000 hashes by default.
         """
         unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
         total = len(unhashed)
@@ -57,16 +58,29 @@ class MediaManager:
             print("Nothing to hash.")
             return 0
 
+        COMMIT_EVERY = 5000  # bulk transaction size
+        processed = 0
+        cursor = self.db.conn.cursor()
+
         with HashEstimator(total=total) as est:
-            processed = 0
-            for row in unhashed:
+            for idx, row in enumerate(unhashed, 1):
                 file_id, path, *_ = row
                 abs_path = os.path.join(self.data_root, path)
-                # update hash
-                self.hasher.update_file_hash(file_id, abs_path)
+                # update hash (only in cursor, not committed yet)
+                cursor.execute('''
+                    UPDATE files
+                    SET checksum = ?, last_hashed = ?
+                    WHERE id = ?
+                ''', (self.hasher.get_xxhash(abs_path), int(time.time()), file_id))
                 processed += 1
                 est.update(done=1)
 
+                # bulk commit every COMMIT_EVERY rows
+                if idx % COMMIT_EVERY == 0:
+                    self.db.conn.commit()
+
+        # final commit for remaining rows
+        self.db.conn.commit()
         return processed
 
     def get_file_info(self, path):
