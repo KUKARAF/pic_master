@@ -63,6 +63,13 @@ def main():
     count.add_argument('--limit',  type=int, default=None,
                         help='Maximum rows to count')
 
+    # media find_broken - discover corrupted images/videos
+    find_broken = sub.add_parser('find_broken', help='Find and mark corrupted images/videos')
+    find_broken.add_argument('path', nargs='?', default='.',
+                             help='Directory to scan (relative to repo root)')
+    find_broken.add_argument('-j', '--jobs', type=int, default=8,
+                              help='Concurrent workers (default: 8)')
+
     args = parser.parse_args()
 
     # strict-check helper
@@ -155,6 +162,13 @@ def main():
                               unhashed_only=args.unhashed,
                               limit=args.limit)
         print(total)
+        m.close()
+        return 0
+
+    elif args.cmd == 'find_broken':
+        m = MediaManager()
+        broken = m.find_broken(args.path, max_workers=args.jobs)
+        print(f"Found {broken} broken files")
         m.close()
         return 0
 
