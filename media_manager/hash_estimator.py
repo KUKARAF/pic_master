@@ -23,17 +23,20 @@ class HashEstimator:
         self.last_print = 0
 
     def __enter__(self):
+        # always print a clear starting line
+        print(f" Hashing {self.total} files …", file=sys.stderr)
         self._print()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        # final line
-        self._print(final=True)
+        # final *permanent* line so the user sees completion even if the loop ran fast
+        self._print(final=True, force=True)
 
     def update(self, done=1):
         self.done += done
         now = time.time()
-        if now - self.last_print >= self.update_every:
+        # update screen regularly
+        if (now - self.last_print) >= self.update_every:
             self._print()
             self.last_print = now
 
@@ -48,10 +51,12 @@ class HashEstimator:
         left = self.total - self.done
         return left / rate  # minutes
 
-    def _print(self, final=False):
+    def _print(self, final=False, force=False):
         rate = self.rate()
         eta_min = self.eta()
         eta_str = f"{eta_min:.1f}min" if eta_min is not None else "--"
         # simple terminal line, overwrite with \r
-        print(f"\r  {self.done}/{self.total}  {rate:.1f}/min  ETA {eta_str}", end="" if not final else "\n")
+        print(f"\r  {self.done}/{self.total}  {rate:.1f}/min  ETA {eta_str}",
+              end="\n" if final else "",
+              file=sys.stderr)
         sys.stdout.flush()

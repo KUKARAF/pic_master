@@ -51,7 +51,7 @@ class MediaManager:
         Hash unhashed files while printing live progress.
         Commits every 5000 hashes by default.
         """
-        unhashed = self.db.get_files_without_hash(limit=None)
+        unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
         total = len(unhashed)
         if total == 0:
             print("Nothing to hash.")
