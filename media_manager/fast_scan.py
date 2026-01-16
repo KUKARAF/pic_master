@@ -6,6 +6,7 @@ import os
 import subprocess
 import sqlite3
 import shutil
+import sys
 
 def fast_scan(root_path, db_conn, data_root, recursive=True):
     """
