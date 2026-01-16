@@ -8,6 +8,7 @@ from .database import Database
 from .hasher import FileHasher
 from .fast_scan import fast_scan
 from .hash_estimator import HashEstimator
+from .broken_finder import find_broken
 
 class MediaManager:
     def __init__(self, db_path=None):
@@ -149,31 +150,6 @@ class MediaManager:
         self.db.conn.commit()
         return True
 
-    def find_moved_candidates(self, limit=20):
-        """
-        Return [(old_path, new_path, checksum), ...] for files that
-        - exist in the DB but not at their recorded path
-        - have the same size+checksum as another file that *does* exist somewhere else
-        Limit caps the result set.
-        """
-        moved = []
-        cursor = self.db.conn.cursor()
-        cursor.execute('SELECT path, size, checksum FROM files WHERE checksum IS NOT NULL')
-        for row in cursor.fetchall():
-            path, size, chksum = row
-            if not os.path.exists(os.path.join(self.data_root, path)):
-                cursor.execute('''
-                    SELECT path FROM files
-                    WHERE size=? AND checksum=? AND path!=?
-                    LIMIT 1
-                ''', (size, chksum, path))
-                twin = cursor.fetchone()
-                if twin:
-                    moved.append((path, twin[0], chksum))
-                    if len(moved) >= limit:
-                        break
-        return moved
-
     def count_files(self, hashed_only=False, unhashed_only=False, limit=None):
         """
         Return the number of rows matching the filter.
@@ -183,5 +159,11 @@ class MediaManager:
                                   unhashed_only=unhashed_only,
                                   limit=limit)
 
-    def close(self):
-        self.db.close()
+    def find_broken(self, path, max_workers=8):
+        """
+        Check images/videos under path for corruption.
+        Sets 'broken' column to current unix timestamp for broken files.
+        Returns number of newly-detected broken files.
+        """
+        abs_path = os.path.join(self.data_root, path)
+        return find_broken(abs_path
