@@ -166,4 +166,19 @@ class MediaManager:
         Returns number of newly-detected broken files.
         """
         abs_path = os.path.join(self.data_root, path)
-        return find_broken(abs_path
+        return find_broken(abs_path, self.db.conn, self.data_root, max_workers)
+
+    def count_broken_files(self):
+        """Return count of files marked as broken (broken NOT NULL)."""
+        return self.db.count_broken_files()
+
+    def list_broken_files(self, limit=100):
+        """Return [(path, broken_timestamp), ...] for broken files."""
+        return self.db.list_broken_files(limit=limit)
+
+    def clear_broken(self, paths):
+        """Clear broken flag (set to NULL) for given list of paths."""
+        return self.db.clear_broken(paths)
+
+    def close(self):
+        self.db.close()
