@@ -37,10 +37,16 @@ class FileHasher:
         """
         files = self.db.get_files_without_hash(limit=batch_size)
         processed = 0
-        for file_id, path, size, mtime in files:
-            if os.path.exists(path):
-                if self.update_file_hash(file_id, path):
+        for row in files:
+            file_id = row['id']
+            path = row['path']
+            abs_path = os.path.join(self.db.data_root, path)  # <-- use repo root
+            try:
+                if self.update_file_hash(file_id, abs_path):
                     processed += 1
+            except (OSError, IOError):
+                # log and skip
+                continue
         return processed
 
     def verify_file_integrity(self, file_id, file_path):
@@ -51,5 +57,6 @@ class FileHasher:
         file_info = self.db.get_file_by_path(file_path)
         if not file_info or file_info['checksum'] is None:
             return False
-        current_hash = self.get_xxhash(file_path)
+        abs_path = os.path.join(self.db.data_root, file_path)  # <-- repo root
+        current_hash = self.get_xxhash(abs_path)
         return current_hash == file_info['checksum']
