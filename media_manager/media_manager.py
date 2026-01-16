@@ -3,6 +3,7 @@ Main MediaManager class providing the primary interface for media management ope
 """
 import os
 import time
+import sys
 from .database import Database
 from .hasher import FileHasher
 from .fast_scan import fast_scan
@@ -16,8 +17,7 @@ class MediaManager:
             db_path = os.path.join(self.data_root, '.media', 'media.db')
         else:
             # If db_path is specified, derive data_root from it
-            self.data_root = os.path.dirname(os.path.dirname(db_path))
-            
+            self.data_root = os.path.dirname(os.path.dirname(db_path))        
         self.db = Database(db_path)
         self.hasher = FileHasher(self.db)
 
@@ -29,7 +29,6 @@ class MediaManager:
             if os.path.isdir(media_dir):
                 return current
             current = os.path.dirname(current)
-        
         # If no .media found, create it in current directory
         media_dir = os.path.join(os.getcwd(), '.media')
         os.makedirs(media_dir, exist_ok=True)
@@ -41,8 +40,11 @@ class MediaManager:
         Path is relative to media_root – uses fast GNU find backend
         """
         abs_path = os.path.join(self.data_root, path)
-        count = fast_scan(abs_path, self.db.conn, self.data_root, recursive)
-        return count
+        try:
+            return fast_scan(abs_path, self.db.conn, self.data_root, recursive)
+        except RuntimeError as e:
+            print(f"Scan failed: {e}", file=sys.stderr)
+            return 0
 
     def hash_files(self, batch_size=100):
         # wrap the low-level hasher call with live estimator
@@ -53,13 +55,13 @@ class MediaManager:
         Hash unhashed files while printing live progress.
         Commits every 5000 hashes by default.
         """
-        unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
+        unhashed = self.db.get_files_without_hash(limit=None)
         total = len(unhashed)
         if total == 0:
             print("Nothing to hash.")
             return 0
 
-        COMMIT_EVERY = 5000  # bulk transaction size
+        COMMIT_EVERY = 5000
         processed = 0
         cursor = self.db.conn.cursor()
 
@@ -88,21 +90,15 @@ class MediaManager:
         return self.db.get_file_by_path(path)
 
     def get_unhashed_files(self, limit=100):
-        """
-        Get database entries for files without a hash.
-        """
+        """Get database entries for files without a hash."""
         return self.db.get_files_without_hash(limit)
 
     def get_hashed_files(self, limit=100):
-        """
-        Get database entries for files with hashes.
-        """
+        """Get database entries for files with hashes."""
         return self.db.get_files_with_hash(limit)
 
     def list_files(self, limit=100, hashed_only=False, unhashed_only=False):
-        """
-        List all files with optional filtering.
-        """
+        """List all files with optional filtering."""
         return self.db.list_files(limit=limit, hashed_only=hashed_only, unhashed_only=unhashed_only)
 
     def get_hash_for_file(self, path):
@@ -123,7 +119,6 @@ class MediaManager:
             if digest:
                 out.append((os.path.relpath(abs_path, self.data_root), digest))
             return out
-
         # directory
         for root, _, files in os.walk(abs_path):
             for fname in files:
@@ -137,11 +132,7 @@ class MediaManager:
         return out
 
     def record_move(self, src, dst):
-        """
-        Update the DB so the file historically at <src> is now at <dst>.
-        Filesystem is *not* touched; caller must rename the actual file.
-        Returns True if successful, False if src does not exist.
-        """
+        """Update the DB so the file historically at <src> is now at <dst>."""
         info = self.db.get_file_by_path(src)
         if not info:
             return False
@@ -168,7 +159,6 @@ class MediaManager:
         """
         moved = []
         cursor = self.db.conn.cursor()
-
         cursor.execute('SELECT path, size, checksum FROM files WHERE checksum IS NOT NULL')
         for row in cursor.fetchall():
             path, size, chksum = row

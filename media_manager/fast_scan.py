@@ -11,7 +11,7 @@ def fast_scan(root_path, db_conn, data_root, recursive=True):
     """
     Call GNU find, parse '%p|%s|%T@' lines, insert/ update DB in one go.
     Spawns 'pv' if available for a simple line-count progress bar.
-    root_path: absolute directory to scan
+    root_path: absolute directory to scan  (must exist)
     db_conn:   sqlite3 connection (with row_factory sqlite3.Row)
     data_root: repo-root used to produce relative paths
     recursive: if False restrict find to max-depth 1
@@ -19,37 +19,47 @@ def fast_scan(root_path, db_conn, data_root, recursive=True):
     root_path = os.path.abspath(root_path)
     depth_args = [] if recursive else ['-maxdepth', '1']
 
-    # find command (without shell=True)
+    # Build find command
     find_cmd = ['find', root_path] + depth_args + ['-type', 'f', '-printf', '%p|%s|%T@\n']
 
+    # Optional pv pipe
     if shutil.which('pv'):
-        # pipe through pv for live line counter
-        pv_cmd = ['pv', '-l']
-        # use Python to create the pipe instead of the shell
+        # Run find -> pv -> our parser
         find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE)
-        pv_proc   = subprocess.Popen(pv_cmd, stdin=find_proc.stdout, stdout=subprocess.PIPE, text=True)
-        find_proc.stdout.close()  # allow find_proc to receive SIGPIPE if pv dies
-        in_stream = pv_proc.stdout
+        pv_proc   = subprocess.Popen(['pv', '-l'],
+                                      stdin=find_proc.stdout,
+                                      stdout=subprocess.PIPE,
+                                      text=True)
+        find_proc.stdout.close()          # let find receive SIGPIPE if pv dies
+        stream = pv_proc.stdout
     else:
-        # plain find output
-        pv_proc = None
-        in_stream = subprocess.Popen(find_cmd, stdout=subprocess.PIPE, text=True).stdout
+        # Plain find
+        find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE, text=True)
+        stream = find_proc.stdout
 
-    cur = db_conn.cursor()
+    cur   = db_conn.cursor()
     batch = []
 
-    for raw in in_stream:
+    for raw in stream:
         raw = raw.rstrip('\n')
         if not raw:
             continue
         try:
-            full_path, size, mtime = raw.split('|', 2)
-        except ValueError:
+            full_path, str_size, str_mtime = raw.split('|', 2)
+            size  = int(str_size)
+            mtime = float(str_mtime)
+        except ValueError as e:
+            # noisy failure: tell user we dropped a line
+            print(f"fast_scan: bad line '{raw[:80]}...'  ({e})", file=sys.stderr)
             continue
+
         rel_path = os.path.relpath(full_path, data_root)
-        size = int(size)
-        mtime = float(mtime)
         batch.append((rel_path, size, mtime, None, None))
+
+    # make sure find exited successfully
+    exit_code = find_proc.wait()
+    if exit_code != 0:
+        raise RuntimeError(f"find exited with code {exit_code}")
 
     # single bulk transaction
     cur.executemany(
@@ -57,8 +67,8 @@ def fast_scan(root_path, db_conn, data_root, recursive=True):
         ' VALUES (?,?,?,?,?)', batch)
     db_conn.commit()
 
-    # clean-up
-    if pv_proc:
+    # reap pv if used
+    if shutil.which('pv'):
         pv_proc.wait()
 
     return len(batch)
