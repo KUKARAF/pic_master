@@ -53,14 +53,12 @@ class MediaManager:
         """
         unhashed = self.db.get_files_without_hash(limit=None)  # fetch all
         total = len(unhashed)
-        if total == 0:
-            print("Skipped – nothing to hash.")
-            return 0
 
         COMMIT_EVERY = 5000
         processed = 0
         cursor = self.db.conn.cursor()
 
+        # always show header/footer even if total == 0
         with HashEstimator(total=total) as est:
             for idx, row in enumerate(unhashed, 1):
                 file_id, path, *_ = row
