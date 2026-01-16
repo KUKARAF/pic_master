@@ -72,7 +72,6 @@ def main():
             sys.exit(1)
 
     # ---- command dispatch -------------------------------------------------
-
     if args.cmd == 'init':
         if os.path.isdir('.media'):
             print("ERROR: media repository already exists", file=sys.stderr)
@@ -153,8 +152,8 @@ def main():
     elif args.cmd == 'count':
         m = MediaManager()
         total = m.count_files(hashed_only=args.hashed,
-                             unhashed_only=args.unhashed,
-                             limit=args.limit)
+                              unhashed_only=args.unhashed,
+                              limit=args.limit)
         print(total)
         m.close()
         return 0
