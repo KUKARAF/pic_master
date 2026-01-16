@@ -119,6 +119,36 @@ class Database:
             ''', (limit,))
         return cursor.fetchall()
 
+    def count_files(self, hashed_only=False, unhashed_only=False, limit=None):
+        """
+        Return the number of rows matching the filter.
+        limit:  maximum rows to count (None == unlimited)
+        """
+        cur = self.conn.cursor()
+        if hashed_only:
+            sql = 'SELECT COUNT(*) FROM files WHERE checksum IS NOT NULL'
+            if limit is not None:
+                sql += ' LIMIT ?'
+                cur.execute(sql, (limit,))
+            else:
+                cur.execute(sql)
+        elif unhashed_only:
+            sql = 'SELECT COUNT(*) FROM files WHERE checksum IS NULL'
+            if limit is not None:
+                sql += ' LIMIT ?'
+                cur.execute(sql, (limit,))
+            else:
+                cur.execute(sql)
+        else:
+            sql = 'SELECT COUNT(*) FROM files'
+            if limit is not None:
+                sql += ' LIMIT ?'
+                cur.execute(sql, (limit,))
+            else:
+                cur.execute(sql)
+        row = cur.fetchone()
+        return row[0] if row else 0
+
     def update_file_hash(self, file_id, checksum):
         """Update the checksum and last_hashed timestamp for a file."""
         cursor = self.conn.cursor()
