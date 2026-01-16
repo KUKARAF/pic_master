@@ -78,7 +78,9 @@ def main():
             print("ERROR: media repository already exists", file=sys.stderr)
             return 1
         os.makedirs('.media', exist_ok=True)
-        Database().close()  # initialise empty db file
+        # initialise empty db file inside .media/
+        from .database import Database
+        Database(os.path.join('.media', 'media.db')).close()
         print("Initialized media repository")
         return 0
 
