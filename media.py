@@ -15,6 +15,7 @@ def main():
     add = sub.add_parser('add', help='Scan a directory for media files')
     add.add_argument('path', help='Directory to scan')
     add.add_argument('-r', '--recursive', action='store_true', default=True, help='Scan recursively')
+    add.add_argument('--fast', action='store_true', help='Use GNU find for speed')
 
     # media hash <path> - show stored hash
     hash_cmd = sub.add_parser('hash', help='Print the stored hash for a file or directory')
@@ -65,8 +66,12 @@ def main():
     elif args.cmd == 'add':
         m = MediaManager()
         try:
-            m.start_scan(args.path, recursive=args.recursive)
-            print("Scan done")
+            if args.fast:
+                count = m.start_fast_scan(args.path, recursive=args.recursive)
+                print(f"Fast scan done, {count} files")
+            else:
+                m.start_scan(args.path, recursive=args.recursive)
+                print("Scan done")
         finally:
             m.close()
     elif args.cmd == 'hash':

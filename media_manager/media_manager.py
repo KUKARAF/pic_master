@@ -5,6 +5,7 @@ import os
 from .database import Database
 from .scanner import FileScanner
 from .hasher import FileHasher
+from .fast_scan import fast_scan
 
 class MediaManager:
     def __init__(self, db_path=None):
@@ -37,10 +38,19 @@ class MediaManager:
     def start_scan(self, path, recursive=True):
         """
         Scan a directory and store file metadata (without hashes).
-        Path is relative to media_root
+        Path is relative to media_root – uses normal os.walk scanner
         """
         abs_path = os.path.join(self.data_root, path)
         return self.scanner.scan_directory(abs_path, recursive)
+
+    def start_fast_scan(self, path, recursive=True):
+        """
+        Same purpose as start_scan but uses GNU find for speed.
+        path is relative to data_root
+        """
+        abs_path = os.path.join(self.data_root, path)
+        count = fast_scan(abs_path, self.db.conn, self.data_root, recursive)
+        return count
 
     def hash_files(self, batch_size=100):
         return self.hasher.process_null_hashes(batch_size)
