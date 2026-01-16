@@ -2,6 +2,7 @@
 Main MediaManager class providing the primary interface for media management operations.
 """
 import os
+import time
 from .database import Database
 from .hasher import FileHasher
 from .fast_scan import fast_scan
