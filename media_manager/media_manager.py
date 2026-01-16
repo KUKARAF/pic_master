@@ -174,5 +174,14 @@ class MediaManager:
                         break
         return moved
 
+    def count_files(self, hashed_only=False, unhashed_only=False, limit=None):
+        """
+        Return the number of rows matching the filter.
+        limit:  maximum rows to count (None == unlimited)
+        """
+        return self.db.count_files(hashed_only=hashed_only,
+                                  unhashed_only=unhashed_only,
+                                  limit=limit)
+
     def close(self):
         self.db.close()
