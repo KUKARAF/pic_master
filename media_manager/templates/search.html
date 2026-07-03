@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}
+{% if q %}Search: {{ q }}{% elif tag %}Tag: {{ tag }}{% elif face_id %}Face: {{ face_id }}{% else %}Search{% endif %} — media
+{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  {% if q %}
+  <h1>Results for "{{ q }}"</h1>
+  <span class="sub">{{ files | length }} result(s)</span>
+  {% elif tag %}
+  <h1>Tag: {{ tag }}</h1>
+  <span class="sub">{{ files | length }} file(s)</span>
+  {% elif face_id %}
+  <h1>Face cluster #{{ face_id }}</h1>
+  {% else %}
+  <h1>Search</h1>
+  {% endif %}
+</div>
+
+{% if message %}
+<div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
+{% endif %}
+
+{% if files %}
+<div class="grid">
+  {% for f in files %}
+  <div class="card">
+    <a class="card-img-link" href="/photo/{{ f.id }}">
+      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+
+    <a class="star-btn"
+       href="/similar/{{ f.id }}"
+       title="I am feeling lucky — find similar images">⭐</a>
+
+    {% if f.score is defined %}
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+    {% endif %}
+
+    <div class="card-body">
+      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
+      {% if f.tags %}
+      <div class="card-tags">
+        {% for tag in f.tags[:3] %}
+        <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
+        {% endfor %}
+        {% if f.tags | length > 3 %}
+        <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% elif not message %}
+<div class="empty-state">
+  <div class="icon">🔍</div>
+  <p>No results found.</p>
+</div>
+{% endif %}
+{% endblock %}

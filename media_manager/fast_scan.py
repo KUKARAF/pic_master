@@ -59,7 +59,7 @@ def fast_scan(root_path, db_conn, data_root, recursive=True):
         if rules.is_ignored(rel_path):
             continue
 
-        batch.append((rel_path, size, mtime, None, None))
+        batch.append((rel_path, size, mtime, None, None, None))
 
     exit_code = find_proc.wait()
     if exit_code != 0:

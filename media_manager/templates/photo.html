@@ -1,0 +1,100 @@
+{% extends "base.html" %}
+
+{% block title %}{{ file.filename }} — media{% endblock %}
+
+{% block head %}
+<script>window.MEDIA_FILE_ID = {{ file.id }};</script>
+{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>{{ file.filename }}</h1>
+  <a href="/" class="sub">← Back to gallery</a>
+</div>
+
+<div class="photo-detail">
+
+  <!-- Image -->
+  <div>
+    {% if file.is_image %}
+    <a href="/image/{{ file.id }}">
+      <img src="/image/{{ file.id }}" alt="{{ file.filename }}">
+    </a>
+    {% else %}
+    <div class="alert">This file is not a supported image type.</div>
+    {% endif %}
+  </div>
+
+  <!-- Sidebar -->
+  <div class="photo-sidebar">
+
+    <!-- Metadata -->
+    <div>
+      <div class="section-title">File info</div>
+      <table class="meta-table">
+        <tr>
+          <td>Path</td>
+          <td>{{ file.path }}</td>
+        </tr>
+        <tr>
+          <td>Size</td>
+          <td>{% if file.size %}{{ (file.size / 1024) | round(1) }} KB{% else %}—{% endif %}</td>
+        </tr>
+        <tr>
+          <td>Hash</td>
+          <td>{{ file.checksum or '—' }}</td>
+        </tr>
+        <tr>
+          <td>Indexed</td>
+          <td>{% if file.last_hashed %}{{ file.last_hashed }}{% else %}—{% endif %}</td>
+        </tr>
+      </table>
+    </div>
+
+    <!-- Tags -->
+    <div>
+      <div class="section-title">Tags</div>
+      <div id="tag-list">
+        {% for tag in file.tags %}
+        <span class="tag-removable" data-tag="{{ tag }}">
+          {{ tag }}
+          <button class="rm" type="button" title="Remove tag">×</button>
+        </span>
+        {% endfor %}
+      </div>
+
+      <form class="tag-input-row" id="tag-form" autocomplete="off">
+        <input type="text" id="tag-input" placeholder="Add a tag…" maxlength="64">
+        <button type="submit">Add</button>
+      </form>
+    </div>
+
+    <!-- Detected objects -->
+    {% if detected_classes %}
+    <div>
+      <div class="section-title">Detected objects</div>
+      <div id="detected-list">
+        {% for cls in detected_classes %}
+        <span class="tag-detected">{{ cls }}</span>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- Faces (stub) -->
+    <div>
+      <div class="section-title">Faces</div>
+      <p class="alert">
+        No faces indexed yet — run <code>media faces</code> to detect faces in this image.
+      </p>
+    </div>
+
+    <!-- Find similar -->
+    <div>
+      <div class="section-title">Similar images</div>
+      <a class="btn-similar" href="/similar/{{ file.id }}">⭐ Find similar</a>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

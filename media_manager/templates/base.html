@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}media{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+
+<nav class="nav">
+  <a class="nav-logo" href="/">📷 media</a>
+
+  <form class="nav-search" action="/search" method="get">
+    <input type="text" name="q" placeholder="Search photos…" value="{{ request.query_params.get('q', '') }}">
+    <button type="submit">Search</button>
+  </form>
+
+  {% if all_tags %}
+  <div style="position:relative;">
+    <button class="nav-tags-btn" id="tags-dropdown-btn" type="button">
+      Tags ▾
+    </button>
+    <div class="tags-dropdown" id="tags-dropdown-menu">
+      {% for tag, count in all_tags %}
+      <a href="/search?tag={{ tag | urlencode }}">
+        <span>{{ tag }}</span>
+        <span class="tag-count">{{ count }}</span>
+      </a>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+</nav>
+
+<div class="container">
+  {% block content %}{% endblock %}
+</div>
+
+<script src="/static/app.js"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

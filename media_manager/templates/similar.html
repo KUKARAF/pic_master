@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}Similar to {{ source_filename }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Similar to: {{ source_filename }}</h1>
+  <a href="/photo/{{ source_id }}" class="sub">← Back to photo</a>
+</div>
+
+{% if message %}
+<div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
+{% endif %}
+
+{% if files %}
+<div class="grid">
+  {% for f in files %}
+  <div class="card">
+    <a class="card-img-link" href="/photo/{{ f.id }}">
+      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+
+    <a class="star-btn"
+       href="/similar/{{ f.id }}"
+       title="I am feeling lucky — find similar images">⭐</a>
+
+    {% if f.score is defined %}
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+    {% endif %}
+
+    <div class="card-body">
+      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
+      {% if f.tags %}
+      <div class="card-tags">
+        {% for tag in f.tags[:3] %}
+        <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
+        {% endfor %}
+        {% if f.tags | length > 3 %}
+        <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% elif not message %}
+<div class="empty-state">
+  <div class="icon">🖼️</div>
+  <p>No similar images found.</p>
+</div>
+{% endif %}
+{% endblock %}

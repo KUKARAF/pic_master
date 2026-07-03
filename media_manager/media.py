@@ -70,6 +70,30 @@ def main():
     find_broken.add_argument('-j', '--jobs', type=int, default=8,
                               help='Concurrent workers (default: 8)')
 
+    # media index [path] - YOLO-World detect objects in images
+    index_cmd = sub.add_parser('index', help='Detect objects in images using YOLO-World')
+    index_cmd.add_argument('path', nargs='?', default='.',
+                           help='Directory to index (relative to repo root, default: .)')
+    index_cmd.add_argument('--batch-size', type=int, default=32,
+                           help='Images per batch (default: 32)')
+    index_cmd.add_argument('--model-size', choices=['s', 'm', 'l', 'x'], default='s',
+                           help='YOLO-World model size (default: s)')
+    index_cmd.add_argument('--conf', type=float, default=0.15,
+                           help='Detection confidence threshold (default: 0.15)')
+
+    # media search <query> - semantic image search
+    search_cmd = sub.add_parser('search', help='Search images by text using CLIP')
+    search_cmd.add_argument('query', help='Text query to search for')
+    search_cmd.add_argument('--limit', type=int, default=20,
+                            help='Number of results to return (default: 20)')
+
+    # media web - launch the FastAPI gallery server
+    web_cmd = sub.add_parser('web', help='Start the web gallery UI at localhost:8000')
+    web_cmd.add_argument('--host', default='127.0.0.1',
+                         help='Host to bind to (default: 127.0.0.1)')
+    web_cmd.add_argument('--port', type=int, default=8000,
+                         help='Port to listen on (default: 8000)')
+
     args = parser.parse_args()
 
     # strict-check helper
@@ -85,7 +109,7 @@ def main():
             return 1
         os.makedirs('.media', exist_ok=True)
         # initialise empty db file inside .media/
-        from .database import Database
+        from media_manager.database import Database
         Database(os.path.join('.media', 'media.db')).close()
         print("Initialized media repository")
         return 0
@@ -96,7 +120,12 @@ def main():
     if args.cmd == 'add':
         m = MediaManager()
         count = m.start_scan(args.path, recursive=args.recursive)
-        print("Scan done,", count, "files")
+        # Also update any moved files
+        moved_count = m.update_moved_files()
+        if moved_count > 0:
+            print(f"Scan done, {count} files (updated {moved_count} moved files)")
+        else:
+            print("Scan done,", count, "files")
         m.close()
         return 0
 
@@ -124,16 +153,25 @@ def main():
     elif args.cmd == 'commit':
         m = MediaManager()
         processed = m.hash_files(batch_size=args.batch_size)
-        print(f"Processed {processed} files")
+        # Also update any moved files
+        moved_count = m.update_moved_files()
+        if moved_count > 0:
+            print(f"Processed {processed} files (updated {moved_count} moved files)")
+        else:
+            print(f"Processed {processed} files")
         m.close()
         return 0
 
     elif args.cmd == 'status':
         m = MediaManager()
-        for file_info in m.get_unhashed_files(limit=args.limit):
+        # 1. unhashed list
+        files = m.get_unhashed_files(limit=args.limit)
+        for file_info in files:
             print(f"unhashed\t{file_info[1]}")
-        for old, new, chksum in m.find_moved_candidates(limit=args.limit):
-            print(f"moved\t{old} → {new}")
+        # 2. moved candidates
+        moved = m.find_moved_candidates(limit=args.limit)
+        for old, new, chksum in moved:
+            print(f"moved\t{old} -> {new}")
         m.close()
         return 0
 
@@ -170,6 +208,44 @@ def main():
         broken = m.find_broken(args.path, max_workers=args.jobs)
         print(f"Found {broken} broken files")
         m.close()
+        return 0
+
+    elif args.cmd == 'index':
+        m = MediaManager()
+        indexed, failed = m.index_files(args.path, model_size=args.model_size, conf_threshold=args.conf)
+        print(f"Done: detected objects in {indexed} images, {failed} failed")
+        m.close()
+        return 0
+
+    elif args.cmd == 'search':
+        m = MediaManager()
+        results = m.search(args.query, limit=args.limit)
+        for path, score in results:
+            print(f"{score:.4f}\t{path}")
+        m.close()
+        return 0
+
+    elif args.cmd == 'web':
+        _ensure_repo()
+        data_root = os.path.abspath('.')
+        try:
+            import uvicorn
+        except ImportError:
+            print("ERROR: uvicorn is not installed. Run: pip install 'uvicorn[standard]'",
+                  file=sys.stderr)
+            return 1
+        try:
+            from media_manager.web import create_app
+        except ImportError as exc:
+            print(f"ERROR: could not import web module: {exc}", file=sys.stderr)
+            return 1
+        try:
+            app = create_app(data_root)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        print(f"Starting media gallery at http://{args.host}:{args.port}/")
+        uvicorn.run(app, host=args.host, port=args.port)
         return 0
 
     else:

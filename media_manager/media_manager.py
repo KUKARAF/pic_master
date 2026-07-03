@@ -10,6 +10,13 @@ from .fast_scan import fast_scan
 from .hash_estimator import HashEstimator
 from .broken_finder import find_broken
 
+_STOPWORDS = {'a', 'an', 'the', 'at', 'in', 'on', 'of', 'with', 'and', 'or', 'to', 'is', 'are', 'for', 'by', 'from'}
+
+def _parse_query(query):
+    tokens = query.lower().split()
+    return [t for t in tokens if t not in _STOPWORDS and len(t) > 1]
+
+
 class MediaManager:
     def __init__(self, db_path=None):
         if db_path is None:
@@ -150,6 +157,49 @@ class MediaManager:
         self.db.conn.commit()
         return True
 
+    def find_moved_candidates(self, limit=20):
+        """
+        Return [(old_path, new_path, checksum), ...] for files that
+        - exist in the DB but not at their recorded path
+        - have the same size+checksum as another file that *does* exist somewhere else
+        Limit caps the result set.
+        """
+        moved = []
+        cursor = self.db.conn.cursor()
+        cursor.execute('SELECT path, size, checksum FROM files WHERE checksum IS NOT NULL')
+        for row in cursor.fetchall():
+            path, size, chksum = row
+            if not os.path.exists(os.path.join(self.data_root, path)):
+                cursor.execute('''
+                    SELECT path FROM files
+                    WHERE size=? AND checksum=? AND path!=?
+                    LIMIT 1
+                ''', (size, chksum, path))
+                twin = cursor.fetchone()
+                if twin:
+                    moved.append((path, twin[0], chksum))
+                    if limit is not None and len(moved) >= limit:
+                        break
+        return moved
+
+    def update_moved_files(self):
+        """
+        Update the database to reflect moved files.
+        For each moved file (old_path -> new_path), remove the old entry and keep the new one.
+        Returns the number of moved files updated.
+        """
+        moved = self.find_moved_candidates(limit=None)  # Get all moved files
+        count = 0
+        cursor = self.db.conn.cursor()
+        
+        for old_path, new_path, _ in moved:
+            # Remove the old entry (the one that doesn't exist anymore)
+            cursor.execute('DELETE FROM files WHERE path = ?', (old_path,))
+            count += 1
+        
+        self.db.conn.commit()
+        return count
+
     def count_files(self, hashed_only=False, unhashed_only=False, limit=None):
         """
         Return the number of rows matching the filter.
@@ -179,6 +229,62 @@ class MediaManager:
     def clear_broken(self, paths):
         """Clear broken flag (set to NULL) for given list of paths."""
         return self.db.clear_broken(paths)
+
+    def index_files(self, path='.', batch_size=32, model_size='s', conf_threshold=0.15):
+        """
+        Run YOLO-World on undetected image files under path, store detections in DB.
+        Returns (indexed_count, failed_count).
+        """
+        from .detector import YOLOWorldDetector, SUPPORTED_EXTENSIONS
+
+        detector = YOLOWorldDetector(model_size=model_size, conf_threshold=conf_threshold)
+        model_id = YOLOWorldDetector.model_id(model_size)
+
+        undetected = self.db.get_undetected_files(limit=None)
+        abs_path = os.path.abspath(os.path.join(self.data_root, path))
+        candidates = []
+        for file_id, rel_path in undetected:
+            ext = os.path.splitext(rel_path)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            abs_file = os.path.join(self.data_root, rel_path)
+            if not abs_file.startswith(abs_path):
+                continue
+            candidates.append((file_id, abs_file))
+
+        total = len(candidates)
+        indexed_count = 0
+        failed_count = 0
+
+        for batch_start in range(0, total, batch_size):
+            batch = candidates[batch_start:batch_start + batch_size]
+            batch_ids = [fid for fid, _ in batch]
+            batch_paths = [fpath for _, fpath in batch]
+
+            results = detector.detect_images(batch_paths)
+            for file_id, (path_, detections, error) in zip(batch_ids, results):
+                if error is not None:
+                    failed_count += 1
+                else:
+                    self.db.insert_detections(file_id, detections, model_id)
+                    indexed_count += 1
+
+            if total > 0:
+                done = min(batch_start + batch_size, total)
+                print(f"Indexed {min(indexed_count + failed_count, done)}/{total}...")
+
+        return indexed_count, failed_count
+
+    def search(self, query, limit=20):
+        """
+        Search images by detected object classes.
+        Returns [(path, score), ...] sorted by score descending.
+        """
+        tokens = _parse_query(query)
+        if not tokens:
+            return []
+        rows = self.db.search_by_classes(tokens, limit=limit)
+        return [(path, score) for _, path, score in rows]
 
     def close(self):
         self.db.close()
