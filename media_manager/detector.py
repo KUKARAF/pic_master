@@ -5,50 +5,7 @@ import time
 SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 
 VOCAB = [
-    "girl", "baby", "toddler", "teenager", "adult", "elderly person",
-    "cum", "asshole", "stockings", "red", "costume", "blowjob", "sex",
-    "anal", "pain", "smile", "happy", "girls", "underwear", "wet"
-    "wedding", "wedding dress", "wedding cake", "birthday party", "birthday cake",
-    "toy", "doll", "teddy bear", "dildo", "latina", "feet up", "handjob", 
-    "2 girls", "oil", "socks", "white", "black", "red", "picnic", "with mom", 
-    "young girl with mom", "gangbang", "oral sex", "pussy","vagina", "bending over", 
-    "bikini", "swimsuite", "school uniform", "school", "staircase", "skirt", 
-    "curly" , "blond", "bangs", "sucking", "with mom", "mom teaching", "shower", 
-    "bathtub", "multiple girls", "curled up", "legs open", "sitting on dick", "dick",
-    "nonude", "foam", "long hair", "ready for sex",
-    # animals
-    "dog", "chicken", "bee",
-    # nature & landscape
-    "beach", "ocean", "sea", "waves", "sand", "sunset", "sunrise",
-    "mountain", "hill", "valley", "cliff", "waterfall", "river", "lake",
-    "forest", "trees", "jungle", "desert", "field", "meadow", "farm",
-    "sky", "clouds", "rainbow", "lightning", "fog", "mist",
-    "snow", "ice", "glacier", "rain", "storm",
-    "flower", "rose", "grass", "leaves", "garden", "park",
-    # food & drink
-    "fruit", "vegetables"
-    # vehicles & transport
-    "car", "truck", "bus", "motorcycle", "bicycle", "scooter",
-    "boat", "sailboat", "ship", "ferry", "kayak",
-    "airplane", "helicopter", "hot air balloon",
-    "train", "subway", "tram",
-    # places & architecture
-    "building", "skyscraper", "house", "apartment", "cottage",
-    "church", "mosque", "temple", "cathedral",
-    "bridge", "road", "street", "alley", "highway",
-    "restaurant", "cafe", "bar", "market", "shop", "mall",
-    "school", "hospital", "library", "museum", "stadium",
-    "swimming pool", "playground", "cemetery",
-    "city", "village", "suburb", "countryside",
-    "chair", "table", "sofa", "couch", "armchair", "bed", "desk",
-    "phone", "smartphone", "laptop", "computer", "tablet", "camera",
-    "television", "monitor", "keyboard",
-    "book", "newspaper", "magazine",
-    "bag", "backpack", "suitcase", "handbag",
-    "umbrella", "hat", "sunglasses", "watch",
-    "flag", "sign", "graffiti",
-    "fire", "smoke", "fireworks",
-    "window", "door", "stairs", "fence", "gate",
+#should not be defined here insgtead be read from .media/search_terms.txt newline seperated
 ]
 
 
