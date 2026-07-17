@@ -93,16 +93,8 @@ body {
   min-height: 100vh;
 }
 
-/* ambient scanlines over everything, exactly as ScanlineOverlay draws them */
-body::after {
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background: var(--scanline);
-  opacity: .5;
-  z-index: 900;
-}
+/* Scanlines live on the chrome only (top bar + photo sidebar, matching the
+   mockup) — NOT page-wide: a global overlay would stripe the actual photos. */
 
 ::selection { background: var(--accent); color: var(--accent-ink); }
 ::-webkit-scrollbar { width: 9px; height: 9px; }
@@ -148,6 +140,15 @@ input[type="range"] { accent-color: var(--accent); }
   position: sticky;
   top: 0;
   z-index: 100;
+}
+
+.nav::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--scanline);
+  opacity: .5;
 }
 
 .nav-logo {
@@ -884,6 +885,15 @@ input[type="range"] { accent-color: var(--accent); }
   display: none;
 }
 .photo-stage.sidebar-open .photo-sidebar { display: flex; }
+
+.photo-stage .photo-sidebar::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--scanline);
+  opacity: .5;
+}
 
 .sidebar-header { display: flex; align-items: flex-start; gap: 10px; }
 .sidebar-header .sidebar-title-wrap { min-width: 0; flex: 1; }
