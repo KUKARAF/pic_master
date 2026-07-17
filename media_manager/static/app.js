@@ -1194,6 +1194,61 @@
     setCurrent.querySelectorAll('[data-set-id]').forEach(wireSetChip);
   }
 
+  /* Suggested sets — CLIP centroid match, fetched lazily so the page render
+     itself isn't blocked on scanning every set. Renders nothing when there's
+     nothing worth suggesting (no embedding yet, no sets, already in every
+     set, or nothing clears the match threshold) — this mirrors auto-detected
+     tags/faces elsewhere in the app, which stay silent rather than nagging. */
+  const setSuggestions = document.getElementById('set-suggestions');
+  if (setSuggestions && fileId) {
+    fetch('/api/files/' + fileId + '/suggested-sets')
+      .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+      .then(function (data) {
+        (data.results || []).forEach(function (set) {
+          const chip = document.createElement('a');
+          chip.className = 'chip-set';
+          chip.href = '#';
+          chip.style.marginRight = '6px';
+          chip.style.marginBottom = '4px';
+          chip.style.display = 'inline-flex';
+          chip.style.alignItems = 'center';
+          chip.style.gap = '4px';
+          chip.title = 'Suggested match — click to add';
+          chip.dataset.setId = set.id;
+
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = set.name + (set.studio ? ' (' + set.studio + ')' : '');
+          chip.appendChild(nameSpan);
+
+          const scoreSpan = document.createElement('span');
+          scoreSpan.className = 'score-badge';
+          scoreSpan.style.position = 'static';
+          scoreSpan.textContent = set.score.toFixed(2);
+          chip.appendChild(scoreSpan);
+
+          chip.addEventListener('click', function (e) {
+            e.preventDefault();
+            chip.style.pointerEvents = 'none';
+            assignSetById(set.id)
+              .then(function (data) {
+                appendSetChip(data);
+                chip.remove();
+              })
+              .catch(function (err) {
+                chip.style.pointerEvents = '';
+                alert('Failed to add set: ' + err.message);
+              });
+          });
+
+          setSuggestions.appendChild(chip);
+        });
+      })
+      .catch(function () {
+        // Non-critical: leave the block empty rather than surfacing an error
+        // for what is, at worst, a missed convenience suggestion.
+      });
+  }
+
   /* Photo (file) favorite heart */
   const fileHeartBtn = document.getElementById('file-heart-btn');
   if (fileHeartBtn) wireHeartButton(fileHeartBtn, '/api/files/' + fileId + '/favorite');

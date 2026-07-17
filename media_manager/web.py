@@ -1086,6 +1086,51 @@ def create_app(data_root: str) -> FastAPI:
         scores_map = {fid: round(score, 3) for (fid, _path, _cs), score in page}
         return _enrich_rows(rows, scores=scores_map)
 
+    def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3):
+        """The reverse of _find_similar_files_for_set: given one photo, rank every
+        set it's not already in by how close the photo's embedding is to that set's
+        centroid — "which set does this probably belong to". Sets are cheap and
+        unpaginated everywhere else in the app (personal-library scale), so unlike
+        the set-detail version this runs synchronously over all of them per call."""
+        emb_bytes = db.get_embedding(file_id)
+        if emb_bytes is None:
+            return []
+        import numpy as np
+        query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+
+        member_of = {s['id'] for s in manual.get_sets_for_checksums([checksum]).get(checksum, [])}
+        candidates = [s for s in manual.list_sets() if s['id'] not in member_of]
+        if not candidates:
+            return []
+
+        scored = []
+        for set_row in candidates:
+            member_checksums = manual.get_files_by_set(set_row['id'], limit=1000)
+            member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
+            member_embeddings = db.get_embeddings_for_files(member_ids)
+            if not member_embeddings:
+                continue
+            vecs = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in member_embeddings])
+            centroid = vecs.mean(axis=0)
+            norm = np.linalg.norm(centroid)
+            if norm == 0:
+                continue
+            centroid = centroid / norm
+            score = float(centroid.dot(query_emb))
+            if score >= threshold:
+                scored.append((set_row, score))
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return [
+            {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'score': round(score, 3)}
+            for s, score in scored[:limit]
+        ]
+
+    @app.get('/api/files/{file_id}/suggested-sets')
+    def api_suggested_sets_for_file(file_id: int):
+        row = _file_or_404(file_id)
+        return {'results': _find_best_sets_for_file(file_id, row['checksum'])}
+
     @app.get('/sets/{set_id}', response_class=HTMLResponse)
     def set_detail_page(request: Request, set_id: int, sort: str = 'added', order: str = 'desc'):
         set_row = manual.get_set(set_id)
