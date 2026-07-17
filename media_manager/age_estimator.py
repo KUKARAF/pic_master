@@ -24,16 +24,77 @@ _WORKER_SCRIPT = _HERE / "age_estimator_worker.py"
 
 # Repo layout for this project: media_manager/media_manager/age_estimator.py -> up
 # two levels is the repo root, where `.age-venv` lives alongside the main `.venv`.
-_DEFAULT_VENV_PYTHON = _HERE.parent.parent / ".age-venv" / "bin" / "python"
+# Only meaningful for a source checkout; for a pip-installed package this resolves
+# somewhere inside site-packages and simply never exists.
+_REPO_CHECKOUT_VENV_DIR = _HERE.parent.parent / ".age-venv"
+
+_REQUIREMENTS_FILE = _HERE / "requirements-age-estimator.txt"
 
 ESTIMATE_TIMEOUT_SECONDS = 120
+
+
+def default_age_venv_dir() -> Path:
+    """Where `media age-setup` installs the venv and where lookup falls back to:
+    $XDG_DATA_HOME/media_manager/age-venv (~/.local/share/media_manager/age-venv)."""
+    data_home = os.environ.get("XDG_DATA_HOME")
+    base = Path(data_home) if data_home else Path.home() / ".local" / "share"
+    return base / "media_manager" / "age-venv"
+
+
+def _venv_python(venv_dir: Path) -> Path:
+    if os.name == "nt":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
 
 
 def _venv_python_path() -> Path:
     override = os.environ.get("MEDIA_AGE_VENV_PYTHON")
     if override:
         return Path(override)
-    return _DEFAULT_VENV_PYTHON
+    repo_python = _venv_python(_REPO_CHECKOUT_VENV_DIR)
+    if repo_python.is_file():
+        return repo_python
+    return _venv_python(default_age_venv_dir())
+
+
+def setup_age_venv(dest=None, force: bool = False) -> Path:
+    """Create the isolated MiVOLO venv and install the pinned requirements into it.
+
+    Backs `media age-setup`. Returns the venv's python executable path. Uses uv when
+    available (much faster, shares its wheel cache), else stdlib venv + pip.
+    """
+    import shutil
+
+    venv_dir = Path(dest).expanduser() if dest else default_age_venv_dir()
+    python = _venv_python(venv_dir)
+
+    if python.is_file() and not force:
+        print(f"Age estimator venv already set up at {venv_dir} — use --force to recreate.")
+        return python
+    if venv_dir.exists() and force:
+        shutil.rmtree(venv_dir)
+
+    print(f"Creating isolated age-estimator venv at {venv_dir}")
+    print("(separate from the main environment: MiVOLO pins an old ultralytics/timm "
+          "that conflict with this app's object detector and CLIP indexer)")
+    uv = shutil.which("uv")
+    if uv:
+        subprocess.run([uv, "venv", str(venv_dir)], check=True)
+        subprocess.run(
+            [uv, "pip", "install", "--python", str(python), "-r", str(_REQUIREMENTS_FILE)],
+            check=True,
+        )
+    else:
+        import venv as venv_module
+        venv_module.create(str(venv_dir), with_pip=True)
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "-r", str(_REQUIREMENTS_FILE)],
+            check=True,
+        )
+
+    print(f"Done. Age estimation is ready (venv: {venv_dir}).")
+    print("Model weights download automatically on the first estimate.")
+    return python
 
 
 class AgeGenderEstimator:
@@ -41,15 +102,11 @@ class AgeGenderEstimator:
         self.venv_python = _venv_python_path()
         if not self.venv_python.is_file():
             raise RuntimeError(
-                f"Age estimator venv not found at '{self.venv_python}'. Set up the isolated "
-                "environment first (it must stay separate from the main venv — MiVOLO pins an "
-                "old timm/ultralytics that conflict with this app's object detector):\n"
-                "    uv venv .age-venv\n"
-                "    uv pip install --python .age-venv/bin/python torch opencv-python numpy\n"
-                "    uv pip install --python .age-venv/bin/python --no-build-isolation "
-                "'git+https://github.com/WildChlamydia/MiVOLO.git'\n"
-                "    uv pip install --python .age-venv/bin/python transformers accelerate\n"
-                "Or point MEDIA_AGE_VENV_PYTHON at an existing isolated venv's python executable."
+                f"Age estimator venv not found at '{self.venv_python}'. "
+                "Run `media age-setup` to create it (it must stay separate from the main "
+                "environment — MiVOLO pins an old timm/ultralytics that conflict with this "
+                "app's object detector), or point MEDIA_AGE_VENV_PYTHON at an existing "
+                "isolated venv's python executable."
             )
 
     def estimate(self, image_path: str, faces: list) -> list:

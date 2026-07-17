@@ -6,7 +6,9 @@
 # YOLO-World object detector and CLIP indexer (confirmed: installing mivolo into the
 # main venv broke `from ultralytics import YOLOWorld`).
 #
-# Setup (from the repo root, alongside the main .venv):
+# Preferred setup: `media age-setup` — creates the venv at
+# ~/.local/share/media_manager/age-venv and installs this file into it (see
+# setup_age_venv in age_estimator.py). Manual equivalent from a repo checkout:
 #   uv venv .age-venv
 #   uv pip install --python .age-venv/bin/python -r media_manager/requirements-age-estimator.txt
 #

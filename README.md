@@ -60,16 +60,18 @@ media web                        # browse at http://127.0.0.1:8000/
 
 MiVOLO pins old `ultralytics`/`timm` versions that conflict with this app's own
 detector and indexer, so it lives in a **separate, isolated virtualenv** — never
-in the main environment. From the repo root:
+in the main environment. One command sets it up:
 
 ```bash
-uv venv .age-venv
-uv pip install --python .age-venv/bin/python -r requirements-age-estimator.txt
+media age-setup
 ```
 
-The app talks to it via a subprocess (`media_manager/age_estimator.py`); set
-`MEDIA_AGE_VENV_PYTHON` to point at the venv's python if you put it elsewhere.
-Everything else works fine without this step.
+This creates the venv at `~/.local/share/media_manager/age-venv` (override with
+`--dest`) and installs the pinned requirements bundled with the package. The app
+talks to it via a subprocess (`media_manager/age_estimator.py`). To use a venv
+you built yourself, set `MEDIA_AGE_VENV_PYTHON` to its python executable; a
+repo checkout's `.age-venv` is also still picked up automatically for
+development. Everything else works fine without this step.
 
 ## Project Structure
 

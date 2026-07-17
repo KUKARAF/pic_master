@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import subprocess
 import sys
 import os
 from media_manager import MediaManager
@@ -143,6 +144,15 @@ def main():
     set_files.add_argument('--studio', default=None, help='Studio name (optional)')
     set_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
 
+    # media age-setup - build the isolated MiVOLO venv (machine-level, not per-repo)
+    age_setup = sub.add_parser(
+        'age-setup',
+        help='Set up age/gender estimation (installs MiVOLO into its own isolated venv)')
+    age_setup.add_argument('--dest', default=None,
+                           help='Venv directory (default: ~/.local/share/media_manager/age-venv)')
+    age_setup.add_argument('--force', action='store_true',
+                           help='Delete and recreate the venv if it already exists')
+
     # media web - launch the FastAPI gallery server
     web_cmd = sub.add_parser('web', help='Start the web gallery UI at localhost:8000')
     web_cmd.add_argument('--host', default='127.0.0.1',
@@ -168,6 +178,19 @@ def main():
         from media_manager.database import Database
         Database(os.path.join('.media', 'media.db')).close()
         print("Initialized media repository")
+        return 0
+
+    if args.cmd == 'age-setup':
+        # Machine-level setup (like init, runs outside any media repo). MiVOLO can't be
+        # a pip extra of this package — its pinned old ultralytics/timm conflict with
+        # the main app's detector/indexer, so it gets its own venv + subprocess bridge.
+        from media_manager.age_estimator import setup_age_venv
+        try:
+            setup_age_venv(dest=args.dest, force=args.force)
+        except subprocess.CalledProcessError as exc:
+            print(f"ERROR: age-setup failed while running: {' '.join(map(str, exc.cmd))}",
+                  file=sys.stderr)
+            return 1
         return 0
 
     # every other command first checks that repo exists when --strict is on

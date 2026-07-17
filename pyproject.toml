@@ -24,8 +24,9 @@ packages = ["media_manager"]
 [tool.setuptools.package-data]
 # web.py serves these from the installed package (Path(__file__).parent), so they
 # must ship inside the wheel — a plain find_packages() install would omit them and
-# `media web` would 500 on every page.
-media_manager = ["templates/*.html", "static/*"]
+# `media web` would 500 on every page. The age-estimator requirements ship too so
+# `media age-setup` can build the isolated venv without fetching anything from the repo.
+media_manager = ["templates/*.html", "static/*", "requirements-age-estimator.txt"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
