@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+
+{% block title %}Faces — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Faces</h1>
+  <span class="sub">{{ faces | length }} unidentified &nbsp;·&nbsp; {{ identities | length }} known people</span>
+</div>
+
+<div style="margin-bottom:16px;">
+  {% if favorite_only %}
+  <a href="/faces" class="sub">← All faces</a>
+  {% else %}
+  <a href="/faces?favorite=1" class="sub">♥ Favorites only</a>
+  {% endif %}
+</div>
+
+<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
+
+  <!-- Face grid -->
+  <div style="flex:1;min-width:300px;">
+    {% if favorite_only %}
+    <div class="section-title" style="margin-bottom:12px;">Favorited faces</div>
+    {% if favorite_faces %}
+    <div style="display:flex;flex-wrap:wrap;gap:16px;">
+      {% for face in favorite_faces %}
+      <div class="face-label-card">
+        <a href="/photo/{{ face.file_id }}">
+          <img src="/face-crop/{{ face.ref }}" alt="face" width="80" height="80" style="border-radius:4px;display:block;">
+        </a>
+        <div style="font-size:0.8em;margin-top:4px;">
+          {% if face.identity %}{{ face.identity }}{% else %}<span class="sub">Unnamed</span>{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="alert">No favorited faces yet.</div>
+    {% endif %}
+    {% elif faces %}
+    <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
+    <div style="display:flex;flex-wrap:wrap;gap:16px;">
+      {% for face in faces %}
+      <div class="face-label-card" id="face-card-{{ face.id }}" data-face-id="{{ face.id }}">
+        <a href="/photo/{{ face.file_id }}">
+          <img src="/face-crop/{{ face.id }}" alt="face" width="80" height="80" style="border-radius:4px;display:block;">
+        </a>
+        {% if face.suggested_name %}
+        <div class="face-suggestion" style="font-size:0.72em;color:var(--text-muted);margin-top:4px;">
+          Looks like <strong>{{ face.suggested_name }}</strong>?
+        </div>
+        {% endif %}
+        <input type="text"
+               class="face-name-input"
+               placeholder="Name…"
+               value="{{ face.suggested_name or '' }}"
+               style="width:80px;font-size:0.8em;margin-top:4px;"
+               data-face-id="{{ face.id }}">
+        <button class="face-save-btn" type="button" data-face-id="{{ face.id }}"
+                style="font-size:0.75em;padding:2px 6px;margin-top:2px;">Save</button>
+        <div class="face-save-msg" id="face-msg-{{ face.id }}" style="font-size:0.75em;color:#888;"></div>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}
+    <div class="alert">
+      No unidentified faces. {% if not identities %}Run <code>media faces .</code> to detect faces first.{% endif %}
+    </div>
+    {% endif %}
+  </div>
+
+  <!-- Known people sidebar -->
+  {% if identities %}
+  <div style="min-width:160px;max-width:220px;">
+    <div class="section-title" style="margin-bottom:8px;">Known people</div>
+    <ul style="list-style:none;padding:0;margin:0;">
+      {% for name, count in identities %}
+      <li style="margin-bottom:6px;" data-identity="{{ name }}">
+        <a href="/search?person={{ name | urlencode }}" style="font-weight:500;">{{ name }}</a>
+        <span style="color:#888;font-size:0.85em;"> ({{ count }})</span>
+        <button type="button" class="identity-rename-btn heart-btn-inline" data-identity="{{ name }}"
+                title="Rename this person everywhere" style="font-size:0.8em;">✏️</button>
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.face-save-btn').forEach(function(btn) {
+  btn.addEventListener('click', async function() {
+    const faceId = btn.dataset.faceId;
+    const input = document.querySelector('.face-name-input[data-face-id="' + faceId + '"]');
+    const msg = document.getElementById('face-msg-' + faceId);
+    const name = input.value.trim();
+    if (!name) { msg.textContent = 'Enter a name.'; return; }
+    try {
+      const resp = await fetch('/api/faces/' + faceId + '/identity', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name}),
+      });
+      if (resp.ok) {
+        msg.textContent = 'Saved!';
+        msg.style.color = '#4a7';
+        document.getElementById('face-card-' + faceId).style.opacity = '0.4';
+      } else {
+        msg.textContent = 'Error saving.';
+        msg.style.color = '#c44';
+      }
+    } catch(e) {
+      msg.textContent = 'Network error.';
+    }
+  });
+});
+
+document.querySelectorAll('.identity-rename-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const oldName = btn.dataset.identity;
+    const newName = prompt('Rename "' + oldName + '" to:', oldName);
+    if (!newName || newName.trim() === '' || newName.trim() === oldName) return;
+    fetch('/api/identities/' + encodeURIComponent(oldName), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: newName.trim()}),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+      .then(function() { location.reload(); })
+      .catch(function(err) { alert('Failed to rename: ' + err.message); });
+  });
+});
+</script>
+{% endblock %}

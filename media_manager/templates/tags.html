@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Tags — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Tags</h1>
+  <span class="sub">{{ tags | length }} tag(s)</span>
+</div>
+
+{% if tags %}
+<ul style="list-style:none;padding:0;margin:0;max-width:480px;">
+  {% for t in tags %}
+  <li style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);" data-label="{{ t.label }}">
+    <a href="/search?tag={{ t.label | urlencode }}" style="font-weight:500;flex:1;">{{ t.label }}</a>
+    <span class="sub" style="font-size:0.85em;">{{ t.count }} photo{{ '' if t.count == 1 else 's' }}</span>
+    <button type="button" class="tag-rename-btn heart-btn-inline" data-label="{{ t.label }}"
+            title="Rename this tag everywhere" style="font-size:0.9em;">✏️</button>
+    <button type="button" class="tag-delete-btn heart-btn-inline" data-label="{{ t.label }}"
+            title="Delete this tag everywhere" style="font-size:0.9em;">🗑️</button>
+  </li>
+  {% endfor %}
+</ul>
+{% else %}
+<div class="empty-state">
+  <div class="icon">🏷️</div>
+  <p>No tags yet. Add one from a photo's detail page.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.tag-rename-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const oldLabel = btn.dataset.label;
+    const newLabel = prompt('Rename "' + oldLabel + '" to:', oldLabel);
+    if (!newLabel || newLabel.trim() === '' || newLabel.trim() === oldLabel) return;
+    fetch('/api/tags/' + encodeURIComponent(oldLabel), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({label: newLabel.trim()}),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+      .then(function() { location.reload(); })
+      .catch(function(err) { alert('Failed to rename: ' + err.message); });
+  });
+});
+
+document.querySelectorAll('.tag-delete-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const label = btn.dataset.label;
+    if (!confirm('Delete tag "' + label + '" from every photo?')) return;
+    fetch('/api/tags/' + encodeURIComponent(label), {method: 'DELETE'})
+      .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+      .then(function() {
+        const li = document.querySelector('li[data-label="' + CSS.escape(label) + '"]');
+        if (li) li.remove();
+      })
+      .catch(function(err) { alert('Failed to delete: ' + err.message); });
+  });
+});
+</script>
+{% endblock %}

@@ -1,0 +1,25 @@
+# Dependencies for the experimental age/gender estimator (MiVOLO) — see
+# media_manager/age_estimator.py and age_estimator_worker.py.
+#
+# These MUST be installed into a SEPARATE, isolated virtualenv (not the main app's
+# .venv): MiVOLO hard-pins an old ultralytics/timm that conflict with this app's own
+# YOLO-World object detector and CLIP indexer (confirmed: installing mivolo into the
+# main venv broke `from ultralytics import YOLOWorld`).
+#
+# Setup (from the repo root, alongside the main .venv):
+#   uv venv .age-venv
+#   uv pip install --python .age-venv/bin/python -r media_manager/requirements-age-estimator.txt
+#
+# torch/torchvision are pinned older than the main app's versions because MiVOLO's
+# own model-construction code (mivolo.model.create_timm_model) fails to import
+# against current timm, and current torch defaults torch.load's weights_only=True
+# in a way old ultralytics (which MiVOLO pins) wasn't updated to handle. Pinning an
+# older, matched torch/torchvision pair sidesteps both issues without touching any
+# security default.
+torch==2.5.1
+torchvision==0.20.1
+opencv-python
+numpy
+transformers
+accelerate
+mivolo @ git+https://github.com/WildChlamydia/MiVOLO.git

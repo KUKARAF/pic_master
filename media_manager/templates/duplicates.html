@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}Duplicates — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Duplicates</h1>
+  <span class="sub">{{ groups | length }} group(s) of identical content</span>
+</div>
+
+<p class="sub" style="margin-bottom:20px;">
+  Same file content (byte-for-byte) found at more than one path. Review and delete the
+  extras yourself — nothing here is deleted automatically.
+</p>
+
+{% if groups %}
+{% for g in groups %}
+<div class="section-title" style="margin-top:24px;">{{ g.paths | length }} copies</div>
+<div class="face-chips">
+  {% for path in g.paths %}
+  <div class="face-chip">
+    <a href="/photo/{{ g.file_id }}">
+      <img src="/thumb/{{ g.file_id }}" alt="thumb" width="120" height="120" style="object-fit:cover;">
+    </a>
+    <span class="face-name" title="{{ path }}">{{ path }}</span>
+  </div>
+  {% endfor %}
+</div>
+{% endfor %}
+{% else %}
+<div class="empty-state">
+  <div class="icon">✨</div>
+  <p>No duplicates found — every tracked file has unique content.</p>
+</div>
+{% endif %}
+{% endblock %}

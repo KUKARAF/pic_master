@@ -1,0 +1,71 @@
+{# Shared photo-card markup for every grid view (gallery, search results, set
+   detail) — one place for the image/star/heart/title/tags+sets+people chips so
+   these three pages don't each duplicate the same HTML. #}
+{% macro card(f, selectable=False) %}
+<div class="card" data-file-id="{{ f.id }}">
+  {% if selectable %}
+  <input type="checkbox" class="card-select-checkbox" data-file-id="{{ f.id }}">
+  {% endif %}
+  <a class="card-img-link" href="/photo/{{ f.id }}">
+    <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
+  </a>
+
+  <a class="star-btn"
+     href="/similar/{{ f.id }}"
+     title="I am feeling lucky — find similar images">⭐</a>
+
+  <button type="button" class="heart-btn file-heart-btn {{ 'is-favorite' if f.favorite else '' }}"
+          data-file-id="{{ f.id }}" title="Favorite this photo">{{ '♥' if f.favorite else '♡' }}</button>
+
+  {% if f.score is defined %}
+  <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+  {% endif %}
+
+  <div class="card-body">
+    <a class="card-name" href="/photo/{{ f.id }}" title="{{ f.path }}">{{ f.title or f.filename }}</a>
+    {% if f.tags or f.sets or f.people %}
+    <div class="card-tags">
+      {% for tag in f.tags[:3] %}
+      <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
+      {% endfor %}
+      {% if f.tags | length > 3 %}
+      <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
+      {% endif %}
+      {% for s in f.sets[:3] %}
+      <a class="chip-set" href="/sets/{{ s.id }}" title="Set">{{ s.name }}</a>
+      {% endfor %}
+      {% if f.sets | length > 3 %}
+      <span class="chip-set" style="background:#888;">+{{ f.sets | length - 3 }}</span>
+      {% endif %}
+      {% for name in f.people[:3] %}
+      <a class="chip-person" href="/search?person={{ name | urlencode }}" title="Recognized person">{{ name }}</a>
+      {% endfor %}
+      {% if f.people | length > 3 %}
+      <span class="chip-person" style="background:#888;">+{{ f.people | length - 3 }}</span>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endmacro %}
+
+{# Sort control shared by gallery/search/set-detail — a plain GET form so it works
+   without JS, preserving whatever other query params the page already has via
+   hidden inputs passed in `extra_params` (a dict). #}
+{% macro sort_controls(sort, order, extra_params={}) %}
+<form class="sort-controls" method="get" style="display:inline-flex;align-items:center;gap:6px;">
+  {% for key, value in extra_params.items() %}
+  {% if value %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}
+  {% endfor %}
+  <label class="sub" for="sort-select" style="font-size:0.85em;">Sort by</label>
+  <select name="sort" id="sort-select" onchange="this.form.submit()">
+    <option value="added" {{ 'selected' if sort == 'added' }}>Date added</option>
+    <option value="modified" {{ 'selected' if sort == 'modified' }}>Date modified</option>
+    <option value="age" {{ 'selected' if sort == 'age' }}>Estimated age</option>
+  </select>
+  <select name="order" onchange="this.form.submit()">
+    <option value="desc" {{ 'selected' if order == 'desc' }}>{{ 'Oldest first' if sort == 'age' else 'Newest first' }}</option>
+    <option value="asc" {{ 'selected' if order == 'asc' }}>{{ 'Youngest first' if sort == 'age' else 'Oldest first' }}</option>
+  </select>
+</form>
+{% endmacro %}

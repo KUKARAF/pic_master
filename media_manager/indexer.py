@@ -5,7 +5,7 @@ from PIL import Image
 import open_clip
 import torch
 
-SUPPORTED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
 
 
 class CLIPIndexer:
@@ -19,11 +19,11 @@ class CLIPIndexer:
 
     def embed_images(self, paths):
         """
-        Return (embeddings, failed_paths).
+        Return (embeddings, failed).
         embeddings: numpy float32 array of shape (N_success, D)
-        failed_paths: list of paths that couldn't be loaded
+        failed: list of (path, message) tuples for paths that couldn't be loaded
         """
-        failed_paths = []
+        failed = []
         all_embeddings = []
 
         batch_size = 32
@@ -42,15 +42,15 @@ class CLIPIndexer:
         for path in paths:
             ext = os.path.splitext(path)[1].lower()
             if ext not in SUPPORTED_EXTENSIONS:
-                failed_paths.append(path)
+                failed.append((path, f'unsupported extension: {ext}'))
                 continue
             try:
                 img = Image.open(path).convert('RGB')
                 tensor = self.preprocess(img)
                 batch_tensors.append(tensor)
                 batch_paths.append(path)
-            except Exception:
-                failed_paths.append(path)
+            except Exception as exc:
+                failed.append((path, str(exc)))
                 continue
 
             if len(batch_tensors) >= batch_size:
@@ -66,7 +66,7 @@ class CLIPIndexer:
         else:
             embeddings = np.empty((0,), dtype=np.float32)
 
-        return embeddings, failed_paths
+        return embeddings, failed
 
     def embed_text(self, text):
         """Return normalized float32 numpy vector for a text query."""

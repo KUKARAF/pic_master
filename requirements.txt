@@ -7,3 +7,8 @@ fastapi
 uvicorn[standard]
 jinja2
 python-multipart
+insightface
+# swap onnxruntime for onnxruntime-gpu for CUDA acceleration
+onnxruntime
+open_clip_torch
+torch

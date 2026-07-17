@@ -1,10 +1,56 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}
-{% if q %}Search: {{ q }}{% elif tag %}Tag: {{ tag }}{% elif face_id %}Face: {{ face_id }}{% else %}Search{% endif %} — media
+{% if q %}Search: {{ q }}{% elif tag %}Tag: {{ tag }}{% elif person or face_id %}Person: {{ person or face_id }}{% else %}Search{% endif %} — media
 {% endblock %}
 
 {% block content %}
+{% if face_ref %}
+<div class="page-heading">
+  <h1>Similar faces</h1>
+  {% if query_face_file_id %}
+  <a href="/photo/{{ query_face_file_id }}" class="sub">← Back to photo</a>
+  {% endif %}
+</div>
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
+  <img src="/face-crop/{{ face_ref }}" width="72" height="72" style="border-radius:50%;object-fit:cover;">
+  <span class="sub">Faces that look like this one</span>
+</div>
+
+{% if similar_faces %}
+<div class="grid" id="similar-unknown-grid">
+  {% for f in similar_faces %}
+  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}">
+    <a class="card-img-link" href="/photo/{{ f.file_id }}">
+      <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+    <div class="card-body">
+      <div class="card-name" title="{{ f.path }}">{% if f.identity %}{{ f.identity }}{% else %}{{ f.filename }}{% endif %}</div>
+      {% if f.identity %}
+      <button type="button" class="btn-similar use-name-btn" data-name="{{ f.identity }}"
+              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "{{ f.identity }}"</button>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="alert" id="similar-empty-state">
+  <p style="margin-bottom:10px;">No similar faces found at the default threshold.</p>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>
+    <input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">
+    <span id="similar-threshold-value" class="sub">0.30</span>
+    <button type="button" id="expand-similar-btn" class="btn-similar" data-face-ref="{{ face_ref }}" style="font-size:0.85em;">Expand similar face search</button>
+  </div>
+  <div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>
+</div>
+<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>
+{% endif %}
+
+{% else %}
 <div class="page-heading">
   {% if q %}
   <h1>Results for "{{ q }}"</h1>
@@ -12,47 +58,44 @@
   {% elif tag %}
   <h1>Tag: {{ tag }}</h1>
   <span class="sub">{{ files | length }} file(s)</span>
-  {% elif face_id %}
-  <h1>Face cluster #{{ face_id }}</h1>
+  {% elif person or face_id %}
+  <h1>Person: {{ person or face_id }}</h1>
+  <span class="sub">{{ files | length }} file(s)</span>
   {% else %}
   <h1>Search</h1>
   {% endif %}
 </div>
+
+{% if not q and not tag and not person and not face_id %}
+<div class="face-search-box" style="margin-bottom:24px;">
+  <div class="section-title">Search by face photo</div>
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+    <input type="file" id="face-upload" accept="image/*" style="font-size:0.9em;">
+    <button type="button" id="face-search-btn" class="btn-similar">Find face</button>
+    <span id="face-search-status" style="font-size:0.85em;color:#888;"></span>
+  </div>
+  <div id="face-results" class="grid" style="margin-top:16px;"></div>
+</div>
+{% endif %}
 
 {% if message %}
 <div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
 {% endif %}
 
 {% if files %}
-<div class="grid">
-  {% for f in files %}
-  <div class="card">
-    <a class="card-img-link" href="/photo/{{ f.id }}">
-      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-
-    <a class="star-btn"
-       href="/similar/{{ f.id }}"
-       title="I am feeling lucky — find similar images">⭐</a>
-
-    {% if f.score is defined %}
-    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
-    {% endif %}
-
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
-      {% if f.tags %}
-      <div class="card-tags">
-        {% for tag in f.tags[:3] %}
-        <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
-        {% endfor %}
-        {% if f.tags | length > 3 %}
-        <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
-        {% endif %}
-      </div>
-      {% endif %}
-    </div>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <button type="button" id="bulk-set-btn" class="btn-similar">+ Add to set</button>
+    <span id="bulk-set-status" class="sub"></span>
   </div>
+  {% if tag or person or face_id %}
+  {{ macros.sort_controls(sort, order, {'tag': tag, 'person': person, 'face_id': face_id}) }}
+  {% endif %}
+</div>
+
+<div class="grid" id="results-grid">
+  {% for f in files %}
+  {{ macros.card(f, selectable=True) }}
   {% endfor %}
 </div>
 
@@ -62,4 +105,290 @@
   <p>No results found.</p>
 </div>
 {% endif %}
+
+{% if (person or face_id) and files %}
+<div class="section-title" style="margin-top:28px;margin-bottom:12px;">
+  Unidentified faces that look like {{ person or face_id }}
+</div>
+
+{% if similar_unknown_faces %}
+<div class="grid" id="similar-unknown-grid">
+  {% for f in similar_unknown_faces %}
+  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}">
+    <a class="card-img-link" href="/photo/{{ f.file_id }}">
+      <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+    <div class="card-body">
+      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
+      <button type="button" class="btn-similar merge-face-btn" data-face-ref="{{ f.ref }}"
+              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="alert" id="similar-empty-state">
+  <p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>
+    <input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">
+    <span id="similar-threshold-value" class="sub">0.30</span>
+    <button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>
+  </div>
+  <div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>
+</div>
+<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>
+{% endif %}
+{% endif %}
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
+  wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+
+/* Bulk "Add to set" — pick/create a target set (same keyboard-first modal as the
+   photo page), then check any number of result cards and add them all at once. */
+(function() {
+  const bulkBtn = document.getElementById('bulk-set-btn');
+  const bulkStatus = document.getElementById('bulk-set-status');
+  const grid = document.getElementById('results-grid');
+  if (!bulkBtn || !grid) return;
+
+  let targetSet = null;
+
+  bulkBtn.addEventListener('click', function() {
+    if (!targetSet) {
+      openSetSearchModal(function(set) {
+        targetSet = set;
+        bulkBtn.textContent = 'Add to "' + set.name + '"';
+        grid.classList.add('select-mode');
+        bulkStatus.textContent = 'Select photos, then click the button again to add them.';
+      });
+      return;
+    }
+
+    const checked = Array.from(grid.querySelectorAll('.card-select-checkbox:checked'));
+    if (!checked.length) {
+      bulkStatus.textContent = 'Select at least one photo first.';
+      return;
+    }
+    bulkBtn.disabled = true;
+    // Sequential, not Promise.all: the backend uses one shared SQLite connection
+    // per database with no locking, so firing these all at once from separate
+    // request threads corrupts cursor state (intermittent 500s / wrong-file 404s).
+    // One at a time keeps every request on the connection serialized and safe.
+    let addedCount = 0;
+    let firstError = null;
+    checked.reduce(function(chain, cb) {
+      return chain.then(function() {
+        return assignFileToSet(cb.dataset.fileId, targetSet.id)
+          .then(function() { addedCount++; cb.checked = false; })
+          .catch(function(err) { if (!firstError) firstError = err; });
+      });
+    }, Promise.resolve())
+      .then(function() {
+        bulkBtn.disabled = false;
+        if (firstError) {
+          bulkStatus.textContent = 'Added ' + addedCount + ' of ' + checked.length +
+            ' photo(s) to "' + targetSet.name + '" — failed: ' + firstError.message;
+        } else {
+          bulkStatus.textContent = 'Added ' + addedCount + ' photo(s) to "' + targetSet.name + '".';
+        }
+      });
+  });
+
+  /* In select mode, clicking the thumbnail toggles selection instead of opening
+     the photo — only the title text (a separate link) still navigates. */
+  grid.addEventListener('click', function(e) {
+    if (!grid.classList.contains('select-mode')) return;
+    const imgLink = e.target.closest('.card-img-link');
+    if (!imgLink) return;
+    e.preventDefault();
+    const card = imgLink.closest('.card');
+    const cb = card ? card.querySelector('.card-select-checkbox') : null;
+    if (cb) cb.checked = !cb.checked;
+  });
+})();
+(function() {
+  const btn = document.getElementById('face-search-btn');
+  if (btn) {
+    btn.addEventListener('click', async function() {
+      const input = document.getElementById('face-upload');
+      const status = document.getElementById('face-search-status');
+      const resultsDiv = document.getElementById('face-results');
+      if (!input.files || !input.files[0]) {
+        status.textContent = 'Please select an image file first.';
+        return;
+      }
+      status.textContent = 'Searching…';
+      resultsDiv.innerHTML = '';
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      try {
+        const resp = await fetch('/api/search/face', { method: 'POST', body: fd });
+        const data = await resp.json();
+        if (data.message) {
+          status.textContent = data.message;
+          return;
+        }
+        if (!data.results || data.results.length === 0) {
+          status.textContent = 'No matching faces found.';
+          return;
+        }
+        status.textContent = data.results.length + ' result(s)';
+        data.results.forEach(function(f) {
+          resultsDiv.innerHTML += `
+            <div class="card">
+              <a class="card-img-link" href="/photo/${f.file_id}">
+                <img src="/thumb/${f.file_id}" alt="${f.filename}" loading="lazy">
+              </a>
+              <span class="score-badge">${f.score.toFixed(3)}</span>
+              <div class="card-body">
+                <div class="card-name" title="${f.path}">${f.filename}</div>
+              </div>
+            </div>`;
+        });
+      } catch(e) {
+        status.textContent = 'Search error: ' + e.message;
+      }
+    });
+  }
+
+  const personName = {{ (person or face_id) | tojson }};
+
+  function wireMergeButton(mbtn) {
+    mbtn.addEventListener('click', function() {
+      const ref = mbtn.dataset.faceRef;
+      mbtn.disabled = true;
+      mbtn.textContent = 'Adding…';
+      fetch('/api/faces/' + ref + '/identity', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: personName}),
+      })
+        .then(function(r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function() {
+          const card = document.getElementById('unknown-card-' + ref);
+          if (card) card.remove();
+        })
+        .catch(function(err) {
+          mbtn.disabled = false;
+          mbtn.textContent = '＋ Add';
+          alert('Failed to add: ' + err.message);
+        });
+    });
+  }
+  document.querySelectorAll('.merge-face-btn').forEach(wireMergeButton);
+
+  /* "Use this name" — only shown in face_ref mode, on a match that's already
+     named. Assigns that name to the *query* face, then jumps back to its photo. */
+  const queryFaceRef = {{ face_ref | tojson }};
+  const queryFaceFileId = {{ query_face_file_id | tojson }};
+
+  function wireUseNameButton(ubtn) {
+    ubtn.addEventListener('click', function() {
+      const name = ubtn.dataset.name;
+      ubtn.disabled = true;
+      ubtn.textContent = 'Saving…';
+      fetch('/api/faces/' + queryFaceRef + '/identity', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: name}),
+      })
+        .then(function(r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function() {
+          window.location.href = queryFaceFileId ? '/photo/' + queryFaceFileId : '/faces';
+        })
+        .catch(function(err) {
+          ubtn.disabled = false;
+          ubtn.textContent = 'Use "' + name + '"';
+          alert('Failed to assign name: ' + err.message);
+        });
+    });
+  }
+  document.querySelectorAll('.use-name-btn').forEach(wireUseNameButton);
+
+  /* Expand similar face search — shown when nothing matched at the default threshold.
+     Two modes share this one control: searching by an existing person's name (hits
+     /api/identities/{name}/similar-faces) or by a single face with no name yet
+     (hits /api/faces/{ref}/similar) — the button's data-face-ref tells them apart. */
+  const slider = document.getElementById('similar-threshold-slider');
+  const sliderValue = document.getElementById('similar-threshold-value');
+  const expandBtn = document.getElementById('expand-similar-btn');
+  const expandStatus = document.getElementById('expand-similar-status');
+  const similarGrid = document.getElementById('similar-unknown-grid');
+
+  if (slider && sliderValue) {
+    slider.addEventListener('input', function() {
+      sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+    });
+  }
+
+  if (expandBtn) {
+    expandBtn.addEventListener('click', function() {
+      const threshold = slider ? slider.value : 0.3;
+      const byFaceRef = expandBtn.dataset.faceRef;
+      const url = byFaceRef
+        ? '/api/faces/' + byFaceRef + '/similar?threshold=' + threshold
+        : '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
+      expandStatus.style.display = 'block';
+      expandStatus.textContent = 'Searching…';
+      fetch(url)
+        .then(function(r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          const results = data.results || [];
+          if (!results.length) {
+            expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
+            return;
+          }
+          expandStatus.style.display = 'none';
+          similarGrid.innerHTML = '';
+          results.forEach(function(f) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.id = 'unknown-card-' + f.ref;
+            card.dataset.faceRef = f.ref;
+            const actionHtml = byFaceRef
+              ? (f.identity
+                  ? '<button type="button" class="btn-similar use-name-btn" data-name="' + f.identity + '" ' +
+                    'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + f.identity + '"</button>'
+                  : '')
+              : '<button type="button" class="btn-similar merge-face-btn" data-face-ref="' + f.ref + '" ' +
+                'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>';
+            card.innerHTML =
+              '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
+                '<img src="/face-crop/' + f.ref + '" alt="' + f.filename + '" loading="lazy">' +
+              '</a>' +
+              '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
+              '<div class="card-body">' +
+                '<div class="card-name" title="' + f.path + '">' + (f.identity || f.filename) + '</div>' +
+                actionHtml +
+              '</div>';
+            similarGrid.appendChild(card);
+            const mergeBtn = card.querySelector('.merge-face-btn');
+            if (mergeBtn) wireMergeButton(mergeBtn);
+            const useNameBtn = card.querySelector('.use-name-btn');
+            if (useNameBtn) wireUseNameButton(useNameBtn);
+          });
+        })
+        .catch(function(err) {
+          expandStatus.textContent = 'Search error: ' + err.message;
+        });
+    });
+  }
+})();
+</script>
 {% endblock %}

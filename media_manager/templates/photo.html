@@ -3,12 +3,23 @@
 {% block title %}{{ file.filename }} — media{% endblock %}
 
 {% block head %}
-<script>window.MEDIA_FILE_ID = {{ file.id }};</script>
+<script>
+  window.MEDIA_FILE_ID = {{ file.id }};
+  window.DETECTED_CLASSES = {{ detected_classes | tojson }};
+</script>
 {% endblock %}
 
 {% block content %}
 <div class="page-heading">
-  <h1>{{ file.filename }}</h1>
+  <h1>
+    <span id="photo-title-display">{{ file.title or file.filename }}</span>
+    <button type="button" id="photo-title-edit-btn" class="heart-btn-inline" title="Edit title" style="font-size:0.8em;">✏️</button>
+    <button type="button" id="file-heart-btn" class="heart-btn-inline heart-btn-file {{ 'is-favorite' if file.favorite else '' }}"
+            title="Favorite this photo">{{ '♥' if file.favorite else '♡' }}</button>
+  </h1>
+  {% if file.title %}
+  <span class="sub" id="photo-filename-sub" title="Original filename">{{ file.filename }}</span>
+  {% endif %}
   <a href="/" class="sub">← Back to gallery</a>
 </div>
 
@@ -17,9 +28,9 @@
   <!-- Image -->
   <div>
     {% if file.is_image %}
-    <a href="/image/{{ file.id }}">
-      <img src="/image/{{ file.id }}" alt="{{ file.filename }}">
-    </a>
+    <div class="photo-image-wrap" id="photo-image-wrap">
+      <img src="/image/{{ file.id }}" alt="{{ file.filename }}" id="photo-image" draggable="false">
+    </div>
     {% else %}
     <div class="alert">This file is not a supported image type.</div>
     {% endif %}
@@ -44,49 +55,145 @@
           <td>Hash</td>
           <td>{{ file.checksum or '—' }}</td>
         </tr>
-        <tr>
-          <td>Indexed</td>
-          <td>{% if file.last_hashed %}{{ file.last_hashed }}{% else %}—{% endif %}</td>
-        </tr>
       </table>
     </div>
 
-    <!-- Tags -->
+    <!-- Tags (manually set + auto-detected are shown together — blue = manual,
+         gray = detected, red = manually rejected and excluded from search) -->
     <div>
       <div class="section-title">Tags</div>
       <div id="tag-list">
         {% for tag in file.tags %}
-        <span class="tag-removable" data-tag="{{ tag }}">
-          {{ tag }}
+        <span class="{{ 'tag-negative' if tag.polarity == 'negative' else 'tag-removable' }}" data-tag-id="{{ tag.id }}">
+          <span class="tag-label-display">
+          {% if tag.polarity == 'negative' %}
+          <span class="tag-negative-label">{{ tag.label }}</span>
+          {% else %}
+          <a href="/search?tag={{ tag.label | urlencode }}" class="tag-label-link">{{ tag.label }}</a>
+          {% endif %}
+          </span>
+          <button class="heart-btn-inline tag-heart-btn {{ 'is-favorite' if tag.favorite else '' }}" type="button"
+                  title="Favorite this tag" style="font-size:0.85em;">{{ '♥' if tag.favorite else '♡' }}</button>
+          <button class="tag-edit-btn" type="button" title="Edit label">✏️</button>
           <button class="rm" type="button" title="Remove tag">×</button>
+        </span>
+        {% endfor %}
+        {% for cls in detected_classes %}
+        <span class="tag-detected" data-detected-label="{{ cls }}" title="Auto-detected">
+          <a href="/search?q={{ cls | urlencode }}" class="tag-label-link">{{ cls }}</a>
+          <button class="rm" type="button" title="Not in this photo — mark as rejected">×</button>
         </span>
         {% endfor %}
       </div>
 
       <form class="tag-input-row" id="tag-form" autocomplete="off">
-        <input type="text" id="tag-input" placeholder="Add a tag…" maxlength="64">
+        <input type="text" id="tag-input" placeholder="Add a tag…" maxlength="64" list="vocab-suggestions">
         <button type="submit">Add</button>
+        <button type="button" id="tag-negative-btn" title="Mark as NOT in this photo (e.g. a wrong detection)">🚫</button>
       </form>
-    </div>
 
-    <!-- Detected objects -->
-    {% if detected_classes %}
-    <div>
-      <div class="section-title">Detected objects</div>
-      <div id="detected-list">
-        {% for cls in detected_classes %}
-        <span class="tag-detected">{{ cls }}</span>
+      {% if file.is_image %}
+      <button type="button" id="reindex-tags-btn" class="btn-similar" style="margin-top:10px;font-size:0.8em;">🔄 Reindex tags</button>
+      <div id="reindex-tags-status" class="sub" style="display:none;"></div>
+      {% endif %}
+
+      {% if spatial_tags %}
+      <div class="section-title" style="margin-top:14px;font-size:0.82rem;">Labeled regions</div>
+      <div id="spatial-tag-list">
+        {% for t in spatial_tags %}
+        <span class="tag-detected">{{ t.label }}</span>
         {% endfor %}
       </div>
-    </div>
-    {% endif %}
+      {% endif %}
 
-    <!-- Faces (stub) -->
+      {% if file.is_image %}
+      <button type="button" id="label-region-btn" class="btn-similar" style="margin-top:10px;font-size:0.8em;">＋ Label region</button>
+      <div id="label-region-status" class="sub" style="display:none;"></div>
+      <form class="tag-input-row" id="region-label-form" style="display:none;margin-top:6px;" autocomplete="off">
+        <input type="text" id="region-label-input" placeholder="What is it?…" maxlength="64" list="vocab-suggestions">
+        <button type="submit">Save</button>
+      </form>
+      {% endif %}
+
+      <datalist id="vocab-suggestions"></datalist>
+    </div>
+
+    <!-- Sets — a photo can belong to any number of sets -->
+    <div>
+      <div class="section-title">Sets</div>
+      <div id="set-current">
+        {% if current_sets %}
+        {% for s in current_sets %}
+        <span class="tag-removable" data-set-id="{{ s.id }}" style="margin-bottom:4px;display:inline-flex;">
+          <a href="/sets/{{ s.id }}" style="color:#fff;">{{ s.name }}</a>{% if s.studio %} <span style="opacity:.8;">({{ s.studio }})</span>{% endif %}
+          <button class="heart-btn-inline set-heart-btn {{ 'is-favorite' if s.favorite else '' }}" type="button"
+                  data-set-id="{{ s.id }}" title="Favorite this set" style="font-size:0.85em;">{{ '♥' if s.favorite else '♡' }}</button>
+          <button class="rm set-remove-btn" type="button" data-set-id="{{ s.id }}" title="Remove from this set">×</button>
+        </span>
+        {% endfor %}
+        {% else %}
+        <span class="sub">Not in any set.</span>
+        {% endif %}
+      </div>
+      <button type="button" id="set-picker-btn" class="btn-similar" style="margin-top:8px;">＋ Add to set</button>
+    </div>
+
+    <!-- Faces -->
     <div>
       <div class="section-title">Faces</div>
+      {% if file.is_image %}
+      <button type="button" id="add-face-btn" class="btn-similar" style="margin-bottom:8px;">＋ Add face</button>
+      <button type="button" id="detect-faces-btn" class="btn-similar" style="margin-bottom:8px;">🔍 Detect faces</button>
+      <button type="button" id="estimate-age-btn" class="btn-similar" style="margin-bottom:8px;">🎂 Estimate age and gender</button>
+      {% if file.frame_count and file.frame_count > 1 %}
+      <button type="button" id="scan-all-frames-btn" class="btn-similar" style="margin-bottom:8px;"
+              title="Run face/object/embedding detection across all {{ file.frame_count }} frames">
+        🎞️ Scan all frames ({{ file.frame_count }})
+      </button>
+      <div id="scan-all-frames-status" class="sub" style="display:none;"></div>
+      {% endif %}
+      <div id="add-face-status" class="sub" style="display:none;"></div>
+      <div id="detect-faces-status" class="sub" style="display:none;"></div>
+      <div id="estimate-age-status" class="sub" style="display:none;"></div>
+      {% endif %}
+      {% if faces %}
+      <div class="face-chips" id="face-chips">
+        {% for face in faces %}
+        <div class="face-chip" data-face-ref="{{ face.ref }}">
+          <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}">
+            <img src="/face-crop/{{ face.ref }}" alt="face" width="60" height="60">
+          </a>
+          <span class="face-name">
+            <a class="heart-btn-inline" href="/search?face_ref={{ face.ref | urlencode }}"
+               title="Find similar faces" style="font-size:0.85em;">🔎</a>
+            {% if face.identity %}
+              <a href="/search?person={{ face.identity | urlencode }}">{{ face.identity }}</a>
+              <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}" title="Rename this face" style="font-size:0.85em;">✏️</a>
+            {% else %}
+              <a href="#" class="unknown face-name-btn" data-face-ref="{{ face.ref }}">Unknown</a>
+            {% endif %}
+            <span class="face-age-gender {{ 'gender-male' if face.gender == 'male' else ('gender-female' if face.gender == 'female' else '') }}"
+                  data-face-ref="{{ face.ref }}" style="font-size:0.85em;">
+              {% if face.age is not none %}{{ face.age | round(0) | int }}{% endif %}
+            </span>
+            {% if face.ref.startswith('manual:') %}
+            <button type="button" class="heart-btn-inline face-heart-btn {{ 'is-favorite' if face.favorite else '' }}"
+                    data-face-ref="{{ face.ref }}" title="Favorite this face" style="font-size:0.85em;">{{ '♥' if face.favorite else '♡' }}</button>
+            {% endif %}
+            {% if face.frame_index is not none %}
+            <span class="sub" style="font-size:0.75em;" title="Found at frame {{ face.frame_index }}">frame {{ face.frame_index }}</span>
+            {% endif %}
+          </span>
+          <button class="rm face-reject-btn" type="button" data-face-ref="{{ face.ref }}" title="Not a face — reject">×</button>
+        </div>
+        {% endfor %}
+      </div>
+      <a href="/faces" class="sub" style="font-size:0.8em;">Label faces →</a>
+      {% else %}
       <p class="alert">
-        No faces indexed yet — run <code>media faces</code> to detect faces in this image.
+        No faces indexed — run <code>media faces</code> to detect faces in this image.
       </p>
+      {% endif %}
     </div>
 
     <!-- Find similar -->

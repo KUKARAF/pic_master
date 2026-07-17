@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}Gallery — media{% endblock %}
 
@@ -8,45 +9,32 @@
   <span class="sub">{{ total }} files tracked</span>
 </div>
 
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+  {% if favorite_only %}
+  <a href="/?sort={{ sort }}&order={{ order }}" class="sub">← All photos</a>
+  {% else %}
+  <a href="/?favorite=1&sort={{ sort }}&order={{ order }}" class="sub">♥ Favorites only</a>
+  {% endif %}
+  {{ macros.sort_controls(sort, order, {'favorite': '1' if favorite_only else ''}) }}
+</div>
+
 {% if files %}
 <div class="grid">
   {% for f in files %}
-  <div class="card">
-    <a class="card-img-link" href="/photo/{{ f.id }}">
-      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-
-    <a class="star-btn"
-       href="/similar/{{ f.id }}"
-       title="I am feeling lucky — find similar images">⭐</a>
-
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
-      {% if f.tags %}
-      <div class="card-tags">
-        {% for tag in f.tags[:3] %}
-        <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
-        {% endfor %}
-        {% if f.tags | length > 3 %}
-        <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
-        {% endif %}
-      </div>
-      {% endif %}
-    </div>
-  </div>
+  {{ macros.card(f) }}
   {% endfor %}
 </div>
 
 {% if total > limit %}
 <div class="pagination">
   {% if page > 1 %}
-  <a href="/?page={{ page - 1 }}">← Prev</a>
+  <a href="/?page={{ page - 1 }}{{ '&favorite=1' if favorite_only else '' }}&sort={{ sort }}&order={{ order }}">← Prev</a>
   {% endif %}
 
   <span class="current">{{ page }}</span>
 
   {% if page * limit < total %}
-  <a href="/?page={{ page + 1 }}">Next →</a>
+  <a href="/?page={{ page + 1 }}{{ '&favorite=1' if favorite_only else '' }}&sort={{ sort }}&order={{ order }}">Next →</a>
   {% endif %}
 </div>
 {% endif %}
@@ -54,7 +42,11 @@
 {% else %}
 <div class="empty-state">
   <div class="icon">📂</div>
+  {% if favorite_only %}
+  <p>No favorited photos yet.</p>
+  {% else %}
   <p>No files tracked yet. Run <code>media add .</code> to scan your photos.</p>
+  {% endif %}
 </div>
 {% endif %}
 {% endblock %}
@@ -62,5 +54,8 @@
 {% block scripts %}
 <script>
 /* tags dropdown (shared logic lives in app.js, initialised automatically) */
+document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
+  wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
 </script>
 {% endblock %}

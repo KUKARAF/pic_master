@@ -1,0 +1,154 @@
+{% extends "base.html" %}
+
+{% block title %}Sets — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Sets{% if studio_filter %} <span class="sub">— {{ studio_filter }}</span>{% endif %}</h1>
+  <span class="sub">{{ sets | length }} set(s)</span>
+</div>
+{% if studio_filter %}
+<div style="margin-bottom:12px;">
+  <a href="/studios" class="sub">← All studios</a>
+</div>
+{% endif %}
+
+<form id="set-create-form" style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;" autocomplete="off">
+  <input type="text" id="set-name-input" placeholder="Set name…" required style="min-width:180px;">
+  <input type="text" id="set-studio-input" placeholder="Studio (optional)…" style="min-width:180px;">
+  <button type="submit">Create set</button>
+  <span id="set-create-msg" style="font-size:0.85em;color:#888;"></span>
+</form>
+
+<div style="margin-bottom:20px;">
+  {% if favorite_only %}
+  <a href="/sets{{ '?studio=' + studio_filter | urlencode if studio_filter else '' }}" class="sub">← All sets</a>
+  {% else %}
+  <a href="/sets?favorite=1{{ '&studio=' + studio_filter | urlencode if studio_filter else '' }}" class="sub">♥ Favorites only</a>
+  {% endif %}
+</div>
+
+{% if sets %}
+<div class="grid" id="sets-grid">
+  {% for s in sets %}
+  <div class="card" id="set-card-{{ s.id }}" data-set-id="{{ s.id }}">
+    <a class="card-img-link" href="/sets/{{ s.id }}">
+      {% if s.thumb_id %}
+      <img src="/thumb/{{ s.thumb_id }}" alt="{{ s.name }}" loading="lazy">
+      {% else %}
+      <div style="aspect-ratio:1;background:#2a2d35;display:flex;align-items:center;justify-content:center;font-size:2rem;">🗂️</div>
+      {% endif %}
+    </a>
+
+    <button type="button" class="icon-btn edit-btn set-edit-btn" data-set-id="{{ s.id }}"
+            data-set-name="{{ s.name }}" data-set-studio="{{ s.studio or '' }}" title="Rename set">✏️</button>
+    <button type="button" class="icon-btn delete-btn set-delete-btn" data-set-id="{{ s.id }}" title="Delete set">🗑️</button>
+    <button type="button" class="heart-btn set-heart-btn {{ 'is-favorite' if s.favorite else '' }}"
+            data-set-id="{{ s.id }}" title="Favorite this set">{{ '♥' if s.favorite else '♡' }}</button>
+
+    <div class="card-body">
+      <div class="card-name" title="{{ s.name }}">
+        <a href="/sets/{{ s.id }}">{{ s.name }}</a>
+        {% if s.studio %} <span class="sub">({{ s.studio }})</span>{% endif %}
+      </div>
+      <div class="sub" style="font-size:0.78rem;">{{ s.image_count }} image(s)</div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="icon">🗂️</div>
+  {% if favorite_only %}
+  <p>No favorited sets yet.</p>
+  {% else %}
+  <p>No sets yet. Create one above, or run <code>media set create &lt;name&gt; [--studio STUDIO]</code>.</p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.getElementById('set-create-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const name = document.getElementById('set-name-input').value.trim();
+  const studio = document.getElementById('set-studio-input').value.trim();
+  const msg = document.getElementById('set-create-msg');
+  if (!name) return;
+  try {
+    const resp = await fetch('/api/sets', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, studio: studio || null}),
+    });
+    if (resp.ok) {
+      location.reload();
+    } else {
+      msg.textContent = 'Error creating set.';
+    }
+  } catch (err) {
+    msg.textContent = 'Network error.';
+  }
+});
+
+document.querySelectorAll('.set-heart-btn').forEach(function(btn) {
+  wireHeartButton(btn, '/api/sets/' + btn.dataset.setId + '/favorite');
+});
+
+document.querySelectorAll('.set-delete-btn').forEach(function(btn) {
+  btn.addEventListener('click', async function() {
+    if (!confirm('Delete this set? Member photos are not affected.')) return;
+    try {
+      const resp = await fetch('/api/sets/' + btn.dataset.setId, {method: 'DELETE'});
+      if (resp.ok) {
+        const card = document.getElementById('set-card-' + btn.dataset.setId);
+        if (card) card.remove();
+      } else {
+        alert('Failed to delete set.');
+      }
+    } catch (err) {
+      alert('Network error.');
+    }
+  });
+});
+
+document.querySelectorAll('.set-edit-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    openModal('Rename set', function(box) {
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.value = btn.dataset.setName;
+      nameInput.style.width = '100%';
+      nameInput.style.marginBottom = '8px';
+      box.appendChild(nameInput);
+
+      const studioInput = document.createElement('input');
+      studioInput.type = 'text';
+      studioInput.placeholder = 'Studio (optional)…';
+      studioInput.value = btn.dataset.setStudio;
+      studioInput.style.width = '100%';
+      studioInput.style.marginBottom = '8px';
+      box.appendChild(studioInput);
+
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.textContent = 'Save';
+      saveBtn.addEventListener('click', function() {
+        const name = nameInput.value.trim();
+        if (!name) return;
+        fetch('/api/sets/' + btn.dataset.setId, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: name, studio: studioInput.value.trim() || null}),
+        })
+          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function() { closeModal(); location.reload(); })
+          .catch(function(err) { alert('Failed to rename set: ' + err.message); });
+      });
+      box.appendChild(saveBtn);
+    });
+  });
+});
+</script>
+{% endblock %}

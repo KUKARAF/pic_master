@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "media-manager"
+version = "0.1.0"
+description = "Media manager - like git for your media files"
+readme = "README.md"
+requires-python = ">=3.9"
+# Dependencies live in requirements.txt (single source of truth for both
+# `pip install .` and `pip install -r requirements.txt`).
+dynamic = ["dependencies"]
+
+[project.scripts]
+media = "media_manager.media:main"
+
+[project.urls]
+Homepage = "https://github.com/KUKARAF/pic_master"
+
+[tool.setuptools]
+packages = ["media_manager"]
+
+[tool.setuptools.package-data]
+# web.py serves these from the installed package (Path(__file__).parent), so they
+# must ship inside the wheel — a plain find_packages() install would omit them and
+# `media web` would 500 on every page.
+media_manager = ["templates/*.html", "static/*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }

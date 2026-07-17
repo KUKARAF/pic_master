@@ -22,12 +22,17 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual environment
+# Virtual environments (incl. the isolated MiVOLO env — see requirements-age-estimator.txt)
+.venv/
+.age-venv/
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
+
+# Per-library media repo state (created by `media init`; holds the index db and search terms)
+.media/
 
 # IDE files
 .vscode/
@@ -45,3 +50,8 @@ venv.bak/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Downloaded model weights (auto-fetched on first use, e.g. the age estimator's
+# person detector) — never something to commit.
+*.pt
+
