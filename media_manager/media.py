@@ -155,6 +155,9 @@ def main():
 
     # media web - launch the FastAPI gallery server
     web_cmd = sub.add_parser('web', help='Start the web gallery UI at localhost:8000')
+    web_cmd.add_argument('host_pos', nargs='?', metavar='host', default=None,
+                         help='Host to bind to, e.g. 192.168.1.231 to expose on the local '
+                              'network (shorthand for --host)')
     web_cmd.add_argument('--host', default='127.0.0.1',
                          help='Host to bind to (default: 127.0.0.1)')
     web_cmd.add_argument('--port', type=int, default=8000,
@@ -416,8 +419,9 @@ def main():
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        print(f"Starting media gallery at http://{args.host}:{args.port}/")
-        uvicorn.run(app, host=args.host, port=args.port)
+        host = args.host_pos or args.host
+        print(f"Starting media gallery at http://{host}:{args.port}/")
+        uvicorn.run(app, host=host, port=args.port)
         return 0
 
     else:
