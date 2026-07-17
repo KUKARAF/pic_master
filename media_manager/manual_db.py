@@ -9,8 +9,9 @@ change and has no meaning at all if media.db is ever rebuilt from scratch. Check
 the one thing that's actually stable: the same photo bytes always hash the same way,
 so a tag/face/set-membership recorded against a checksum stays correctly attached to
 that photo forever, independent of anything that ever happens to media.db."""
-import sqlite3
 import time
+
+from media_manager.database import ThreadLocalDB
 
 # Cosine similarity above which a newly detected face is auto-assigned to a known
 # identity without asking — deliberately stricter than the 0.45 "suggest a match and
@@ -19,10 +20,9 @@ import time
 AUTO_MATCH_THRESHOLD = 0.6
 
 
-class ManualDB:
+class ManualDB(ThreadLocalDB):
     def __init__(self, db_path):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        super().__init__(db_path)
         self._create_tables()
 
     def _create_tables(self):
@@ -765,6 +765,3 @@ class ManualDB:
             (key, int(time.time()))
         )
         self.conn.commit()
-
-    def close(self):
-        self.conn.close()

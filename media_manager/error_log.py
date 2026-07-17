@@ -1,13 +1,13 @@
 """Separate error/warning log — deliberately its own sqlite file (.media/error.db),
 independent of media.db, so it can be queried/reset without touching image metadata."""
-import sqlite3
 import time
 
+from media_manager.database import ThreadLocalDB
 
-class ErrorLog:
+
+class ErrorLog(ThreadLocalDB):
     def __init__(self, db_path):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
+        super().__init__(db_path)
         cur = self.conn.cursor()
         cur.execute('''
             CREATE TABLE IF NOT EXISTS errors (
@@ -52,5 +52,3 @@ class ErrorLog:
         cur.execute('UPDATE errors SET read = 1 WHERE read = 0')
         self.conn.commit()
 
-    def close(self):
-        self.conn.close()

@@ -3,9 +3,11 @@ FastAPI web server for media_manager — gallery UI with CLIP search, tags, and 
 """
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional
@@ -73,6 +75,22 @@ def _gray_placeholder() -> bytes:
     return buf.getvalue()
 
 
+def _save_jpeg_atomic(img, dst_path: str, quality: int):
+    """Save via a unique temp file + os.replace so dst_path only ever holds a
+    complete JPEG. Concurrent requests for a not-yet-cached thumb/crop each
+    generate it in parallel, and a plain in-place save lets one request stream
+    a half-written file ('Response content shorter than Content-Length')."""
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    tmp_path = f'{dst_path}.{os.getpid()}.{threading.get_ident()}.tmp'
+    try:
+        img.save(tmp_path, format='JPEG', quality=quality)
+        os.replace(tmp_path, dst_path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp_path)
+        raise
+
+
 def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
     """Resize src to 400 px wide, save as JPEG at dst_path.
     Returns (success, message). message is a non-fatal decoder warning (e.g.
@@ -91,8 +109,7 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
                 new_w = 400
                 new_h = max(1, int(h * new_w / w))
                 img = img.resize((new_w, new_h), PILImage.LANCZOS)
-                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-                img.save(dst_path, format='JPEG', quality=80)
+                _save_jpeg_atomic(img, dst_path, quality=80)
         message = '; '.join(str(w.message) for w in caught) if caught else None
         return True, message
     except Exception as exc:
@@ -167,8 +184,7 @@ def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 
             body = img.crop((x1, y1, x2, y2))
             new_w = max(1, int(body.width * height / body.height))
             body = body.resize((new_w, height), PILImage.LANCZOS)
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            body.save(dst_path, format='JPEG', quality=85)
+            _save_jpeg_atomic(body, dst_path, quality=85)
             return True
     except Exception:
         return False
@@ -192,8 +208,7 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
                 return False
             face = img.crop((x1, y1, x2, y2))
             face = face.resize((size, size), PILImage.LANCZOS)
-            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            face.save(dst_path, format='JPEG', quality=85)
+            _save_jpeg_atomic(face, dst_path, quality=85)
             return True
     except Exception:
         return False

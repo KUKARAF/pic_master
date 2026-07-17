@@ -2,12 +2,48 @@
 Database schema and operations for media management.
 """
 import sqlite3
+import threading
 import time
 
-class Database:
+
+class ThreadLocalDB:
+    """One sqlite connection per thread, opened lazily via the `conn` property.
+
+    A single connection shared across threads — even with check_same_thread=False —
+    is not safe for *concurrent* use: FastAPI's threadpool runs handlers in parallel
+    and two overlapping cursor.execute() calls on one connection crash with
+    'InterfaceError: bad parameter or other API misuse' (seen as random blank
+    thumbnails in the gallery). Multiple connections to the same file are the
+    supported way to do this; WAL mode lets readers proceed during a write and
+    busy_timeout makes writers wait instead of erroring when they collide."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._local = threading.local()
+        # Persistent for the db file, so one-time here on the creating thread.
+        self.conn.execute('PRAGMA journal_mode=WAL')
+
+    @property
+    def conn(self):
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA busy_timeout=5000')
+            self._local.conn = conn
+        return conn
+
+    def close(self):
+        """Close the calling thread's connection (other threads' stay open)."""
+        conn = getattr(self._local, 'conn', None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+
+
+class Database(ThreadLocalDB):
     def __init__(self, db_path="media.db"):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row  # Enable column access by name
+        super().__init__(db_path)
         self.create_tables()
 
     def create_tables(self):
