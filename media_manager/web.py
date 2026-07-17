@@ -637,16 +637,9 @@ def create_app(data_root: str) -> FastAPI:
                 # skip self
                 ranked = [(fid, path, score, cs) for fid, path, score, cs in ranked if fid != file_id][:20]
 
-                tag_map = manual.list_tags_for_checksums([cs for _, _, _, cs in ranked])
-                for fid, path, score, cs in ranked:
-                    files.append({
-                        'id': fid,
-                        'path': path,
-                        'filename': os.path.basename(path),
-                        'has_embedding': True,
-                        'tags': tag_map.get(cs, []),
-                        'score': round(score, 4),
-                    })
+                rows = [(fid, path, True, cs) for fid, path, _score, cs in ranked]
+                scores = {fid: round(score, 4) for fid, _path, score, _cs in ranked}
+                files = _enrich_rows(rows, scores=scores)
             except Exception as exc:
                 message = f'Similarity search error: {exc}'
 
@@ -707,10 +700,9 @@ def create_app(data_root: str) -> FastAPI:
 
     def _body_search(query_row, exclude_file_id: int, limit: int = 40, threshold: float = 0.5):
         """Cosine-rank all body crops against one query crop's embedding. Dedupes to
-        the best crop per file (like search_by_face_image) and annotates each result
-        with an identity name when a named face sits inside the matched body box."""
+        the best crop per file (like search_by_face_image) and enriches each result
+        with tags/sets/recognized people, same as every other card grid."""
         import numpy as np
-        from media_manager import body_index
 
         query_emb = np.frombuffer(query_row[2], dtype=np.float32)
         rows = db.get_all_body_embeddings()
@@ -729,25 +721,21 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             best_per_file[r[1]] = (r, score)
 
-        results = []
+        body_ids = {}
+        rows = []
+        scores = {}
         for r, score in best_per_file.values():
-            body_id, fid, path, bbox_json, _emb = r
-            identity = None
+            body_id, fid, path, _bbox_json, _emb = r
             file_row = db.get_file_by_id(fid)
-            if file_row is not None:
-                bbox = json.loads(bbox_json)
-                for face in _combined_faces_for_file(fid, file_row['checksum']):
-                    if face['identity'] and body_index.match_face_to_body(face['bbox'], [bbox]):
-                        identity = face['identity']
-                        break
-            results.append({
-                'body_id': body_id,
-                'id': fid,
-                'path': path,
-                'filename': os.path.basename(path),
-                'score': round(score, 4),
-                'identity': identity,
-            })
+            if file_row is None:
+                continue
+            body_ids[fid] = body_id
+            rows.append((fid, path, False, file_row['checksum']))
+            scores[fid] = round(score, 4)
+
+        results = _enrich_rows(rows, scores=scores)
+        for card in results:
+            card['body_id'] = body_ids[card['id']]
         results.sort(key=lambda item: item['score'], reverse=True)
         return results
 
@@ -1063,9 +1051,13 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    def _find_similar_files_for_set(set_id, threshold, limit=20):
+    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0):
         """Images not yet in the set whose CLIP embedding is close to the set's
-        centroid (mean of its members' embeddings) — "images that might belong here"."""
+        centroid (mean of its members' embeddings) — "images that might belong
+        here". `offset` skips that many already-threshold-passing candidates
+        before taking `limit`, for infinite-scroll pagination; the full ranking
+        is recomputed each call (as before offset existed), which is fine at
+        personal-library scale."""
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
         member_embeddings = db.get_embeddings_for_files(member_ids)
@@ -1087,19 +1079,12 @@ def create_app(data_root: str) -> FastAPI:
         scores = cand_matrix.dot(centroid)
 
         ranked = sorted(zip(candidates, scores.tolist()), key=lambda x: x[1], reverse=True)
-        results = []
-        for (fid, path, _emb, _cs), score in ranked:
-            if score < threshold:
-                continue
-            results.append({
-                'id': fid,
-                'path': path,
-                'filename': os.path.basename(path),
-                'score': round(score, 3),
-            })
-            if len(results) >= limit:
-                break
-        return results
+        passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+        page = passing[offset:offset + limit]
+
+        rows = [(fid, path, True, cs) for (fid, path, cs), _score in page]
+        scores_map = {fid: round(score, 3) for (fid, _path, _cs), score in page}
+        return _enrich_rows(rows, scores=scores_map)
 
     @app.get('/sets/{set_id}', response_class=HTMLResponse)
     def set_detail_page(request: Request, set_id: int, sort: str = 'added', order: str = 'desc'):
@@ -1113,22 +1098,24 @@ def create_app(data_root: str) -> FastAPI:
         files = _enrich_rows(rows)
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
-        similar_files = _find_similar_files_for_set(set_id, SET_SUGGEST_THRESHOLD)
+        similar_files = _find_similar_files_for_set(set_id, SET_SUGGEST_THRESHOLD, limit=12, offset=0)
         return templates.TemplateResponse(request, 'set_detail.html', {
             'set': dict(set_row),
             'files': files,
             'all_tags': all_tags,
             'similar_files': similar_files,
+            'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
             'sort': sort,
             'order': order,
         })
 
     @app.get('/api/sets/{set_id}/similar-files')
-    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 20):
+    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         threshold = max(0.0, min(1.0, threshold))
-        return {'results': _find_similar_files_for_set(set_id, threshold, limit=limit)}
+        offset = max(0, offset)
+        return {'results': _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset)}
 
     @app.get('/api/sets')
     def api_list_sets(favorite: bool = False):

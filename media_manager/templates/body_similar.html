@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}Find by body — {{ source_filename }} — media{% endblock %}
 
@@ -38,26 +39,11 @@
 {% if results %}
 <div class="grid">
   {% for f in results %}
-  <div class="card">
-    <a class="card-img-link" href="/photo/{{ f.id }}">
-      <img src="/body-crop/{{ f.body_id }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-
-    <a class="star-btn"
-       href="/body-similar/{{ f.id }}?body_id={{ f.body_id }}"
-       title="Find bodies similar to this one">🧍</a>
-
-    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
-
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
-      {% if f.identity %}
-      <div class="card-tags">
-        <a class="tag" href="/search?person={{ f.identity | urlencode }}">{{ f.identity }}</a>
-      </div>
-      {% endif %}
-    </div>
-  </div>
+  {{ macros.card(f,
+       img_src='/body-crop/' ~ f.body_id,
+       star_href='/body-similar/' ~ f.id ~ '?body_id=' ~ f.body_id,
+       star_title='Find bodies similar to this one',
+       star_icon='🧍') }}
   {% endfor %}
 </div>
 
@@ -67,4 +53,12 @@
   <p>No similar bodies found. If the body index isn't built yet, build it above.</p>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
+  wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+</script>
 {% endblock %}

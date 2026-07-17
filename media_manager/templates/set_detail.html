@@ -40,17 +40,7 @@
 {% if similar_files %}
 <div class="grid" id="similar-set-grid">
   {% for f in similar_files %}
-  <div class="card" id="similar-set-card-{{ f.id }}" data-file-id="{{ f.id }}">
-    <a class="card-img-link" href="/photo/{{ f.id }}">
-      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
-      <button type="button" class="btn-similar add-to-set-btn" data-file-id="{{ f.id }}"
-              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>
-    </div>
-  </div>
+  {{ macros.card(f, add_to_set=True) }}
   {% endfor %}
 </div>
 {% else %}
@@ -66,6 +56,7 @@
 </div>
 <div class="grid" id="similar-set-grid" style="margin-top:16px;"></div>
 {% endif %}
+<div id="similar-set-sentinel" style="height:1px;"></div>
 {% endif %}
 {% endblock %}
 
@@ -146,7 +137,7 @@
           return r.json();
         })
         .then(function() {
-          const card = document.getElementById('similar-set-card-' + fileId);
+          const card = document.querySelector('#similar-set-grid .card[data-file-id="' + fileId + '"]');
           if (card) card.remove();
         })
         .catch(function(err) {
@@ -158,11 +149,128 @@
   }
   document.querySelectorAll('.add-to-set-btn').forEach(wireAddButton);
 
+  /* ---- suggestions grid: card building + chip rendering (mirrors
+     _macros.html's card()/card_chips() output exactly, via DOM APIs rather
+     than string concatenation so tag/set/person text is never treated as
+     HTML) ---- */
+  function addChipRow(container, items, cls, hrefFor, textFor, titleFor) {
+    items.slice(0, 3).forEach(function(item) {
+      const a = document.createElement('a');
+      a.className = cls;
+      a.href = hrefFor(item);
+      if (titleFor) a.title = titleFor(item);
+      a.textContent = textFor(item);
+      container.appendChild(a);
+    });
+    if (items.length > 3) {
+      const span = document.createElement('span');
+      span.className = cls;
+      span.style.background = '#111811';
+      span.style.borderColor = '#243024';
+      span.style.color = '#728C72';
+      span.textContent = '+' + (items.length - 3);
+      container.appendChild(span);
+    }
+  }
+
+  function buildSuggestionCard(f) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.id = 'similar-set-card-' + f.id;
+    card.dataset.fileId = f.id;
+
+    const imgLink = document.createElement('a');
+    imgLink.className = 'card-img-link';
+    imgLink.href = '/photo/' + f.id;
+    const img = document.createElement('img');
+    img.src = '/thumb/' + f.id;
+    img.alt = f.filename;
+    img.loading = 'lazy';
+    imgLink.appendChild(img);
+    card.appendChild(imgLink);
+
+    const starBtn = document.createElement('a');
+    starBtn.className = 'star-btn';
+    starBtn.href = '/similar/' + f.id;
+    starBtn.title = 'I am feeling lucky — find similar images';
+    starBtn.textContent = '⭐';
+    card.appendChild(starBtn);
+
+    const heartBtn = document.createElement('button');
+    heartBtn.type = 'button';
+    heartBtn.className = 'heart-btn file-heart-btn' + (f.favorite ? ' is-favorite' : '');
+    heartBtn.dataset.fileId = f.id;
+    heartBtn.title = 'Favorite this photo';
+    heartBtn.textContent = f.favorite ? '♥' : '♡';
+    card.appendChild(heartBtn);
+    wireHeartButton(heartBtn, '/api/files/' + f.id + '/favorite');
+
+    const scoreBadge = document.createElement('span');
+    scoreBadge.className = 'score-badge';
+    scoreBadge.textContent = f.score.toFixed(3);
+    card.appendChild(scoreBadge);
+
+    const cardBody = document.createElement('div');
+    cardBody.className = 'card-body';
+
+    const nameLink = document.createElement('a');
+    nameLink.className = 'card-name';
+    nameLink.href = '/photo/' + f.id;
+    nameLink.title = f.path;
+    nameLink.textContent = f.title || f.filename;
+    cardBody.appendChild(nameLink);
+
+    const tags = f.tags || [], sets = f.sets || [], people = f.people || [];
+    if (tags.length || sets.length || people.length) {
+      const chipsWrap = document.createElement('div');
+      chipsWrap.className = 'card-tags';
+      if (tags.length) {
+        addChipRow(chipsWrap, tags, 'tag',
+          function(t) { return '/search?tag=' + encodeURIComponent(t); },
+          function(t) { return t; });
+      }
+      if (sets.length) {
+        addChipRow(chipsWrap, sets, 'chip-set',
+          function(s) { return '/sets/' + s.id; },
+          function(s) { return s.name; },
+          function() { return 'Set'; });
+      }
+      if (people.length) {
+        addChipRow(chipsWrap, people, 'chip-person',
+          function(p) { return '/search?person=' + encodeURIComponent(p); },
+          function(p) { return p; },
+          function() { return 'Recognized person'; });
+      }
+      cardBody.appendChild(chipsWrap);
+    }
+
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'btn-similar add-to-set-btn';
+    addBtn.dataset.fileId = f.id;
+    addBtn.style.fontSize = '0.8em';
+    addBtn.style.padding = '4px 10px';
+    addBtn.style.marginTop = '6px';
+    addBtn.textContent = '＋ Add';
+    cardBody.appendChild(addBtn);
+    wireAddButton(addBtn);
+
+    card.appendChild(cardBody);
+    return card;
+  }
+
   const slider = document.getElementById('similar-set-threshold-slider');
   const sliderValue = document.getElementById('similar-set-threshold-value');
   const expandBtn = document.getElementById('expand-similar-set-btn');
   const expandStatus = document.getElementById('expand-similar-set-status');
   const similarGrid = document.getElementById('similar-set-grid');
+  const sentinel = document.getElementById('similar-set-sentinel');
+
+  const PAGE_SIZE = 12;
+  let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
+  let currentOffset = {{ similar_files | length if similar_files else 0 }};
+  let loadingMore = false;
+  let exhausted = currentOffset < PAGE_SIZE;
 
   if (slider && sliderValue) {
     slider.addEventListener('input', function() {
@@ -172,10 +280,10 @@
 
   if (expandBtn) {
     expandBtn.addEventListener('click', function() {
-      const threshold = slider ? slider.value : 0.6;
+      const threshold = slider ? parseFloat(slider.value) : 0.6;
       expandStatus.style.display = 'block';
       expandStatus.textContent = 'Searching…';
-      fetch('/api/sets/' + setId + '/similar-files?threshold=' + threshold)
+      fetch('/api/sets/' + setId + '/similar-files?threshold=' + threshold + '&limit=' + PAGE_SIZE)
         .then(function(r) {
           if (!r.ok) throw new Error('Request failed: ' + r.status);
           return r.json();
@@ -183,34 +291,46 @@
         .then(function(data) {
           const results = data.results || [];
           if (!results.length) {
-            expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
+            expandStatus.textContent = 'Still no matches at threshold ' + threshold.toFixed(2) + ' — try lowering it further.';
             return;
           }
           expandStatus.style.display = 'none';
           similarGrid.innerHTML = '';
-          results.forEach(function(f) {
-            const card = document.createElement('div');
-            card.className = 'card';
-            card.id = 'similar-set-card-' + f.id;
-            card.dataset.fileId = f.id;
-            card.innerHTML =
-              '<a class="card-img-link" href="/photo/' + f.id + '">' +
-                '<img src="/thumb/' + f.id + '" alt="' + f.filename + '" loading="lazy">' +
-              '</a>' +
-              '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
-              '<div class="card-body">' +
-                '<div class="card-name" title="' + f.path + '">' + f.filename + '</div>' +
-                '<button type="button" class="btn-similar add-to-set-btn" data-file-id="' + f.id + '" ' +
-                  'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>' +
-              '</div>';
-            similarGrid.appendChild(card);
-            wireAddButton(card.querySelector('.add-to-set-btn'));
-          });
+          results.forEach(function(f) { similarGrid.appendChild(buildSuggestionCard(f)); });
+          currentThreshold = threshold;
+          currentOffset = results.length;
+          exhausted = results.length < PAGE_SIZE;
         })
         .catch(function(err) {
           expandStatus.textContent = 'Search error: ' + err.message;
         });
     });
+  }
+
+  /* infinite scroll: load 12 more suggestions when the sentinel below the
+     grid comes into view, at whatever threshold is currently active. */
+  if (sentinel && similarGrid) {
+    const observer = new IntersectionObserver(function(entries) {
+      if (!entries[0].isIntersecting || loadingMore || exhausted) return;
+      loadingMore = true;
+      fetch('/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
+            '&limit=' + PAGE_SIZE + '&offset=' + currentOffset)
+        .then(function(r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          const results = data.results || [];
+          results.forEach(function(f) { similarGrid.appendChild(buildSuggestionCard(f)); });
+          currentOffset += results.length;
+          exhausted = results.length < PAGE_SIZE;
+        })
+        .catch(function() {
+          // transient failure — allow retry on the next intersection
+        })
+        .finally(function() { loadingMore = false; });
+    }, { rootMargin: '400px' });
+    observer.observe(sentinel);
   }
 })();
 </script>

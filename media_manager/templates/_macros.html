@@ -1,18 +1,53 @@
+{# Shared tag/set/recognized-people chip block for every card, whether it comes
+   from the `card()` macro below or one of the JS-built cards (set-detail's
+   "suggested images" infinite scroll) that mirror this exact markup. #}
+{% macro card_chips(f) %}
+{% if f.tags or f.sets or f.people %}
+<div class="card-tags">
+  {% for tag in f.tags[:3] %}
+  <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
+  {% endfor %}
+  {% if f.tags | length > 3 %}
+  <span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.tags | length - 3 }}</span>
+  {% endif %}
+  {% for s in f.sets[:3] %}
+  <a class="chip-set" href="/sets/{{ s.id }}" title="Set">{{ s.name }}</a>
+  {% endfor %}
+  {% if f.sets | length > 3 %}
+  <span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.sets | length - 3 }}</span>
+  {% endif %}
+  {% for name in f.people[:3] %}
+  <a class="chip-person" href="/search?person={{ name | urlencode }}" title="Recognized person">{{ name }}</a>
+  {% endfor %}
+  {% if f.people | length > 3 %}
+  <span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.people | length - 3 }}</span>
+  {% endif %}
+</div>
+{% endif %}
+{% endmacro %}
+
 {# Shared photo-card markup for every grid view (gallery, search results, set
-   detail) — one place for the image/star/heart/title/tags+sets+people chips so
-   these three pages don't each duplicate the same HTML. #}
-{% macro card(f, selectable=False) %}
+   detail, similar/body-similar results) — one place for the
+   image/star/heart/title/tags+sets+people chips so these pages don't each
+   duplicate the same HTML.
+   img_src/star_href/star_title/star_icon let a page swap the thumbnail and
+   "lucky" action (e.g. body-similar shows a person crop + "find by body"
+   instead of the default thumbnail + "find similar"), defaulting to today's
+   behavior everywhere else. add_to_set renders the same "＋ Add" button the
+   set-detail suggestions grid uses (no set id needed on the button — the
+   page's own wireAddButton/setId closure wires any .add-to-set-btn it finds). #}
+{% macro card(f, selectable=False, img_src=None, star_href=None, star_title=None, star_icon='⭐', add_to_set=False) %}
 <div class="card" data-file-id="{{ f.id }}">
   {% if selectable %}
   <input type="checkbox" class="card-select-checkbox" data-file-id="{{ f.id }}">
   {% endif %}
   <a class="card-img-link" href="/photo/{{ f.id }}">
-    <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
+    <img src="{{ img_src or ('/thumb/' ~ f.id) }}" alt="{{ f.filename }}" loading="lazy">
   </a>
 
   <a class="star-btn"
-     href="/similar/{{ f.id }}"
-     title="I am feeling lucky — find similar images">⭐</a>
+     href="{{ star_href or ('/similar/' ~ f.id) }}"
+     title="{{ star_title or 'I am feeling lucky — find similar images' }}">{{ star_icon }}</a>
 
   <button type="button" class="heart-btn file-heart-btn {{ 'is-favorite' if f.favorite else '' }}"
           data-file-id="{{ f.id }}" title="Favorite this photo">{{ '♥' if f.favorite else '♡' }}</button>
@@ -23,27 +58,10 @@
 
   <div class="card-body">
     <a class="card-name" href="/photo/{{ f.id }}" title="{{ f.path }}">{{ f.title or f.filename }}</a>
-    {% if f.tags or f.sets or f.people %}
-    <div class="card-tags">
-      {% for tag in f.tags[:3] %}
-      <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
-      {% endfor %}
-      {% if f.tags | length > 3 %}
-      <span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.tags | length - 3 }}</span>
-      {% endif %}
-      {% for s in f.sets[:3] %}
-      <a class="chip-set" href="/sets/{{ s.id }}" title="Set">{{ s.name }}</a>
-      {% endfor %}
-      {% if f.sets | length > 3 %}
-      <span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.sets | length - 3 }}</span>
-      {% endif %}
-      {% for name in f.people[:3] %}
-      <a class="chip-person" href="/search?person={{ name | urlencode }}" title="Recognized person">{{ name }}</a>
-      {% endfor %}
-      {% if f.people | length > 3 %}
-      <span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.people | length - 3 }}</span>
-      {% endif %}
-    </div>
+    {{ card_chips(f) }}
+    {% if add_to_set %}
+    <button type="button" class="btn-similar add-to-set-btn" data-file-id="{{ f.id }}"
+            style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>
     {% endif %}
   </div>
 </div>
