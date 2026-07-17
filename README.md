@@ -2,8 +2,9 @@
 
 Media manager — like git for your media files. Scan directories, track files by
 content hash, then layer ML on top: object detection (YOLO-World), visual
-similarity search (CLIP), face detection/recognition (InsightFace), EXIF
-metadata, and a local web gallery.
+similarity search (CLIP), face detection/recognition (InsightFace), find-by-body
+(re-identify a person by outfit/build when their face is hidden — web UI only),
+EXIF metadata, and a local web gallery.
 
 ## Installation
 

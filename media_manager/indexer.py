@@ -33,11 +33,7 @@ class CLIPIndexer:
         def _process_batch(tensors, bpaths):
             if not tensors:
                 return
-            batch = torch.stack(tensors).to(self.device)
-            with torch.no_grad():
-                feats = self.model.encode_image(batch)
-                feats = feats / feats.norm(dim=-1, keepdim=True)
-            all_embeddings.append(feats.cpu().float().numpy())
+            all_embeddings.append(self._encode_tensor_batch(tensors))
 
         for path in paths:
             ext = os.path.splitext(path)[1].lower()
@@ -67,6 +63,26 @@ class CLIPIndexer:
             embeddings = np.empty((0,), dtype=np.float32)
 
         return embeddings, failed
+
+    def _encode_tensor_batch(self, tensors):
+        batch = torch.stack(tensors).to(self.device)
+        with torch.no_grad():
+            feats = self.model.encode_image(batch)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+        return feats.cpu().float().numpy()
+
+    def embed_pil_images(self, images):
+        """Embed in-memory PIL images (e.g. person crops — no on-disk path to hand
+        to embed_images). Returns an L2-normalized float32 array of shape (N, D) in
+        the same space as embed_images."""
+        if not images:
+            return np.empty((0,), dtype=np.float32)
+        all_embeddings = []
+        batch_size = 32
+        for start in range(0, len(images), batch_size):
+            tensors = [self.preprocess(img.convert('RGB')) for img in images[start:start + batch_size]]
+            all_embeddings.append(self._encode_tensor_batch(tensors))
+        return np.concatenate(all_embeddings, axis=0)
 
     def embed_text(self, text):
         """Return normalized float32 numpy vector for a text query."""

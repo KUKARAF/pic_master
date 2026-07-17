@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% block title %}Find by body — {{ source_filename }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Find by body: {{ source_filename }}</h1>
+  <a href="/photo/{{ source_id }}" class="sub">← Back to photo</a>
+</div>
+
+<p class="sub" style="margin-bottom:16px;">
+  Matches people by outfit and build — works when the face is blurry or covered.
+  Strongest within the same event/outfit.
+</p>
+
+<div id="body-index-banner" class="alert" style="display:none;margin-bottom:20px;">
+  <span id="body-index-text"></span>
+  <button type="button" id="body-index-build-btn" class="btn-similar"
+          style="display:inline-block;width:auto;margin-left:10px;">Build body index</button>
+</div>
+
+{% if message %}
+<div class="alert" style="margin-bottom:20px;">{{ message }}</div>
+{% endif %}
+
+{% if crops | length > 1 %}
+<div class="section-title">Pick a person</div>
+<div class="body-crop-picker">
+  {% for c in crops %}
+  <a href="/body-similar/{{ source_id }}?body_id={{ c.id }}"
+     class="body-crop-choice {{ 'selected' if c.id == selected_id else '' }}">
+    <img src="/body-crop/{{ c.id }}" alt="person {{ loop.index }}">
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if results %}
+<div class="grid">
+  {% for f in results %}
+  <div class="card">
+    <a class="card-img-link" href="/photo/{{ f.id }}">
+      <img src="/body-crop/{{ f.body_id }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+
+    <a class="star-btn"
+       href="/body-similar/{{ f.id }}?body_id={{ f.body_id }}"
+       title="Find bodies similar to this one">🧍</a>
+
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+
+    <div class="card-body">
+      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
+      {% if f.identity %}
+      <div class="card-tags">
+        <a class="tag" href="/search?person={{ f.identity | urlencode }}">{{ f.identity }}</a>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% elif selected_id and not message %}
+<div class="empty-state">
+  <div class="icon">🕵️</div>
+  <p>No similar bodies found. If the body index isn't built yet, build it above.</p>
+</div>
+{% endif %}
+{% endblock %}

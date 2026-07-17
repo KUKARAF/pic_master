@@ -146,6 +146,34 @@ def _get_age_estimator():
     return _age_estimator
 
 
+def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 260) -> bool:
+    """Crop a person from src_path using bbox JSON, save JPEG to dst_path. Unlike
+    _make_face_crop this preserves aspect ratio — body boxes are tall, and squashing
+    them square makes outfits (the thing find-by-body compares) unrecognizable."""
+    import json
+    from PIL import Image as PILImage
+    try:
+        bbox = json.loads(bbox_json)
+        if not bbox or len(bbox) < 4:
+            return False
+        x1, y1, x2, y2 = [int(v) for v in bbox]
+        with PILImage.open(src_path) as img:
+            img = img.convert('RGB')
+            w, h = img.size
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            if x2 <= x1 or y2 <= y1:
+                return False
+            body = img.crop((x1, y1, x2, y2))
+            new_w = max(1, int(body.width * height / body.height))
+            body = body.resize((new_w, height), PILImage.LANCZOS)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            body.save(dst_path, format='JPEG', quality=85)
+            return True
+    except Exception:
+        return False
+
+
 def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 200) -> bool:
     """Crop a face from src_path using bbox JSON, save JPEG to dst_path. Returns True on success."""
     import json
@@ -615,6 +643,193 @@ def create_app(data_root: str) -> FastAPI:
             'message': message,
             'all_tags': all_tags,
         })
+
+    # ------------------------------------------------------------------
+    # Find-by-body: person re-ID by outfit/build (see body_index.py).
+    # Web-only by design — the body index is built and queried from here,
+    # never by a CLI command.
+    # ------------------------------------------------------------------
+
+    body_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+
+    def _ensure_own_bodies(file_id: int, row) -> list:
+        """Return this photo's non-sentinel body rows, embedding them on demand the
+        first time find-by-body is opened for a not-yet-indexed photo. A photo with
+        no stored person detections gets a lazy one-image YOLO-World pass (vocab
+        pinned to 'person'; results are NOT written to the detections table — that
+        would destructively replace the photo's real tag detections)."""
+        from media_manager import body_index
+
+        own = db.get_body_embeddings_for_file(file_id)
+        if own:
+            return own
+        cursor = db.conn.cursor()
+        cursor.execute(
+            'SELECT COUNT(*) FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL',
+            (file_id,)
+        )
+        if cursor.fetchone()[0] > 0:
+            return []  # already processed: sentinel row says "no people here"
+
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+
+        person_boxes = db.get_person_detections_for_file(
+            file_id, min_conf=body_index.MIN_PERSON_CONFIDENCE)
+        if not person_boxes:
+            detector = _get_object_detector()
+            detector.set_vocab(['person'])
+            _, detections, error = detector.detect_images([abs_path])[0]
+            if error:
+                raise HTTPException(status_code=500, detail=f'Person detection failed: {error}')
+            person_boxes = [[x1, y1, x2, y2] for _cls, conf, x1, y1, x2, y2 in detections
+                            if conf >= body_index.MIN_PERSON_CONFIDENCE]
+
+        body_index.embed_bodies_for_file(
+            db, _get_clip_indexer(), file_id, abs_path, person_boxes=person_boxes)
+        return db.get_body_embeddings_for_file(file_id)
+
+    def _body_search(query_row, exclude_file_id: int, limit: int = 40, threshold: float = 0.5):
+        """Cosine-rank all body crops against one query crop's embedding. Dedupes to
+        the best crop per file (like search_by_face_image) and annotates each result
+        with an identity name when a named face sits inside the matched body box."""
+        import numpy as np
+        from media_manager import body_index
+
+        query_emb = np.frombuffer(query_row[2], dtype=np.float32)
+        rows = db.get_all_body_embeddings()
+        if not rows:
+            return []
+        matrix = np.stack([np.frombuffer(r[4], dtype=np.float32) for r in rows])
+        scores = matrix.dot(query_emb)
+
+        best_per_file = {}
+        for i in np.argsort(-scores):
+            score = float(scores[int(i)])
+            if score < threshold or len(best_per_file) >= limit:
+                break
+            r = rows[int(i)]
+            if r[1] == exclude_file_id or r[1] in best_per_file:
+                continue
+            best_per_file[r[1]] = (r, score)
+
+        results = []
+        for r, score in best_per_file.values():
+            body_id, fid, path, bbox_json, _emb = r
+            identity = None
+            file_row = db.get_file_by_id(fid)
+            if file_row is not None:
+                bbox = json.loads(bbox_json)
+                for face in _combined_faces_for_file(fid, file_row['checksum']):
+                    if face['identity'] and body_index.match_face_to_body(face['bbox'], [bbox]):
+                        identity = face['identity']
+                        break
+            results.append({
+                'body_id': body_id,
+                'id': fid,
+                'path': path,
+                'filename': os.path.basename(path),
+                'score': round(score, 4),
+                'identity': identity,
+            })
+        results.sort(key=lambda item: item['score'], reverse=True)
+        return results
+
+    @app.get('/body-similar/{file_id}', response_class=HTMLResponse)
+    def body_similar_page(request: Request, file_id: int, body_id: Optional[int] = None):
+        row = _file_or_404(file_id)
+        filename = os.path.basename(row['path'])
+        message = ''
+        results = []
+        selected_id = None
+
+        try:
+            own = _ensure_own_bodies(file_id, row)
+        except HTTPException as exc:
+            own = []
+            message = str(exc.detail)
+
+        crops = [{'id': r[0]} for r in own]
+        if not own and not message:
+            message = 'No people detected in this photo.'
+        elif own:
+            chosen = None
+            if body_id is not None:
+                chosen = next((r for r in own if r[0] == body_id), None)
+                if chosen is None:
+                    message = 'Unknown person crop for this photo.'
+            elif len(own) == 1:
+                chosen = own[0]
+            if chosen is not None:
+                selected_id = chosen[0]
+                results = _body_search(chosen, file_id)
+
+        return templates.TemplateResponse(request, 'body_similar.html', {
+            'source_id': file_id,
+            'source_filename': filename,
+            'crops': crops,
+            'selected_id': selected_id,
+            'results': results,
+            'message': message,
+            'all_tags': manual.list_all_tags(),
+        })
+
+    @app.get('/body-crop/{body_id}')
+    def serve_body_crop(body_id: int):
+        rec = db.get_body_embedding(body_id)
+        if rec is None:
+            return Response(content=_gray_placeholder(), media_type='image/jpeg', status_code=404)
+        b_file_id, bbox_json, _emb = rec
+        file_row = db.get_file_by_id(b_file_id)
+        if file_row is None:
+            return Response(content=_gray_placeholder(), media_type='image/jpeg', status_code=404)
+        crop_path = os.path.join(thumbs_dir, f'body_{body_id}.jpg')
+        if not os.path.isfile(crop_path):
+            src_path = _live_abs_path(b_file_id, file_row['path'])
+            if src_path is None or not _make_body_crop(src_path, bbox_json, crop_path):
+                return Response(content=_gray_placeholder(), media_type='image/jpeg')
+        return FileResponse(crop_path, media_type='image/jpeg')
+
+    @app.post('/api/body-index/start')
+    def api_body_index_start():
+        import threading
+        from media_manager import body_index
+
+        if body_index_job['running']:
+            return {'started': False, 'message': 'Body index build already running.'}
+        body_index_job.update(
+            running=True, done=0, total=len(db.get_body_indexable_files()), error=None)
+
+        def _run():
+            try:
+                def _progress(done, total):
+                    body_index_job['done'] = done
+                    body_index_job['total'] = total
+                body_index.build_body_index(
+                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress)
+            except Exception as exc:
+                body_index_job['error'] = str(exc)
+            finally:
+                body_index_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': body_index_job['total']}
+
+    @app.get('/api/body-index/status')
+    def api_body_index_status():
+        indexable = len(db.get_body_indexable_files())
+        unindexed = len(db.get_unbody_indexed_files())
+        return {
+            'running': body_index_job['running'],
+            'done': body_index_job['done'],
+            'total': body_index_job['total'],
+            'error': body_index_job['error'],
+            'pending': indexable,
+            # Files that can't join the body index until `media index` gives them
+            # person detections — surfaced so the banner can explain the gap.
+            'no_detections': max(0, unindexed - indexable),
+        }
 
     # ------------------------------------------------------------------
     # JSON API

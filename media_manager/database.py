@@ -144,6 +144,24 @@ class Database:
                 frame_index INTEGER
             )
         ''')
+        # Body embeddings table: CLIP vectors of person crops, for find-by-body
+        # (re-identifying a person by outfit/build when the face is hidden). Derived,
+        # rebuildable data keyed by file_id like detections/embeddings — not part of
+        # the checksum-keyed manual ground truth. bbox is a JSON [x1,y1,x2,y2] like
+        # faces.bbox; the crop's source person box comes from YOLO detections.
+        # frame_index: same NULL-means-primary-frame convention as detections/faces.
+        # Sentinel for processed-but-no-person files: bbox='[]' with an empty blob.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS body_embeddings (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                bbox        TEXT NOT NULL,
+                embedding   BLOB NOT NULL,
+                model       TEXT NOT NULL,
+                indexed_at  INTEGER NOT NULL,
+                frame_index INTEGER
+            )
+        ''')
         # Migrate DBs created before frame_index existed (nullable ADD COLUMN is safe
         # in-place — every existing row correctly becomes "primary frame" = NULL).
         detections_cols = {row[1] for row in cursor.execute('PRAGMA table_info(detections)')}
@@ -792,16 +810,115 @@ class Database:
         ''')
         return cursor.fetchall()
 
+    # ------------------------------------------------------------------
+    # Body embedding methods (find-by-body: CLIP-embedded person crops)
+    # ------------------------------------------------------------------
+
+    def insert_body_embeddings(self, file_id: int, bodies: list, model: str) -> None:
+        """Upsert primary-frame body rows for a file.
+        bodies: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray}
+        Always writes at least one sentinel row (bbox='[]', empty blob) so the file
+        is never re-queued. DELETE scoped to frame_index IS NULL, mirroring
+        insert_faces."""
+        import json
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
+        now = int(time.time())
+        if not bodies:
+            cursor.execute(
+                'INSERT INTO body_embeddings (file_id, bbox, embedding, model, indexed_at) VALUES (?,?,?,?,?)',
+                (file_id, '[]', b'', model, now)
+            )
+        else:
+            for body in bodies:
+                cursor.execute(
+                    'INSERT INTO body_embeddings (file_id, bbox, embedding, model, indexed_at) VALUES (?,?,?,?,?)',
+                    (file_id, json.dumps(body['bbox']), body['embedding'].tobytes(), model, now)
+                )
+        self.conn.commit()
+
+    def get_body_embeddings_for_file(self, file_id: int) -> list:
+        """Return non-sentinel (id, bbox, embedding) rows for a file."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, bbox, embedding FROM body_embeddings WHERE file_id = ? AND bbox != '[]'",
+            (file_id,)
+        )
+        return cursor.fetchall()
+
+    def get_body_embedding(self, body_id: int):
+        """Return (file_id, bbox, embedding_bytes) for one body row, or None."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT file_id, bbox, embedding FROM body_embeddings WHERE id = ?', (body_id,))
+        return cursor.fetchone()
+
+    def get_all_body_embeddings(self) -> list:
+        """Return [(body_id, file_id, path, bbox, embedding_bytes)] excluding sentinels."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT b.id, b.file_id, f.path, b.bbox, b.embedding
+            FROM body_embeddings b
+            JOIN files_with_path f ON f.id = b.file_id
+            WHERE b.bbox != '[]' AND b.embedding != x''
+        ''')
+        return cursor.fetchall()
+
+    def get_unbody_indexed_files(self, limit=None) -> list:
+        """Return (id, path) for files that have no primary (frame_index IS NULL)
+        row in body_embeddings — independent of whether frame-specific rows exist."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN body_embeddings b ON b.file_id = f.id AND b.frame_index IS NULL
+            WHERE b.file_id IS NULL
+        '''
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def get_body_indexable_files(self) -> list:
+        """Return (id, path) for files that have primary-frame detections (so person
+        boxes are knowable without running a detector) but no body_embeddings rows
+        yet. Files never YOLO-indexed are deliberately excluded — they become
+        indexable after `media index` runs, rather than being sentineled as
+        person-free here."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            JOIN detections d ON d.file_id = f.id AND d.frame_index IS NULL
+            LEFT JOIN body_embeddings b ON b.file_id = f.id AND b.frame_index IS NULL
+            WHERE b.file_id IS NULL
+            GROUP BY f.id
+        ''')
+        return cursor.fetchall()
+
+    def get_person_detections_for_file(self, file_id: int, min_conf: float = 0.3) -> list:
+        """Return [x1,y1,x2,y2] person boxes from the primary-frame YOLO detections
+        for a file. Only rows with real coordinates count — old rows and sentinels
+        have NULL coords."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT x1, y1, x2, y2 FROM detections
+            WHERE file_id = ? AND class_name = 'person' AND confidence >= ?
+              AND frame_index IS NULL AND x1 IS NOT NULL
+        ''', (file_id, min_conf))
+        return [list(row) for row in cursor.fetchall()]
+
     def clear_primary_ml_data(self, file_id):
-        """Delete primary-frame (frame_index NULL/0) detections, faces, and the
-        frame-0 embedding for a file, so the next index/embed/faces run reprocesses
-        it from scratch. Used by 'media add/commit --reindex' for files that were
-        already tracked at the same path. Frame-specific rows from 'scan all frames'
-        are left untouched."""
+        """Delete primary-frame (frame_index NULL/0) detections, faces, body
+        embeddings, and the frame-0 embedding for a file, so the next
+        index/embed/faces run reprocesses it from scratch. Used by 'media
+        add/commit --reindex' for files that were already tracked at the same path.
+        Frame-specific rows from 'scan all frames' are left untouched."""
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM detections WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
+        cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         self.conn.commit()
 
     def close(self):

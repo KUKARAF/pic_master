@@ -704,6 +704,26 @@ a:hover { text-decoration: underline; }
   text-decoration: none;
 }
 .btn-similar:hover { background: var(--accent-hover); text-decoration: none; color: #fff; }
+.btn-similar.btn-disabled {
+  background: var(--surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  cursor: not-allowed;
+}
+.btn-similar.btn-disabled:hover { background: var(--surface); color: var(--text-muted); }
+
+/* find-by-body: person crop picker */
+.body-crop-picker { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 24px; }
+.body-crop-choice {
+  display: block;
+  border: 2px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  line-height: 0;
+}
+.body-crop-choice img { height: 140px; width: auto; }
+.body-crop-choice:hover { border-color: var(--accent-hover); }
+.body-crop-choice.selected { border-color: var(--accent); }
 
 /* ------------------------------------------------------------------ */
 /* Messages / alerts                                                    */

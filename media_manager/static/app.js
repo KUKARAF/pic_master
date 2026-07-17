@@ -1296,4 +1296,54 @@
     });
   }
 
+  // ---- Find by body: body-index build banner (body_similar.html) ----
+  const bodyIndexBanner = document.getElementById('body-index-banner');
+  if (bodyIndexBanner) {
+    const bodyIndexText = document.getElementById('body-index-text');
+    const bodyIndexBtn = document.getElementById('body-index-build-btn');
+    let bodyIndexWasRunning = false;
+
+    function refreshBodyIndexBanner() {
+      fetch('/api/body-index/status')
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          if (s.running) {
+            bodyIndexWasRunning = true;
+            bodyIndexBanner.style.display = '';
+            bodyIndexBtn.style.display = 'none';
+            bodyIndexText.textContent = 'Building body index\u2026 ' + s.done + ' / ' + s.total;
+            setTimeout(refreshBodyIndexBanner, 1500);
+          } else if (bodyIndexWasRunning) {
+            // build finished while we were watching — reload to pick up new results
+            location.reload();
+          } else if (s.error) {
+            bodyIndexBanner.style.display = '';
+            bodyIndexText.textContent = 'Body index build failed: ' + s.error;
+          } else if (s.pending > 0) {
+            bodyIndexBanner.style.display = '';
+            bodyIndexBtn.style.display = '';
+            let text = s.pending + ' photo(s) are not in the body index yet.';
+            if (s.no_detections > 0) {
+              text += ' (' + s.no_detections + ' more need object indexing first \u2014 run media index.)';
+            }
+            bodyIndexText.textContent = text;
+          } else {
+            bodyIndexBanner.style.display = 'none';
+          }
+        });
+    }
+
+    bodyIndexBtn.addEventListener('click', function () {
+      bodyIndexBtn.disabled = true;
+      fetch('/api/body-index/start', { method: 'POST' })
+        .then(function () {
+          bodyIndexWasRunning = true;
+          bodyIndexBtn.disabled = false;
+          refreshBodyIndexBanner();
+        });
+    });
+
+    refreshBodyIndexBanner();
+  }
+
 })();

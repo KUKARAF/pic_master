@@ -196,10 +196,12 @@
       {% endif %}
     </div>
 
-    <!-- Find similar -->
+    <!-- Search actions -->
     <div>
-      <div class="section-title">Similar images</div>
-      <a class="btn-similar" href="/similar/{{ file.id }}">⭐ Find similar</a>
+      <div class="section-title">Search</div>
+      <a class="btn-similar" href="/similar/{{ file.id }}" style="margin-bottom:8px;">⭐ Find similar images</a>
+      <span class="btn-similar btn-disabled" title="Coming soon" style="margin-bottom:8px;">👤 Faces</span>
+      <a class="btn-similar" href="/body-similar/{{ file.id }}">🧍 Find by body</a>
     </div>
 
   </div>
