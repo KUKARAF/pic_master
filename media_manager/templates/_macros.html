@@ -29,19 +29,19 @@
       <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
       {% endfor %}
       {% if f.tags | length > 3 %}
-      <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
+      <span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.tags | length - 3 }}</span>
       {% endif %}
       {% for s in f.sets[:3] %}
       <a class="chip-set" href="/sets/{{ s.id }}" title="Set">{{ s.name }}</a>
       {% endfor %}
       {% if f.sets | length > 3 %}
-      <span class="chip-set" style="background:#888;">+{{ f.sets | length - 3 }}</span>
+      <span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.sets | length - 3 }}</span>
       {% endif %}
       {% for name in f.people[:3] %}
       <a class="chip-person" href="/search?person={{ name | urlencode }}" title="Recognized person">{{ name }}</a>
       {% endfor %}
       {% if f.people | length > 3 %}
-      <span class="chip-person" style="background:#888;">+{{ f.people | length - 3 }}</span>
+      <span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.people | length - 3 }}</span>
       {% endif %}
     </div>
     {% endif %}

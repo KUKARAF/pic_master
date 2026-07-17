@@ -59,7 +59,7 @@
                data-face-id="{{ face.id }}">
         <button class="face-save-btn" type="button" data-face-id="{{ face.id }}"
                 style="font-size:0.75em;padding:2px 6px;margin-top:2px;">Save</button>
-        <div class="face-save-msg" id="face-msg-{{ face.id }}" style="font-size:0.75em;color:#888;"></div>
+        <div class="face-save-msg" id="face-msg-{{ face.id }}" style="font-size:0.75em;color:#728C72;"></div>
       </div>
       {% endfor %}
     </div>
@@ -78,7 +78,7 @@
       {% for name, count in identities %}
       <li style="margin-bottom:6px;" data-identity="{{ name }}">
         <a href="/search?person={{ name | urlencode }}" style="font-weight:500;">{{ name }}</a>
-        <span style="color:#888;font-size:0.85em;"> ({{ count }})</span>
+        <span style="color:#728C72;font-size:0.85em;"> ({{ count }})</span>
         <button type="button" class="identity-rename-btn heart-btn-inline" data-identity="{{ name }}"
                 title="Rename this person everywhere" style="font-size:0.8em;">✏️</button>
       </li>

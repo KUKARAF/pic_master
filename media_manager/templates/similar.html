@@ -36,7 +36,7 @@
         <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
         {% endfor %}
         {% if f.tags | length > 3 %}
-        <span class="tag" style="background:#888;">+{{ f.tags | length - 3 }}</span>
+        <span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.tags | length - 3 }}</span>
         {% endif %}
       </div>
       {% endif %}

@@ -1346,4 +1346,61 @@
     refreshBodyIndexBanner();
   }
 
+  // ---- Photo stage: fit-mode cycling + overlay sidebar (photo.html) ----
+  const photoStage = document.getElementById('photo-stage');
+  if (photoStage) {
+    const FIT_MODES = [
+      { key: 'fit',     cls: 'fit-contain', label: 'FIT' },
+      { key: 'fill',    cls: 'fit-cover',   label: 'FILL' },
+      { key: 'stretch', cls: 'fit-stretch', label: 'STRETCH' },
+      { key: 'pixel',   cls: 'fit-pixel',   label: '1:1' },
+    ];
+    const fitBtn = document.getElementById('fit-mode-btn');
+    const fitLabel = document.getElementById('fit-mode-label');
+
+    function setFit(key) {
+      const mode = FIT_MODES.find(function (m) { return m.key === key; }) || FIT_MODES[0];
+      FIT_MODES.forEach(function (m) { photoStage.classList.remove(m.cls); });
+      photoStage.classList.add(mode.cls);
+      if (fitLabel) fitLabel.textContent = mode.label;
+      try { localStorage.setItem('mm_fit', mode.key); } catch (e) {}
+    }
+    function cycleFit() {
+      const cur = FIT_MODES.findIndex(function (m) { return photoStage.classList.contains(m.cls); });
+      setFit(FIT_MODES[(cur + 1) % FIT_MODES.length].key);
+    }
+    try { setFit(localStorage.getItem('mm_fit') || 'fit'); } catch (e) { setFit('fit'); }
+    if (fitBtn) fitBtn.addEventListener('click', cycleFit);
+
+    // Drag-to-draw (add face / label region) maps clicks through the img element
+    // box, which only equals the visible image outside FILL mode — so entering a
+    // draw tool snaps back to FIT.
+    ['add-face-btn', 'label-region-btn'].forEach(function (id) {
+      const btn = document.getElementById(id);
+      if (btn) btn.addEventListener('click', function () {
+        if (photoStage.classList.contains('fit-cover')) setFit('fit');
+      });
+    });
+
+    const sidebarOpenBtn = document.getElementById('sidebar-open-btn');
+    const sidebarCloseBtn = document.getElementById('sidebar-close-btn');
+    function setSidebar(open) {
+      photoStage.classList.toggle('sidebar-open', open);
+      if (sidebarOpenBtn) sidebarOpenBtn.style.display = open ? 'none' : '';
+      try { localStorage.setItem('mm_sidebar', open ? '1' : '0'); } catch (e) {}
+    }
+    let sidebarPref = '1';
+    try { sidebarPref = localStorage.getItem('mm_sidebar') || '1'; } catch (e) {}
+    setSidebar(sidebarPref === '1');
+    if (sidebarOpenBtn) sidebarOpenBtn.addEventListener('click', function () { setSidebar(true); });
+    if (sidebarCloseBtn) sidebarCloseBtn.addEventListener('click', function () { setSidebar(false); });
+
+    window.addEventListener('keydown', function (e) {
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if (e.key === 'f' || e.key === 'F') cycleFit();
+      if (e.key === 'Escape') setSidebar(!photoStage.classList.contains('sidebar-open'));
+    });
+  }
+
 })();

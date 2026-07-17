@@ -10,7 +10,7 @@
 <body>
 
 <nav class="nav">
-  <a class="nav-logo" href="/">📷 media</a>
+  <a class="nav-logo" href="/">MEDIA<span class="logo-dim">//</span>MGR</a>
   <a class="nav-link" href="/faces">Faces</a>
   <a class="nav-link" href="/tags">Tags</a>
   <a class="nav-link" href="/sets">Sets</a>
@@ -18,7 +18,7 @@
   <a class="nav-link" href="/duplicates">Duplicates</a>
 
   <form class="nav-search" action="/search" method="get">
-    <input type="text" name="q" placeholder="Search photos…" value="{{ request.query_params.get('q', '') }}">
+    <input type="text" name="q" placeholder="search photos, tags, people…" value="{{ request.query_params.get('q', '') }}">
     <button type="submit">Search</button>
   </form>
 
@@ -49,7 +49,7 @@
   </div>
 </nav>
 
-<div class="container">
+<div class="container {% block container_class %}{% endblock %}">
   {% block content %}{% endblock %}
 </div>
 

@@ -26,7 +26,7 @@ packages = ["media_manager"]
 # must ship inside the wheel — a plain find_packages() install would omit them and
 # `media web` would 500 on every page. The age-estimator requirements ship too so
 # `media age-setup` can build the isolated venv without fetching anything from the repo.
-media_manager = ["templates/*.html", "static/*", "requirements-age-estimator.txt"]
+media_manager = ["templates/*.html", "static/*", "static/fonts/*", "requirements-age-estimator.txt"]
 
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
