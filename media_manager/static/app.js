@@ -1377,11 +1377,7 @@
           } else if (s.pending > 0) {
             bodyIndexBanner.style.display = '';
             bodyIndexBtn.style.display = '';
-            let text = s.pending + ' photo(s) are not in the body index yet.';
-            if (s.no_detections > 0) {
-              text += ' (' + s.no_detections + ' more need object indexing first \u2014 run media index.)';
-            }
-            bodyIndexText.textContent = text;
+            bodyIndexText.textContent = s.pending + ' photo(s) are not in the body index yet.';
           } else {
             bodyIndexBanner.style.display = 'none';
           }

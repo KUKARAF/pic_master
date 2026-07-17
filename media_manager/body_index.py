@@ -1,12 +1,19 @@
-"""Find-by-body: crop stored person detections and CLIP-embed the crops, so a
-person can be re-identified by outfit/build when their face is hidden or blurry.
+"""Find-by-body: find/crop person boxes and CLIP-embed the crops, so a person can
+be re-identified by outfit/build when their face is hidden or blurry — which means
+this must NOT depend on a face, or even on `media index` having run, existing for
+a photo. Matching is appearance-based: strong within the same event/outfit, weak
+across clothing changes. Web-only by design — no CLI command calls this; web.py
+triggers both the background corpus build and the on-demand per-photo embedding
+on the find-by-body page.
 
-Person boxes come from the YOLO-World detections `media index` already stores
-('person' is in the default vocab), so building the body index is crop+embed only —
-no extra detection pass. Matching is appearance-based: strong within the same
-event/outfit, weak across clothing changes. Web-only by design — no CLI command
-calls this; web.py triggers both the background corpus build and the on-demand
-per-photo embedding on the find-by-body page.
+Person boxes are reused from `media index`'s stored YOLO-World detections when a
+file already has them (cheap — no model call), but for a file that's never been
+object-indexed this runs its own dedicated person-only detection pass instead of
+skipping the file — otherwise the body-search corpus would silently exclude every
+photo that only ever went through `media add`/`media faces`, regardless of how
+visible the person in it is (confirmed: YOLO-World's 'person' confidence barely
+drops with the face occluded or entirely out of frame — detection quality was
+never the bottleneck, the missing `media index` prerequisite was).
 
 match_face_to_body duplicates the logic in age_estimator_worker.py, which runs in
 an isolated venv and can't import from the main app — keep the two in sync.
@@ -68,13 +75,27 @@ def crop_bodies(abs_path, bboxes):
     return pairs
 
 
-def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None):
+def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None, detector=None):
     """Crop + embed one file's person boxes and upsert its body_embeddings rows
-    (sentinel when none). person_boxes defaults to the file's stored detections;
-    the find-by-body page passes freshly detected boxes for a not-yet-indexed
-    query photo. Returns the number of bodies embedded."""
+    (sentinel when none). person_boxes, when given, skips detection entirely (used
+    when a caller already has fresh boxes on hand). Otherwise: reuse this file's
+    stored YOLO-World detections if `media index` already ran on it; for a file
+    that's never been object-indexed at all, run a dedicated person-only pass with
+    `detector` instead of treating "no stored detections" as "no person" — that
+    distinction (via db.has_object_detections) is what makes this self-sufficient
+    rather than silently skipping every never-object-indexed file. Returns the
+    number of bodies embedded."""
     if person_boxes is None:
         person_boxes = db.get_person_detections_for_file(file_id, min_conf=MIN_PERSON_CONFIDENCE)
+        if not person_boxes and not db.has_object_detections(file_id):
+            if detector is None:
+                raise ValueError('file has no stored object index and no detector was given')
+            detector.set_vocab(['person'])
+            _, detections, error = detector.detect_images([abs_path])[0]
+            if error:
+                raise RuntimeError(f'person detection failed: {error}')
+            person_boxes = [[x1, y1, x2, y2] for _cls, conf, x1, y1, x2, y2 in detections
+                            if conf >= MIN_PERSON_CONFIDENCE]
     bodies = []
     if person_boxes:
         pairs = crop_bodies(abs_path, person_boxes)
@@ -86,13 +107,15 @@ def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None
     return len(bodies)
 
 
-def build_body_index(db, errors, clip_indexer, data_root, on_progress=None):
-    """Body-index every file that has stored detections but no body rows yet — the
-    background corpus build behind the web UI's "Build body index" button. Failures
-    go to the error log (same policy as the batch ML passes in media_manager.py);
-    a failed file is left un-sentineled so a rebuild retries it. Returns
-    (processed, total)."""
-    files = db.get_body_indexable_files()
+def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=None):
+    """Body-index every tracked file that has no body row yet — the background
+    corpus build behind the web UI's "Build body index" button. No longer requires
+    `media index` to have run first: files with stored YOLO-World detections reuse
+    them (fast path, no model call), everything else gets a dedicated person-only
+    detection pass via `detector`. Failures go to the error log (same policy as the
+    batch ML passes in media_manager.py); a failed file is left un-sentineled so a
+    rebuild retries it. Returns (processed, total)."""
+    files = db.get_unbody_indexed_files()
     total = len(files)
     processed = 0
     for file_id, rel_path in files:
@@ -100,7 +123,7 @@ def build_body_index(db, errors, clip_indexer, data_root, on_progress=None):
             abs_path = os.path.join(data_root, rel_path)
             if not os.path.isfile(abs_path):
                 raise FileNotFoundError('file missing on disk')
-            embed_bodies_for_file(db, clip_indexer, file_id, abs_path)
+            embed_bodies_for_file(db, clip_indexer, file_id, abs_path, detector=detector)
         except Exception as exc:
             errors.log(rel_path, f'body index: {exc}')
         processed += 1

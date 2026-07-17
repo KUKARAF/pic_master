@@ -683,19 +683,11 @@ def create_app(data_root: str) -> FastAPI:
         if abs_path is None:
             raise HTTPException(status_code=404, detail='Image file not found on disk')
 
-        person_boxes = db.get_person_detections_for_file(
-            file_id, min_conf=body_index.MIN_PERSON_CONFIDENCE)
-        if not person_boxes:
-            detector = _get_object_detector()
-            detector.set_vocab(['person'])
-            _, detections, error = detector.detect_images([abs_path])[0]
-            if error:
-                raise HTTPException(status_code=500, detail=f'Person detection failed: {error}')
-            person_boxes = [[x1, y1, x2, y2] for _cls, conf, x1, y1, x2, y2 in detections
-                            if conf >= body_index.MIN_PERSON_CONFIDENCE]
-
-        body_index.embed_bodies_for_file(
-            db, _get_clip_indexer(), file_id, abs_path, person_boxes=person_boxes)
+        try:
+            body_index.embed_bodies_for_file(
+                db, _get_clip_indexer(), file_id, abs_path, detector=_get_object_detector())
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=f'Person detection failed: {exc}')
         return db.get_body_embeddings_for_file(file_id)
 
     def _body_search(query_row, exclude_file_id: int, limit: int = 40, threshold: float = 0.5):
@@ -802,7 +794,7 @@ def create_app(data_root: str) -> FastAPI:
         if body_index_job['running']:
             return {'started': False, 'message': 'Body index build already running.'}
         body_index_job.update(
-            running=True, done=0, total=len(db.get_body_indexable_files()), error=None)
+            running=True, done=0, total=len(db.get_unbody_indexed_files()), error=None)
 
         def _run():
             try:
@@ -810,7 +802,8 @@ def create_app(data_root: str) -> FastAPI:
                     body_index_job['done'] = done
                     body_index_job['total'] = total
                 body_index.build_body_index(
-                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress)
+                    db, errors, _get_clip_indexer(), _get_object_detector(), data_root,
+                    on_progress=_progress)
             except Exception as exc:
                 body_index_job['error'] = str(exc)
             finally:
@@ -821,17 +814,12 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/body-index/status')
     def api_body_index_status():
-        indexable = len(db.get_body_indexable_files())
-        unindexed = len(db.get_unbody_indexed_files())
         return {
             'running': body_index_job['running'],
             'done': body_index_job['done'],
             'total': body_index_job['total'],
             'error': body_index_job['error'],
-            'pending': indexable,
-            # Files that can't join the body index until `media index` gives them
-            # person detections — surfaced so the banner can explain the gap.
-            'no_detections': max(0, unindexed - indexable),
+            'pending': len(db.get_unbody_indexed_files()),
         }
 
     # ------------------------------------------------------------------

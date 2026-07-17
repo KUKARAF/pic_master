@@ -915,22 +915,18 @@ class Database(ThreadLocalDB):
             cursor.execute(sql)
         return cursor.fetchall()
 
-    def get_body_indexable_files(self) -> list:
-        """Return (id, path) for files that have primary-frame detections (so person
-        boxes are knowable without running a detector) but no body_embeddings rows
-        yet. Files never YOLO-indexed are deliberately excluded — they become
-        indexable after `media index` runs, rather than being sentineled as
-        person-free here."""
+    def has_object_detections(self, file_id: int) -> bool:
+        """True if `media index` has already processed this file — a primary-frame
+        detections row exists at all, even if it's just the sentinel meaning
+        "confirmed zero classes". Lets body_index.py tell "never object-indexed"
+        (worth a fresh person-only detection pass) apart from "object-indexed,
+        genuinely no person" (trust that, don't re-detect)."""
         cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT f.id, f.path
-            FROM files_with_path f
-            JOIN detections d ON d.file_id = f.id AND d.frame_index IS NULL
-            LEFT JOIN body_embeddings b ON b.file_id = f.id AND b.frame_index IS NULL
-            WHERE b.file_id IS NULL
-            GROUP BY f.id
-        ''')
-        return cursor.fetchall()
+        cursor.execute(
+            'SELECT 1 FROM detections WHERE file_id = ? AND frame_index IS NULL LIMIT 1',
+            (file_id,)
+        )
+        return cursor.fetchone() is not None
 
     def get_person_detections_for_file(self, file_id: int, min_conf: float = 0.3) -> list:
         """Return [x1,y1,x2,y2] person boxes from the primary-frame YOLO detections
