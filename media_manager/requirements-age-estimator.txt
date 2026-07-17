@@ -9,8 +9,13 @@
 # Preferred setup: `media age-setup` — creates the venv at
 # ~/.local/share/media_manager/age-venv and installs this file into it (see
 # setup_age_venv in age_estimator.py). Manual equivalent from a repo checkout:
-#   uv venv .age-venv
-#   uv pip install --python .age-venv/bin/python -r media_manager/requirements-age-estimator.txt
+#   uv venv --python 3.12 .age-venv
+#   uv pip install --python .age-venv/bin/python 'setuptools<81' wheel
+#   uv pip install --python .age-venv/bin/python --no-build-isolation-package mivolo \
+#       -r media_manager/requirements-age-estimator.txt
+# Python 3.12 because the pinned torch==2.5.1 has no wheels for 3.14+; the
+# setuptools<81 + no-build-isolation dance because MiVOLO's setup.py imports
+# pkg_resources, which modern setuptools no longer ships.
 #
 # torch/torchvision are pinned older than the main app's versions because MiVOLO's
 # own model-construction code (mivolo.model.create_timm_model) fails to import

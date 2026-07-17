@@ -30,6 +30,22 @@ _REPO_CHECKOUT_VENV_DIR = _HERE.parent.parent / ".age-venv"
 
 _REQUIREMENTS_FILE = _HERE / "requirements-age-estimator.txt"
 
+# The venv must run an older Python: the pinned torch==2.5.1 (required for MiVOLO's
+# old timm/ultralytics, see requirements-age-estimator.txt) publishes no wheels for
+# Python 3.14+.
+_AGE_VENV_PYTHON_SERIES = "3.12"
+
+# MiVOLO's setup.py does `import pkg_resources`, which modern setuptools no longer
+# ships — so an isolated build env (which gets latest setuptools) can't build it.
+# Instead we pre-install the last setuptools line that still bundles pkg_resources
+# into the venv and build mivolo against the venv itself (no build isolation).
+_BUILD_SETUPTOOLS_PIN = "setuptools<81"
+
+# Written into the venv after a fully successful install; its absence means a
+# previous age-setup run died partway (venv exists, packages don't) and the venv
+# should be rebuilt rather than reported as already set up.
+_SETUP_COMPLETE_MARKER = ".setup-complete"
+
 ESTIMATE_TIMEOUT_SECONDS = 120
 
 
@@ -45,6 +61,13 @@ def _venv_python(venv_dir: Path) -> Path:
     if os.name == "nt":
         return venv_dir / "Scripts" / "python.exe"
     return venv_dir / "bin" / "python"
+
+
+def _find_compatible_python() -> str | None:
+    """PATH lookup for a Python matching _AGE_VENV_PYTHON_SERIES (pip fallback path
+    only — uv resolves/downloads interpreters itself)."""
+    import shutil
+    return shutil.which(f"python{_AGE_VENV_PYTHON_SERIES}")
 
 
 def _venv_python_path() -> Path:
@@ -67,11 +90,14 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
 
     venv_dir = Path(dest).expanduser() if dest else default_age_venv_dir()
     python = _venv_python(venv_dir)
+    marker = venv_dir / _SETUP_COMPLETE_MARKER
 
-    if python.is_file() and not force:
+    if python.is_file() and marker.is_file() and not force:
         print(f"Age estimator venv already set up at {venv_dir} — use --force to recreate.")
         return python
-    if venv_dir.exists() and force:
+    if venv_dir.exists():
+        if python.is_file() and not marker.is_file():
+            print(f"Found leftovers of an interrupted setup at {venv_dir} — rebuilding.")
         shutil.rmtree(venv_dir)
 
     print(f"Creating isolated age-estimator venv at {venv_dir}")
@@ -79,19 +105,54 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
           "that conflict with this app's object detector and CLIP indexer)")
     uv = shutil.which("uv")
     if uv:
-        subprocess.run([uv, "venv", str(venv_dir)], check=True)
+        # A compatible interpreter, not the system Python (which may be too new for
+        # the pinned torch): a system pythonX.Y if installed, else uv's managed one.
+        # Distro uv packages often set python-downloads to 'manual', so the download
+        # has to be opted into explicitly for this one command.
+        base_python = _find_compatible_python() or _AGE_VENV_PYTHON_SERIES
+        if base_python == _AGE_VENV_PYTHON_SERIES:
+            print(f"No system python{_AGE_VENV_PYTHON_SERIES} found — "
+                  f"letting uv download a managed Python {_AGE_VENV_PYTHON_SERIES}.")
         subprocess.run(
-            [uv, "pip", "install", "--python", str(python), "-r", str(_REQUIREMENTS_FILE)],
+            [uv, "venv", "--python", base_python, str(venv_dir)],
+            check=True,
+            env={**os.environ, "UV_PYTHON_DOWNLOADS": "automatic"},
+        )
+        subprocess.run(
+            [uv, "pip", "install", "--python", str(python), _BUILD_SETUPTOOLS_PIN, "wheel"],
+            check=True,
+        )
+        subprocess.run(
+            [uv, "pip", "install", "--python", str(python),
+             "--no-build-isolation-package", "mivolo",
+             "-r", str(_REQUIREMENTS_FILE)],
             check=True,
         )
     else:
+        base_python = _find_compatible_python()
         import venv as venv_module
-        venv_module.create(str(venv_dir), with_pip=True)
+        if base_python is None:
+            raise RuntimeError(
+                f"No Python {_AGE_VENV_PYTHON_SERIES} interpreter found on PATH and uv is "
+                f"not installed. The age estimator needs Python {_AGE_VENV_PYTHON_SERIES} "
+                "(its pinned torch==2.5.1 has no wheels for newer Pythons). Install uv "
+                "(it auto-downloads a compatible interpreter) or install "
+                f"python{_AGE_VENV_PYTHON_SERIES} and re-run `media age-setup`."
+            )
+        subprocess.run([base_python, "-m", "venv", str(venv_dir)], check=True)
         subprocess.run(
-            [str(python), "-m", "pip", "install", "-r", str(_REQUIREMENTS_FILE)],
+            [str(python), "-m", "pip", "install", _BUILD_SETUPTOOLS_PIN, "wheel"],
+            check=True,
+        )
+        # Global --no-build-isolation is fine here: everything except mivolo installs
+        # from wheels, and mivolo's build needs are covered by the setuptools above.
+        subprocess.run(
+            [str(python), "-m", "pip", "install", "--no-build-isolation",
+             "-r", str(_REQUIREMENTS_FILE)],
             check=True,
         )
 
+    marker.touch()
     print(f"Done. Age estimation is ready (venv: {venv_dir}).")
     print("Model weights download automatically on the first estimate.")
     return python
