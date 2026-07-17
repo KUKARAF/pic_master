@@ -295,6 +295,49 @@ class MediaManager:
 
         return indexed_count, failed_count
 
+    def index_bodies(self, path='.', batch_size=16):
+        """Crop+embed person boxes under path for find-by-body search (see
+        body_index.py) — the CLI equivalent of the web UI's "Build body index"
+        button. Reuses stored YOLO-World 'person' detections when a file already
+        has them (from `media index`); for a file that's never been object-indexed,
+        runs its own dedicated person-only detection pass instead of skipping it,
+        so this doesn't require `media index` to have run first. Returns
+        (indexed_count, failed_count)."""
+        from . import body_index
+        from .detector import YOLOWorldDetector
+        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
+
+        detector = YOLOWorldDetector(conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
+        clip_indexer = CLIPIndexer()
+
+        unindexed = self.db.get_unbody_indexed_files()
+        abs_path = os.path.abspath(os.path.join(self.data_root, path))
+        candidates = []
+        for file_id, rel_path in unindexed:
+            ext = os.path.splitext(rel_path)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            abs_file = os.path.join(self.data_root, rel_path)
+            if not abs_file.startswith(abs_path):
+                continue
+            candidates.append((file_id, abs_file))
+
+        total = len(candidates)
+        indexed_count = 0
+        failed_count = 0
+
+        for i, (file_id, abs_file) in enumerate(candidates, start=1):
+            try:
+                body_index.embed_bodies_for_file(self.db, clip_indexer, file_id, abs_file, detector=detector)
+                indexed_count += 1
+            except Exception as exc:
+                failed_count += 1
+                self.errors.log(abs_file, str(exc))
+            if total > 0 and (i % batch_size == 0 or i == total):
+                print(f"Body-indexed {i}/{total}...")
+
+        return indexed_count, failed_count
+
     def detect_faces(self, path='.', batch_size=16, model_name='buffalo_l', det_thresh=0.5):
         """Run InsightFace on un-face-indexed image files under path.
         Returns (indexed_count, face_count, failed_count).

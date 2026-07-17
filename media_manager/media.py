@@ -110,6 +110,13 @@ def main():
     faces_cmd.add_argument('--thresh', type=float, default=0.5,
                            help='Detection confidence threshold (default: 0.5)')
 
+    # media bodies [path] - crop + embed person boxes for find-by-body search
+    bodies_cmd = sub.add_parser('bodies', help='Crop and embed person boxes for find-by-body search')
+    bodies_cmd.add_argument('path', nargs='?', default='.',
+                            help='Directory to scan (relative to repo root, default: .)')
+    bodies_cmd.add_argument('--batch-size', type=int, default=16,
+                            help='Images per progress update (default: 16)')
+
     # media metadata [path] - read EXIF capture time + GPS coordinates
     metadata_cmd = sub.add_parser('metadata', help='Read EXIF capture time and GPS coordinates for images')
     metadata_cmd.add_argument('path', nargs='?', default='.',
@@ -379,6 +386,13 @@ def main():
             det_thresh=args.thresh,
         )
         print(f"Done: processed {indexed} images, found {face_count} faces, {failed} failed")
+        m.close()
+        return 0
+
+    elif args.cmd == 'bodies':
+        m = MediaManager()
+        indexed, failed = m.index_bodies(args.path, batch_size=args.batch_size)
+        print(f"Done: body-indexed {indexed} images, {failed} failed")
         m.close()
         return 0
 

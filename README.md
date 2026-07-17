@@ -52,6 +52,7 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media search <query>` | Search by detected object class |
 | `media embed [path]` | Build CLIP embeddings for similarity search |
 | `media faces [path]` | Detect and embed faces (InsightFace) |
+| `media bodies [path]` | Crop + embed person boxes for find-by-body search |
 | `media who <image>` | Find which known people appear in an image |
 | `media metadata [path]` | Read EXIF capture time + GPS |
 | `media set create/ls/assign/files` | Manage named sets (e.g. a studio shoot) |
