@@ -11,8 +11,12 @@
 window.initSwipeStack = function (config) {
   const BUFFER_SIZE = 10;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
-  const CARD_WIDTH = 320; // fixed card size — cards never stretch to fill width;
-  const PEEK_STEP = 64;   // more of them fan out across the width instead
+  // Cards size themselves to their photo's own aspect ratio (see .swipe-card
+  // img's fixed height in style.css) rather than a uniform box, so this is
+  // only a rough estimate for "how many cards roughly fit" — not an enforced
+  // width. More cards fan out across the width rather than any one stretching.
+  const CARD_WIDTH_ESTIMATE = 320;
+  const PEEK_STEP = 64;
 
   const stackEl = document.getElementById(config.stackElId);
   const confirmBtn = document.getElementById(config.confirmBtnId);
@@ -26,7 +30,7 @@ window.initSwipeStack = function (config) {
 
   function visibleCount() {
     const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
-    const fits = Math.floor((Math.max(wrapWidth, CARD_WIDTH) - CARD_WIDTH) / PEEK_STEP) + 1;
+    const fits = Math.floor((Math.max(wrapWidth, CARD_WIDTH_ESTIMATE) - CARD_WIDTH_ESTIMATE) / PEEK_STEP) + 1;
     return Math.max(1, Math.min(fits, BUFFER_SIZE, queue.length));
   }
 
@@ -34,7 +38,6 @@ window.initSwipeStack = function (config) {
     const el = document.createElement('div');
     el.className = 'swipe-card';
     el.dataset.ref = card.ref;
-    el.style.width = CARD_WIDTH + 'px';
     el.style.zIndex = String(BUFFER_SIZE - index);
     el.style.transform = `translateX(${index * PEEK_STEP}px)`;
 

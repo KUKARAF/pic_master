@@ -1178,13 +1178,13 @@ input[type="range"] { accent-color: var(--accent); }
 .swipe-stack-wrap {
   position: relative;
   width: 100%;
-  height: 440px;
+  height: 480px;
 }
 .swipe-card {
   position: absolute;
   top: 0;
   left: 0;
-  height: 100%;
+  min-width: 220px;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -1211,18 +1211,16 @@ input[type="range"] { accent-color: var(--accent); }
 .swipe-card.dragging { transition: none; cursor: grabbing; }
 .swipe-card-img-link {
   display: block;
-  height: 68%;
   cursor: pointer;
 }
 .swipe-card img {
-  width: 100%;
-  height: 100%;
-  object-fit: contain;
+  /* Fixed height, natural width — each card takes on its photo's own aspect
+     ratio (portrait/landscape/square) instead of being cropped or letterboxed
+     into a uniform box. */
+  height: 320px;
+  width: auto;
   display: block;
   pointer-events: none;
-}
-.swipe-card > img {
-  height: 68%;
 }
 .swipe-card-body {
   padding: 14px 16px;
