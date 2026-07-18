@@ -85,8 +85,13 @@
 {% if files %}
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <button type="button" id="select-many-btn" class="btn-similar">Select many</button>
     <button type="button" id="bulk-set-btn" class="btn-similar">+ Add to set</button>
     <span id="bulk-set-status" class="sub"></span>
+    {% if person or face_id %}
+    <button type="button" id="bulk-unname-btn" class="btn-similar">Make unknown again</button>
+    <span id="bulk-unname-status" class="sub"></span>
+    {% endif %}
   </div>
   {% if tag or person or face_id %}
   {{ macros.sort_controls(sort, order, {'tag': tag, 'person': person, 'face_id': face_id}) }}
@@ -162,6 +167,62 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
 });
 
+/* Bulk selection — shared by every bulk action on this grid (add-to-set,
+   make-unknown-again, ...). "Select many" toggles select-mode directly;
+   "+ Add to set" also turns it on once a target set is picked, same as
+   before. Shift-click extends the selection from the last-clicked card
+   through the clicked one (inclusive), like a file manager's range-select. */
+(function() {
+  const grid = document.getElementById('results-grid');
+  if (!grid) return;
+
+  const selectManyBtn = document.getElementById('select-many-btn');
+  let lastClicked = null;
+
+  function setSelectMode(active) {
+    grid.classList.toggle('select-mode', active);
+    if (selectManyBtn) selectManyBtn.textContent = active ? 'Unselect many' : 'Select many';
+    if (!active) {
+      grid.querySelectorAll('.card-select-checkbox:checked').forEach(function(cb) { cb.checked = false; });
+      lastClicked = null;
+    }
+  }
+
+  if (selectManyBtn) {
+    selectManyBtn.addEventListener('click', function() {
+      setSelectMode(!grid.classList.contains('select-mode'));
+    });
+  }
+
+  /* In select mode, clicking anywhere on a card (thumbnail or checkbox) toggles
+     selection instead of navigating — handled entirely here so shift-click
+     range-select and plain toggle share one code path rather than racing with
+     the checkbox's own native click-to-toggle behavior. */
+  grid.addEventListener('click', function(e) {
+    if (!grid.classList.contains('select-mode')) return;
+    const card = e.target.closest('.card');
+    const cb = card ? card.querySelector('.card-select-checkbox') : null;
+    if (!cb) return;
+    e.preventDefault();
+
+    if (e.shiftKey && lastClicked) {
+      const all = Array.from(grid.querySelectorAll('.card-select-checkbox'));
+      const start = all.indexOf(lastClicked);
+      const end = all.indexOf(cb);
+      if (start !== -1 && end !== -1) {
+        const lo = Math.min(start, end), hi = Math.max(start, end);
+        for (let i = lo; i <= hi; i++) all[i].checked = true;
+        lastClicked = cb;
+        return;
+      }
+    }
+    cb.checked = !cb.checked;
+    lastClicked = cb;
+  });
+
+  window.__resultsGridSelectMode = { setSelectMode: setSelectMode };
+})();
+
 /* Bulk "Add to set" — pick/create a target set (same keyboard-first modal as the
    photo page), then check any number of result cards and add them all at once. */
 (function() {
@@ -177,7 +238,7 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
       openSetSearchModal(function(set) {
         targetSet = set;
         bulkBtn.textContent = 'Add to "' + set.name + '"';
-        grid.classList.add('select-mode');
+        window.__resultsGridSelectMode.setSelectMode(true);
         bulkStatus.textContent = 'Select photos, then click the button again to add them.';
       });
       return;
@@ -212,17 +273,47 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
         }
       });
   });
+})();
 
-  /* In select mode, clicking the thumbnail toggles selection instead of opening
-     the photo — only the title text (a separate link) still navigates. */
-  grid.addEventListener('click', function(e) {
-    if (!grid.classList.contains('select-mode')) return;
-    const imgLink = e.target.closest('.card-img-link');
-    if (!imgLink) return;
-    e.preventDefault();
-    const card = imgLink.closest('.card');
-    const cb = card ? card.querySelector('.card-select-checkbox') : null;
-    if (cb) cb.checked = !cb.checked;
+/* Bulk "Make unknown again" — only present when browsing a specific person's
+   photos (?person=/?face_id=). Reverts every selected photo's face(s) for
+   this identity back to unidentified, for when the auto-categorizer (or a
+   misclick) wrongly joined someone into this person. */
+(function() {
+  const bulkBtn = document.getElementById('bulk-unname-btn');
+  const bulkStatus = document.getElementById('bulk-unname-status');
+  const grid = document.getElementById('results-grid');
+  const personName = {{ (person or face_id) | tojson }};
+  if (!bulkBtn || !grid || !personName) return;
+
+  bulkBtn.addEventListener('click', function() {
+    if (!grid.classList.contains('select-mode')) {
+      window.__resultsGridSelectMode.setSelectMode(true);
+      bulkStatus.textContent = 'Select photos, then click the button again to make them unknown.';
+      return;
+    }
+
+    const checked = Array.from(grid.querySelectorAll('.card-select-checkbox:checked'));
+    if (!checked.length) {
+      bulkStatus.textContent = 'Select at least one photo first.';
+      return;
+    }
+    if (!confirm('Make ' + checked.length + ' photo(s) unknown again for "' + personName + '"?')) return;
+    bulkBtn.disabled = true;
+    fetch('/api/identities/' + encodeURIComponent(personName) + '/unassign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_ids: checked.map(function(cb) { return parseInt(cb.dataset.fileId, 10); }) }),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function(data) {
+        bulkStatus.textContent = 'Made ' + data.unassigned + ' face(s) unknown again. Reloading…';
+        setTimeout(function() { location.reload(); }, 600);
+      })
+      .catch(function(err) {
+        bulkBtn.disabled = false;
+        bulkStatus.textContent = 'Failed: ' + err.message;
+      });
   });
 })();
 (function() {

@@ -827,6 +827,21 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE faces SET identity = ?, rejected = 0 WHERE id = ?', (name.strip(), manual_face_id))
         self.conn.commit()
 
+    def unassign_identity_for_checksum(self, checksum, name):
+        """Clear the identity (back to unidentified, not rejected) for every
+        manual.db face row on this one photo currently named `name` — used by
+        the person-search page's bulk "make unknown again" action, for when
+        the auto-categorizer's confidence threshold wrongly merged someone
+        into this identity, or a misclick joined the wrong two people.
+        Returns the number of rows updated."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'UPDATE faces SET identity = NULL WHERE checksum = ? AND identity = ?',
+            (checksum, name)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
     def rename_identity(self, old_name, new_name):
         """Renames a person everywhere they appear (every manual.db face row with this
         identity), not just a single face — fixes a typo/renaming once instead of

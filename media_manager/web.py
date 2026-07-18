@@ -68,6 +68,9 @@ class TagLabelBody(BaseModel):
 class RenameIdentityBody(BaseModel):
     name: str
 
+class UnassignIdentityBody(BaseModel):
+    file_ids: List[int]
+
 class TitleBody(BaseModel):
     title: str
 
@@ -1873,6 +1876,22 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=400, detail='Name must not be empty')
         manual.rename_identity(name, new_name)
         return {'name': new_name}
+
+    @app.post('/api/identities/{name}/unassign')
+    def api_unassign_identity(name: str, body: UnassignIdentityBody):
+        """Bulk 'make unknown again' — clears this identity from every named
+        face on each given photo (not rejected, just back to unidentified),
+        for the person-search page's select-many + shift-click-range bulk
+        action. A photo not actually carrying this identity is silently
+        skipped rather than erroring, so a mixed selection doesn't need to be
+        filtered client-side first."""
+        unassigned = 0
+        for file_id in body.file_ids:
+            row = db.get_file_by_id(file_id)
+            if row is None:
+                continue
+            unassigned += manual.unassign_identity_for_checksum(row['checksum'], name)
+        return {'unassigned': unassigned}
 
     @app.get('/api/identities/{name}/similar-faces')
     def api_similar_unknown_faces(name: str, threshold: float = SUGGEST_THRESHOLD, limit: int = 20):
