@@ -197,7 +197,7 @@
           questionHtml: 'Add <strong>' + escapeHtml(name) + '</strong> to this set?',
           scoreText: typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '',
           metaHtml: swipeCardMeta(card),
-          originalUrl: '/image/' + card.id,
+          originalUrl: '/photo/' + card.id,
         };
       },
       onConfirm: function(card) {

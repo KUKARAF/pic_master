@@ -96,7 +96,7 @@ if (document.getElementById('faces-swipe-stack')) {
         questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
         scoreText: 'match score ' + card.score.toFixed(2),
         metaHtml: swipeCardMeta(card),
-        originalUrl: '/image/' + card.file_id,
+        originalUrl: '/photo/' + card.file_id,
       };
     },
     onConfirm: function(card) {

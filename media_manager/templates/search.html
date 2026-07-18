@@ -424,7 +424,7 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
         questionHtml: 'Does this have <strong>' + escapeHtml(tagLabel) + '</strong>?',
         scoreText: 'match score ' + card.score.toFixed(2),
         metaHtml: swipeCardMeta(card),
-        originalUrl: '/image/' + card.file_id,
+        originalUrl: '/photo/' + card.file_id,
       };
     },
     onConfirm: function(card) {
@@ -470,7 +470,7 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
         questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
         scoreText: 'match score ' + card.score.toFixed(2),
         metaHtml: swipeCardMeta(card),
-        originalUrl: '/image/' + card.file_id,
+        originalUrl: '/photo/' + card.file_id,
       };
     },
     onConfirm: function(card) {

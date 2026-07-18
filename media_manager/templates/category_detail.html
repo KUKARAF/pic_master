@@ -131,7 +131,7 @@
       questionHtml: `Does this belong in <strong>${escapeHtml(categoryName)}</strong>?`,
       scoreText: `similarity ${card.score.toFixed(2)}`,
       metaHtml: swipeCardMeta(card),
-      originalUrl: `/image/${card.file_id}`,
+      originalUrl: `/photo/${card.file_id}`,
     }),
     onConfirm: (card) => ({
       url: `/api/files/${card.file_id}/category`,
