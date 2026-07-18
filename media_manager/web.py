@@ -397,6 +397,17 @@ def create_app(data_root: str) -> FastAPI:
             card['category'] = category_map.get(checksum)
         return cards
 
+    def _chunked(items, size=500):
+        """SQLite has a hard cap on bound parameters per query (varies by build,
+        often as low as 999) — any `WHERE x IN (...)` lookup built from an
+        *unbounded* candidate pool (e.g. every file clearing a similarity
+        threshold across a whole library, not just a fixed-size page) needs to
+        be split into chunks like this rather than bound in one query, or it
+        raises 'too many SQL variables' once the library is large enough."""
+        items = list(items)
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
+
     def _deprioritize_files_with_named_face(candidates, file_id_index):
         """Stable-sort (score order preserved within each group) so candidates
         whose photo already has at least one identified person come after ones
@@ -407,9 +418,14 @@ def create_app(data_root: str) -> FastAPI:
         if not candidates:
             return candidates
         file_ids = list({c[file_id_index] for c in candidates})
-        file_rows = {r['id']: r for r in db.get_files_by_ids(file_ids)}
+        file_rows = {}
+        for chunk in _chunked(file_ids):
+            for r in db.get_files_by_ids(chunk):
+                file_rows[r['id']] = r
         checksums = [r['checksum'] for r in file_rows.values()]
-        identities_map = manual.get_identities_for_checksums(checksums)
+        identities_map = {}
+        for chunk in _chunked(checksums):
+            identities_map.update(manual.get_identities_for_checksums(chunk))
 
         def has_named_face(c):
             row = file_rows.get(c[file_id_index])
@@ -1260,7 +1276,9 @@ def create_app(data_root: str) -> FastAPI:
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
         if avoid_existing and passing:
-            sets_map = manual.get_sets_for_checksums([cs for (_fid, _path, cs), _score in passing])
+            sets_map = {}
+            for chunk in _chunked([cs for (_fid, _path, cs), _score in passing]):
+                sets_map.update(manual.get_sets_for_checksums(chunk))
             passing.sort(key=lambda item: bool(sets_map.get(item[0][2])))
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
