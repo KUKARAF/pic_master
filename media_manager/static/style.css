@@ -1178,7 +1178,7 @@ input[type="range"] { accent-color: var(--accent); }
 .swipe-stack-wrap {
   position: relative;
   width: 100%;
-  height: 480px;
+  height: 80vh;
 }
 .swipe-card {
   position: absolute;
@@ -1217,7 +1217,7 @@ input[type="range"] { accent-color: var(--accent); }
   /* Fixed height, natural width — each card takes on its photo's own aspect
      ratio (portrait/landscape/square) instead of being cropped or letterboxed
      into a uniform box. */
-  height: 320px;
+  height: calc(80vh - 130px);
   width: auto;
   display: block;
   pointer-events: none;

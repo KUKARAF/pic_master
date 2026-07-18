@@ -250,13 +250,38 @@
   }
 
   if (sentinel) {
-    const observer = new IntersectionObserver(function(entries) {
-      if (!entries[0].isIntersecting) return;
-      observer.disconnect();
+    // Deliberately not an IntersectionObserver: on a short page the sentinel
+    // can already sit inside the initial viewport (nothing to scroll past),
+    // and IO fires the moment it's visible regardless of rootMargin — showing
+    // the swipe stack immediately alongside the page-1 grid, which is exactly
+    // the "why do I see both" bug this replaces. Instead, only activate once
+    // the user has genuinely scrolled (on a page that has anything to scroll
+    // at all — a page short enough to have no scrollable overflow has nothing
+    // to hide behind a scroll gesture, so it activates immediately there).
+    let activated = false;
+    function maybeActivate() {
+      if (activated) return;
+      // scrollHeight isn't reliable until images finish loading (this script
+      // runs at DOM-parse time, before async image loads settle final layout —
+      // measuring too early under-counts a grid whose images haven't loaded
+      // yet, making a genuinely tall page look short enough to skip the
+      // scroll gate). The 'load' listener below re-checks once that's settled.
+      const scrollable = document.documentElement.scrollHeight > window.innerHeight + 10;
+      if (scrollable && window.scrollY <= 0) return;
+      const rect = sentinel.getBoundingClientRect();
+      if (rect.top >= window.innerHeight || rect.bottom <= 0) return;
+      activated = true;
+      window.removeEventListener('scroll', maybeActivate);
+      window.removeEventListener('load', maybeActivate);
       sentinel.style.display = 'none';
       activateSwipeStack();
-    }, { rootMargin: '400px' });
-    observer.observe(sentinel);
+    }
+    window.addEventListener('scroll', maybeActivate, { passive: true });
+    if (document.readyState === 'complete') {
+      maybeActivate();
+    } else {
+      window.addEventListener('load', maybeActivate);
+    }
   } else {
     activateSwipeStack();
   }
