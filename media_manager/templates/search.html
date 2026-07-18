@@ -439,6 +439,11 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
         body: { tag: tagLabel, polarity: 'negative' },
       };
     },
+    onUndo: function(card, action) {
+      const polarity = action === 'confirm' ? 'positive' : 'negative';
+      const params = new URLSearchParams({ label: tagLabel, polarity: polarity });
+      return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
+    },
     emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',
   });
 })();
@@ -478,6 +483,9 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     },
     onReject: function(card) {
       return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+    },
+    onUndo: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
     },
     emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.</div>',
   });

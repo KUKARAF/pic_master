@@ -11,6 +11,56 @@
 // Cards peek horizontally (stacked left-to-right, full width) purely for the
 // visual "stack of photos" look — that's unrelated to the decide gesture
 // (dominant drag axis picks confirm/reject vs skip, not the peek direction).
+// Ctrl/Cmd+Z undoes the last decision (reverses config.onUndo's persisted
+// effect, if any, and puts the card back on top). Right arrow shows the
+// current card's full photo full-screen; any further key (or a click) closes
+// it, without also triggering whatever that key would otherwise have done.
+
+// Shared across every stack instance on a page (e.g. search.html can have both
+// a tag stack and a person stack) — one overlay, not one per stack.
+let _fullviewOverlay = null;
+let _fullviewOpen = false;
+
+function _getFullviewOverlay() {
+  if (_fullviewOverlay) return _fullviewOverlay;
+  const overlay = document.createElement('div');
+  overlay.className = 'swipe-fullview-overlay';
+  const img = document.createElement('img');
+  overlay.appendChild(img);
+  overlay.addEventListener('click', _hideFullview);
+  document.body.appendChild(overlay);
+  _fullviewOverlay = overlay;
+  return overlay;
+}
+
+function _showFullview(src) {
+  const overlay = _getFullviewOverlay();
+  overlay.querySelector('img').src = src;
+  overlay.classList.add('open');
+  _fullviewOpen = true;
+}
+
+function _hideFullview() {
+  if (_fullviewOverlay) _fullviewOverlay.classList.remove('open');
+  _fullviewOpen = false;
+}
+
+// Registered once at module load, before any per-stack keydown listener below
+// (each initSwipeStack() call adds its own listener later, and same-element
+// document listeners run in registration order) — so this always sees a
+// fullview-dismissing keypress first and can suppress it before the
+// corresponding stack tries to also treat that key as a decide/undo action.
+document.addEventListener('keydown', (e) => {
+  if (!_fullviewOpen) return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  _hideFullview();
+});
+
+function _isEditableTarget(target) {
+  return !!target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+}
+
 window.initSwipeStack = function (config) {
   const BUFFER_SIZE = 10;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
@@ -30,6 +80,7 @@ window.initSwipeStack = function (config) {
   const known = new Set(queue.map(c => c.ref)); // queued or already-decided refs
   let fetching = false;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
+  const history = []; // [{card, action}, ...] — most recent decision last
 
   function visibleCount() {
     const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
@@ -111,34 +162,47 @@ window.initSwipeStack = function (config) {
     }
   }
 
+  function sendRequest(req) {
+    if (!req) return;
+    fetch(req.url, {
+      method: req.method || 'POST',
+      headers: req.body ? { 'Content-Type': 'application/json' } : undefined,
+      body: req.body ? JSON.stringify(req.body) : undefined,
+    }).catch(() => {});
+  }
+
   async function decide(action) {
     const card = topCard();
     if (!card) return;
     const el = stackEl.querySelector(`.swipe-card[data-ref="${CSS.escape(card.ref)}"]`);
     if (el) flyOut(el, action);
     queue.shift();
+    history.push({ card, action });
 
     // 'skip' ("not sure") never persists anything and never biases future
     // suggestions — it's purely "don't show me this one again this session"
     // (already covered by `known`, which every queued card is added to
     // regardless of how it's eventually decided).
     if (action !== 'skip') {
-      const req = action === 'confirm'
+      sendRequest(action === 'confirm'
         ? (config.onConfirm ? config.onConfirm(card) : null)
-        : (config.onReject ? config.onReject(card) : null);
-      if (req) {
-        fetch(req.url, {
-          method: req.method || 'POST',
-          headers: req.body ? { 'Content-Type': 'application/json' } : undefined,
-          body: req.body ? JSON.stringify(req.body) : undefined,
-        }).catch(() => {});
-      }
+        : (config.onReject ? config.onReject(card) : null));
       const biasKey = config.biasKeyFor ? config.biasKeyFor(card) : card.ref;
       maybeFetchMore(biasKey, action);
     } else {
       maybeFetchMore();
     }
     setTimeout(render, el ? 180 : 0);
+  }
+
+  function undo() {
+    if (!history.length) return;
+    const { card, action } = history.pop();
+    if (action !== 'skip' && config.onUndo) {
+      sendRequest(config.onUndo(card, action));
+    }
+    queue.unshift(card);
+    render();
   }
 
   function flyOut(el, action) {
@@ -220,7 +284,16 @@ window.initSwipeStack = function (config) {
   if (rejectBtn) rejectBtn.addEventListener('click', () => decide('reject'));
 
   document.addEventListener('keydown', (e) => {
-    if (!topCard()) return;
+    if (_isEditableTarget(e.target)) return;
+
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+      e.preventDefault();
+      undo();
+      return;
+    }
+
+    const card = topCard();
+    if (!card) return;
     if (e.key === 'ArrowUp') {
       e.preventDefault();
       decide('confirm');
@@ -230,6 +303,10 @@ window.initSwipeStack = function (config) {
     } else if (e.key === 'ArrowLeft') {
       e.preventDefault();
       decide('skip');
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      const fileId = card.file_id != null ? card.file_id : card.id;
+      _showFullview('/image/' + fileId);
     }
   });
 

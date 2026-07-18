@@ -235,6 +235,18 @@ class ManualDB(ThreadLocalDB):
         cur.execute('DELETE FROM tags WHERE id = ?', (tag_id,))
         self.conn.commit()
 
+    def remove_tag_by_label(self, checksum, label, polarity):
+        """Delete a single whole-file tag row by (checksum, label, polarity) rather
+        than by numeric id — lets a caller (the tag-suggestion swipe stream's undo)
+        reverse its own add_tag call without having to thread the row id it never
+        asked for back through a fetch response."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'DELETE FROM tags WHERE checksum = ? AND label = ? AND polarity = ? AND x1 IS NULL',
+            (checksum, label, polarity)
+        )
+        self.conn.commit()
+
     def update_tag_label(self, tag_id, new_label):
         """Fix a typo in a tag's label in place, without a delete-and-re-add round trip."""
         cur = self.conn.cursor()
@@ -662,6 +674,17 @@ class ManualDB(ThreadLocalDB):
         ''', (checksum, category_id, int(time.time())))
         self.conn.commit()
 
+    def clear_category_override(self, checksum):
+        """Hard-delete the override row entirely — distinct from
+        set_file_category(checksum, None), which UPSERTS an explicit 'no
+        category' row. This restores "no manual decision was ever made", used
+        to undo a category swipe decision (confirm or reject) back to the
+        pre-decision state — safe because the suggestion stream only ever
+        offers files that had no override to begin with."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_category_overrides WHERE checksum = ?', (checksum,))
+        self.conn.commit()
+
     def get_category_override(self, checksum):
         """Return None if no manual decision was ever made for this file, else
         {'category_id', 'name'} — name is None for an explicit 'no category' row."""
@@ -778,6 +801,18 @@ class ManualDB(ThreadLocalDB):
                 DO UPDATE SET rejected=1, identity=NULL
         ''', (checksum, x1, y1, x2, y2, embedding_bytes, source_face_id,
               image_width, image_height, int(time.time()), frame_index))
+        self.conn.commit()
+
+    def delete_face_decision_by_source(self, source_face_id):
+        """Hard-delete the manual.db row (if any) created by promote_auto_face or
+        reject_auto_face for this auto-detected face — restoring it to fully
+        unhandled, unlike reject_auto_face's kept-as-hard-negative row. Used to
+        undo a face swipe decision (confirm or reject) back to the pre-decision
+        state; safe because the face-suggestion stream only ever offers faces
+        with no existing manual.db row for this source_face_id (see
+        _unpromoted_auto_faces)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM faces WHERE source_face_id = ?', (source_face_id,))
         self.conn.commit()
 
     def reject_face(self, manual_face_id):

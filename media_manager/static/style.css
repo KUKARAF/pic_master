@@ -1270,4 +1270,16 @@ input[type="range"] { accent-color: var(--accent); }
 .swipe-btn:hover { border-color: var(--border-accent); color: var(--accent); }
 .swipe-btn.swipe-btn-reject:hover { color: var(--danger); border-color: var(--danger); }
 .swipe-hint { font-size: 13px; color: var(--text-faint); text-align: center; }
+.swipe-fullview-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.94);
+  z-index: 10000;
+  align-items: center;
+  justify-content: center;
+  cursor: zoom-out;
+}
+.swipe-fullview-overlay.open { display: flex; }
+.swipe-fullview-overlay img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
 .swipe-empty { text-align: center; color: var(--text-muted); padding: 40px 0; }

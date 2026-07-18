@@ -147,6 +147,12 @@
       onReject: function() {
         return null; // sets have no "explicitly not in this set" concept to persist
       },
+      onUndo: function(card, action) {
+        // Only 'confirm' persisted anything (added the file to this set);
+        // 'reject' never did, so there's nothing to reverse for it.
+        if (action !== 'confirm') return null;
+        return { url: '/api/files/' + card.id + '/sets/' + setId, method: 'DELETE' };
+      },
       emptyStateHtml: function(stackEl) {
         stackEl.innerHTML =
           '<div class="swipe-empty">' +

@@ -957,6 +957,16 @@ def create_app(data_root: str) -> FastAPI:
         manual.remove_tag(tag_id)
         return {'tags': _whole_tags(row['checksum'])}
 
+    @app.delete('/api/files/{file_id}/tags-by-label')
+    def api_remove_tag_by_label(file_id: int, label: str, polarity: str = 'positive'):
+        """Undo a confirm or reject made via the tag-suggestion swipe stream —
+        removes the specific tag row by (label, polarity) instead of by numeric
+        id, since the swipe stream never learns the id the POST endpoint
+        assigned (it doesn't read the response body)."""
+        row = _file_or_404(file_id)
+        manual.remove_tag_by_label(row['checksum'], label, polarity)
+        return {'tags': _whole_tags(row['checksum'])}
+
     @app.patch('/api/files/{file_id}/tags/{tag_id}')
     def api_update_tag(file_id: int, tag_id: int, body: TagLabelBody):
         row = _file_or_404(file_id)
@@ -1443,6 +1453,17 @@ def create_app(data_root: str) -> FastAPI:
         row = _file_or_404(file_id)
         manual.set_file_category(row['checksum'], None)
         return {'category': None}
+
+    @app.delete('/api/files/{file_id}/category/decision')
+    def api_undo_file_category_decision(file_id: int):
+        """Undo a confirm or reject made via the category-suggestion swipe
+        stream — hard-deletes the override row entirely (unlike the plain
+        DELETE above, which upserts an explicit 'no category' row), restoring
+        'no manual decision was ever made'. Safe because the suggestion stream
+        never offers a file that already had an override."""
+        row = _file_or_404(file_id)
+        manual.clear_category_override(row['checksum'])
+        return {'ok': True}
 
     def _next_category_suggestions(category_id, count, exclude_refs):
         """Rank currently-unresolved-or-differently-resolved files against this ONE
@@ -2011,6 +2032,19 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='File not found')
         bbox = json.loads(src['bbox'])
         manual.reject_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], None, None)
+        return {'ok': True}
+
+    @app.delete('/api/faces/{face_id}/decision')
+    def api_undo_face_decision(face_id: str):
+        """Undo a confirm or reject made via the face-suggestion swipe stream —
+        hard-deletes the manual.db row so the face returns to fully unhandled,
+        rather than reject_face's usual kept-as-hard-negative row. Only
+        meaningful for auto-sourced refs (the swipe stream never offers
+        already-manual faces)."""
+        kind, raw_id = _parse_face_ref(face_id)
+        if kind != 'auto':
+            raise HTTPException(status_code=400, detail='Only auto-detected faces have a decision to undo')
+        manual.delete_face_decision_by_source(raw_id)
         return {'ok': True}
 
     @app.post('/api/faces/{face_id}/favorite')

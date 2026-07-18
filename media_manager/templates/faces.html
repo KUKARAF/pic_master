@@ -105,6 +105,9 @@ if (document.getElementById('faces-swipe-stack')) {
     onReject: function(card) {
       return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
     },
+    onUndo: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+    },
     emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces or come back later.</div>',
   });
 }

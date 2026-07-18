@@ -142,6 +142,10 @@
       url: `/api/files/${card.file_id}/category`,
       method: 'DELETE',
     }),
+    onUndo: (card) => ({
+      url: `/api/files/${card.file_id}/category/decision`,
+      method: 'DELETE',
+    }),
     emptyStateHtml: 'No more suggestions for this category right now.<br>'
       + 'Assign a few more example files above, or come back after indexing more photos.',
   });
