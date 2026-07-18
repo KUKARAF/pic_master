@@ -140,6 +140,27 @@ class ManualDB(ThreadLocalDB):
             ''')
             cur.execute('DROP TABLE file_sets_old')
         cur.execute('''
+            CREATE TABLE IF NOT EXISTS categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                temperature REAL NOT NULL DEFAULT 0.75,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        # category_id NULL is a legal, meaningful value here — it records a human's
+        # explicit "this file has no category" decision (see set_file_category),
+        # which must still block ML auto-matching from claiming the file. Absence
+        # of a row entirely (not this) means "no manual decision ever made".
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_category_overrides (
+                checksum TEXT PRIMARY KEY,
+                category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_category_overrides_category ON file_category_overrides (category_id)')
+
+        cur.execute('''
             CREATE TABLE IF NOT EXISTS faces (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 checksum TEXT NOT NULL,
@@ -276,6 +297,13 @@ class ManualDB(ThreadLocalDB):
             (label, limit)
         )
         return [row[0] for row in cur.fetchall()]
+
+    def get_decided_checksums_for_tag(self, label):
+        """Checksums with ANY tag row for this label — positive (already tagged) or
+        negative (explicitly rejected) — must never be re-suggested for this label."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM tags WHERE label = ?', (label,))
+        return {row[0] for row in cur.fetchall()}
 
     def list_all_tags(self):
         """Return [(label, count), ...] for positive tags only, ordered by count descending."""
@@ -551,6 +579,129 @@ class ManualDB(ThreadLocalDB):
         for checksum, set_id, name, studio in cur.fetchall():
             result.setdefault(checksum, []).append({'id': set_id, 'name': name, 'studio': studio})
         return result
+
+    # ------------------------------------------------------------------
+    # Categories
+    # ------------------------------------------------------------------
+
+    def _clamp_temperature(self, temperature):
+        return max(0.0, min(1.0, temperature))
+
+    def create_category(self, name, temperature=0.75):
+        """Find-or-create (mirrors create_set): if the category already exists,
+        its stored temperature is NOT updated — call set_category_temperature
+        for that."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT OR IGNORE INTO categories (name, temperature, created_at) VALUES (?, ?, ?)',
+            (name.strip(), self._clamp_temperature(temperature), int(time.time()))
+        )
+        self.conn.commit()
+        cur.execute('SELECT id FROM categories WHERE name = ?', (name.strip(),))
+        return cur.fetchone()[0]
+
+    def find_category(self, name):
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM categories WHERE name = ?', (name,))
+        return cur.fetchone()
+
+    def get_category(self, category_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM categories WHERE id = ?', (category_id,))
+        return cur.fetchone()
+
+    def list_categories(self):
+        """Return category rows with id, name, temperature, created_at, image_count —
+        image_count here is manual-assignment-only (file_category_overrides rows
+        with a non-NULL category_id), mirroring list_sets's image_count."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT c.id, c.name, c.temperature, c.created_at,
+                   COUNT(fco.checksum) as image_count
+            FROM categories c
+            LEFT JOIN file_category_overrides fco
+                ON fco.category_id = c.id
+            GROUP BY c.id
+            ORDER BY c.name
+        ''')
+        return cur.fetchall()
+
+    def rename_category(self, category_id, name):
+        cur = self.conn.cursor()
+        cur.execute('UPDATE categories SET name = ? WHERE id = ?', (name.strip(), category_id))
+        self.conn.commit()
+
+    def set_category_temperature(self, category_id, temperature):
+        cur = self.conn.cursor()
+        cur.execute(
+            'UPDATE categories SET temperature = ? WHERE id = ?',
+            (self._clamp_temperature(temperature), category_id)
+        )
+        self.conn.commit()
+
+    def delete_category(self, category_id):
+        """Deletes the category entity only. Any file_category_overrides row that
+        pointed at it becomes category_id=NULL via ON DELETE SET NULL — i.e. those
+        files become explicitly uncategorized, NOT reverted to 'no decision made'.
+        Once a human has touched a file's category, ML must never silently reclaim
+        it just because the specific category they picked was later removed."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM categories WHERE id = ?', (category_id,))
+        self.conn.commit()
+
+    def set_file_category(self, checksum, category_id):
+        """Upsert a file's manual category override. category_id=None is a
+        legitimate call — it records an explicit 'no category' human decision,
+        which still outranks any ML auto-match (see category_resolver.py). This
+        single method serves both 'assign' and 'clear' from the CLI/web UI."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT INTO file_category_overrides (checksum, category_id, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(checksum) DO UPDATE SET category_id=excluded.category_id, created_at=excluded.created_at
+        ''', (checksum, category_id, int(time.time())))
+        self.conn.commit()
+
+    def get_category_override(self, checksum):
+        """Return None if no manual decision was ever made for this file, else
+        {'category_id', 'name'} — name is None for an explicit 'no category' row."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT fco.category_id, c.name
+            FROM file_category_overrides fco
+            LEFT JOIN categories c ON c.id = fco.category_id
+            WHERE fco.checksum = ?
+        ''', (checksum,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {'category_id': row[0], 'name': row[1]}
+
+    def get_category_overrides_for_checksums(self, checksums):
+        """Batched lookup: {checksum: {'category_id','name'}} for whichever of
+        `checksums` have a manual decision recorded — a checksum missing from the
+        result had no decision made at all (mirrors get_sets_for_checksums)."""
+        if not checksums:
+            return {}
+        placeholders = ','.join('?' for _ in checksums)
+        cur = self.conn.cursor()
+        cur.execute(f'''
+            SELECT fco.checksum, fco.category_id, c.name
+            FROM file_category_overrides fco
+            LEFT JOIN categories c ON c.id = fco.category_id
+            WHERE fco.checksum IN ({placeholders})
+        ''', tuple(checksums))
+        return {row[0]: {'category_id': row[1], 'name': row[2]} for row in cur.fetchall()}
+
+    def get_example_checksums_for_category(self, category_id, limit=1000):
+        """Files manually assigned to this category — the ML training examples
+        used to build a similarity centroid (mirrors get_files_by_set)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT checksum FROM file_category_overrides WHERE category_id = ? LIMIT ?',
+            (category_id, limit)
+        )
+        return [row[0] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Faces

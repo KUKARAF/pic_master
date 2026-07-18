@@ -16,7 +16,7 @@
       menu.classList.remove('open');
     });
   }
-  wireDropdown('tags-dropdown-btn', 'tags-dropdown-menu');
+  wireDropdown('categories-dropdown-btn', 'categories-dropdown-menu');
   wireDropdown('warn-dropdown-btn', 'warn-dropdown-menu');
 
   /* Generic modal — used by the set picker and face-naming modal */
@@ -58,6 +58,15 @@
   // faces.html, ...) can reuse the same modal instead of rebuilding one.
   window.openModal = openModal;
   window.closeModal = closeModal;
+
+  // Exposed globally so any per-page inline <script> (including swipe-core.js
+  // config blocks) can escape user-controlled strings before dropping them into
+  // innerHTML, without each page reimplementing this.
+  window.escapeHtml = function (s) {
+    const d = document.createElement('div');
+    d.textContent = s == null ? '' : s;
+    return d.innerHTML;
+  };
 
   /* Shared favorite-heart toggle — POSTs {favorite: bool} to `endpoint` and flips the
      button's glyph/class on success. Used by every heart button across the app so
@@ -1048,6 +1057,108 @@
         });
     });
   }
+
+  /* Category assignment — single-valued, unlike sets. Manual assign/clear
+     always wins over whatever the ML auto-match set (see category_resolver.py). */
+  const categoryCurrent = document.getElementById('category-current');
+  const categoryPickerBtn = document.getElementById('category-picker-btn');
+
+  function renderCategory(category) {
+    if (!categoryCurrent) return;
+    categoryCurrent.innerHTML = '';
+    if (!category || !category.name) {
+      const span = document.createElement('span');
+      span.className = 'sub';
+      span.textContent = 'Uncategorized.';
+      categoryCurrent.appendChild(span);
+      return;
+    }
+    const span = document.createElement('span');
+    span.className = 'tag-removable';
+    span.style.marginBottom = '4px';
+    span.style.display = 'inline-flex';
+
+    const link = document.createElement('a');
+    link.href = '/search?category=' + encodeURIComponent(category.name);
+    link.style.color = '#fff';
+    link.textContent = category.name;
+    span.appendChild(link);
+
+    if (category.source === 'auto') {
+      const autoSpan = document.createElement('span');
+      autoSpan.style.opacity = '.7';
+      autoSpan.textContent = ' (auto)';
+      span.appendChild(autoSpan);
+    }
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'rm';
+    removeBtn.type = 'button';
+    removeBtn.id = 'category-remove-btn';
+    removeBtn.title = 'Clear category';
+    removeBtn.textContent = '×';
+    removeBtn.addEventListener('click', clearFileCategory);
+    span.appendChild(removeBtn);
+
+    categoryCurrent.appendChild(span);
+  }
+
+  function assignFileCategory(categoryId) {
+    return fetch('/api/files/' + fileId + '/category', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category_id: categoryId }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    }).then(function (data) { renderCategory(data.category); });
+  }
+
+  function clearFileCategory() {
+    fetch('/api/files/' + fileId + '/category', { method: 'DELETE' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('Request failed: ' + r.status);
+        return r.json();
+      })
+      .then(function () { renderCategory(null); })
+      .catch(function (err) { alert('Failed to clear category: ' + err.message); });
+  }
+
+  function openCategoryPickerModal() {
+    openModal('Set category', function (box) {
+      const list = document.createElement('div');
+      list.textContent = 'Loading…';
+      box.appendChild(list);
+      fetch('/api/categories')
+        .then(function (r) { return r.json(); })
+        .then(function (categories) {
+          list.innerHTML = '';
+          if (!categories.length) {
+            list.textContent = 'No categories yet — create one on the Categories page first.';
+            return;
+          }
+          categories.forEach(function (cat) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'btn-similar';
+            btn.style.display = 'block';
+            btn.style.width = '100%';
+            btn.style.marginBottom = '6px';
+            btn.textContent = cat.name;
+            btn.addEventListener('click', function () {
+              assignFileCategory(cat.id)
+                .then(closeModal)
+                .catch(function (err) { alert('Failed to set category: ' + err.message); });
+            });
+            list.appendChild(btn);
+          });
+        });
+    });
+  }
+
+  const categoryRemoveBtn = document.getElementById('category-remove-btn');
+  if (categoryRemoveBtn) categoryRemoveBtn.addEventListener('click', clearFileCategory);
+  if (categoryPickerBtn) categoryPickerBtn.addEventListener('click', openCategoryPickerModal);
 
   /* Set assignment — a photo can belong to any number of sets */
   const setCurrent = document.getElementById('set-current');

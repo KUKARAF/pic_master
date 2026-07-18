@@ -13,12 +13,18 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from media_manager import frames
+from media_manager.category_resolver import (
+    get_category_counts,
+    get_resolved_checksums_for_category,
+    resolve_categories_for_checksums,
+    resolve_category_for_file,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -64,6 +70,11 @@ class RenameIdentityBody(BaseModel):
 
 class TitleBody(BaseModel):
     title: str
+
+class CategoryBody(BaseModel):
+    name: Optional[str] = None
+    temperature: Optional[float] = None
+    category_id: Optional[int] = None
 
 
 def _gray_placeholder() -> bytes:
@@ -332,6 +343,7 @@ def create_app(data_root: str) -> FastAPI:
         title_map = manual.get_titles_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
         identities_map = manual.get_identities_for_checksums(checksums)
+        category_map = resolve_categories_for_checksums(manual, db, [(row[0], row[3]) for row in rows])
         result = []
         for row in rows:
             file_id = row[0]
@@ -349,6 +361,7 @@ def create_app(data_root: str) -> FastAPI:
                 'title': title_map.get(checksum),
                 'sets': sets_map.get(checksum, []),
                 'people': identities_map.get(checksum, []),
+                'category': category_map.get(checksum),
             }
             if scores is not None and file_id in scores:
                 card['score'] = scores[file_id]
@@ -452,6 +465,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': total,
             'limit': limit,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'sort': sort,
             'order': order,
@@ -491,6 +505,8 @@ def create_app(data_root: str) -> FastAPI:
             {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'favorite': bool(s['favorite'])}
             for s in manual.get_sets_for_file(checksum)
         ]
+        file_info['category'] = resolve_category_for_file(manual, db, file_id, checksum)
+        all_categories = _all_categories_for_nav()
         # Age/gender estimates (experimental — see age_estimator.py) are shown inline
         # next to each face's name, not as a separate section, so merge them directly
         # into the same `faces` list the template already iterates over.
@@ -505,17 +521,21 @@ def create_app(data_root: str) -> FastAPI:
             'faces': faces,
             'spatial_tags': spatial_tags,
             'all_tags': all_tags,
+            'all_categories': all_categories,
             'current_sets': current_sets,
         })
 
     @app.get('/search', response_class=HTMLResponse)
     def search_page(request: Request, q: str = '', tag: str = '', face_id: str = '', person: str = '',
-                     face_ref: str = '', sort: str = 'added', order: str = 'desc'):
+                     face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc'):
         files = []
         message = ''
         all_tags = manual.list_all_tags()
+        all_categories = _all_categories_for_nav()
         similar_unknown_faces = []
         similar_faces = []
+        initial_similar_cards = []
+        tag_swipe_initial_cards = []
 
         if face_ref:
             # "Find similar faces" from a specific face chip — reuses the same
@@ -529,10 +549,12 @@ def create_app(data_root: str) -> FastAPI:
                 'face_id': face_id,
                 'person': person,
                 'face_ref': face_ref,
+                'category': category,
                 'query_face_file_id': _get_face_file_id(face_ref),
                 'similar_faces': similar_faces,
                 'message': message,
                 'all_tags': all_tags,
+                'all_categories': all_categories,
                 'similar_unknown_faces': similar_unknown_faces,
             })
 
@@ -548,9 +570,11 @@ def create_app(data_root: str) -> FastAPI:
                 if sort == 'age':
                     files = _sort_cards_by_age(files, order)
 
-            # Unidentified auto-detected faces that look like this person — offer a
-            # one-click "Add" to merge them into the identity instead of retyping the name.
-            similar_unknown_faces = _find_similar_unknown_faces(name_query, SUGGEST_THRESHOLD)
+            # Unidentified auto-detected faces that look like this person, as a swipe
+            # stream scoped to just this identity (see _next_face_suggestions's
+            # identity_filter — bias is meaningless here since every candidate
+            # already shares this one identity, so no bias params are ever sent).
+            initial_similar_cards = _next_face_suggestions(10, set(), identity_filter=name_query)
 
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
@@ -559,6 +583,26 @@ def create_app(data_root: str) -> FastAPI:
             files = _enrich_rows(rows)
             if sort == 'age':
                 files = _sort_cards_by_age(files, order)
+
+            # Always computed (not gated on `files` being non-empty) so a brand-new
+            # or sparsely-tagged label still gets a swipe stream once it has at
+            # least one positively-tagged, embedded file.
+            tag_swipe_initial_cards = _next_tag_suggestions(tag, 10, set())
+
+        elif category:
+            cat_row = manual.find_category(category)
+            if cat_row is None:
+                message = f'No category named "{category}".'
+            else:
+                checksums = get_resolved_checksums_for_category(manual, db, cat_row['id'], cat_row['name'], limit=500)
+                if not checksums:
+                    message = f'No files resolved to category "{category}" yet.'
+                else:
+                    file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
+                    rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+                    files = _enrich_rows(rows)
+                    if sort == 'age':
+                        files = _sort_cards_by_age(files, order)
 
         elif q:
             # YOLO-World object detection search, plus a filename/path substring
@@ -597,10 +641,14 @@ def create_app(data_root: str) -> FastAPI:
             'face_id': face_id,
             'person': person,
             'face_ref': '',
+            'category': category,
             'query_face_file_id': None,
             'message': message,
             'all_tags': all_tags,
+            'all_categories': all_categories,
             'similar_unknown_faces': similar_unknown_faces,
+            'initial_similar_cards': initial_similar_cards,
+            'tag_swipe_initial_cards': tag_swipe_initial_cards,
             'sort': sort,
             'order': order,
         })
@@ -650,6 +698,7 @@ def create_app(data_root: str) -> FastAPI:
             'files': files,
             'message': message,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
         })
 
     # ------------------------------------------------------------------
@@ -768,6 +817,7 @@ def create_app(data_root: str) -> FastAPI:
             'results': results,
             'message': message,
             'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
         })
 
     @app.get('/body-crop/{body_id}')
@@ -953,6 +1003,7 @@ def create_app(data_root: str) -> FastAPI:
         return templates.TemplateResponse(request, 'tags.html', {
             'tags': tags,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
         })
 
     @app.put('/api/tags/{label}')
@@ -967,6 +1018,73 @@ def create_app(data_root: str) -> FastAPI:
     def api_delete_tag_label(label: str):
         manual.delete_tag_label(label)
         return {'ok': True}
+
+    # CLIP tag-relevance (single object/concept label) sits closer to the
+    # face-identity similarity regime than the same-scene-photo regime that
+    # justified SET_SUGGEST_THRESHOLD=0.75, so this borrows SUGGEST_THRESHOLD's
+    # value rather than inventing a new one without data.
+    TAG_SUGGEST_THRESHOLD = 0.45
+
+    def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None):
+        """Rank not-yet-decided files against the centroid of files already
+        positively tagged `label`. Returns up to `count` dicts, best score first:
+        [{'ref': str, 'file_id': int, 'label': str, 'score': float}, ...].
+
+        A file is excluded if it already has a tag row (either polarity) for this
+        exact label — manual.get_decided_checksums_for_tag covers both a past
+        confirm and a past reject, so neither is ever re-suggested.
+
+        Bias is keyed on the specific just-confirmed/rejected file_id (the label
+        itself is constant for the whole stream, so biasing on it would be a
+        no-op). Unlike the categorical identity-match bias faces use, this blends
+        a continuous file-to-file similarity signal into the file-to-centroid
+        score, since there's no discrete identity dimension to bias tags by."""
+        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+
+        member_checksums = manual.get_files_by_tag(label, limit=1000)
+        member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
+        member_embeddings = db.get_embeddings_for_files(member_ids)
+        centroid = mean_normalized_centroid([e for _fid, e in member_embeddings])
+        if centroid is None:
+            return []
+
+        decided = manual.get_decided_checksums_for_tag(label)
+        candidates = [
+            row for row in db.get_all_embeddings()
+            if row[3] not in decided and row[0] not in exclude_ids
+        ]
+        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
+        qualifying = [(row, score) for row, score in ranked if score >= TAG_SUGGEST_THRESHOLD]
+
+        if bias_file_id is not None and bias in ('confirm', 'reject'):
+            import numpy as np
+
+            bias_rows = db.get_embeddings_for_files([bias_file_id])
+            if bias_rows:
+                bias_vec = np.frombuffer(bias_rows[0][1], dtype=np.float32)
+                sign = 1.0 if bias == 'confirm' else -1.0
+
+                def blended(item):
+                    row, score = item
+                    sim_to_bias = float(np.frombuffer(row[2], dtype=np.float32).dot(bias_vec))
+                    return score + sign * sim_to_bias
+
+                qualifying.sort(key=blended, reverse=True)
+
+        return [
+            {'ref': str(row[0]), 'file_id': row[0], 'label': label, 'score': round(float(score), 3)}
+            for row, score in qualifying[:count]
+        ]
+
+    @app.get('/api/tags/{label}/suggestions/next')
+    def api_next_tag_suggestions(label: str, count: int = 10, exclude: str = '',
+                                  bias_file_id: str = '', bias: str = ''):
+        from media_manager.swipe_support import parse_exclude
+
+        exclude_ids = {int(x) for x in parse_exclude(exclude) if x.isdigit()}
+        bias_id = int(bias_file_id) if bias_file_id.strip().isdigit() else None
+        cards = _next_tag_suggestions(label, count, exclude_ids, bias_id, bias or None)
+        return {'cards': cards}
 
     @app.get('/api/vocab')
     def api_vocab():
@@ -1011,6 +1129,7 @@ def create_app(data_root: str) -> FastAPI:
         return templates.TemplateResponse(request, 'sets.html', {
             'sets': sets,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'studio_filter': studio_filter,
         })
@@ -1025,6 +1144,7 @@ def create_app(data_root: str) -> FastAPI:
         return templates.TemplateResponse(request, 'studios.html', {
             'studios': studios,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
         })
 
     @app.get('/api/studios')
@@ -1039,40 +1159,47 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0):
+    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None):
         """Images not yet in the set whose CLIP embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
         before taking `limit`, for infinite-scroll pagination; the full ranking
         is recomputed each call (as before offset existed), which is fine at
-        personal-library scale."""
+        personal-library scale.
+
+        `exclude_ids`, when given (a set of file ids), filters the
+        threshold-passing candidates by id instead and `offset` is ignored — the
+        swipe-buffer caller (set-detail's swipe stack) has no stable page
+        position since confirming a file removes it from the candidate pool on
+        the very next call, so it just wants "up to `limit` more I haven't
+        already been shown", not a page number."""
+        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
         member_embeddings = db.get_embeddings_for_files(member_ids)
-        if not member_embeddings:
+        centroid = mean_normalized_centroid([e for _fid, e in member_embeddings])
+        if centroid is None:
             return []
-        import numpy as np
-        vecs = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in member_embeddings])
-        centroid = vecs.mean(axis=0)
-        norm = np.linalg.norm(centroid)
-        if norm == 0:
-            return []
-        centroid = centroid / norm
 
         member_checksum_set = set(member_checksums)
         candidates = [row for row in db.get_all_embeddings() if row[3] not in member_checksum_set]
         if not candidates:
             return []
-        cand_matrix = np.stack([np.frombuffer(row[2], dtype=np.float32) for row in candidates])
-        scores = cand_matrix.dot(centroid)
-
-        ranked = sorted(zip(candidates, scores.tolist()), key=lambda x: x[1], reverse=True)
+        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
-        page = passing[offset:offset + limit]
+        if exclude_ids:
+            passing = [item for item in passing if item[0][0] not in exclude_ids]
+            page = passing[:limit]
+        else:
+            page = passing[offset:offset + limit]
 
         rows = [(fid, path, True, cs) for (fid, path, cs), _score in page]
         scores_map = {fid: round(score, 3) for (fid, _path, _cs), score in page}
-        return _enrich_rows(rows, scores=scores_map)
+        cards = _enrich_rows(rows, scores=scores_map)
+        for card in cards:
+            card['ref'] = str(card['id'])
+        return cards
 
     def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
@@ -1136,6 +1263,7 @@ def create_app(data_root: str) -> FastAPI:
             'set': dict(set_row),
             'files': files,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
             'similar_files': similar_files,
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
             'sort': sort,
@@ -1143,12 +1271,18 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     @app.get('/api/sets/{set_id}/similar-files')
-    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0):
+    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0, exclude: str = ''):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
-        return {'results': _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset)}
+        from media_manager.swipe_support import parse_exclude
+        exclude_ids = {int(r) for r in parse_exclude(exclude) if r.isdigit()} or None
+        results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids)
+        # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
+        # response contract expects; 'results' stays for the pre-existing grid
+        # (offset-based load-more + threshold-expand) callers, unchanged.
+        return {'results': results, 'cards': results}
 
     @app.get('/api/sets')
     def api_list_sets(favorite: bool = False):
@@ -1191,6 +1325,186 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='Set not found')
         manual.set_set_favorite(set_id, body.favorite)
         return {'id': set_id, 'favorite': body.favorite}
+
+    # ------------------------------------------------------------------
+    # Categories (single-value, ML-assisted classification)
+    # ------------------------------------------------------------------
+
+    def _all_categories_for_nav():
+        counts = get_category_counts(manual, db)
+        return sorted(
+            ({'name': name, 'count': count} for name, count in counts.items()),
+            key=lambda c: c['name']
+        )
+
+    @app.get('/categories', response_class=HTMLResponse)
+    def categories_page(request: Request):
+        all_tags = manual.list_all_tags()
+        all_categories = _all_categories_for_nav()
+        categories = []
+        for r in manual.list_categories():
+            thumb_id = None
+            example_checksums = manual.get_example_checksums_for_category(r['id'], limit=1)
+            if example_checksums:
+                thumb_rows = db.get_files_by_checksums(example_checksums)
+                if thumb_rows:
+                    thumb_id = thumb_rows[0]['id']
+            categories.append({
+                'id': r['id'], 'name': r['name'], 'temperature': r['temperature'],
+                'image_count': r['image_count'], 'thumb_id': thumb_id,
+            })
+        return templates.TemplateResponse(request, 'categories.html', {
+            'categories': categories,
+            'all_tags': all_tags,
+            'all_categories': all_categories,
+        })
+
+    @app.get('/api/categories')
+    def api_list_categories():
+        return [
+            {'id': r['id'], 'name': r['name'], 'temperature': r['temperature'], 'image_count': r['image_count']}
+            for r in manual.list_categories()
+        ]
+
+    @app.post('/api/categories')
+    def api_create_category(body: CategoryBody):
+        name = (body.name or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='Category name must not be empty')
+        temperature = body.temperature if body.temperature is not None else 0.75
+        category_id = manual.create_category(name, temperature)
+        cat = manual.get_category(category_id)
+        return {'id': cat['id'], 'name': cat['name'], 'temperature': cat['temperature']}
+
+    @app.put('/api/categories/{category_id}')
+    def api_update_category(category_id: int, body: CategoryBody):
+        if manual.get_category(category_id) is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        if body.name is not None:
+            name = body.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail='Category name must not be empty')
+            manual.rename_category(category_id, name)
+        if body.temperature is not None:
+            manual.set_category_temperature(category_id, body.temperature)
+        row = manual.get_category(category_id)
+        return {'id': row['id'], 'name': row['name'], 'temperature': row['temperature']}
+
+    @app.delete('/api/categories/{category_id}')
+    def api_delete_category(category_id: int):
+        if manual.get_category(category_id) is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        manual.delete_category(category_id)
+        return {'ok': True}
+
+    @app.post('/api/files/{file_id}/category')
+    def api_set_file_category(file_id: int, body: CategoryBody):
+        row = _file_or_404(file_id)
+        if body.category_id is None:
+            raise HTTPException(status_code=400, detail='category_id is required')
+        cat = manual.get_category(body.category_id)
+        if cat is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        manual.set_file_category(row['checksum'], body.category_id)
+        return {'category': {'name': cat['name'], 'source': 'manual', 'score': None}}
+
+    @app.delete('/api/files/{file_id}/category')
+    def api_clear_file_category(file_id: int):
+        """Explicit clear — records an explicit 'no category' override, not a
+        revert to whatever the ML auto-match would otherwise suggest."""
+        row = _file_or_404(file_id)
+        manual.set_file_category(row['checksum'], None)
+        return {'category': None}
+
+    def _next_category_suggestions(category_id, count, exclude_refs):
+        """Rank currently-unresolved-or-differently-resolved files against this ONE
+        category's centroid (mirrors media_manager.py's MediaManager.match_categories
+        exactly — same centroid-vs-temperature-threshold math — but interactive/
+        one-at-a-time instead of batch-write). Returns up to `count` dicts, best
+        score first: [{'ref': str, 'file_id': int, 'score': float}, ...].
+
+        A file is excluded from candidacy if it has ANY manual category override —
+        assigned to this category, assigned to a DIFFERENT category, or an explicit
+        "no category" decision — manual decisions must never be re-suggested,
+        matching match_categories' own skip rule exactly.
+
+        A file that already has an ML auto-match to a DIFFERENT category IS still
+        offered here: auto-matches are provisional machine guesses, not human
+        decisions, and confirming here always writes a manual override that
+        outranks any auto-match per category_resolver.py's precedence rules."""
+        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+        from media_manager.swipe_support import bias_reorder
+
+        cat = manual.get_category(category_id)
+        if cat is None:
+            return []
+
+        example_checksums = manual.get_example_checksums_for_category(category_id)
+        example_ids = [r['id'] for r in db.get_files_by_checksums(example_checksums)]
+        centroid = mean_normalized_centroid(
+            [e for _fid, e in db.get_embeddings_for_files(example_ids)]
+        )
+        if centroid is None:
+            return []
+
+        all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
+        checksums = [c[3] for c in all_candidates]
+        overrides = manual.get_category_overrides_for_checksums(checksums)
+
+        filtered = [
+            c for c in all_candidates
+            if c[3] not in overrides and f"file:{c[0]}" not in exclude_refs
+        ]
+        ranked = rank_by_similarity(centroid, filtered, embedding_index=2)
+        threshold = cat['temperature']
+        qualifying = [(c, score) for c, score in ranked if score >= threshold]
+
+        # Wrapped in the shared bias-reorder helper for structural consistency with
+        # every other feature's swipe endpoint, even though bias is inert here: a
+        # single-category detail page has only one possible "key" for every
+        # candidate, so confirm/reject bias can never produce a different
+        # partition than plain score-desc order.
+        ordered = bias_reorder(qualifying, key_fn=lambda pair: category_id,
+                                bias_key=None, bias_action=None)
+
+        return [
+            {'ref': f"file:{c[0]}", 'file_id': c[0], 'score': round(float(score), 3)}
+            for c, score in ordered[:count]
+        ]
+
+    @app.get('/categories/{category_id}', response_class=HTMLResponse)
+    def category_detail_page(request: Request, category_id: int, sort: str = 'added', order: str = 'desc'):
+        cat = manual.get_category(category_id)
+        if cat is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        all_tags = manual.list_all_tags()
+        all_categories = _all_categories_for_nav()
+        example_checksums = manual.get_example_checksums_for_category(category_id, limit=500)
+        file_rows = _sort_file_rows(db.get_files_by_checksums(example_checksums), sort, order)
+        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+        files = _enrich_rows(rows)
+        if sort == 'age':
+            files = _sort_cards_by_age(files, order)
+        initial_cards = _next_category_suggestions(category_id, 10, set())
+        return templates.TemplateResponse(request, 'category_detail.html', {
+            'category': dict(cat),
+            'files': files,
+            'all_tags': all_tags,
+            'all_categories': all_categories,
+            'initial_cards': initial_cards,
+            'sort': sort,
+            'order': order,
+        })
+
+    @app.get('/api/categories/{category_id}/suggestions/next')
+    def api_next_category_suggestions(category_id: int, count: int = 10, exclude: str = ''):
+        from media_manager.swipe_support import parse_exclude
+
+        if manual.get_category(category_id) is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        exclude_refs = parse_exclude(exclude)
+        cards = _next_category_suggestions(category_id, count, exclude_refs)
+        return {'cards': cards}
 
     @app.post('/api/files/{file_id}/sets')
     def api_assign_set(file_id: int, body: SetBody):
@@ -1403,23 +1717,18 @@ def create_app(data_root: str) -> FastAPI:
                     'identity': row['identity'],
                 })
             faces = []
+            initial_cards = []
         else:
-            unidentified = _unpromoted_auto_faces(limit=200)
-            suggestions = _suggest_names(unidentified)
-            faces = [
-                {
-                    'id': f"auto:{row[0]}", 'file_id': row[1], 'path': row[2], 'bbox': row[3],
-                    'suggested_name': suggestions.get(row[0], {}).get('name'),
-                    'suggested_score': suggestions.get(row[0], {}).get('score'),
-                }
-                for row in unidentified
-            ]
+            faces = []
+            initial_cards = _next_face_suggestions(10, set())
         return templates.TemplateResponse(request, 'faces.html', {
             'faces': faces,
             'identities': identities,
             'all_tags': all_tags,
+            'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'favorite_faces': favorite_faces,
+            'initial_cards': initial_cards,
         })
 
     @app.get('/face-crop/{face_id}')
@@ -1532,6 +1841,98 @@ def create_app(data_root: str) -> FastAPI:
         of the same person before deciding what to call them."""
         threshold = max(0.0, min(1.0, threshold))
         return {'results': _find_similar_faces_to_ref(face_id, threshold, limit=limit)}
+
+    # ------------------------------------------------------------------
+    # Tinder-style face-suggestion card stack (swipe to confirm/reject)
+    # ------------------------------------------------------------------
+
+    def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None, identity_filter=None):
+        """Rank unpromoted auto-detected faces against every known identity (same
+        embedding math as _suggest_names) and return up to `count` candidates that
+        clear SUGGEST_THRESHOLD, best score first. `exclude_refs` filters out faces
+        already sitting in the client's buffer (not yet swiped) so a refill never
+        hands back a duplicate card. `bias_identity`/`bias` optionally reorder the
+        result: after a same-face confirm we want more of that same person surfaced
+        next; after a reject we want that identity pushed to the back rather than
+        immediately re-suggested — a simple sort tweak, not a new ranking model.
+
+        `identity_filter`, when set, scopes the whole comparison to one identity's
+        own confirmed embeddings (same accessor _find_similar_unknown_faces uses)
+        instead of arguing over every named person — every returned card then
+        already carries that one identity, which makes bias_identity/bias
+        naturally inert here (the reorder partition never has anything to
+        partition against); that's expected, not a bug, so callers in this mode
+        simply don't bother passing bias params."""
+        if identity_filter is not None:
+            ref_embeddings = manual.get_embeddings_for_identity(identity_filter)
+            if not ref_embeddings:
+                return []
+            import numpy as np
+            matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
+
+            candidates = []  # (score, ref, file_id, identity)
+            for face_id_, file_id_, _path, _bbox, emb_bytes in _unpromoted_auto_faces(limit=None):
+                ref = f"auto:{face_id_}"
+                if ref in exclude_refs or not emb_bytes:
+                    continue
+                vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                score = float(matrix.dot(vec).max())
+                if score >= SUGGEST_THRESHOLD:
+                    candidates.append((score, ref, file_id_, identity_filter))
+
+            from media_manager.swipe_support import bias_reorder
+            candidates.sort(key=lambda c: -c[0])
+            candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
+            return [
+                {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
+                for score, ref, file_id_, identity in candidates[:count]
+            ]
+
+        named = manual.get_named_face_embeddings()
+        if not named:
+            return []
+        import numpy as np
+        names = [n for n, _ in named]
+        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
+
+        candidates = []  # (score, ref, file_id, identity)
+        for face_id_, file_id_, _path, _bbox, emb_bytes in _unpromoted_auto_faces(limit=None):
+            ref = f"auto:{face_id_}"
+            if ref in exclude_refs or not emb_bytes:
+                continue
+            vec = np.frombuffer(emb_bytes, dtype=np.float32)
+            scores = matrix.dot(vec)
+            best_idx = int(scores.argmax())
+            best_score = float(scores[best_idx])
+            if best_score >= SUGGEST_THRESHOLD:
+                candidates.append((best_score, ref, file_id_, names[best_idx]))
+
+        from media_manager.swipe_support import bias_reorder
+        candidates.sort(key=lambda c: -c[0])
+        candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
+        return [
+            {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
+            for score, ref, file_id_, identity in candidates[:count]
+        ]
+
+    @app.get('/swipe')
+    def swipe_page_redirect():
+        """/faces absorbed the face-swipe stack — redirect old bookmarks/links
+        rather than 404ing them."""
+        return RedirectResponse(url='/faces')
+
+    @app.get('/api/face-suggestions/next')
+    def api_next_face_suggestions(count: int = 10, exclude: str = '', bias_identity: str = '', bias: str = '',
+                                   identity: str = ''):
+        """Feeds the swipe-card stack's background buffer. `exclude` is a comma-joined
+        list of face refs the client already holds (queued or just-decided) so a
+        refill never repeats a card still in flight client-side. `identity` (distinct
+        from `bias_identity`) scopes the stream to one person's own confirmed faces,
+        for the person-search page's swipe stack."""
+        exclude_refs = {r for r in exclude.split(',') if r}
+        cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
+                                        identity_filter=identity or None)
+        return {'cards': cards}
 
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):

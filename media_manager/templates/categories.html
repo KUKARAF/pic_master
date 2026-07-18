@@ -1,0 +1,164 @@
+{% extends "base.html" %}
+
+{% block title %}Categories — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Categories</h1>
+  <span class="sub">{{ categories | length }} categor{{ 'y' if categories | length == 1 else 'ies' }}</span>
+</div>
+
+<form id="category-create-form" style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;" autocomplete="off">
+  <input type="text" id="category-name-input" placeholder="Category name…" required style="min-width:180px;">
+  <label class="sub" style="display:flex;align-items:center;gap:6px;">
+    Temperature
+    <input type="range" id="category-temperature-input" min="0" max="1" step="0.01" value="0.75">
+    <span id="category-temperature-readout">0.75</span>
+  </label>
+  <button type="submit" class="btn-similar">＋ Create category</button>
+  <span id="category-create-msg" style="font-size:0.85em;color:#728C72;"></span>
+</form>
+
+{% if categories %}
+<div class="grid" id="categories-grid">
+  {% for c in categories %}
+  <div class="card" id="category-card-{{ c.id }}" data-category-id="{{ c.id }}">
+    <a class="card-img-link" href="/categories/{{ c.id }}">
+      {% if c.thumb_id %}
+      <img src="/thumb/{{ c.thumb_id }}" alt="{{ c.name }}" loading="lazy">
+      {% else %}
+      <div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2rem;">🏷️</div>
+      {% endif %}
+    </a>
+
+    <button type="button" class="icon-btn edit-btn category-edit-btn" data-category-id="{{ c.id }}"
+            data-category-name="{{ c.name }}" title="Rename category">✏️</button>
+    <button type="button" class="icon-btn delete-btn category-delete-btn" data-category-id="{{ c.id }}" title="Delete category">🗑️</button>
+
+    <div class="card-body">
+      <div class="card-name" title="{{ c.name }}">
+        <a href="/categories/{{ c.id }}">{{ c.name }}</a>
+      </div>
+      <div class="sub" style="font-size:0.78rem;">
+        {{ c.image_count }} manually assigned ·
+        <a href="/search?category={{ c.name | urlencode }}">view all files</a>
+      </div>
+      <label class="sub" style="display:flex;align-items:center;gap:6px;font-size:0.78rem;margin-top:4px;">
+        Temp
+        <input type="range" class="category-temperature-slider" data-category-id="{{ c.id }}"
+               min="0" max="1" step="0.01" value="{{ c.temperature }}">
+        <span class="category-temperature-value">{{ '%.2f' % c.temperature }}</span>
+      </label>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="icon">🏷️</div>
+  <p>No categories yet. Create one above (e.g. "Outside", "Convention", "Anime"), assign a few example files to it, then run <code>media category match &lt;path&gt;</code> to auto-classify the rest.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+const temperatureInput = document.getElementById('category-temperature-input');
+const temperatureReadout = document.getElementById('category-temperature-readout');
+temperatureInput.addEventListener('input', function() {
+  temperatureReadout.textContent = temperatureInput.value;
+});
+
+document.getElementById('category-create-form').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const name = document.getElementById('category-name-input').value.trim();
+  const temperature = parseFloat(temperatureInput.value);
+  const msg = document.getElementById('category-create-msg');
+  if (!name) return;
+  try {
+    const resp = await fetch('/api/categories', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name, temperature: temperature}),
+    });
+    if (resp.ok) {
+      location.reload();
+    } else {
+      msg.textContent = 'Error creating category.';
+    }
+  } catch (err) {
+    msg.textContent = 'Network error.';
+  }
+});
+
+document.querySelectorAll('.category-delete-btn').forEach(function(btn) {
+  btn.addEventListener('click', async function() {
+    if (!confirm('Delete this category? Files manually assigned to it become explicitly uncategorized.')) return;
+    try {
+      const resp = await fetch('/api/categories/' + btn.dataset.categoryId, {method: 'DELETE'});
+      if (resp.ok) {
+        const card = document.getElementById('category-card-' + btn.dataset.categoryId);
+        if (card) card.remove();
+      } else {
+        alert('Failed to delete category.');
+      }
+    } catch (err) {
+      alert('Network error.');
+    }
+  });
+});
+
+document.querySelectorAll('.category-edit-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    openModal('Rename category', function(box) {
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.value = btn.dataset.categoryName;
+      nameInput.style.width = '100%';
+      nameInput.style.marginBottom = '8px';
+      box.appendChild(nameInput);
+
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button';
+      saveBtn.textContent = 'Save';
+      saveBtn.addEventListener('click', function() {
+        const name = nameInput.value.trim();
+        if (!name) return;
+        fetch('/api/categories/' + btn.dataset.categoryId, {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: name}),
+        })
+          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function() { closeModal(); location.reload(); })
+          .catch(function(err) { alert('Failed to rename category: ' + err.message); });
+      });
+      box.appendChild(saveBtn);
+    });
+  });
+});
+
+document.querySelectorAll('.category-temperature-slider').forEach(function(slider) {
+  slider.addEventListener('change', async function() {
+    const valueEl = slider.parentElement.querySelector('.category-temperature-value');
+    try {
+      const resp = await fetch('/api/categories/' + slider.dataset.categoryId, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({temperature: parseFloat(slider.value)}),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        valueEl.textContent = data.temperature.toFixed(2);
+      }
+    } catch (err) {
+      alert('Failed to update temperature.');
+    }
+  });
+  slider.addEventListener('input', function() {
+    const valueEl = slider.parentElement.querySelector('.category-temperature-value');
+    valueEl.textContent = parseFloat(slider.value).toFixed(2);
+  });
+});
+</script>
+{% endblock %}

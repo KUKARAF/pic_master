@@ -198,6 +198,24 @@ class Database(ThreadLocalDB):
                 frame_index INTEGER
             )
         ''')
+        # Categories: single-value ML auto-match result per file, keyed by file_id
+        # like detections/faces (derived, rebuildable data). Stores the category as
+        # a name string rather than manual.db's numeric category id, since a cross-
+        # database foreign key can't be enforced and would go stale silently if
+        # manual.db is ever rebuilt — same rationale as faces.identity being a plain
+        # string. Manual overrides live in manual.db and always take precedence over
+        # this table at read time (see category_resolver.py).
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS file_category_matches (
+                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                category_name TEXT NOT NULL,
+                score REAL NOT NULL,
+                model TEXT NOT NULL,
+                matched_at INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_category_matches_name ON file_category_matches (category_name)')
+
         # Migrate DBs created before frame_index existed (nullable ADD COLUMN is safe
         # in-place — every existing row correctly becomes "primary frame" = NULL).
         detections_cols = {row[1] for row in cursor.execute('PRAGMA table_info(detections)')}
@@ -939,6 +957,57 @@ class Database(ThreadLocalDB):
               AND frame_index IS NULL AND x1 IS NOT NULL
         ''', (file_id, min_conf))
         return [list(row) for row in cursor.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Category matches (ML auto-classification — see category_resolver.py for
+    # how this is merged with manual.db's manual overrides, which always win)
+    # ------------------------------------------------------------------
+
+    def set_file_category_match(self, file_id, category_name, score, model):
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO file_category_matches (file_id, category_name, score, model, matched_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (file_id, category_name, score, model, int(time.time())))
+        self.conn.commit()
+
+    def clear_file_category_match(self, file_id):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM file_category_matches WHERE file_id = ?', (file_id,))
+        self.conn.commit()
+
+    def get_file_category_match(self, file_id):
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT category_name, score, model FROM file_category_matches WHERE file_id = ?',
+            (file_id,)
+        )
+        return cursor.fetchone()
+
+    def get_file_category_matches_for_files(self, file_ids):
+        """Batched lookup: {file_id: (category_name, score, model)} — mirrors
+        get_embeddings_for_files."""
+        if not file_ids:
+            return {}
+        placeholders = ','.join('?' for _ in file_ids)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f'SELECT file_id, category_name, score, model FROM file_category_matches WHERE file_id IN ({placeholders})',
+            tuple(file_ids)
+        )
+        return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+
+    def get_all_file_category_matches(self):
+        """Return [(file_id, checksum, category_name, score), ...] joined for
+        checksum — used by category_resolver's navbar-count/search-by-category
+        helpers, mirrors get_all_embeddings's join-for-checksum style."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT m.file_id, f.checksum, m.category_name, m.score
+            FROM file_category_matches m
+            JOIN files_with_path f ON f.id = m.file_id
+        ''')
+        return cursor.fetchall()
 
     def clear_primary_ml_data(self, file_id):
         """Delete primary-frame (frame_index NULL/0) detections, faces, body

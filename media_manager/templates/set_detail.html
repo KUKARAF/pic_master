@@ -43,24 +43,26 @@
   {{ macros.card(f, add_to_set=True) }}
   {% endfor %}
 </div>
-{% else %}
-<div class="alert" id="similar-set-empty-state">
-  <p style="margin-bottom:10px;">No suggestions found at the default threshold — either nothing looks similar enough yet, or run <code>media embed</code> to build CLIP embeddings first.</p>
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-    <label for="similar-set-threshold-slider" style="font-size:0.85em;">Match threshold:</label>
-    <input type="range" id="similar-set-threshold-slider" min="0.40" max="0.75" step="0.05" value="0.60">
-    <span id="similar-set-threshold-value" class="sub">0.60</span>
-    <button type="button" id="expand-similar-set-btn" class="btn-similar" style="font-size:0.85em;">Expand similar image search</button>
-  </div>
-  <div id="expand-similar-set-status" class="sub" style="margin-top:8px;display:none;"></div>
-</div>
-<div class="grid" id="similar-set-grid" style="margin-top:16px;"></div>
-{% endif %}
 <div id="similar-set-sentinel" style="height:1px;"></div>
+{% endif %}
+
+{# Swipe stack for everything past page 1 of suggestions. When similar_files
+   is empty at load, the sentinel/grid above are skipped entirely and this
+   mounts immediately instead — its own empty state carries the threshold
+   slider that used to live in a separate static alert block. #}
+<div class="swipe-page" id="set-swipe-page" style="display:none;">
+  <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Drag the card, or use ← / → · ↓ skip · ↑ add to set</div>
+</div>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/swipe-core.js"></script>
 <script>
 (function() {
   const setId = {{ set.id }};
@@ -149,188 +151,112 @@
   }
   document.querySelectorAll('.add-to-set-btn').forEach(wireAddButton);
 
-  /* ---- suggestions grid: card building + chip rendering (mirrors
-     _macros.html's card()/card_chips() output exactly, via DOM APIs rather
-     than string concatenation so tag/set/person text is never treated as
-     HTML) ---- */
-  function addChipRow(container, items, cls, hrefFor, textFor, titleFor) {
-    items.slice(0, 3).forEach(function(item) {
-      const a = document.createElement('a');
-      a.className = cls;
-      a.href = hrefFor(item);
-      if (titleFor) a.title = titleFor(item);
-      a.textContent = textFor(item);
-      container.appendChild(a);
-    });
-    if (items.length > 3) {
-      const span = document.createElement('span');
-      span.className = cls;
-      span.style.background = '#111811';
-      span.style.borderColor = '#243024';
-      span.style.color = '#728C72';
-      span.textContent = '+' + (items.length - 3);
-      container.appendChild(span);
-    }
-  }
+  /* ---- suggestions beyond page 1: one-time hand-off from the static grid's
+     sentinel to a swipe stack (replaces both the old infinite-scroll grid
+     append and the separate threshold-slider alert — that slider now lives
+     inside the stack's own empty state instead of a second, divergent UI).
 
-  function buildSuggestionCard(f) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.id = 'similar-set-card-' + f.id;
-    card.dataset.fileId = f.id;
-
-    const imgLink = document.createElement('a');
-    imgLink.className = 'card-img-link';
-    imgLink.href = '/photo/' + f.id;
-    const img = document.createElement('img');
-    img.src = '/thumb/' + f.id;
-    img.alt = f.filename;
-    img.loading = 'lazy';
-    imgLink.appendChild(img);
-    card.appendChild(imgLink);
-
-    const starBtn = document.createElement('a');
-    starBtn.className = 'star-btn';
-    starBtn.href = '/similar/' + f.id;
-    starBtn.title = 'I am feeling lucky — find similar images';
-    starBtn.textContent = '⭐';
-    card.appendChild(starBtn);
-
-    const heartBtn = document.createElement('button');
-    heartBtn.type = 'button';
-    heartBtn.className = 'heart-btn file-heart-btn' + (f.favorite ? ' is-favorite' : '');
-    heartBtn.dataset.fileId = f.id;
-    heartBtn.title = 'Favorite this photo';
-    heartBtn.textContent = f.favorite ? '♥' : '♡';
-    card.appendChild(heartBtn);
-    wireHeartButton(heartBtn, '/api/files/' + f.id + '/favorite');
-
-    const scoreBadge = document.createElement('span');
-    scoreBadge.className = 'score-badge';
-    scoreBadge.textContent = f.score.toFixed(3);
-    card.appendChild(scoreBadge);
-
-    const cardBody = document.createElement('div');
-    cardBody.className = 'card-body';
-
-    const nameLink = document.createElement('a');
-    nameLink.className = 'card-name';
-    nameLink.href = '/photo/' + f.id;
-    nameLink.title = f.path;
-    nameLink.textContent = f.title || f.filename;
-    cardBody.appendChild(nameLink);
-
-    const tags = f.tags || [], sets = f.sets || [], people = f.people || [];
-    if (tags.length || sets.length || people.length) {
-      const chipsWrap = document.createElement('div');
-      chipsWrap.className = 'card-tags';
-      if (tags.length) {
-        addChipRow(chipsWrap, tags, 'tag',
-          function(t) { return '/search?tag=' + encodeURIComponent(t); },
-          function(t) { return t; });
-      }
-      if (sets.length) {
-        addChipRow(chipsWrap, sets, 'chip-set',
-          function(s) { return '/sets/' + s.id; },
-          function(s) { return s.name; },
-          function() { return 'Set'; });
-      }
-      if (people.length) {
-        addChipRow(chipsWrap, people, 'chip-person',
-          function(p) { return '/search?person=' + encodeURIComponent(p); },
-          function(p) { return p; },
-          function() { return 'Recognized person'; });
-      }
-      cardBody.appendChild(chipsWrap);
-    }
-
-    const addBtn = document.createElement('button');
-    addBtn.type = 'button';
-    addBtn.className = 'btn-similar add-to-set-btn';
-    addBtn.dataset.fileId = f.id;
-    addBtn.style.fontSize = '0.8em';
-    addBtn.style.padding = '4px 10px';
-    addBtn.style.marginTop = '6px';
-    addBtn.textContent = '＋ Add';
-    cardBody.appendChild(addBtn);
-    wireAddButton(addBtn);
-
-    card.appendChild(cardBody);
-    return card;
-  }
-
-  const slider = document.getElementById('similar-set-threshold-slider');
-  const sliderValue = document.getElementById('similar-set-threshold-value');
-  const expandBtn = document.getElementById('expand-similar-set-btn');
-  const expandStatus = document.getElementById('expand-similar-set-status');
-  const similarGrid = document.getElementById('similar-set-grid');
+     initSwipeStack's own render() only calls maybeFetchMore() once its queue
+     is already non-empty (an empty initialCards list renders the empty state
+     immediately and never auto-fetches), so the very first batch — and any
+     "expand search at a lower threshold" retry — is always fetched here and
+     handed in as initialCards, rather than left to the buffer-refill path
+     that only tops up an already-showing stack between swipes. */
   const sentinel = document.getElementById('similar-set-sentinel');
-
-  const PAGE_SIZE = 12;
+  const swipePage = document.getElementById('set-swipe-page');
+  const gridSeedIds = {{ similar_files | map(attribute='id') | list | tojson }};
   let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
-  let currentOffset = {{ similar_files | length if similar_files else 0 }};
-  let loadingMore = false;
-  let exhausted = currentOffset < PAGE_SIZE;
+  let stack = null;
 
-  if (slider && sliderValue) {
-    slider.addEventListener('input', function() {
-      sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+  function fetchMoreUrl(known, need) {
+    const exclude = new Set(gridSeedIds.map(String));
+    known.forEach(function(ref) { exclude.add(ref); });
+    return '/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
+      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(exclude).join(','));
+  }
+
+  function launchStack(initialCards) {
+    swipePage.style.display = '';
+    // Re-launching (e.g. after "expand search") abandons any previous stack
+    // rather than mutating it; the old one's queue stays permanently empty
+    // (nothing ever pushes to it again), so its dangling keydown/click
+    // listeners are inert — safe to leave behind instead of threading a
+    // teardown hook through swipe-core.js.
+    stack = initSwipeStack({
+      stackElId: 'set-swipe-stack',
+      confirmBtnId: 'set-swipe-confirm-btn',
+      rejectBtnId: 'set-swipe-reject-btn',
+      initialCards: initialCards,
+      fetchMoreUrl: function(known, biasKey, biasAction, need) {
+        return fetchMoreUrl(known, need);
+      },
+      renderCard: function(card) {
+        const name = card.title || card.filename || ('photo #' + card.id);
+        return {
+          imageUrl: '/thumb/' + card.id,
+          questionHtml: 'Add <strong>' + escapeHtml(name) + '</strong> to this set?',
+          scoreText: typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '',
+        };
+      },
+      onConfirm: function(card) {
+        return { url: '/api/files/' + card.id + '/sets', method: 'POST', body: { set_id: setId } };
+      },
+      onReject: function() {
+        return null; // sets have no "explicitly not in this set" concept to persist
+      },
+      emptyStateHtml: function(stackEl) {
+        stackEl.innerHTML =
+          '<div class="swipe-empty">' +
+            '<p style="margin-bottom:10px;">No more suggestions at threshold ' + currentThreshold.toFixed(2) + '.</p>' +
+            '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;">' +
+              '<label for="set-swipe-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
+              '<input type="range" id="set-swipe-threshold-slider" min="0.40" max="0.75" step="0.05" value="' + currentThreshold.toFixed(2) + '">' +
+              '<span id="set-swipe-threshold-value" class="sub">' + currentThreshold.toFixed(2) + '</span>' +
+              '<button type="button" id="set-swipe-expand-btn" class="btn-similar" style="font-size:0.85em;">Expand similar image search</button>' +
+            '</div>' +
+          '</div>';
+        const slider = stackEl.querySelector('#set-swipe-threshold-slider');
+        const sliderValue = stackEl.querySelector('#set-swipe-threshold-value');
+        const expandBtn = stackEl.querySelector('#set-swipe-expand-btn');
+        if (slider && sliderValue) {
+          slider.addEventListener('input', function() {
+            sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+          });
+        }
+        if (expandBtn) {
+          expandBtn.addEventListener('click', function() {
+            currentThreshold = slider ? parseFloat(slider.value) : Math.max(0.4, currentThreshold - 0.1);
+            expandBtn.disabled = true;
+            expandBtn.textContent = 'Searching…';
+            fetchAndLaunch();
+          });
+        }
+      },
     });
   }
 
-  if (expandBtn) {
-    expandBtn.addEventListener('click', function() {
-      const threshold = slider ? parseFloat(slider.value) : 0.6;
-      expandStatus.style.display = 'block';
-      expandStatus.textContent = 'Searching…';
-      fetch('/api/sets/' + setId + '/similar-files?threshold=' + threshold + '&limit=' + PAGE_SIZE)
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function(data) {
-          const results = data.results || [];
-          if (!results.length) {
-            expandStatus.textContent = 'Still no matches at threshold ' + threshold.toFixed(2) + ' — try lowering it further.';
-            return;
-          }
-          expandStatus.style.display = 'none';
-          similarGrid.innerHTML = '';
-          results.forEach(function(f) { similarGrid.appendChild(buildSuggestionCard(f)); });
-          currentThreshold = threshold;
-          currentOffset = results.length;
-          exhausted = results.length < PAGE_SIZE;
-        })
-        .catch(function(err) {
-          expandStatus.textContent = 'Search error: ' + err.message;
-        });
-    });
+  function fetchAndLaunch() {
+    fetch(fetchMoreUrl(new Set(), 10))
+      .then(function(r) { return r.ok ? r.json() : { cards: [] }; })
+      .then(function(data) { launchStack(data.cards || []); })
+      .catch(function() { launchStack([]); });
   }
 
-  /* infinite scroll: load 12 more suggestions when the sentinel below the
-     grid comes into view, at whatever threshold is currently active. */
-  if (sentinel && similarGrid) {
+  function activateSwipeStack() {
+    if (stack || !swipePage) return;
+    fetchAndLaunch();
+  }
+
+  if (sentinel) {
     const observer = new IntersectionObserver(function(entries) {
-      if (!entries[0].isIntersecting || loadingMore || exhausted) return;
-      loadingMore = true;
-      fetch('/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
-            '&limit=' + PAGE_SIZE + '&offset=' + currentOffset)
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function(data) {
-          const results = data.results || [];
-          results.forEach(function(f) { similarGrid.appendChild(buildSuggestionCard(f)); });
-          currentOffset += results.length;
-          exhausted = results.length < PAGE_SIZE;
-        })
-        .catch(function() {
-          // transient failure — allow retry on the next intersection
-        })
-        .finally(function() { loadingMore = false; });
+      if (!entries[0].isIntersecting) return;
+      observer.disconnect();
+      sentinel.style.display = 'none';
+      activateSwipeStack();
     }, { rootMargin: '400px' });
     observer.observe(sentinel);
+  } else {
+    activateSwipeStack();
   }
 })();
 </script>

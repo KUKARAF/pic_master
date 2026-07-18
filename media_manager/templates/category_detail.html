@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}{{ category.name }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>
+    {{ category.name }}
+    <button type="button" id="category-edit-btn" class="heart-btn-inline" title="Rename category">✏️</button>
+    <button type="button" id="category-delete-btn" class="heart-btn-inline" title="Delete category">🗑️</button>
+  </h1>
+  <a href="/categories" class="sub">← Back to categories</a>
+</div>
+
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
+  <p class="sub">{{ files | length }} image(s)</p>
+  <label class="sub" style="display:flex;align-items:center;gap:6px;">
+    Temp
+    <input type="range" id="category-temperature-slider" min="0" max="1" step="0.01" value="{{ category.temperature }}">
+    <span id="category-temperature-value">{{ '%.2f' % category.temperature }}</span>
+  </label>
+  {{ macros.sort_controls(sort, order) }}
+</div>
+
+{% if files %}
+<div class="grid">
+  {% for f in files %}
+  {{ macros.card(f) }}
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="icon">🏷️</div>
+  <p>No example files assigned to this category yet. Assign one from a photo's detail page, or confirm one of the suggestions below.</p>
+</div>
+{% endif %}
+
+<div class="section-title" style="margin-top:28px;margin-bottom:12px;">
+  Suggestions for this category
+</div>
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="category-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="category-swipe-reject-btn" title="Not this category (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="category-swipe-confirm-btn" title="Belongs in this category (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Drag the card, or use ← / → · ↓ reject · ↑ confirm</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>window.CATEGORY_DETAIL_INITIAL_CARDS = {{ initial_cards | tojson }};</script>
+<script src="/static/swipe-core.js"></script>
+<script>
+(function () {
+  const categoryId = {{ category.id }};
+  const categoryName = {{ category.name | tojson }};
+
+  const editBtn = document.getElementById('category-edit-btn');
+  if (editBtn) {
+    editBtn.addEventListener('click', function() {
+      openModal('Rename category', function(box) {
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.value = categoryName;
+        nameInput.style.width = '100%';
+        nameInput.style.marginBottom = '8px';
+        box.appendChild(nameInput);
+
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.textContent = 'Save';
+        saveBtn.addEventListener('click', function() {
+          const name = nameInput.value.trim();
+          if (!name) return;
+          fetch('/api/categories/' + categoryId, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name}),
+          })
+            .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+            .then(function() { closeModal(); location.reload(); })
+            .catch(function(err) { alert('Failed to rename category: ' + err.message); });
+        });
+        box.appendChild(saveBtn);
+      });
+    });
+  }
+
+  const deleteBtn = document.getElementById('category-delete-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', function() {
+      if (!confirm('Delete this category? Files manually assigned to it become explicitly uncategorized.')) return;
+      fetch('/api/categories/' + categoryId, { method: 'DELETE' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { window.location.href = '/categories'; })
+        .catch(function(err) { alert('Failed to delete category: ' + err.message); });
+    });
+  }
+
+  const slider = document.getElementById('category-temperature-slider');
+  const sliderValue = document.getElementById('category-temperature-value');
+  if (slider) {
+    slider.addEventListener('input', function() {
+      sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+    });
+    slider.addEventListener('change', function() {
+      fetch('/api/categories/' + categoryId, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({temperature: parseFloat(slider.value)}),
+      })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { location.reload(); })
+        .catch(function(err) { alert('Failed to update temperature: ' + err.message); });
+    });
+  }
+
+  window.initSwipeStack({
+    stackElId: 'category-swipe-stack',
+    confirmBtnId: 'category-swipe-confirm-btn',
+    rejectBtnId: 'category-swipe-reject-btn',
+    initialCards: window.CATEGORY_DETAIL_INITIAL_CARDS || [],
+    fetchMoreUrl: (excludeSet /*, biasKey, biasAction */) =>
+      `/api/categories/${categoryId}/suggestions/next?count=10&exclude=`
+      + encodeURIComponent(Array.from(excludeSet).join(',')),
+    renderCard: (card) => ({
+      imageUrl: `/thumb/${card.file_id}`,
+      questionHtml: `Does this belong in <strong>${escapeHtml(categoryName)}</strong>?`,
+      scoreText: `similarity ${card.score.toFixed(2)}`,
+    }),
+    onConfirm: (card) => ({
+      url: `/api/files/${card.file_id}/category`,
+      method: 'POST',
+      body: { category_id: categoryId },
+    }),
+    onReject: (card) => ({
+      url: `/api/files/${card.file_id}/category`,
+      method: 'DELETE',
+    }),
+    emptyStateHtml: 'No more suggestions for this category right now.<br>'
+      + 'Assign a few more example files above, or come back after indexing more photos.',
+  });
+})();
+</script>
+{% endblock %}

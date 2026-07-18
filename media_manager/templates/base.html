@@ -22,18 +22,22 @@
     <button type="submit">Search</button>
   </form>
 
-  {% if all_tags %}
+  {% if all_categories %}
   <div style="position:relative;">
-    <button class="nav-tags-btn" id="tags-dropdown-btn" type="button">
-      Tags ▾
+    <button class="nav-tags-btn" id="categories-dropdown-btn" type="button">
+      Categories ▾
     </button>
-    <div class="tags-dropdown" id="tags-dropdown-menu">
-      {% for tag, count in all_tags %}
-      <a href="/search?tag={{ tag | urlencode }}">
-        <span>{{ tag }}</span>
-        <span class="tag-count">{{ count }}</span>
+    <div class="tags-dropdown" id="categories-dropdown-menu">
+      {% for cat in all_categories %}
+      <a href="/search?category={{ cat.name | urlencode }}">
+        <span>{{ cat.name }}</span>
+        <span class="tag-count">{{ cat.count }}</span>
       </a>
       {% endfor %}
+      <!-- Deliberately no separate top-level "Categories" nav-link — this
+           dropdown is the only entry point to /categories, unlike Tags which
+           has both a nav-link and (previously) a duplicate dropdown. -->
+      <a href="/categories" style="border-top:1px solid #333;margin-top:4px;padding-top:6px;font-weight:600;">Manage categories →</a>
     </div>
   </div>
   {% endif %}

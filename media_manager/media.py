@@ -179,6 +179,37 @@ def main():
     set_files.add_argument('--studio', default=None, help='Studio name (optional)')
     set_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
 
+    # media category <create|ls|assign|clear|files|match> - single-value,
+    # ML-assisted classification (e.g. Outside/Convention/Anime)
+    category_cmd = sub.add_parser('category', help='Manage image categories (single-value, ML-assisted classification)')
+    category_sub = category_cmd.add_subparsers(dest='category_cmd', required=True)
+
+    category_create = category_sub.add_parser('create', help='Create a category')
+    category_create.add_argument('name', help='Category name')
+    category_create.add_argument('--temperature', type=float, default=0.75,
+                                  help='Similarity threshold 0.0-1.0 for auto-matching (default: 0.75)')
+
+    category_ls = category_sub.add_parser('ls', help='List all categories')
+
+    category_assign = category_sub.add_parser(
+        'assign', help='Manually assign a file to a category (creates the category if needed)')
+    category_assign.add_argument('path', help='File path (relative to repo root)')
+    category_assign.add_argument('name', help='Category name')
+
+    category_clear = category_sub.add_parser(
+        'clear',
+        help="Manually clear a file's category (marks it explicitly uncategorized; "
+             "blocks future auto-matching until reassigned)")
+    category_clear.add_argument('path', help='File path (relative to repo root)')
+
+    category_files = category_sub.add_parser('files', help='List files resolved to a category (manual + auto-matched)')
+    category_files.add_argument('name', help='Category name')
+    category_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
+
+    category_match = category_sub.add_parser('match', help='Run CLIP-similarity auto-matching against category examples')
+    category_match.add_argument('path', nargs='?', default='.', help='Path to scope matching to (default: whole repo)')
+    category_match.add_argument('--dry-run', action='store_true', help='Report matches without writing to the DB')
+
     # media age-setup - build the isolated MiVOLO venv (machine-level, not per-repo)
     age_setup = sub.add_parser(
         'age-setup',
@@ -405,6 +436,59 @@ def main():
                 file_row = m.db.get_file_by_checksum(checksum)
                 if file_row is not None:
                     print(file_row['path'])
+        m.close()
+        return 0
+
+    elif args.cmd == 'category':
+        m = MediaManager()
+        if args.category_cmd == 'create':
+            category_id = m.manual.create_category(args.name, args.temperature)
+            cat = m.manual.get_category(category_id)
+            print(f"Category '{args.name}' (temperature {cat['temperature']}) — id {category_id}")
+
+        elif args.category_cmd == 'ls':
+            categories = m.manual.list_categories()
+            if not categories:
+                print("No categories yet. Create one with: media category create <name> [--temperature 0.0-1.0]")
+            for row in categories:
+                print(f"{row['id']}\t{row['name']}\ttemp={row['temperature']}\t{row['image_count']} files")
+
+        elif args.category_cmd == 'assign':
+            file_row = m.db.get_file_by_path(args.path)
+            if file_row is None:
+                print(f"ERROR: '{args.path}' not tracked — run 'media add' first", file=sys.stderr)
+                m.close()
+                sys.exit(1)
+            category_id = m.manual.create_category(args.name)
+            m.manual.set_file_category(file_row['checksum'], category_id)
+            print(f"Assigned '{args.path}' to category '{args.name}'")
+
+        elif args.category_cmd == 'clear':
+            file_row = m.db.get_file_by_path(args.path)
+            if file_row is None:
+                print(f"ERROR: '{args.path}' not tracked — run 'media add' first", file=sys.stderr)
+                m.close()
+                sys.exit(1)
+            m.manual.set_file_category(file_row['checksum'], None)
+            print(f"Cleared category for '{args.path}' (explicitly marked uncategorized)")
+
+        elif args.category_cmd == 'files':
+            row = m.manual.find_category(args.name)
+            if row is None:
+                print(f"ERROR: no category named '{args.name}'", file=sys.stderr)
+                m.close()
+                sys.exit(1)
+            from media_manager.category_resolver import get_resolved_checksums_for_category
+            checksums = get_resolved_checksums_for_category(m.manual, m.db, row['id'], row['name'], limit=args.limit)
+            for checksum in checksums:
+                file_row = m.db.get_file_by_checksum(checksum)
+                if file_row is not None:
+                    print(file_row['path'])
+
+        elif args.category_cmd == 'match':
+            matched, skipped, considered = m.match_categories(args.path, dry_run=args.dry_run)
+            verb = "Would match" if args.dry_run else "Matched"
+            print(f"{verb} {matched} file(s); skipped {skipped} with a manual override; considered {considered} total.")
         m.close()
         return 0
 

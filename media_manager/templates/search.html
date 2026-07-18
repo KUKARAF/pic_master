@@ -111,21 +111,14 @@
   Unidentified faces that look like {{ person or face_id }}
 </div>
 
-{% if similar_unknown_faces %}
-<div class="grid" id="similar-unknown-grid">
-  {% for f in similar_unknown_faces %}
-  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}">
-    <a class="card-img-link" href="/photo/{{ f.file_id }}">
-      <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{{ f.filename }}</div>
-      <button type="button" class="btn-similar merge-face-btn" data-face-ref="{{ f.ref }}"
-              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>
-    </div>
+{% if initial_similar_cards %}
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="similar-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="similar-swipe-reject-btn" title="Not same face (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="similar-swipe-confirm-btn" title="Same face (↑)">✓</button>
   </div>
-  {% endfor %}
+  <div class="swipe-hint">Drag the card, or use ← / → · ↓ reject · ↑ confirm</div>
 </div>
 {% else %}
 <div class="alert" id="similar-empty-state">
@@ -142,9 +135,24 @@
 {% endif %}
 {% endif %}
 {% endif %}
+
+{% if tag %}
+<div class="section-title" style="margin-top:28px;margin-bottom:12px;">
+  Suggestions for tag "{{ tag }}"
+</div>
+<div class="swipe-page" style="padding:0;">
+  <div class="swipe-stack-wrap" id="tag-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="tag-swipe-reject-btn" title="Not this tag (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="tag-swipe-confirm-btn" title="Has this tag (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Drag the card, or use ← / → · ↓ reject · ↑ confirm</div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/swipe-core.js"></script>
 <script>
 document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
@@ -389,6 +397,86 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
         });
     });
   }
+})();
+
+(function() {
+  const tagLabel = {{ tag | tojson }};
+  if (!tagLabel || !window.initSwipeStack) return;
+  window.initSwipeStack({
+    stackElId: 'tag-swipe-stack',
+    confirmBtnId: 'tag-swipe-confirm-btn',
+    rejectBtnId: 'tag-swipe-reject-btn',
+    initialCards: {{ tag_swipe_initial_cards | tojson }},
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      const params = new URLSearchParams({
+        count: String(need || 10),
+        exclude: Array.from(excludeSet).join(','),
+      });
+      if (biasKey) {
+        params.set('bias_file_id', biasKey);
+        params.set('bias', biasAction);
+      }
+      return '/api/tags/' + encodeURIComponent(tagLabel) + '/suggestions/next?' + params.toString();
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/thumb/' + card.file_id,
+        questionHtml: 'Does this have <strong>' + escapeHtml(tagLabel) + '</strong>?',
+        scoreText: 'match score ' + card.score.toFixed(2),
+      };
+    },
+    onConfirm: function(card) {
+      return {
+        url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+        body: { tag: tagLabel, polarity: 'positive' },
+      };
+    },
+    onReject: function(card) {
+      return {
+        url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+        body: { tag: tagLabel, polarity: 'negative' },
+      };
+    },
+    emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',
+  });
+})();
+
+/* Identity-scoped face-suggestion stream on the person-search page — same
+   /api/face-suggestions/next stream as /faces, but scoped via `identity` to
+   just this one person's confirmed embeddings (see _next_face_suggestions'
+   identity_filter). Bias is meaningless in this scoped mode (every candidate
+   already shares this identity), so fetchMoreUrl never sends bias params. */
+(function() {
+  const personName = {{ (person or face_id) | tojson }};
+  if (!personName || !window.initSwipeStack || !document.getElementById('similar-swipe-stack')) return;
+  window.initSwipeStack({
+    stackElId: 'similar-swipe-stack',
+    confirmBtnId: 'similar-swipe-confirm-btn',
+    rejectBtnId: 'similar-swipe-reject-btn',
+    initialCards: {{ initial_similar_cards | tojson }},
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      const params = new URLSearchParams({
+        count: String(need || 10),
+        exclude: Array.from(excludeSet).join(','),
+        identity: personName,
+      });
+      return '/api/face-suggestions/next?' + params.toString();
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+        questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
+        scoreText: 'match score ' + card.score.toFixed(2),
+      };
+    },
+    onConfirm: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
+    },
+    onReject: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+    },
+    emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.</div>',
+  });
 })();
 </script>
 {% endblock %}

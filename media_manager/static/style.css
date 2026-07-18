@@ -1164,3 +1164,99 @@ input[type="range"] { accent-color: var(--accent); }
   background: var(--surface);
   transition: opacity 0.3s;
 }
+
+/* ------------------------------------------------------------------ */
+/* Swipe stack (face-suggestion card stack, /swipe)                     */
+/* ------------------------------------------------------------------ */
+.swipe-page {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 22px;
+  padding-top: 8px;
+}
+.swipe-stack-wrap {
+  position: relative;
+  width: min(360px, 92vw);
+  height: 440px;
+}
+.swipe-card {
+  position: absolute;
+  inset: 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  box-shadow: 0 14px 34px rgba(0,0,0,.6), 0 2px 0 rgba(255,255,255,.03);
+  will-change: transform, opacity;
+  transition: transform .28s ease, opacity .28s ease, top .28s ease;
+  touch-action: none;
+  user-select: none;
+}
+.swipe-card::before {
+  content: "";
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  width: 9px;
+  height: 9px;
+  border-top: 1px solid var(--accent);
+  border-left: 1px solid var(--accent);
+  opacity: .55;
+  z-index: 2;
+  pointer-events: none;
+}
+.swipe-card.dragging { transition: none; cursor: grabbing; }
+.swipe-card img {
+  width: 100%;
+  height: 68%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
+.swipe-card-body {
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.swipe-card-question { font-size: 17px; color: var(--text); }
+.swipe-card-question strong { color: var(--accent); }
+.swipe-card-score { font-size: 13px; color: var(--text-muted); }
+.swipe-card-stamp {
+  position: absolute;
+  top: 18px;
+  font-family: var(--font-pixel);
+  font-size: 13px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .1s;
+}
+.swipe-card-stamp.stamp-yes { left: 18px; color: var(--accent); border: 2px solid var(--accent); transform: rotate(-14deg); }
+.swipe-card-stamp.stamp-no { right: 18px; color: var(--danger); border: 2px solid var(--danger); transform: rotate(14deg); }
+.swipe-controls {
+  display: flex;
+  gap: 22px;
+  align-items: center;
+}
+.swipe-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 58px;
+  height: 58px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 22px;
+  cursor: pointer;
+}
+.swipe-btn:hover { border-color: var(--border-accent); color: var(--accent); }
+.swipe-btn.swipe-btn-reject:hover { color: var(--danger); border-color: var(--danger); }
+.swipe-hint { font-size: 13px; color: var(--text-faint); text-align: center; }
+.swipe-empty { text-align: center; color: var(--text-muted); padding: 40px 0; }

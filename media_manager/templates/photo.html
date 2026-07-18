@@ -138,6 +138,24 @@
       <datalist id="vocab-suggestions"></datalist>
     </div>
 
+    <!-- Category — single-valued, unlike tags/sets. Manual assignment always
+         wins over an ML auto-match (see category_resolver.py). -->
+    <div class="sidebar-panel">
+      <div class="section-title">Category</div>
+      <div id="category-current">
+        {% if file.category and file.category.name %}
+        <span class="tag-removable" style="margin-bottom:4px;display:inline-flex;">
+          <a href="/search?category={{ file.category.name | urlencode }}">{{ file.category.name }}</a>
+          {% if file.category.source == 'auto' %}<span style="opacity:.7;">(auto)</span>{% endif %}
+          <button class="rm" type="button" id="category-remove-btn" title="Clear category">×</button>
+        </span>
+        {% else %}
+        <span class="sub">Uncategorized.</span>
+        {% endif %}
+      </div>
+      <button type="button" id="category-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Set category</button>
+    </div>
+
     <!-- Sets — a photo can belong to any number of sets -->
     <div class="sidebar-panel">
       <div class="section-title">Sets</div>
