@@ -1,9 +1,37 @@
 #!/usr/bin/env python3
 import argparse
+import shutil
 import subprocess
 import sys
 import os
 from media_manager import MediaManager
+
+def _ensure_self_signed_cert(media_dir, host):
+    """Return (certfile, keyfile), generating a self-signed cert via the
+    system openssl binary if one isn't already cached in .media/."""
+    certfile = os.path.join(media_dir, 'https_cert.pem')
+    keyfile = os.path.join(media_dir, 'https_key.pem')
+    if os.path.exists(certfile) and os.path.exists(keyfile):
+        return certfile, keyfile
+
+    if not shutil.which('openssl'):
+        print("ERROR: --https requires the 'openssl' command-line tool, which "
+              "was not found on PATH.", file=sys.stderr)
+        sys.exit(1)
+
+    print("Generating self-signed HTTPS certificate (first run)...")
+    subj = f'/CN={host}'
+    cmd = [
+        'openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+        '-keyout', keyfile, '-out', certfile,
+        '-days', '3650', '-nodes', '-subj', subj,
+        '-addext', f'subjectAltName=DNS:{host},IP:{host}' if host.replace('.', '').isdigit()
+                   else f'subjectAltName=DNS:{host}',
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    os.chmod(keyfile, 0o600)
+    return certfile, keyfile
+
 
 def main():
     parser = argparse.ArgumentParser(description='Media manager - like git for your media files')
@@ -169,6 +197,9 @@ def main():
                          help='Host to bind to (default: 127.0.0.1)')
     web_cmd.add_argument('--port', type=int, default=8000,
                          help='Port to listen on (default: 8000)')
+    web_cmd.add_argument('--https', action='store_true',
+                         help='Serve over HTTPS using a self-signed cert '
+                              '(auto-generated via the openssl binary, cached in .media/)')
 
     args = parser.parse_args()
 
@@ -434,8 +465,15 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
         host = args.host_pos or args.host
-        print(f"Starting media gallery at http://{host}:{args.port}/")
-        uvicorn.run(app, host=host, port=args.port)
+        ssl_kwargs = {}
+        scheme = 'http'
+        if args.https:
+            media_dir = os.path.join(data_root, '.media')
+            certfile, keyfile = _ensure_self_signed_cert(media_dir, host)
+            ssl_kwargs = {'ssl_certfile': certfile, 'ssl_keyfile': keyfile}
+            scheme = 'https'
+        print(f"Starting media gallery at {scheme}://{host}:{args.port}/")
+        uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
         return 0
 
     else:
