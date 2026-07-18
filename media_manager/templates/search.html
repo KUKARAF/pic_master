@@ -112,6 +112,10 @@
 </div>
 
 {% if initial_similar_cards %}
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="similar-avoid-existing-toggle" checked>
+  Deprioritize photos that already have an identified face
+</label>
 <div class="swipe-page">
   <div class="swipe-stack-wrap" id="similar-swipe-stack"></div>
   <div class="swipe-controls">
@@ -462,10 +466,12 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     rejectBtnId: 'similar-swipe-reject-btn',
     initialCards: {{ initial_similar_cards | tojson }},
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      const avoidToggle = document.getElementById('similar-avoid-existing-toggle');
       const params = new URLSearchParams({
         count: String(need || 10),
         exclude: Array.from(excludeSet).join(','),
         identity: personName,
+        avoid_existing: String(!avoidToggle || avoidToggle.checked),
       });
       return '/api/face-suggestions/next?' + params.toString();
     },

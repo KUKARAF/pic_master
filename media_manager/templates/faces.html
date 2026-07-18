@@ -40,6 +40,10 @@
     {% endif %}
     {% else %}
     <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
+    <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+      <input type="checkbox" id="faces-avoid-existing-toggle" checked>
+      Deprioritize photos that already have an identified face
+    </label>
     <div class="swipe-page">
       <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
       <div class="swipe-controls">
@@ -83,7 +87,11 @@ if (document.getElementById('faces-swipe-stack')) {
     initialCards: window.FACES_SWIPE_INITIAL_CARDS || [],
     biasKeyFor: function(card) { return card.identity; },
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
-      const params = new URLSearchParams({ count: String(need), exclude: Array.from(excludeSet).join(',') });
+      const avoidToggle = document.getElementById('faces-avoid-existing-toggle');
+      const params = new URLSearchParams({
+        count: String(need), exclude: Array.from(excludeSet).join(','),
+        avoid_existing: String(!avoidToggle || avoidToggle.checked),
+      });
       if (biasKey) {
         params.set('bias_identity', biasKey);
         params.set('bias', biasAction);

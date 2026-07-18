@@ -394,6 +394,27 @@ def create_app(data_root: str) -> FastAPI:
             card['category'] = category_map.get(checksum)
         return cards
 
+    def _deprioritize_files_with_named_face(candidates, file_id_index):
+        """Stable-sort (score order preserved within each group) so candidates
+        whose photo already has at least one identified person come after ones
+        from photos with no identified face yet — a UI toggle (on by default)
+        for the face-suggestion stream, matching _find_similar_files_for_set's
+        avoid_existing for sets: surface still-unidentified photos first
+        without hard-excluding ones that already have someone named."""
+        if not candidates:
+            return candidates
+        file_ids = list({c[file_id_index] for c in candidates})
+        file_rows = {r['id']: r for r in db.get_files_by_ids(file_ids)}
+        checksums = [r['checksum'] for r in file_rows.values()]
+        identities_map = manual.get_identities_for_checksums(checksums)
+
+        def has_named_face(c):
+            row = file_rows.get(c[file_id_index])
+            return bool(row is not None and identities_map.get(row['checksum']))
+
+        candidates.sort(key=has_named_face)
+        return candidates
+
     def _sort_cards_by_age(cards, order):
         """Sort already-enriched cards by their average estimated age (see
         manual.get_average_ages_for_checksums). Cards with no age estimate at all
@@ -1197,7 +1218,7 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None):
+    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True):
         """Images not yet in the set whose CLIP embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
@@ -1210,7 +1231,16 @@ def create_app(data_root: str) -> FastAPI:
         swipe-buffer caller (set-detail's swipe stack) has no stable page
         position since confirming a file removes it from the candidate pool on
         the very next call, so it just wants "up to `limit` more I haven't
-        already been shown", not a page number."""
+        already been shown", not a page number.
+
+        `avoid_existing` (default True — a UI toggle, on by default): files
+        already belonging to ANY set are stable-sorted after ones in no set at
+        all, so browsing/swiping surfaces still-unsorted photos first without
+        hard-excluding files that happen to already be organized somewhere —
+        applied across the whole ranked pool before slicing to `limit`, not
+        just within whatever page/buffer size was requested, so it can
+        actually pull in fresh candidates rather than just reordering a
+        handful already selected."""
         from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
 
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
@@ -1226,6 +1256,9 @@ def create_app(data_root: str) -> FastAPI:
             return []
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+        if avoid_existing and passing:
+            sets_map = manual.get_sets_for_checksums([cs for (_fid, _path, cs), _score in passing])
+            passing.sort(key=lambda item: bool(sets_map.get(item[0][2])))
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -1309,14 +1342,16 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     @app.get('/api/sets/{set_id}/similar-files')
-    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0, exclude: str = ''):
+    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0,
+                                   exclude: str = '', avoid_existing: bool = True):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         from media_manager.swipe_support import parse_exclude
         exclude_ids = {int(r) for r in parse_exclude(exclude) if r.isdigit()} or None
-        results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids)
+        results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids,
+                                                avoid_existing=avoid_existing)
         # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
         # response contract expects; 'results' stays for the pre-existing grid
         # (offset-based load-more + threshold-expand) callers, unchanged.
@@ -1895,7 +1930,7 @@ def create_app(data_root: str) -> FastAPI:
     # Tinder-style face-suggestion card stack (swipe to confirm/reject)
     # ------------------------------------------------------------------
 
-    def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None, identity_filter=None):
+    def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None, identity_filter=None, avoid_existing=True):
         """Rank unpromoted auto-detected faces against every known identity (same
         embedding math as _suggest_names) and return up to `count` candidates that
         clear SUGGEST_THRESHOLD, best score first. `exclude_refs` filters out faces
@@ -1911,7 +1946,13 @@ def create_app(data_root: str) -> FastAPI:
         already carries that one identity, which makes bias_identity/bias
         naturally inert here (the reorder partition never has anything to
         partition against); that's expected, not a bug, so callers in this mode
-        simply don't bother passing bias params."""
+        simply don't bother passing bias params.
+
+        `avoid_existing` (default True — a UI toggle, on by default): faces
+        whose photo already has at least one identified person are
+        deprioritized (see _deprioritize_files_with_named_face) rather than
+        excluded, so already-covered photos don't crowd out fresh ones but
+        can still surface if nothing else clears the threshold."""
         if identity_filter is not None:
             ref_embeddings = manual.get_embeddings_for_identity(identity_filter)
             if not ref_embeddings:
@@ -1931,6 +1972,8 @@ def create_app(data_root: str) -> FastAPI:
 
             from media_manager.swipe_support import bias_reorder
             candidates.sort(key=lambda c: -c[0])
+            if avoid_existing:
+                candidates = _deprioritize_files_with_named_face(candidates, 2)
             candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
             return _attach_file_meta([
                 {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
@@ -1958,6 +2001,8 @@ def create_app(data_root: str) -> FastAPI:
 
         from media_manager.swipe_support import bias_reorder
         candidates.sort(key=lambda c: -c[0])
+        if avoid_existing:
+            candidates = _deprioritize_files_with_named_face(candidates, 2)
         candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
         return _attach_file_meta([
             {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
@@ -1972,7 +2017,7 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/face-suggestions/next')
     def api_next_face_suggestions(count: int = 10, exclude: str = '', bias_identity: str = '', bias: str = '',
-                                   identity: str = ''):
+                                   identity: str = '', avoid_existing: bool = True):
         """Feeds the swipe-card stack's background buffer. `exclude` is a comma-joined
         list of face refs the client already holds (queued or just-decided) so a
         refill never repeats a card still in flight client-side. `identity` (distinct
@@ -1980,7 +2025,7 @@ def create_app(data_root: str) -> FastAPI:
         for the person-search page's swipe stack."""
         exclude_refs = {r for r in exclude.split(',') if r}
         cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
-                                        identity_filter=identity or None)
+                                        identity_filter=identity or None, avoid_existing=avoid_existing)
         return {'cards': cards}
 
     @app.post('/api/faces/{face_id}/identity')

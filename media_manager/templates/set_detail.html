@@ -37,6 +37,10 @@
   Suggested images for this set
 </div>
 
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="set-avoid-existing-toggle" checked>
+  Deprioritize photos that already belong to a set
+</label>
 <div class="swipe-page" id="set-swipe-page">
   <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
   <div class="swipe-controls">
@@ -118,8 +122,10 @@
   let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
 
   function fetchMoreUrl(known, need) {
+    const avoidToggle = document.getElementById('set-avoid-existing-toggle');
     return '/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
-      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(known).join(','));
+      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(known).join(',')) +
+      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked);
   }
 
   function launchStack(initialCards) {
