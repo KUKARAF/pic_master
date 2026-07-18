@@ -10,9 +10,9 @@
 // visual "stack of photos" look — that's unrelated to the decide gesture.
 window.initSwipeStack = function (config) {
   const BUFFER_SIZE = 10;
-  const VISIBLE_PEEK = 4;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
-  const CARD_WIDTH_FRACTION = 0.72; // each card's width, as a fraction of the stack's own width
+  const CARD_WIDTH = 320; // fixed card size — cards never stretch to fill width;
+  const PEEK_STEP = 64;   // more of them fan out across the width instead
 
   const stackEl = document.getElementById(config.stackElId);
   const confirmBtn = document.getElementById(config.confirmBtnId);
@@ -24,20 +24,19 @@ window.initSwipeStack = function (config) {
   let fetching = false;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
 
+  function visibleCount() {
+    const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
+    const fits = Math.floor((Math.max(wrapWidth, CARD_WIDTH) - CARD_WIDTH) / PEEK_STEP) + 1;
+    return Math.max(1, Math.min(fits, BUFFER_SIZE, queue.length));
+  }
+
   function cardEl(card, index) {
     const el = document.createElement('div');
     el.className = 'swipe-card';
     el.dataset.ref = card.ref;
-
-    const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
-    const cardWidth = wrapWidth * CARD_WIDTH_FRACTION;
-    const maxOffset = wrapWidth - cardWidth;
-    const step = VISIBLE_PEEK > 1 ? maxOffset / (VISIBLE_PEEK - 1) : 0;
-    const scale = 1 - index * 0.03;
-    el.style.width = cardWidth + 'px';
+    el.style.width = CARD_WIDTH + 'px';
     el.style.zIndex = String(BUFFER_SIZE - index);
-    el.style.transform = `translateX(${index * step}px) scale(${scale})`;
-    el.style.opacity = index < VISIBLE_PEEK ? '1' : '0';
+    el.style.transform = `translateX(${index * PEEK_STEP}px)`;
 
     const { imageUrl, questionHtml, scoreText, metaHtml, originalUrl } = config.renderCard(card);
     const imgTag = `<img src="${imageUrl}" alt="suggestion">`;
@@ -71,7 +70,7 @@ window.initSwipeStack = function (config) {
       renderEmptyState();
       return;
     }
-    const visible = queue.slice(0, Math.max(VISIBLE_PEEK, 1));
+    const visible = queue.slice(0, visibleCount());
     // Append back-to-front so the first (top) card ends up last in DOM order / on top visually.
     for (let i = visible.length - 1; i >= 0; i--) {
       stackEl.appendChild(cardEl(visible[i], i));
