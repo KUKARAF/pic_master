@@ -1248,6 +1248,7 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .swipe-card-stamp.stamp-yes { left: 18px; color: var(--accent); border: 2px solid var(--accent); transform: rotate(-14deg); }
 .swipe-card-stamp.stamp-no { right: 18px; color: var(--danger); border: 2px solid var(--danger); transform: rotate(14deg); }
+.swipe-card-stamp.stamp-skip { left: 18px; top: 60px; color: var(--text-muted); border: 2px solid var(--text-muted); }
 .swipe-controls {
   display: flex;
   gap: 22px;

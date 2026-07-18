@@ -37,26 +37,13 @@
   Suggested images for this set
 </div>
 
-{% if similar_files %}
-<div class="grid" id="similar-set-grid">
-  {% for f in similar_files %}
-  {{ macros.card(f, add_to_set=True) }}
-  {% endfor %}
-</div>
-<div id="similar-set-sentinel" style="height:1px;"></div>
-{% endif %}
-
-{# Swipe stack for everything past page 1 of suggestions. When similar_files
-   is empty at load, the sentinel/grid above are skipped entirely and this
-   mounts immediately instead — its own empty state carries the threshold
-   slider that used to live in a separate static alert block. #}
-<div class="swipe-page" id="set-swipe-page" style="display:none;">
+<div class="swipe-page" id="set-swipe-page">
   <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
   <div class="swipe-controls">
     <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
     <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
   </div>
-  <div class="swipe-hint">Swipe up to add, down to skip (or use ↑ / ↓)</div>
+  <div class="swipe-hint">Swipe up to add, down or left to skip (or use ↑ / ↓ / ←)</div>
 </div>
 {% endif %}
 {% endblock %}
@@ -124,65 +111,19 @@
     wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
   });
 
-  function wireAddButton(abtn) {
-    abtn.addEventListener('click', function() {
-      const fileId = abtn.dataset.fileId;
-      abtn.disabled = true;
-      abtn.textContent = 'Adding…';
-      fetch('/api/files/' + fileId + '/sets', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({set_id: setId}),
-      })
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function() {
-          const card = document.querySelector('#similar-set-grid .card[data-file-id="' + fileId + '"]');
-          if (card) card.remove();
-        })
-        .catch(function(err) {
-          abtn.disabled = false;
-          abtn.textContent = '＋ Add';
-          alert('Failed to add: ' + err.message);
-        });
-    });
-  }
-  document.querySelectorAll('.add-to-set-btn').forEach(wireAddButton);
-
-  /* ---- suggestions beyond page 1: one-time hand-off from the static grid's
-     sentinel to a swipe stack (replaces both the old infinite-scroll grid
-     append and the separate threshold-slider alert — that slider now lives
-     inside the stack's own empty state instead of a second, divergent UI).
-
-     initSwipeStack's own render() only calls maybeFetchMore() once its queue
-     is already non-empty (an empty initialCards list renders the empty state
-     immediately and never auto-fetches), so the very first batch — and any
-     "expand search at a lower threshold" retry — is always fetched here and
-     handed in as initialCards, rather than left to the buffer-refill path
-     that only tops up an already-showing stack between swipes. */
-  const sentinel = document.getElementById('similar-set-sentinel');
+  /* Suggestions are shown entirely as a swipe stack, seeded directly from the
+     server-rendered similar_files (no separate page-1 grid+"Add" wall — the
+     whole suggestion experience is the swipe stack, not just "beyond page 1"). */
   const swipePage = document.getElementById('set-swipe-page');
-  const gridSeedIds = {{ similar_files | map(attribute='id') | list | tojson }};
   let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
-  let stack = null;
 
   function fetchMoreUrl(known, need) {
-    const exclude = new Set(gridSeedIds.map(String));
-    known.forEach(function(ref) { exclude.add(ref); });
     return '/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
-      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(exclude).join(','));
+      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(known).join(','));
   }
 
   function launchStack(initialCards) {
-    swipePage.style.display = '';
-    // Re-launching (e.g. after "expand search") abandons any previous stack
-    // rather than mutating it; the old one's queue stays permanently empty
-    // (nothing ever pushes to it again), so its dangling keydown/click
-    // listeners are inert — safe to leave behind instead of threading a
-    // teardown hook through swipe-core.js.
-    stack = initSwipeStack({
+    initSwipeStack({
       stackElId: 'set-swipe-stack',
       confirmBtnId: 'set-swipe-confirm-btn',
       rejectBtnId: 'set-swipe-reject-btn',
@@ -244,46 +185,8 @@
       .catch(function() { launchStack([]); });
   }
 
-  function activateSwipeStack() {
-    if (stack || !swipePage) return;
-    fetchAndLaunch();
-  }
-
-  if (sentinel) {
-    // Deliberately not an IntersectionObserver: on a short page the sentinel
-    // can already sit inside the initial viewport (nothing to scroll past),
-    // and IO fires the moment it's visible regardless of rootMargin — showing
-    // the swipe stack immediately alongside the page-1 grid, which is exactly
-    // the "why do I see both" bug this replaces. Instead, only activate once
-    // the user has genuinely scrolled (on a page that has anything to scroll
-    // at all — a page short enough to have no scrollable overflow has nothing
-    // to hide behind a scroll gesture, so it activates immediately there).
-    let activated = false;
-    function maybeActivate() {
-      if (activated) return;
-      // scrollHeight isn't reliable until images finish loading (this script
-      // runs at DOM-parse time, before async image loads settle final layout —
-      // measuring too early under-counts a grid whose images haven't loaded
-      // yet, making a genuinely tall page look short enough to skip the
-      // scroll gate). The 'load' listener below re-checks once that's settled.
-      const scrollable = document.documentElement.scrollHeight > window.innerHeight + 10;
-      if (scrollable && window.scrollY <= 0) return;
-      const rect = sentinel.getBoundingClientRect();
-      if (rect.top >= window.innerHeight || rect.bottom <= 0) return;
-      activated = true;
-      window.removeEventListener('scroll', maybeActivate);
-      window.removeEventListener('load', maybeActivate);
-      sentinel.style.display = 'none';
-      activateSwipeStack();
-    }
-    window.addEventListener('scroll', maybeActivate, { passive: true });
-    if (document.readyState === 'complete') {
-      maybeActivate();
-    } else {
-      window.addEventListener('load', maybeActivate);
-    }
-  } else {
-    activateSwipeStack();
+  if (swipePage) {
+    launchStack({{ similar_files | tojson }});
   }
 })();
 </script>

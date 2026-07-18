@@ -5,9 +5,12 @@
 // per page via the `config` object passed to initSwipeStack — this file only
 // knows about stack positioning, drag/keyboard gestures, and buffer bookkeeping.
 //
-// Swipe direction is vertical only: up = confirm, down = reject ("no match").
+// Decide gesture: up = confirm, down = reject ("no match", persisted via
+// config.onReject and biases future suggestions away from it), left = skip
+// ("not sure" — never persisted, never biases anything, just moves on).
 // Cards peek horizontally (stacked left-to-right, full width) purely for the
-// visual "stack of photos" look — that's unrelated to the decide gesture.
+// visual "stack of photos" look — that's unrelated to the decide gesture
+// (dominant drag axis picks confirm/reject vs skip, not the peek direction).
 window.initSwipeStack = function (config) {
   const BUFFER_SIZE = 10;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
@@ -54,6 +57,7 @@ window.initSwipeStack = function (config) {
       </div>
       <div class="swipe-card-stamp stamp-yes">SAME</div>
       <div class="swipe-card-stamp stamp-no">NOT</div>
+      <div class="swipe-card-stamp stamp-skip">NOT SURE</div>
     `;
     if (index === 0) bindTopCardGestures(el, card);
     return el;
@@ -114,34 +118,50 @@ window.initSwipeStack = function (config) {
     if (el) flyOut(el, action);
     queue.shift();
 
-    const req = action === 'confirm'
-      ? (config.onConfirm ? config.onConfirm(card) : null)
-      : (config.onReject ? config.onReject(card) : null);
-    if (req) {
-      fetch(req.url, {
-        method: req.method || 'POST',
-        headers: req.body ? { 'Content-Type': 'application/json' } : undefined,
-        body: req.body ? JSON.stringify(req.body) : undefined,
-      }).catch(() => {});
+    // 'skip' ("not sure") never persists anything and never biases future
+    // suggestions — it's purely "don't show me this one again this session"
+    // (already covered by `known`, which every queued card is added to
+    // regardless of how it's eventually decided).
+    if (action !== 'skip') {
+      const req = action === 'confirm'
+        ? (config.onConfirm ? config.onConfirm(card) : null)
+        : (config.onReject ? config.onReject(card) : null);
+      if (req) {
+        fetch(req.url, {
+          method: req.method || 'POST',
+          headers: req.body ? { 'Content-Type': 'application/json' } : undefined,
+          body: req.body ? JSON.stringify(req.body) : undefined,
+        }).catch(() => {});
+      }
+      const biasKey = config.biasKeyFor ? config.biasKeyFor(card) : card.ref;
+      maybeFetchMore(biasKey, action);
+    } else {
+      maybeFetchMore();
     }
-
-    const biasKey = config.biasKeyFor ? config.biasKeyFor(card) : card.ref;
-    maybeFetchMore(biasKey, action);
     setTimeout(render, el ? 180 : 0);
   }
 
   function flyOut(el, action) {
     el.classList.add('dragging');
-    const dy = action === 'confirm' ? -700 : 700;
-    const rot = action === 'confirm' ? -6 : 6;
+    let dx = 0, dy = 0, rot = 0;
+    if (action === 'confirm') { dy = -700; rot = -6; }
+    else if (action === 'reject') { dy = 700; rot = 6; }
+    else { dx = -700; rot = -12; } // skip
     el.style.transition = 'transform .25s ease, opacity .25s ease';
-    el.style.transform = `translate(0, ${dy}px) rotate(${rot}deg)`;
+    el.style.transform = `translate(${dx}px, ${dy}px) rotate(${rot}deg)`;
     el.style.opacity = '0';
   }
 
   function bindTopCardGestures(el, card) {
     const stampYes = el.querySelector('.stamp-yes');
     const stampNo = el.querySelector('.stamp-no');
+    const stampSkip = el.querySelector('.stamp-skip');
+
+    function resetStamps() {
+      stampYes.style.opacity = '0';
+      stampNo.style.opacity = '0';
+      stampSkip.style.opacity = '0';
+    }
 
     function pointerDown(e) {
       const point = e.touches ? e.touches[0] : e;
@@ -163,6 +183,7 @@ window.initSwipeStack = function (config) {
       el.style.transform = `translate(${dragging.dx}px, ${dragging.dy}px) rotate(${rot}deg)`;
       stampYes.style.opacity = String(Math.max(0, Math.min(1, -dragging.dy / DECIDE_THRESHOLD)));
       stampNo.style.opacity = String(Math.max(0, Math.min(1, dragging.dy / DECIDE_THRESHOLD)));
+      stampSkip.style.opacity = String(Math.max(0, Math.min(1, -dragging.dx / DECIDE_THRESHOLD)));
     }
 
     function pointerUp() {
@@ -171,16 +192,24 @@ window.initSwipeStack = function (config) {
       window.removeEventListener('mouseup', pointerUp);
       window.removeEventListener('touchend', pointerUp);
       if (!dragging) return;
-      const { dy } = dragging;
+      const { dx, dy } = dragging;
       dragging = null;
-      if (Math.abs(dy) < DECIDE_THRESHOLD) {
+      // Left is a distinct third action (skip/"not sure"); right is
+      // deliberately not bound to anything yet. Dominant axis picks between
+      // vertical (confirm/reject) and leftward (skip) when the drag is diagonal.
+      const leftDominant = dx < 0 && Math.abs(dx) >= Math.abs(dy);
+      const magnitude = leftDominant ? Math.abs(dx) : Math.abs(dy);
+      if (magnitude < DECIDE_THRESHOLD) {
         el.classList.remove('dragging');
         el.style.transform = '';
-        stampYes.style.opacity = '0';
-        stampNo.style.opacity = '0';
+        resetStamps();
         return;
       }
-      decide(dy < 0 ? 'confirm' : 'reject');
+      if (leftDominant) {
+        decide('skip');
+      } else {
+        decide(dy < 0 ? 'confirm' : 'reject');
+      }
     }
 
     el.addEventListener('mousedown', pointerDown);
@@ -198,6 +227,9 @@ window.initSwipeStack = function (config) {
     } else if (e.key === 'ArrowDown') {
       e.preventDefault();
       decide('reject');
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      decide('skip');
     }
   });
 
