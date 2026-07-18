@@ -582,6 +582,8 @@ def create_app(data_root: str) -> FastAPI:
                 'all_tags': all_tags,
                 'all_categories': all_categories,
                 'similar_unknown_faces': similar_unknown_faces,
+                'initial_similar_cards': initial_similar_cards,
+                'tag_swipe_initial_cards': tag_swipe_initial_cards,
             })
 
         name_query = person or face_id
