@@ -68,6 +68,20 @@
     return d.innerHTML;
   };
 
+  // Shared swipe-card metadata line — every swipe suggestion (faces/sets/
+  // categories/tags) attaches the same filename/tags/sets/category/people
+  // fields server-side (see web.py's _attach_file_meta / _enrich_rows), so this
+  // formats them identically instead of each page's config reimplementing it.
+  window.swipeCardMeta = function (card) {
+    const parts = [];
+    if (card.filename) parts.push(escapeHtml(card.filename));
+    if (card.people && card.people.length) parts.push('with ' + card.people.map(escapeHtml).join(', '));
+    if (card.category && card.category.name) parts.push('category: ' + escapeHtml(card.category.name));
+    if (card.sets && card.sets.length) parts.push('in ' + card.sets.map(function (s) { return escapeHtml(s.name); }).join(', '));
+    if (card.tags && card.tags.length) parts.push('tags: ' + card.tags.map(escapeHtml).join(', '));
+    return parts.join(' · ');
+  };
+
   /* Shared favorite-heart toggle — POSTs {favorite: bool} to `endpoint` and flips the
      button's glyph/class on success. Used by every heart button across the app so
      the toggle behaves identically everywhere. */

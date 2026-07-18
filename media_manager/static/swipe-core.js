@@ -4,10 +4,15 @@
 // work does. Feature-specific bits (ranking, endpoints, card copy) are supplied
 // per page via the `config` object passed to initSwipeStack — this file only
 // knows about stack positioning, drag/keyboard gestures, and buffer bookkeeping.
+//
+// Swipe direction is vertical only: up = confirm, down = reject ("no match").
+// Cards peek horizontally (stacked left-to-right, full width) purely for the
+// visual "stack of photos" look — that's unrelated to the decide gesture.
 window.initSwipeStack = function (config) {
   const BUFFER_SIZE = 10;
   const VISIBLE_PEEK = 4;
-  const DECIDE_THRESHOLD = 90; // px drag distance that commits a decision
+  const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
+  const CARD_WIDTH_FRACTION = 0.72; // each card's width, as a fraction of the stack's own width
 
   const stackEl = document.getElementById(config.stackElId);
   const confirmBtn = document.getElementById(config.confirmBtnId);
@@ -23,17 +28,27 @@ window.initSwipeStack = function (config) {
     const el = document.createElement('div');
     el.className = 'swipe-card';
     el.dataset.ref = card.ref;
-    const scale = 1 - index * 0.045;
-    const offset = index * 20;
+
+    const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
+    const cardWidth = wrapWidth * CARD_WIDTH_FRACTION;
+    const maxOffset = wrapWidth - cardWidth;
+    const step = VISIBLE_PEEK > 1 ? maxOffset / (VISIBLE_PEEK - 1) : 0;
+    const scale = 1 - index * 0.03;
+    el.style.width = cardWidth + 'px';
     el.style.zIndex = String(BUFFER_SIZE - index);
-    el.style.transform = `translateY(${offset}px) scale(${scale})`;
+    el.style.transform = `translateX(${index * step}px) scale(${scale})`;
     el.style.opacity = index < VISIBLE_PEEK ? '1' : '0';
-    const { imageUrl, questionHtml, scoreText } = config.renderCard(card);
+
+    const { imageUrl, questionHtml, scoreText, metaHtml, originalUrl } = config.renderCard(card);
+    const imgTag = `<img src="${imageUrl}" alt="suggestion">`;
     el.innerHTML = `
-      <img src="${imageUrl}" alt="suggestion">
+      ${originalUrl
+        ? `<a class="swipe-card-img-link" href="${originalUrl}" target="_blank" rel="noopener">${imgTag}</a>`
+        : imgTag}
       <div class="swipe-card-body">
         <div class="swipe-card-question">${questionHtml}</div>
         <div class="swipe-card-score">${scoreText}</div>
+        ${metaHtml ? `<div class="swipe-card-meta">${metaHtml}</div>` : ''}
       </div>
       <div class="swipe-card-stamp stamp-yes">SAME</div>
       <div class="swipe-card-stamp stamp-no">NOT</div>
@@ -115,10 +130,10 @@ window.initSwipeStack = function (config) {
 
   function flyOut(el, action) {
     el.classList.add('dragging');
-    const dx = action === 'confirm' ? 640 : -640;
-    const rot = action === 'confirm' ? 24 : -24;
+    const dy = action === 'confirm' ? -700 : 700;
+    const rot = action === 'confirm' ? -6 : 6;
     el.style.transition = 'transform .25s ease, opacity .25s ease';
-    el.style.transform = `translate(${dx}px, -60px) rotate(${rot}deg)`;
+    el.style.transform = `translate(0, ${dy}px) rotate(${rot}deg)`;
     el.style.opacity = '0';
   }
 
@@ -142,10 +157,10 @@ window.initSwipeStack = function (config) {
       const point = e.touches ? e.touches[0] : e;
       dragging.dx = point.clientX - dragging.startX;
       dragging.dy = point.clientY - dragging.startY;
-      const rot = dragging.dx / 18;
+      const rot = dragging.dy / 18;
       el.style.transform = `translate(${dragging.dx}px, ${dragging.dy}px) rotate(${rot}deg)`;
-      stampYes.style.opacity = String(Math.max(0, Math.min(1, Math.max(dragging.dx, -dragging.dy) / DECIDE_THRESHOLD)));
-      stampNo.style.opacity = String(Math.max(0, Math.min(1, Math.max(-dragging.dx, dragging.dy) / DECIDE_THRESHOLD)));
+      stampYes.style.opacity = String(Math.max(0, Math.min(1, -dragging.dy / DECIDE_THRESHOLD)));
+      stampNo.style.opacity = String(Math.max(0, Math.min(1, dragging.dy / DECIDE_THRESHOLD)));
     }
 
     function pointerUp() {
@@ -154,19 +169,16 @@ window.initSwipeStack = function (config) {
       window.removeEventListener('mouseup', pointerUp);
       window.removeEventListener('touchend', pointerUp);
       if (!dragging) return;
-      const { dx, dy } = dragging;
+      const { dy } = dragging;
       dragging = null;
-      const horizontal = Math.abs(dx) >= Math.abs(dy);
-      const magnitude = horizontal ? Math.abs(dx) : Math.abs(dy);
-      if (magnitude < DECIDE_THRESHOLD) {
+      if (Math.abs(dy) < DECIDE_THRESHOLD) {
         el.classList.remove('dragging');
         el.style.transform = '';
         stampYes.style.opacity = '0';
         stampNo.style.opacity = '0';
         return;
       }
-      const isConfirm = horizontal ? dx > 0 : dy < 0;
-      decide(isConfirm ? 'confirm' : 'reject');
+      decide(dy < 0 ? 'confirm' : 'reject');
     }
 
     el.addEventListener('mousedown', pointerDown);
@@ -178,10 +190,10 @@ window.initSwipeStack = function (config) {
 
   document.addEventListener('keydown', (e) => {
     if (!topCard()) return;
-    if (e.key === 'ArrowUp' || e.key === 'ArrowRight') {
+    if (e.key === 'ArrowUp') {
       e.preventDefault();
       decide('confirm');
-    } else if (e.key === 'ArrowDown' || e.key === 'ArrowLeft') {
+    } else if (e.key === 'ArrowDown') {
       e.preventDefault();
       decide('reject');
     }

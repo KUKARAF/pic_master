@@ -1177,12 +1177,14 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .swipe-stack-wrap {
   position: relative;
-  width: min(360px, 92vw);
+  width: 100%;
   height: 440px;
 }
 .swipe-card {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  height: 100%;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -1207,12 +1209,20 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 .swipe-card.dragging { transition: none; cursor: grabbing; }
+.swipe-card-img-link {
+  display: block;
+  height: 68%;
+  cursor: pointer;
+}
 .swipe-card img {
   width: 100%;
-  height: 68%;
+  height: 100%;
   object-fit: cover;
   display: block;
   pointer-events: none;
+}
+.swipe-card > img {
+  height: 68%;
 }
 .swipe-card-body {
   padding: 14px 16px;
@@ -1223,6 +1233,8 @@ input[type="range"] { accent-color: var(--accent); }
 .swipe-card-question { font-size: 17px; color: var(--text); }
 .swipe-card-question strong { color: var(--accent); }
 .swipe-card-score { font-size: 13px; color: var(--text-muted); }
+.swipe-card-meta { font-size: 12px; color: var(--text-muted); line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.swipe-card-meta strong { color: var(--text); font-weight: normal; }
 .swipe-card-stamp {
   position: absolute;
   top: 18px;

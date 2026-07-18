@@ -368,6 +368,32 @@ def create_app(data_root: str) -> FastAPI:
             result.append(card)
         return result
 
+    def _attach_file_meta(cards, file_id_field='file_id'):
+        """Merge filename/tags/sets/category/people onto swipe-suggestion cards that
+        weren't already built via _enrich_rows (faces/categories/tags suggestions —
+        sets suggestions already go through _enrich_rows and don't need this).
+        Reuses the exact same batched lookups as _enrich_rows so this doesn't
+        become a second, divergent way of assembling the same information."""
+        file_rows = {r['id']: r for r in db.get_files_by_ids([c[file_id_field] for c in cards])}
+        checksums = [r['checksum'] for r in file_rows.values()]
+        tag_map = manual.list_tags_for_checksums(checksums)
+        sets_map = manual.get_sets_for_checksums(checksums)
+        identities_map = manual.get_identities_for_checksums(checksums)
+        category_map = resolve_categories_for_checksums(
+            manual, db, [(r['id'], r['checksum']) for r in file_rows.values()]
+        )
+        for card in cards:
+            row = file_rows.get(card[file_id_field])
+            if row is None:
+                continue
+            checksum = row['checksum']
+            card['filename'] = os.path.basename(row['path'])
+            card['tags'] = tag_map.get(checksum, [])
+            card['sets'] = sets_map.get(checksum, [])
+            card['people'] = identities_map.get(checksum, [])
+            card['category'] = category_map.get(checksum)
+        return cards
+
     def _sort_cards_by_age(cards, order):
         """Sort already-enriched cards by their average estimated age (see
         manual.get_average_ages_for_checksums). Cards with no age estimate at all
@@ -1071,10 +1097,10 @@ def create_app(data_root: str) -> FastAPI:
 
                 qualifying.sort(key=blended, reverse=True)
 
-        return [
+        return _attach_file_meta([
             {'ref': str(row[0]), 'file_id': row[0], 'label': label, 'score': round(float(score), 3)}
             for row, score in qualifying[:count]
-        ]
+        ])
 
     @app.get('/api/tags/{label}/suggestions/next')
     def api_next_tag_suggestions(label: str, count: int = 10, exclude: str = '',
@@ -1467,10 +1493,10 @@ def create_app(data_root: str) -> FastAPI:
         ordered = bias_reorder(qualifying, key_fn=lambda pair: category_id,
                                 bias_key=None, bias_action=None)
 
-        return [
+        return _attach_file_meta([
             {'ref': f"file:{c[0]}", 'file_id': c[0], 'score': round(float(score), 3)}
             for c, score in ordered[:count]
-        ]
+        ])
 
     @app.get('/categories/{category_id}', response_class=HTMLResponse)
     def category_detail_page(request: Request, category_id: int, sort: str = 'added', order: str = 'desc'):
@@ -1883,10 +1909,10 @@ def create_app(data_root: str) -> FastAPI:
             from media_manager.swipe_support import bias_reorder
             candidates.sort(key=lambda c: -c[0])
             candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
-            return [
+            return _attach_file_meta([
                 {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
                 for score, ref, file_id_, identity in candidates[:count]
-            ]
+            ])
 
         named = manual.get_named_face_embeddings()
         if not named:
@@ -1910,10 +1936,10 @@ def create_app(data_root: str) -> FastAPI:
         from media_manager.swipe_support import bias_reorder
         candidates.sort(key=lambda c: -c[0])
         candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
-        return [
+        return _attach_file_meta([
             {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
             for score, ref, file_id_, identity in candidates[:count]
-        ]
+        ])
 
     @app.get('/swipe')
     def swipe_page_redirect():

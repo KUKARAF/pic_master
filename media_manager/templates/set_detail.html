@@ -56,7 +56,7 @@
     <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
     <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
   </div>
-  <div class="swipe-hint">Drag the card, or use ← / → · ↓ skip · ↑ add to set</div>
+  <div class="swipe-hint">Swipe up to add, down to skip (or use ↑ / ↓)</div>
 </div>
 {% endif %}
 {% endblock %}
@@ -196,6 +196,8 @@
           imageUrl: '/thumb/' + card.id,
           questionHtml: 'Add <strong>' + escapeHtml(name) + '</strong> to this set?',
           scoreText: typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '',
+          metaHtml: swipeCardMeta(card),
+          originalUrl: '/image/' + card.id,
         };
       },
       onConfirm: function(card) {
