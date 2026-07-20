@@ -167,31 +167,41 @@ window.initSwipeStack = function (config) {
   async function maybeFetchMore(biasKey, biasAction) {
     if (fetching || queue.length >= BUFFER_SIZE) return;
     fetching = true;
+    let fetchedCards = [];
     try {
       const need = BUFFER_SIZE - queue.length;
       const url = config.fetchMoreUrl(known, biasKey, biasAction, need);
-      if (!url) return;
-      const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ exclude: Array.from(known) }),
-      });
-      if (!resp.ok) return;
-      const data = await resp.json();
-      for (const card of data.cards || []) {
-        if (known.has(card.ref)) continue;
-        known.add(card.ref);
-        queue.push(card);
+      if (url) {
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exclude: Array.from(known) }),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          fetchedCards = data.cards || [];
+        }
       }
     } catch (e) {
       // Silent — the buffer just stays smaller until the next swipe retries the fetch.
     } finally {
       fetching = false;
-      // Nothing else re-renders after an async fetch resolves (a card already on
-      // screen doesn't need to move just because more got queued behind it), but
-      // the very first fetch is different: it's what actually reveals content for
-      // a stack that started empty on purpose, so it needs its own paint.
-      if (!initialLoadDone) {
+      // Checked here, success or failure, fresh at resolution time (not "is
+      // this the stack's very first fetch ever"): decide()'s
+      // setTimeout(render, 180) can fire before a slower refill resolves
+      // (ranking scans the whole library, easily >180ms), showing the real
+      // empty state while this fetch is still in flight. If that already
+      // happened, the queue is sitting at 0 right now even though this isn't
+      // the stack's first load, and nothing else will ever repaint to reveal
+      // what this fetch found (or confirm there's genuinely nothing left)
+      // unless it does so itself.
+      const wasEmpty = queue.length === 0;
+      for (const card of fetchedCards) {
+        if (known.has(card.ref)) continue;
+        known.add(card.ref);
+        queue.push(card);
+      }
+      if (wasEmpty) {
         initialLoadDone = true;
         render();
       }
