@@ -47,7 +47,7 @@
     <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
     <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
   </div>
-  <div class="swipe-hint">Swipe up to add, down to exclude (remembered), or left if not sure (or use ↑ / ↓ / ←)</div>
+  <div class="swipe-hint">Swipe up to add, down to exclude (remembered), or left if not sure (or use ↑ / ↓ / ←) — press "o" to add to a different set instead</div>
 </div>
 {% endif %}
 {% endblock %}
@@ -121,6 +121,10 @@
      load so this page itself never blocks on the ranking work. */
   const swipePage = document.getElementById('set-swipe-page');
   let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
+  // Tracks whichever initSwipeStack() call is current — "expand similar search"
+  // re-launches the stack at a new threshold, so this always needs to point at
+  // the live one, not whichever existed when the page first loaded.
+  let stackHandle = null;
 
   function fetchMoreUrl(known, need) {
     const avoidToggle = document.getElementById('set-avoid-existing-toggle');
@@ -130,7 +134,7 @@
   }
 
   function launchStack(initialCards) {
-    initSwipeStack({
+    stackHandle = initSwipeStack({
       stackElId: 'set-swipe-stack',
       confirmBtnId: 'set-swipe-confirm-btn',
       rejectBtnId: 'set-swipe-reject-btn',
@@ -208,6 +212,26 @@
   if (swipePage) {
     launchStack([]);
   }
+
+  /* "o" — add the current suggestion to a DIFFERENT set via the same search/
+     create picker the photo page and search page's bulk-add already use. Since
+     a file assigned elsewhere is implicitly not this set, a successful assign
+     auto-triggers the same reject path a manual down-swipe takes (persists an
+     exclusion for *this* set, advances to the next card) — one keypress covers
+     both actions instead of requiring "o" then a separate down-swipe. */
+  document.addEventListener('keydown', function(e) {
+    if (e.key !== 'o' && e.key !== 'O') return;
+    if (_isEditableTarget(e.target)) return;
+    if (!stackHandle) return;
+    const card = stackHandle.getTopCard();
+    if (!card) return;
+    e.preventDefault();
+    window.openSetSearchModal(function(otherSet) {
+      window.assignFileToSet(card.id, otherSet.id)
+        .then(function() { stackHandle.decide('reject'); })
+        .catch(function(err) { alert('Failed to add to set: ' + err.message); });
+    }, setId);
+  });
 })();
 </script>
 {% endblock %}

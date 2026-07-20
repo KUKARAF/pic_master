@@ -263,7 +263,7 @@
     });
   }
 
-  function openSetSearchModal(onResolved) {
+  function openSetSearchModal(onResolved, excludeSetId) {
     openModal('Choose a set', function (box) {
       const input = document.createElement('input');
       input.type = 'text';
@@ -309,6 +309,9 @@
       fetch('/api/sets')
         .then(function (r) { return r.json(); })
         .then(function (sets) {
+          if (excludeSetId != null) {
+            sets = sets.filter(function (s) { return s.id !== excludeSetId; });
+          }
           setsByLabel = {};
           datalist.innerHTML = '';
           sets.forEach(function (s) {

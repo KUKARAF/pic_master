@@ -353,5 +353,9 @@ window.initSwipeStack = function (config) {
   // its own kick to ever load anything.
   if (queue.length === 0) maybeFetchMore();
 
-  return { refill: () => maybeFetchMore() };
+  // getTopCard/decide let a page-specific script drive the stack externally
+  // (e.g. set_detail.html's "add to a different set" flow, which needs to
+  // inspect the current card and then trigger the same reject path a manual
+  // down-swipe takes) without duplicating any queue/history/re-render logic.
+  return { refill: () => maybeFetchMore(), getTopCard: () => topCard(), decide: (action) => decide(action) };
 };
