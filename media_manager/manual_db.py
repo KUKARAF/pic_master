@@ -574,6 +574,21 @@ class ManualDB(ThreadLocalDB):
         ''', (checksum,))
         return cur.fetchall()
 
+    def get_all_set_member_checksums(self):
+        """Every checksum that belongs to at least one set, as a plain set() —
+        one cheap query independent of any candidate list size, unlike
+        get_sets_for_checksums (which needs one bound SQL parameter per
+        checksum and has to be chunked for a large *caller-supplied* list).
+        Used by the set-suggestion stream's avoid_existing check, which
+        otherwise needs this same yes/no answer for every file in the whole
+        library that clears the similarity threshold — recomputing that via
+        chunked IN(...) lookups on every single background buffer refill was
+        the actual slow part once a library got large, not just the SQLite
+        bound-parameter crash it was originally chunked to avoid."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM file_sets')
+        return {row[0] for row in cur.fetchall()}
+
     def get_sets_for_checksums(self, checksums):
         """Batched lookup: {checksum: [{'id', 'name', 'studio'}, ...]} — avoids N+1
         queries on list pages (mirrors list_tags_for_checksums)."""
@@ -885,6 +900,15 @@ class ManualDB(ThreadLocalDB):
         for checksum, identity in cur.fetchall():
             result.setdefault(checksum, []).append(identity)
         return result
+
+    def get_all_checksums_with_named_face(self):
+        """Every checksum with at least one identified (named, non-rejected)
+        face, as a plain set() — same one-cheap-query-instead-of-chunked-
+        per-candidate-lookups shape as get_all_set_member_checksums, for the
+        face-suggestion stream's avoid_existing check."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT checksum FROM faces WHERE identity IS NOT NULL AND rejected = 0")
+        return {row[0] for row in cur.fetchall()}
 
     def get_favorite_faces(self):
         """Non-rejected, favorited manual.db face rows (always named or hand-drawn,

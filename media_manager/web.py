@@ -422,14 +422,11 @@ def create_app(data_root: str) -> FastAPI:
         for chunk in _chunked(file_ids):
             for r in db.get_files_by_ids(chunk):
                 file_rows[r['id']] = r
-        checksums = [r['checksum'] for r in file_rows.values()]
-        identities_map = {}
-        for chunk in _chunked(checksums):
-            identities_map.update(manual.get_identities_for_checksums(chunk))
+        named_checksums = manual.get_all_checksums_with_named_face()
 
         def has_named_face(c):
             row = file_rows.get(c[file_id_index])
-            return bool(row is not None and identities_map.get(row['checksum']))
+            return bool(row is not None and row['checksum'] in named_checksums)
 
         candidates.sort(key=has_named_face)
         return candidates
@@ -1276,10 +1273,8 @@ def create_app(data_root: str) -> FastAPI:
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
         if avoid_existing and passing:
-            sets_map = {}
-            for chunk in _chunked([cs for (_fid, _path, cs), _score in passing]):
-                sets_map.update(manual.get_sets_for_checksums(chunk))
-            passing.sort(key=lambda item: bool(sets_map.get(item[0][2])))
+            member_checksums_anywhere = manual.get_all_set_member_checksums()
+            passing.sort(key=lambda item: item[0][2] in member_checksums_anywhere)
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
