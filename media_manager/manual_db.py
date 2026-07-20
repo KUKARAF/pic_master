@@ -155,6 +155,23 @@ class ManualDB(ThreadLocalDB):
                 PRIMARY KEY (checksum, set_id)
             )
         ''')
+        # A human-confirmed "this person appears somewhere in this photo,"
+        # independent of any specific detected face — no bbox, no embedding.
+        # Exists for photos where face detection missed the person entirely
+        # (turned away, obscured, out of frame at detection time, etc.) but a
+        # human still recognizes them; the regular per-face path
+        # (add_manual_face/promote_auto_face, which always carries a real
+        # ArcFace embedding) stays how every other identity confirmation is
+        # recorded, so this table is never mistaken for training data about
+        # what a face looks like — it only ever answers "who's in this photo."
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS identity_photo_assignments (
+                checksum TEXT NOT NULL,
+                identity TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, identity)
+            )
+        ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1047,6 +1064,39 @@ class ManualDB(ThreadLocalDB):
         cur.execute(
             "SELECT DISTINCT checksum FROM faces WHERE LOWER(identity) LIKE LOWER(?) AND rejected = 0 LIMIT ?",
             (f'%{name}%', limit)
+        )
+        return [row[0] for row in cur.fetchall()]
+
+    def assign_identity_to_photo(self, checksum, identity):
+        """See identity_photo_assignments' schema comment: a whole-photo, no-bbox
+        identity confirmation, for photos where no individual face crop exists
+        to attach the identity to. `set_id`-style bulk assignment (every member
+        of a set) and single-photo assignment both funnel through this."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO identity_photo_assignments (checksum, identity, created_at)
+            VALUES (?, ?, ?)
+        ''', (checksum, identity, int(time.time())))
+        self.conn.commit()
+
+    def remove_identity_photo_assignment(self, checksum, identity):
+        cur = self.conn.cursor()
+        cur.execute(
+            'DELETE FROM identity_photo_assignments WHERE checksum = ? AND identity = ?',
+            (checksum, identity)
+        )
+        self.conn.commit()
+
+    def get_photos_assigned_to_identity(self, identity, limit=1000):
+        """Checksums manually whole-photo-assigned to this identity (exact match,
+        unlike get_files_by_face_identity's substring search — these are written
+        with one exact name, not searched by a user-typed query) — a second,
+        independent source of "files for this person" that callers building
+        that combined list need to union in alongside get_files_by_face_identity."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT checksum FROM identity_photo_assignments WHERE identity = ? LIMIT ?',
+            (identity, limit)
         )
         return [row[0] for row in cur.fetchall()]
 

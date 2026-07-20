@@ -71,6 +71,9 @@ class RenameIdentityBody(BaseModel):
 class UnassignIdentityBody(BaseModel):
     file_ids: List[int]
 
+class AssignIdentitySetBody(BaseModel):
+    set_id: int
+
 class TitleBody(BaseModel):
     title: str
 
@@ -604,6 +607,19 @@ def create_app(data_root: str) -> FastAPI:
             'current_sets': current_sets,
         })
 
+    def _unsorted_candidate_photos_for_identity(exclude_checksums, limit=60, overfetch=300):
+        """Plain, unranked browse list for the person page's manual "assign to an
+        individual photo" picker: recent files that belong to no set at all and
+        aren't already linked to this identity by any means (a real face or a
+        prior whole-photo assignment). Deliberately not ML-ranked — this path is
+        for photos face detection/suggestion missed entirely, so there's nothing
+        principled to rank by; `overfetch` just needs to be generous enough that
+        filtering out excluded checksums still leaves `limit` candidates in a
+        typical personal library."""
+        rows = db.list_files_with_embedding_flag(limit=overfetch, sort='added', order='desc')
+        candidates = [row for row in rows if row[3] not in exclude_checksums][:limit]
+        return _enrich_rows(candidates)
+
     @app.get('/search', response_class=HTMLResponse)
     def search_page(request: Request, q: str = '', tag: str = '', face_id: str = '', person: str = '',
                      face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc'):
@@ -613,6 +629,8 @@ def create_app(data_root: str) -> FastAPI:
         all_categories = _all_categories_for_nav()
         similar_unknown_faces = []
         similar_faces = []
+        available_sets = []
+        unsorted_candidate_photos = []
 
         if face_ref:
             # "Find similar faces" from a specific face chip — reuses the same
@@ -637,15 +655,29 @@ def create_app(data_root: str) -> FastAPI:
 
         name_query = person or face_id
         if name_query:
-            checksums = manual.get_files_by_face_identity(name_query, limit=200)
+            checksums = set(manual.get_files_by_face_identity(name_query, limit=200))
+            if person:
+                # Union in whole-photo manual assignments (no face crop involved)
+                # alongside the regular per-face identification — either one
+                # makes a file "this person's", and both need to show up here.
+                checksums |= set(manual.get_photos_assigned_to_identity(person, limit=200))
             if not checksums:
                 message = f'No files found with person "{name_query}" — run <code>media faces</code> to detect faces first.'
             else:
-                file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
+                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
                 rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
                 files = _enrich_rows(rows)
                 if sort == 'age':
                     files = _sort_cards_by_age(files, order)
+
+            if person:
+                # Manual-only tools (no ML suggestion involved): bulk-assign this
+                # identity to every file in a chosen set, or to one file at a
+                # time from photos that aren't in any set — for photos face
+                # detection missed the person in entirely.
+                available_sets = manual.list_sets()
+                already_linked = checksums | manual.get_all_set_member_checksums()
+                unsorted_candidate_photos = _unsorted_candidate_photos_for_identity(already_linked)
 
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
@@ -713,6 +745,8 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': all_categories,
             'similar_unknown_faces': similar_unknown_faces,
+            'available_sets': available_sets,
+            'unsorted_candidate_photos': unsorted_candidate_photos,
             'sort': sort,
             'order': order,
         })
@@ -1910,6 +1944,39 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             unassigned += manual.unassign_identity_for_checksum(row['checksum'], name)
         return {'unassigned': unassigned}
+
+    @app.post('/api/identities/{name}/assign-set')
+    def api_assign_identity_to_set(name: str, body: AssignIdentitySetBody):
+        """Bulk manual assignment: 'this person appears somewhere in every photo
+        in this set.' Writes a whole-photo identity_photo_assignments row per
+        member (see manual_db.assign_identity_to_photo) — no face crop involved,
+        so already-covered members (a real detected+named face, or a prior
+        assignment) are simply left as-is via INSERT OR IGNORE, not an error."""
+        set_row = manual.get_set(body.set_id)
+        if set_row is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        member_checksums = manual.get_files_by_set(body.set_id, limit=1000)
+        for checksum in member_checksums:
+            manual.assign_identity_to_photo(checksum, name)
+        return {'assigned': len(member_checksums)}
+
+    @app.post('/api/files/{file_id}/identity-assignments')
+    def api_assign_identity_to_file(file_id: int, body: IdentityBody):
+        """Manual, whole-photo 'this person is in this picture' — for a photo
+        where no individual face crop exists to name (missed detection, face
+        turned away, etc.). See manual_db.assign_identity_to_photo."""
+        row = _file_or_404(file_id)
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='Name must not be empty')
+        manual.assign_identity_to_photo(row['checksum'], name)
+        return {'ok': True}
+
+    @app.delete('/api/files/{file_id}/identity-assignments/{name}')
+    def api_remove_identity_assignment(file_id: int, name: str):
+        row = _file_or_404(file_id)
+        manual.remove_identity_photo_assignment(row['checksum'], name)
+        return {'ok': True}
 
     @app.get('/api/identities/{name}/similar-faces')
     def api_similar_unknown_faces(name: str, threshold: float = SUGGEST_THRESHOLD, limit: int = 20):

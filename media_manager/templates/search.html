@@ -111,6 +111,45 @@
 </div>
 {% endif %}
 
+{% if person %}
+<div class="section-title" style="margin-top:28px;margin-bottom:12px;">
+  Assign {{ person }} to an entire set
+</div>
+{% if available_sets %}
+<div id="identity-sets-list" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
+  {% for s in available_sets %}
+  <button type="button" class="btn-similar identity-assign-set-btn" data-set-id="{{ s.id }}">
+    {{ s.name }}{% if s.studio %} ({{ s.studio }}){% endif %}
+  </button>
+  {% endfor %}
+</div>
+{% else %}
+<p class="sub" style="margin-bottom:20px;">No sets yet.</p>
+{% endif %}
+
+<div class="section-title" style="margin-bottom:12px;">
+  Assign {{ person }} to an individual photo
+</div>
+{% if unsorted_candidate_photos %}
+<div class="grid" id="identity-unsorted-grid" style="margin-bottom:20px;">
+  {% for f in unsorted_candidate_photos %}
+  <div class="card" id="identity-unsorted-card-{{ f.id }}" data-file-id="{{ f.id }}">
+    <a class="card-img-link" href="/photo/{{ f.id }}">
+      <img src="/thumb/{{ f.id }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+    <div class="card-body">
+      <a class="card-name" href="/photo/{{ f.id }}" title="{{ f.path }}">{{ f.title or f.filename }}</a>
+      <button type="button" class="btn-similar identity-assign-photo-btn" data-file-id="{{ f.id }}"
+              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">+ This is {{ person }}</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="sub" style="margin-bottom:20px;">No unsorted photos left to manually assign.</p>
+{% endif %}
+{% endif %}
+
 {% if (person or face_id) and files %}
 <div class="section-title" style="margin-top:28px;margin-bottom:12px;">
   Unidentified faces that look like {{ person or face_id }}
@@ -544,6 +583,62 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
       return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
     },
     emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',
+  });
+})();
+
+/* Manual, non-ML identity assignment: bulk-assign this person to every file in
+   a chosen set, or one at a time to an unsorted photo — for photos face
+   detection/suggestion missed the person in entirely. Both hit the same
+   whole-photo assignment (manual_db.assign_identity_to_photo), no face crop
+   involved, so on success the picked set button / photo card just gets marked
+   done rather than needing a reload to reflect the new state. */
+(function() {
+  const personName = {{ person | tojson }};
+  if (!personName) return;
+
+  document.querySelectorAll('.identity-assign-set-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const original = btn.textContent;
+      btn.textContent = 'Assigning…';
+      fetch('/api/identities/' + encodeURIComponent(personName) + '/assign-set', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({set_id: parseInt(btn.dataset.setId, 10)}),
+      })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function(data) {
+          btn.textContent = original + ' ✓ (' + data.assigned + ')';
+        })
+        .catch(function(err) {
+          btn.disabled = false;
+          btn.textContent = original;
+          alert('Failed to assign set: ' + err.message);
+        });
+    });
+  });
+
+  document.querySelectorAll('.identity-assign-photo-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      const fileId = btn.dataset.fileId;
+      fetch('/api/files/' + fileId + '/identity-assignments', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: personName}),
+      })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function() {
+          const card = document.getElementById('identity-unsorted-card-' + fileId);
+          if (card) card.remove();
+        })
+        .catch(function(err) {
+          btn.disabled = false;
+          alert('Failed to assign photo: ' + err.message);
+        });
+    });
   });
 })();
 
