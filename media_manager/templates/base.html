@@ -42,6 +42,28 @@
   <div class="modal-box" id="modal-box"></div>
 </div>
 
+<script>
+/* Watch queue: clicking into a photo from any grid (gallery, set/category
+   detail, search, similar/body-similar) records that grid's file ids +
+   the clicked position in sessionStorage, so the photo viewer's Left/Right
+   keys browse that exact collection instead of global photo order. */
+document.addEventListener('click', function (e) {
+  var link = e.target.closest('.card-img-link, .card-name');
+  if (!link) return;
+  var cardEl = link.closest('.card[data-file-id]');
+  if (!cardEl) return;
+  var container = cardEl.closest('[data-queue-source]') || cardEl.parentElement;
+  if (!container) return;
+  var cards = Array.prototype.slice.call(container.querySelectorAll('.card[data-file-id]'));
+  var ids = cards.map(function (c) { return parseInt(c.dataset.fileId, 10); });
+  var cursor = ids.indexOf(parseInt(cardEl.dataset.fileId, 10));
+  sessionStorage.setItem('photoQueue', JSON.stringify({
+    ids: ids,
+    cursor: cursor,
+    label: container.dataset.queueSource || document.title,
+  }));
+});
+</script>
 <script src="/static/app.js"></script>
 {% block scripts %}{% endblock %}
 </body>

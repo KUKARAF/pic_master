@@ -14,7 +14,7 @@
 {% endif %}
 
 {% if files %}
-<div class="grid">
+<div class="grid" data-queue-source="Similar to #{{ source_id }}">
   {% for f in files %}
   {{ macros.card(f) }}
   {% endfor %}

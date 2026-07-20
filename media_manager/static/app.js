@@ -572,43 +572,45 @@
   const fileId = window.MEDIA_FILE_ID;
   if (!fileId) return;
 
-  /* Arrow-key photo navigation. History (the sequence of photos actually visited,
-     not just id order) is kept in localStorage so Left/Right behave like browser
-     back/forward across full page loads, not just simple id+1/id-1 stepping. */
+  /* Arrow-key photo navigation via the watch queue. The queue (file ids +
+     cursor + a display label) is written to sessionStorage by base.html's
+     click-capture script whenever a photo is opened from a grid (gallery,
+     set/category detail, search, similar). If the current photo isn't part
+     of a live queue — arrived via a non-grid link, a bookmark, or the queue
+     is stale — there's nothing to browse: Left/Right do nothing. */
   (function () {
-    const STORAGE_KEY = 'mediaPhotoHistory';
-    const MAX_HISTORY = 500;
+    const STORAGE_KEY = 'photoQueue';
     const currentId = parseInt(fileId, 10);
 
-    function loadHistory() {
+    function loadQueue() {
       try {
-        const raw = JSON.parse(localStorage.getItem(STORAGE_KEY));
+        const raw = JSON.parse(sessionStorage.getItem(STORAGE_KEY));
         if (raw && Array.isArray(raw.ids) && typeof raw.cursor === 'number') return raw;
       } catch (e) { /* ignore corrupt storage */ }
-      return { ids: [], cursor: -1 };
+      return null;
     }
 
-    function saveHistory(hist) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(hist));
-    }
-
-    let hist = loadHistory();
-    const existingIndex = hist.ids.indexOf(currentId);
-    if (existingIndex !== -1) {
-      hist.cursor = existingIndex;
-    } else {
-      // Arrived here via a link/search, not via arrow nav — drop any stale
-      // "forward" entries past the current position, then record this visit.
-      hist.ids = hist.ids.slice(0, hist.cursor + 1);
-      hist.ids.push(currentId);
-      hist.cursor = hist.ids.length - 1;
-      if (hist.ids.length > MAX_HISTORY) {
-        const drop = hist.ids.length - MAX_HISTORY;
-        hist.ids = hist.ids.slice(drop);
-        hist.cursor -= drop;
+    let queue = loadQueue();
+    if (queue) {
+      const idx = queue.ids.indexOf(currentId);
+      if (idx !== -1) {
+        queue.cursor = idx;
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+      } else {
+        // This photo isn't part of the last recorded queue — stale/unrelated.
+        sessionStorage.removeItem(STORAGE_KEY);
+        queue = null;
       }
     }
-    saveHistory(hist);
+
+    window.__photoQueue = queue;
+
+    const hintEl = document.getElementById('stage-hint');
+    if (hintEl) {
+      hintEl.textContent = queue
+        ? queue.label + ' · ' + (queue.cursor + 1) + '/' + queue.ids.length + ' · ← → BROWSE · F FIT · ESC PANEL'
+        : 'F FIT · ESC PANEL';
+    }
 
     function goTo(id) {
       window.location.href = '/photo/' + id;
@@ -621,43 +623,20 @@
     }
 
     document.addEventListener('keydown', function (e) {
+      if (!queue) return;
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       if (isTypingTarget(document.activeElement)) return;
       if (e.altKey || e.ctrlKey || e.metaKey) return;
 
       if (e.key === 'ArrowLeft') {
-        if (hist.cursor > 0) {
-          hist.cursor -= 1;
-          saveHistory(hist);
-          goTo(hist.ids[hist.cursor]);
-        } else {
-          fetch('/api/files/' + currentId + '/neighbors')
-            .then(function (r) { return r.json(); })
-            .then(function (data) {
-              if (data.prev == null) return;
-              hist.ids.unshift(data.prev);
-              hist.cursor = 0;
-              saveHistory(hist);
-              goTo(data.prev);
-            });
-        }
+        if (queue.cursor <= 0) return;
+        queue.cursor -= 1;
       } else {
-        if (hist.cursor < hist.ids.length - 1) {
-          hist.cursor += 1;
-          saveHistory(hist);
-          goTo(hist.ids[hist.cursor]);
-        } else {
-          fetch('/api/files/' + currentId + '/neighbors')
-            .then(function (r) { return r.json(); })
-            .then(function (data) {
-              if (data.next == null) return;
-              hist.ids.push(data.next);
-              hist.cursor = hist.ids.length - 1;
-              saveHistory(hist);
-              goTo(data.next);
-            });
-        }
+        if (queue.cursor >= queue.ids.length - 1) return;
+        queue.cursor += 1;
       }
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+      goTo(queue.ids[queue.cursor]);
     });
   })();
 

@@ -98,7 +98,8 @@
   {% endif %}
 </div>
 
-<div class="grid" id="results-grid">
+<div class="grid" id="results-grid"
+     data-queue-source="{% if tag %}Tag: {{ tag }}{% elif person or face_id %}Person: {{ person or face_id }}{% elif q %}Search: {{ q }}{% else %}Search{% endif %}">
   {% for f in files %}
   {{ macros.card(f, selectable=True) }}
   {% endfor %}
@@ -132,7 +133,7 @@
   Assign {{ person }} to an individual photo
 </div>
 {% if unsorted_candidate_photos %}
-<div class="grid" id="identity-unsorted-grid" style="margin-bottom:20px;">
+<div class="grid" id="identity-unsorted-grid" style="margin-bottom:20px;" data-queue-source="Person: {{ person }}">
   {% for f in unsorted_candidate_photos %}
   <div class="card" id="identity-unsorted-card-{{ f.id }}" data-file-id="{{ f.id }}">
     <a class="card-img-link" href="/photo/{{ f.id }}">
