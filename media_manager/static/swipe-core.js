@@ -140,12 +140,26 @@ window.initSwipeStack = function (config) {
     return queue[0] || null;
   }
 
+  // Bounds how much of `known` gets sent to the server as the exclude list —
+  // `known` itself grows forever over a long session (every card ever seen,
+  // decided or not), and a GET request with that whole set joined into the
+  // URL eventually exceeds the HTTP server's request-line size limit
+  // (confirmed failure around 64KB / ~15000 refs), after which every
+  // subsequent buffer refill fails silently and the stack just stops
+  // growing until a full page reload resets `known` back to empty. Sending
+  // only the most-recently-seen refs keeps the URL bounded regardless of
+  // session length; local dedup (below) still checks the full, uncapped set.
+  const EXCLUDE_SEND_CAP = 500;
+
   async function maybeFetchMore(biasKey, biasAction) {
     if (fetching || queue.length >= BUFFER_SIZE) return;
     fetching = true;
     try {
       const need = BUFFER_SIZE - queue.length;
-      const url = config.fetchMoreUrl(known, biasKey, biasAction, need);
+      const excludeForRequest = known.size > EXCLUDE_SEND_CAP
+        ? new Set(Array.from(known).slice(-EXCLUDE_SEND_CAP))
+        : known;
+      const url = config.fetchMoreUrl(excludeForRequest, biasKey, biasAction, need);
       if (!url) return;
       const resp = await fetch(url);
       if (!resp.ok) return;
