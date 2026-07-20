@@ -47,7 +47,7 @@
     <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
     <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
   </div>
-  <div class="swipe-hint">Swipe up to add, down or left to skip (or use ↑ / ↓ / ←)</div>
+  <div class="swipe-hint">Swipe up to add, down to exclude (remembered), or left if not sure (or use ↑ / ↓ / ←)</div>
 </div>
 {% endif %}
 {% endblock %}
@@ -150,14 +150,17 @@
       onConfirm: function(card) {
         return { url: '/api/files/' + card.id + '/sets', method: 'POST', body: { set_id: setId } };
       },
-      onReject: function() {
-        return null; // sets have no "explicitly not in this set" concept to persist
+      onReject: function(card) {
+        return { url: '/api/files/' + card.id + '/sets/' + setId + '/exclude', method: 'POST' };
       },
       onUndo: function(card, action) {
-        // Only 'confirm' persisted anything (added the file to this set);
-        // 'reject' never did, so there's nothing to reverse for it.
-        if (action !== 'confirm') return null;
-        return { url: '/api/files/' + card.id + '/sets/' + setId, method: 'DELETE' };
+        if (action === 'confirm') {
+          return { url: '/api/files/' + card.id + '/sets/' + setId, method: 'DELETE' };
+        }
+        if (action === 'reject') {
+          return { url: '/api/files/' + card.id + '/sets/' + setId + '/exclude', method: 'DELETE' };
+        }
+        return null;
       },
       emptyStateHtml: function(stackEl) {
         stackEl.innerHTML =

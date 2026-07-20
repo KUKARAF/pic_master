@@ -139,6 +139,22 @@ class ManualDB(ThreadLocalDB):
                 SELECT checksum, set_id, created_at FROM file_sets_old
             ''')
             cur.execute('DROP TABLE file_sets_old')
+        # A human-confirmed "this file does NOT belong in this set" — the
+        # negative counterpart to file_sets, same (checksum, set_id) shape,
+        # scoped per-set (unlike faces' single global `rejected` flag, since
+        # a file can genuinely belong to one set while being a confirmed
+        # non-match for another). Kept as real ground truth like everything
+        # else in this file, not just a session-scoped UI convenience — see
+        # this module's docstring on why manual decisions are never thrown
+        # away here, even ones that only exist to say "not this".
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_set_exclusions (
+                checksum TEXT NOT NULL,
+                set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, set_id)
+            )
+        ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -552,12 +568,43 @@ class ManualDB(ThreadLocalDB):
         cur.execute('''
             INSERT OR IGNORE INTO file_sets (checksum, set_id, created_at) VALUES (?, ?, ?)
         ''', (checksum, set_id, int(time.time())))
+        # A file can't be both a confirmed member and a confirmed exclusion for
+        # the same set — a later confirm (e.g. from the photo page) always wins.
+        cur.execute('DELETE FROM file_set_exclusions WHERE checksum = ? AND set_id = ?', (checksum, set_id))
         self.conn.commit()
 
     def remove_file_from_set(self, checksum, set_id):
         cur = self.conn.cursor()
         cur.execute('DELETE FROM file_sets WHERE checksum = ? AND set_id = ?', (checksum, set_id))
         self.conn.commit()
+
+    def exclude_file_from_set(self, checksum, set_id):
+        """Record a human's 'not this set' decision for this file — the
+        suggestion stream's reject action. Permanent ground truth, not a
+        session-only UI convenience: a file excluded here is never offered
+        as a suggestion for this same set again (see get_excluded_checksums_
+        for_set), and this is exactly the kind of manual-vs-ML-derived
+        negative example this database exists to preserve for future
+        training."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO file_set_exclusions (checksum, set_id, created_at) VALUES (?, ?, ?)
+        ''', (checksum, set_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_set_exclusion(self, checksum, set_id):
+        """Undo a prior exclude_file_from_set call (the reject-swipe's Ctrl+Z)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_set_exclusions WHERE checksum = ? AND set_id = ?', (checksum, set_id))
+        self.conn.commit()
+
+    def get_excluded_checksums_for_set(self, set_id):
+        """Every checksum a human has confirmed does NOT belong in this set —
+        used to permanently filter these out of future suggestion candidates
+        for this set, the same way file_sets' own members are filtered out."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_set_exclusions WHERE set_id = ?', (set_id,))
+        return {row[0] for row in cur.fetchall()}
 
     def get_files_by_set(self, set_id, limit=200):
         """Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""

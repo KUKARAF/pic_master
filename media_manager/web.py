@@ -1267,7 +1267,11 @@ def create_app(data_root: str) -> FastAPI:
             return []
 
         member_checksum_set = set(member_checksums)
-        candidates = [row for row in db.get_all_embeddings() if row[3] not in member_checksum_set]
+        excluded_checksum_set = manual.get_excluded_checksums_for_set(set_id)
+        candidates = [
+            row for row in db.get_all_embeddings()
+            if row[3] not in member_checksum_set and row[3] not in excluded_checksum_set
+        ]
         if not candidates:
             return []
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
@@ -1631,6 +1635,23 @@ def create_app(data_root: str) -> FastAPI:
     def api_remove_set(file_id: int, set_id: int):
         row = _file_or_404(file_id)
         manual.remove_file_from_set(row['checksum'], set_id)
+        return {'ok': True}
+
+    @app.post('/api/files/{file_id}/sets/{set_id}/exclude')
+    def api_exclude_from_set(file_id: int, set_id: int):
+        """The suggestion stream's reject action: records a permanent 'this file
+        is NOT in this set' decision so it's never suggested for this set again."""
+        row = _file_or_404(file_id)
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        manual.exclude_file_from_set(row['checksum'], set_id)
+        return {'ok': True}
+
+    @app.delete('/api/files/{file_id}/sets/{set_id}/exclude')
+    def api_remove_set_exclusion(file_id: int, set_id: int):
+        """Undoes a prior exclude (the reject-swipe's Ctrl+Z)."""
+        row = _file_or_404(file_id)
+        manual.remove_set_exclusion(row['checksum'], set_id)
         return {'ok': True}
 
     @app.post('/api/files/{file_id}/favorite')
