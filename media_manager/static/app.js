@@ -16,7 +16,6 @@
       menu.classList.remove('open');
     });
   }
-  wireDropdown('categories-dropdown-btn', 'categories-dropdown-menu');
   wireDropdown('warn-dropdown-btn', 'warn-dropdown-menu');
 
   /* Generic modal — used by the set picker and face-naming modal */

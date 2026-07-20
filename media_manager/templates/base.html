@@ -13,6 +13,7 @@
   <a class="nav-logo" href="/">MEDIA<span class="logo-dim">//</span>MGR</a>
   <a class="nav-link" href="/faces">Faces</a>
   <a class="nav-link" href="/tags">Tags</a>
+  <a class="nav-link" href="/categories">Categories</a>
   <a class="nav-link" href="/sets">Sets</a>
   <a class="nav-link" href="/studios">Studios</a>
   <a class="nav-link" href="/duplicates">Duplicates</a>
@@ -21,26 +22,6 @@
     <input type="text" name="q" placeholder="search photos, tags, people…" value="{{ request.query_params.get('q', '') }}">
     <button type="submit">Search</button>
   </form>
-
-  {% if all_categories %}
-  <div style="position:relative;">
-    <button class="nav-tags-btn" id="categories-dropdown-btn" type="button">
-      Categories ▾
-    </button>
-    <div class="tags-dropdown" id="categories-dropdown-menu">
-      {% for cat in all_categories %}
-      <a href="/search?category={{ cat.name | urlencode }}">
-        <span>{{ cat.name }}</span>
-        <span class="tag-count">{{ cat.count }}</span>
-      </a>
-      {% endfor %}
-      <!-- Deliberately no separate top-level "Categories" nav-link — this
-           dropdown is the only entry point to /categories, unlike Tags which
-           has both a nav-link and (previously) a duplicate dropdown. -->
-      <a href="/categories" style="border-top:1px solid #333;margin-top:4px;padding-top:6px;font-weight:600;">Manage categories →</a>
-    </div>
-  </div>
-  {% endif %}
 
   <div style="position:relative;">
     <button class="nav-tags-btn" id="warn-dropdown-btn" type="button">
