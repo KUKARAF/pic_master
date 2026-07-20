@@ -1089,6 +1089,19 @@ class ManualDB(ThreadLocalDB):
         ''')
         return cur.fetchall()
 
+    def get_representative_face_ids(self):
+        """{identity: earliest non-rejected manual.db face id} for every named
+        identity — feeds a thumbnail (a representative face crop) per person in
+        the identity picker, same "first face for this name" query
+        get_people_present_in_set uses for its own fallback lookup."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT identity, MIN(id) FROM faces
+            WHERE identity IS NOT NULL AND rejected = 0
+            GROUP BY identity
+        ''')
+        return {identity: face_id for identity, face_id in cur.fetchall()}
+
     def get_files_by_face_identity(self, name, limit=100):
         """Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""
         cur = self.conn.cursor()

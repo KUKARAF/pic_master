@@ -263,74 +263,295 @@
     });
   }
 
-  function openSetSearchModal(onResolved, excludeSetId) {
-    openModal('Choose a set', function (box) {
+  /* Fuzzy subsequence match: every character of `query` must appear in `text`
+     in order (case-insensitive) but not necessarily contiguously. Returns
+     null when it's not a match at all; otherwise a score where lower is
+     better (an earlier, tighter match ranks first), for stable sorting. */
+  function fuzzyScore(query, text) {
+    if (!query) return 0;
+    const q = query.toLowerCase();
+    const t = (text || '').toLowerCase();
+    let searchFrom = 0, firstIndex = -1, lastIndex = -1;
+    for (let qi = 0; qi < q.length; qi++) {
+      const idx = t.indexOf(q[qi], searchFrom);
+      if (idx === -1) return null;
+      if (firstIndex === -1) firstIndex = idx;
+      lastIndex = idx;
+      searchFrom = idx + 1;
+    }
+    return firstIndex + (lastIndex - firstIndex) * 0.1;
+  }
+
+  // Per-type behavior for openEntitySearchModal — the one place that knows how
+  // to list/label/create each kind of entity. `image` is only set for
+  // 'identity' (a face-crop thumbnail); every other type renders text-only.
+  const ENTITY_TYPE_CONFIGS = {
+    set: {
+      title: 'Choose a set',
+      placeholder: 'Search or create a set…',
+      fetchAll: function () { return fetch('/api/sets').then(function (r) { return r.json(); }); },
+      label: function (s) { return s.name; },
+      secondary: function (s) { return s.studio || ''; },
+      image: null,
+      // Matches today's exact chained behavior: a new set's studio is its own
+      // keyboard-first step, not folded into this one.
+      createFn: function (typedName) {
+        return new Promise(function (resolve) { openStudioPromptModal(typedName, resolve); });
+      },
+    },
+    category: {
+      title: 'Set category',
+      placeholder: 'Search or create a category…',
+      fetchAll: function () { return fetch('/api/categories').then(function (r) { return r.json(); }); },
+      label: function (c) { return c.name; },
+      secondary: function (c) { return (c.image_count || 0) + ' photo(s)'; },
+      image: null,
+      createFn: function (typedName) {
+        return fetch('/api/categories', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: typedName }),
+        }).then(function (r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        });
+      },
+    },
+    tag: {
+      title: 'Search or create a tag',
+      placeholder: 'Search or type a tag…',
+      // Vocab is already the merged "every known label" list (YOLO-World's
+      // search terms + manual.db's confirmed tags) — exactly the right
+      // candidate pool for this picker, hint-only entries included.
+      fetchAll: function () {
+        return fetch('/api/vocab').then(function (r) { return r.json(); })
+          .then(function (data) { return (data.vocab || []).map(function (name) { return { name: name }; }); });
+      },
+      label: function (t) { return t.name; },
+      secondary: null,
+      image: null,
+      createFn: null, // any typed text is a legal tag — nothing to create ahead of time
+    },
+    identity: {
+      title: 'Choose a person',
+      placeholder: 'Search or type a name…',
+      fetchAll: function () { return fetch('/api/identities').then(function (r) { return r.json(); }); },
+      label: function (i) { return i.name; },
+      secondary: function (i) { return i.count + ' photo(s)'; },
+      image: function (i) { return i.face_id != null ? '/face-crop/manual:' + i.face_id : null; },
+      createFn: null, // naming is just picking a string; the caller decides what "use" means
+    },
+  };
+
+  /* The one consolidated "search existing or create new" picker — every
+     entity type (set/category/tag/identity) goes through this, replacing
+     three previously separate, near-duplicate flows. Native <datalist>
+     can't render an image per option (needed for a face-crop thumbnail next
+     to an identity match), so results are a custom-rendered, keyboard-
+     navigable list instead of a datalist.
+
+     A "＋ Create '<query>'" row is always appended (not only when nothing
+     matches) whenever the input has text, so a fuzzy match against an
+     unrelated existing entity never silently steals a name you meant to
+     create fresh — you always have an explicit, visible way to create even
+     when something similar already exists.
+
+     options = {
+       type,                 // 'set' | 'category' | 'tag' | 'identity'
+       title,                 // optional override of the per-type default
+       excludeIds,             // single id or array — filtered out of results
+       previewImage,            // optional url shown above the input
+       allowEmpty,              // adds a "Save without a name" button (identity naming)
+       extraSuggestion(resolve, box),  // optional extra one-click option (identity's embedding-match suggestion)
+       onResolved(entity),      // entity = {..., name} for an existing pick, or
+                                 // {name, isNew:true} for a typed one (isNew only
+                                 // ever reaches here for types with no createFn —
+                                 // set/category resolve to the real created object)
+     } */
+  function openEntitySearchModal(options) {
+    const config = ENTITY_TYPE_CONFIGS[options.type];
+    if (!config) throw new Error('Unknown entity type: ' + options.type);
+    const excludeIds = options.excludeIds == null ? []
+      : Array.isArray(options.excludeIds) ? options.excludeIds : [options.excludeIds];
+
+    openModal(options.title || config.title, function (box) {
+      if (options.previewImage) {
+        const preview = document.createElement('img');
+        preview.src = options.previewImage;
+        preview.width = 80;
+        preview.height = 80;
+        preview.style.borderRadius = '6px';
+        preview.style.display = 'block';
+        preview.style.marginBottom = '10px';
+        box.appendChild(preview);
+      }
+
       const input = document.createElement('input');
       input.type = 'text';
-      input.placeholder = 'Search or create a set…';
-      input.setAttribute('list', 'set-picker-datalist');
+      input.placeholder = config.placeholder;
       input.autocomplete = 'off';
-      input.style.width = '100%';
-      input.style.fontSize = '1.2rem';
-      input.style.padding = '10px 12px';
       input.style.marginBottom = '8px';
       box.appendChild(input);
 
-      const datalist = document.createElement('datalist');
-      datalist.id = 'set-picker-datalist';
-      box.appendChild(datalist);
-
       const status = document.createElement('div');
       status.className = 'modal-empty';
-      status.textContent = 'Loading sets…';
+      status.textContent = 'Loading…';
       box.appendChild(status);
 
-      let setsByLabel = {};
+      const list = document.createElement('div');
+      list.className = 'modal-list';
+      box.appendChild(list);
 
-      function submit() {
-        const value = input.value.trim();
-        if (!value || input.disabled) return;
+      const extraBox = document.createElement('div');
+      box.appendChild(extraBox);
+
+      let allItems = [];
+      let visible = []; // [{kind:'existing', item} | {kind:'create', text}]
+      let highlighted = -1;
+      let resolved = false;
+
+      function resolveWith(entity) {
+        if (resolved) return;
+        resolved = true;
         input.disabled = true;
-        const match = setsByLabel[value.toLowerCase()];
-        if (match) {
-          closeModal();
-          onResolved(match);
-          return;
-        }
-        // No existing set matches — this is a brand-new set, so ask for its
-        // (optional) studio before creating it, rather than assuming none.
-        openStudioPromptModal(value, onResolved);
+        closeModal();
+        options.onResolved(entity);
       }
 
+      function resolveEntry(entry) {
+        if (resolved) return;
+        if (entry.kind === 'create' && config.createFn) {
+          resolved = true;
+          input.disabled = true;
+          config.createFn(entry.text)
+            .then(function (created) { closeModal(); options.onResolved(created); })
+            .catch(function (err) {
+              resolved = false;
+              input.disabled = false;
+              alert('Failed to create: ' + err.message);
+            });
+        } else if (entry.kind === 'create') {
+          resolveWith({ name: entry.text, isNew: true });
+        } else {
+          resolveWith(entry.item);
+        }
+      }
+
+      function updateHighlight() {
+        Array.from(list.children).forEach(function (row, i) {
+          row.classList.toggle('is-highlighted', i === highlighted);
+        });
+      }
+
+      function renderList() {
+        list.innerHTML = '';
+        visible.forEach(function (entry, i) {
+          const row = document.createElement('div');
+          row.className = 'modal-list-item' + (i === highlighted ? ' is-highlighted' : '');
+          if (entry.kind === 'create') {
+            row.textContent = '＋ Create "' + entry.text + '"';
+          } else {
+            const item = entry.item;
+            const text = document.createElement('div');
+            const label = document.createElement('div');
+            label.textContent = config.label(item);
+            text.appendChild(label);
+            const secondary = config.secondary ? config.secondary(item) : '';
+            if (secondary) {
+              const sub = document.createElement('div');
+              sub.className = 'sub';
+              sub.textContent = secondary;
+              text.appendChild(sub);
+            }
+            row.appendChild(text);
+            const imgUrl = config.image ? config.image(item) : null;
+            if (imgUrl) {
+              const thumb = document.createElement('img');
+              thumb.className = 'modal-list-item-thumb';
+              thumb.src = imgUrl;
+              row.appendChild(thumb);
+            }
+          }
+          row.addEventListener('click', function () { resolveEntry(entry); });
+          row.addEventListener('mouseenter', function () { highlighted = i; updateHighlight(); });
+          list.appendChild(row);
+        });
+      }
+
+      function applyFilter() {
+        const query = input.value.trim();
+        let matched;
+        if (!query) {
+          matched = allItems.slice(0, 50);
+        } else {
+          matched = allItems
+            .map(function (item) { return { item: item, score: fuzzyScore(query, config.label(item)) }; })
+            .filter(function (x) { return x.score !== null; })
+            .sort(function (a, b) { return a.score - b.score; })
+            .slice(0, 50)
+            .map(function (x) { return x.item; });
+        }
+        visible = matched.map(function (item) { return { kind: 'existing', item: item }; });
+        if (query) visible.push({ kind: 'create', text: query });
+        highlighted = visible.length ? 0 : -1;
+        renderList();
+      }
+
+      input.addEventListener('input', applyFilter);
+
       input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (highlighted < visible.length - 1) { highlighted++; updateHighlight(); }
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (highlighted > 0) { highlighted--; updateHighlight(); }
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          if (highlighted >= 0 && visible[highlighted]) resolveEntry(visible[highlighted]);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          closeModal();
+        }
       });
 
-      fetch('/api/sets')
-        .then(function (r) { return r.json(); })
-        .then(function (sets) {
-          if (excludeSetId != null) {
-            sets = sets.filter(function (s) { return s.id !== excludeSetId; });
+      if (options.allowEmpty) {
+        const noNameBtn = document.createElement('button');
+        noNameBtn.type = 'button';
+        noNameBtn.className = 'btn-similar';
+        noNameBtn.style.fontSize = '0.85em';
+        noNameBtn.style.marginTop = '8px';
+        noNameBtn.textContent = 'Save without a name';
+        noNameBtn.title = 'Confirm this is a distinct person without naming them yet — rename anytime later.';
+        noNameBtn.addEventListener('click', function () { resolveWith({ name: null, isNew: true }); });
+        box.appendChild(noNameBtn);
+      }
+
+      config.fetchAll()
+        .then(function (items) {
+          if (excludeIds.length) {
+            items = items.filter(function (item) { return excludeIds.indexOf(item.id) === -1; });
           }
-          setsByLabel = {};
-          datalist.innerHTML = '';
-          sets.forEach(function (s) {
-            const label = s.name + (s.studio ? ' (' + s.studio + ')' : '');
-            setsByLabel[label.toLowerCase()] = s;
-            const opt = document.createElement('option');
-            opt.value = label;
-            datalist.appendChild(opt);
-          });
-          status.textContent = sets.length
-            ? 'Type to search ' + sets.length + ' existing set(s) — Enter to add, or type a new name and press Enter to create it.'
-            : 'No sets yet — type a name and press Enter to create one.';
+          allItems = items;
+          status.textContent = items.length
+            ? 'Type to search ' + items.length + ' — Enter to pick, or create a new one.'
+            : 'Nothing yet — type a name and press Enter to create one.';
+          applyFilter();
         })
         .catch(function () {
-          status.textContent = 'Failed to load existing sets — you can still type a new name and press Enter.';
+          status.textContent = 'Failed to load — you can still type a name and press Enter.';
         });
+
+      if (options.extraSuggestion) options.extraSuggestion(resolveWith, extraBox);
 
       setTimeout(function () { input.focus(); }, 0);
     });
+  }
+
+  window.openEntitySearchModal = openEntitySearchModal;
+
+  function openSetSearchModal(onResolved, excludeSetId) {
+    openEntitySearchModal({ type: 'set', excludeIds: excludeSetId, onResolved: onResolved });
   }
 
   window.openSetSearchModal = openSetSearchModal;
@@ -350,22 +571,6 @@
 
   const fileId = window.MEDIA_FILE_ID;
   if (!fileId) return;
-
-  /* Tag/region-label autocomplete — every label YOLO-World already knows about
-     (search_terms.txt + manual.db's confirmed tags), shared by both inputs. */
-  const vocabDatalist = document.getElementById('vocab-suggestions');
-  if (vocabDatalist) {
-    fetch('/api/vocab')
-      .then(function (r) { return r.json(); })
-      .then(function (data) {
-        (data.vocab || []).forEach(function (term) {
-          const opt = document.createElement('option');
-          opt.value = term;
-          vocabDatalist.appendChild(opt);
-        });
-      })
-      .catch(function () { /* autocomplete is a nice-to-have, fail silently */ });
-  }
 
   /* Arrow-key photo navigation. History (the sequence of photos actually visited,
      not just id order) is kept in localStorage so Left/Right behave like browser
@@ -457,8 +662,6 @@
   })();
 
   const tagList = document.getElementById('tag-list');
-  const tagInput = document.getElementById('tag-input');
-  const tagForm = document.getElementById('tag-form');
 
   function renderTags(tags) {
     tagList.innerHTML = '';
@@ -643,7 +846,6 @@
       })
       .then(function (data) {
         renderTags(data.tags);
-        if (tagInput) tagInput.value = '';
       })
       .catch(function (err) {
         alert('Failed to add tag: ' + err.message);
@@ -666,19 +868,24 @@
       });
   }
 
-  if (tagForm) {
-    tagForm.addEventListener('submit', function (e) {
-      e.preventDefault();
-      const tag = (tagInput ? tagInput.value : '').trim();
-      if (tag) addTag(tag, 'positive');
+  const addTagBtn = document.getElementById('add-tag-btn');
+  if (addTagBtn) {
+    addTagBtn.addEventListener('click', function () {
+      openEntitySearchModal({
+        type: 'tag',
+        onResolved: function (entity) { addTag(entity.name, 'positive'); },
+      });
     });
   }
 
   const tagNegativeBtn = document.getElementById('tag-negative-btn');
   if (tagNegativeBtn) {
     tagNegativeBtn.addEventListener('click', function () {
-      const tag = (tagInput ? tagInput.value : '').trim();
-      if (tag) addTag(tag, 'negative');
+      openEntitySearchModal({
+        type: 'tag',
+        title: 'Mark tag as NOT present',
+        onResolved: function (entity) { addTag(entity.name, 'negative'); },
+      });
     });
   }
 
@@ -831,160 +1038,78 @@
   /* Label region (spatial tag) */
   const labelRegionBtn = document.getElementById('label-region-btn');
   const labelRegionStatus = document.getElementById('label-region-status');
-  const regionLabelForm = document.getElementById('region-label-form');
-  const regionLabelInput = document.getElementById('region-label-input');
-  let pendingRegionBbox = null;
 
   const labelRegionState = wireBoxDraw(labelRegionBtn, 'Click and drag on the photo…', '＋ Label region', function (bbox) {
-    pendingRegionBbox = bbox;
-    if (regionLabelForm) {
-      regionLabelForm.style.display = 'flex';
-      if (regionLabelInput) regionLabelInput.focus();
-    }
-  });
-  if (labelRegionState) boxDrawStates.push(labelRegionState);
-
-  if (regionLabelForm) {
-    regionLabelForm.addEventListener('submit', function (e) {
-      e.preventDefault();
-      const label = (regionLabelInput ? regionLabelInput.value : '').trim();
-      if (!label || !pendingRegionBbox) return;
-      if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Saving…'; }
-      fetch('/api/files/' + fileId + '/tags/region', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label: label, bbox: pendingRegionBbox }),
-      })
-        .then(function (r) {
-          if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
-          return r.json();
-        })
-        .then(function () {
-          location.reload();
-        })
-        .catch(function (err) {
-          if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Failed: ' + err.message; }
-        });
-    });
-  }
-
-  /* Face naming modal — click any face chip (named or "Unknown") to name/rename it.
-     Keyboard-first, same shape as the set picker: one big autofocused input backed
-     by a native <datalist> of every known person; Enter saves whatever's typed,
-     whether it matches an existing person (renames onto them) or is brand new
-     (naming doesn't need a separate create step — identity is just a string). An
-     embedding-similarity suggestion, if any, shows as a one-click shortcut below. */
-  function openFaceNamingModal(faceRef) {
-    openModal('Name this face', function (box) {
-      const thumb = document.createElement('img');
-      thumb.src = '/face-crop/' + faceRef;
-      thumb.width = 80;
-      thumb.height = 80;
-      thumb.style.borderRadius = '6px';
-      thumb.style.display = 'block';
-      thumb.style.marginBottom = '10px';
-      box.appendChild(thumb);
-
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.placeholder = 'Search or type a name…';
-      input.setAttribute('list', 'face-naming-datalist');
-      input.autocomplete = 'off';
-      input.style.width = '100%';
-      input.style.fontSize = '1.2rem';
-      input.style.padding = '10px 12px';
-      input.style.marginBottom = '8px';
-      box.appendChild(input);
-
-      const datalist = document.createElement('datalist');
-      datalist.id = 'face-naming-datalist';
-      box.appendChild(datalist);
-
-      const status = document.createElement('div');
-      status.className = 'modal-empty';
-      status.textContent = 'Loading known people…';
-      box.appendChild(status);
-
-      const suggestBox = document.createElement('div');
-      suggestBox.style.marginTop = '8px';
-      box.appendChild(suggestBox);
-
-      // A blank name is a legal save: it confirms "this is a distinct person"
-      // without requiring one to be typed — the server auto-generates a
-      // placeholder ("Unnamed N"), renamable later exactly like any other name.
-      function saveName(name) {
-        if (input.disabled) return;
-        input.disabled = true;
-        fetch('/api/faces/' + faceRef + '/identity', {
+    openEntitySearchModal({
+      type: 'tag',
+      title: 'Label this region',
+      onResolved: function (entity) {
+        if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Saving…'; }
+        fetch('/api/files/' + fileId + '/tags/region', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name || null }),
+          body: JSON.stringify({ label: entity.name, bbox: bbox }),
         })
           .then(function (r) {
-            if (!r.ok) throw new Error('Request failed: ' + r.status);
+            if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
             return r.json();
           })
           .then(function () {
-            closeModal();
             location.reload();
           })
           .catch(function (err) {
-            input.disabled = false;
-            alert('Failed to save name: ' + err.message);
+            if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Failed: ' + err.message; }
           });
-      }
+      },
+    });
+  });
+  if (labelRegionState) boxDrawStates.push(labelRegionState);
 
-      input.addEventListener('keydown', function (e) {
-        // Enter only submits a typed name — an accidental empty Enter shouldn't
-        // silently create a placeholder identity; that's what the explicit
-        // "Save without a name" button below is for.
-        if (e.key === 'Enter' && input.value.trim()) { e.preventDefault(); saveName(input.value.trim()); }
-      });
-
-      const noNameBtn = document.createElement('button');
-      noNameBtn.type = 'button';
-      noNameBtn.className = 'btn-similar';
-      noNameBtn.style.fontSize = '0.85em';
-      noNameBtn.style.marginBottom = '8px';
-      noNameBtn.textContent = 'Save without a name';
-      noNameBtn.title = 'Confirm this is a distinct person without naming them yet — rename anytime later.';
-      noNameBtn.addEventListener('click', function () { saveName(null); });
-      box.appendChild(noNameBtn);
-
-      fetch('/api/identities')
-        .then(function (r) { return r.json(); })
-        .then(function (identities) {
-          datalist.innerHTML = '';
-          identities.forEach(function (i) {
-            const opt = document.createElement('option');
-            opt.value = i.name;
-            datalist.appendChild(opt);
-          });
-          status.textContent = identities.length
-            ? 'Type to search ' + identities.length + ' known people — Enter to name/rename this face.'
-            : 'No known people yet — type a name and press Enter.';
+  /* Face naming modal — click any face chip (named or "Unknown") to name/rename
+     it. Goes through the shared entity picker: fuzzy-search known people, pick
+     one, or type a new name (or none at all — "Save without a name" confirms a
+     distinct, still-unnamed person; the server auto-generates a placeholder
+     like "Unnamed N", renamable later exactly like any other name). The
+     embedding-similarity match, if any, is wired in as an extra one-click
+     suggestion alongside the regular search results. */
+  function openFaceNamingModal(faceRef) {
+    function saveName(name) {
+      fetch('/api/faces/' + faceRef + '/identity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name || null }),
+      })
+        .then(function (r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
         })
-        .catch(function () {
-          status.textContent = 'Failed to load known people — you can still type a name and press Enter.';
-        });
+        .then(function () { location.reload(); })
+        .catch(function (err) { alert('Failed to save name: ' + err.message); });
+    }
 
-      fetch('/api/faces/' + faceRef + '/suggestions')
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-          const top = data.suggestions && data.suggestions[0];
-          if (!top) return;
-          suggestBox.innerHTML = '';
-          const suggestBtn = document.createElement('button');
-          suggestBtn.type = 'button';
-          suggestBtn.className = 'btn-similar';
-          suggestBtn.style.fontSize = '0.85em';
-          suggestBtn.textContent = 'Looks like ' + top.name + '? (' + top.score.toFixed(2) + ')';
-          suggestBtn.addEventListener('click', function () { saveName(top.name); });
-          suggestBox.appendChild(suggestBtn);
-        })
-        .catch(function () {});
-
-      setTimeout(function () { input.focus(); }, 0);
+    openEntitySearchModal({
+      type: 'identity',
+      title: 'Name this face',
+      previewImage: '/face-crop/' + faceRef,
+      allowEmpty: true,
+      extraSuggestion: function (resolve, box) {
+        fetch('/api/faces/' + faceRef + '/suggestions')
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            const top = data.suggestions && data.suggestions[0];
+            if (!top) return;
+            const suggestBtn = document.createElement('button');
+            suggestBtn.type = 'button';
+            suggestBtn.className = 'btn-similar';
+            suggestBtn.style.fontSize = '0.85em';
+            suggestBtn.style.marginTop = '8px';
+            suggestBtn.textContent = 'Looks like ' + top.name + '? (' + top.score.toFixed(2) + ')';
+            suggestBtn.addEventListener('click', function () { resolve({ name: top.name }); });
+            box.appendChild(suggestBtn);
+          })
+          .catch(function () {});
+      },
+      onResolved: function (entity) { saveName(entity.name); },
     });
   }
 
@@ -1157,34 +1282,12 @@
   }
 
   function openCategoryPickerModal() {
-    openModal('Set category', function (box) {
-      const list = document.createElement('div');
-      list.textContent = 'Loading…';
-      box.appendChild(list);
-      fetch('/api/categories')
-        .then(function (r) { return r.json(); })
-        .then(function (categories) {
-          list.innerHTML = '';
-          if (!categories.length) {
-            list.textContent = 'No categories yet — create one on the Categories page first.';
-            return;
-          }
-          categories.forEach(function (cat) {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'btn-similar';
-            btn.style.display = 'block';
-            btn.style.width = '100%';
-            btn.style.marginBottom = '6px';
-            btn.textContent = cat.name;
-            btn.addEventListener('click', function () {
-              assignFileCategory(cat.id)
-                .then(closeModal)
-                .catch(function (err) { alert('Failed to set category: ' + err.message); });
-            });
-            list.appendChild(btn);
-          });
-        });
+    openEntitySearchModal({
+      type: 'category',
+      onResolved: function (entity) {
+        assignFileCategory(entity.id)
+          .catch(function (err) { alert('Failed to set category: ' + err.message); });
+      },
     });
   }
 

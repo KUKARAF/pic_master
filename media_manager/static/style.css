@@ -365,8 +365,9 @@ input[type="range"] { accent-color: var(--accent); }
   cursor: pointer;
   font-size: 17px;
 }
-.modal-list-item:hover { background: var(--input-bg); color: var(--accent); }
+.modal-list-item:hover, .modal-list-item.is-highlighted { background: var(--input-bg); color: var(--accent); }
 .modal-list-item .sub { font-size: 14px; color: var(--text-muted); }
+.modal-list-item-thumb { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
 .modal-empty { padding: 6px 2px; font-size: 15px; color: var(--text-muted); }
 .modal-divider { border-top: 1px dashed var(--border); margin: 12px 0; padding-top: 12px; }
 .modal-box input[type="text"] { width: 100%; padding: 9px 10px; }

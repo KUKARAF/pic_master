@@ -106,11 +106,10 @@
         {% endfor %}
       </div>
 
-      <form class="tag-input-row" id="tag-form" autocomplete="off">
-        <input type="text" id="tag-input" placeholder="add tag…" maxlength="64" list="vocab-suggestions">
-        <button type="submit">Add</button>
+      <div class="tag-input-row">
+        <button type="button" id="add-tag-btn" class="btn-similar">＋ Add tag</button>
         <button type="button" id="tag-negative-btn" title="Mark as NOT in this photo (e.g. a wrong detection)">🚫</button>
-      </form>
+      </div>
 
       {% if file.is_image %}
       <button type="button" id="reindex-tags-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🔄 Reindex tags</button>
@@ -129,13 +128,7 @@
       {% if file.is_image %}
       <button type="button" id="label-region-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">＋ Label region</button>
       <div id="label-region-status" class="sub" style="display:none;"></div>
-      <form class="tag-input-row" id="region-label-form" style="display:none;margin-top:6px;" autocomplete="off">
-        <input type="text" id="region-label-input" placeholder="What is it?…" maxlength="64" list="vocab-suggestions">
-        <button type="submit">Save</button>
-      </form>
       {% endif %}
-
-      <datalist id="vocab-suggestions"></datalist>
     </div>
 
     <!-- Category — single-valued, unlike tags/sets. Manual assignment always

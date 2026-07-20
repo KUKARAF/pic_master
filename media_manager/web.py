@@ -1956,7 +1956,11 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/identities')
     def api_list_identities():
-        return [{'name': r[0], 'count': r[1]} for r in manual.get_all_identities()]
+        face_ids = manual.get_representative_face_ids()
+        return [
+            {'name': r[0], 'count': r[1], 'face_id': face_ids.get(r[0])}
+            for r in manual.get_all_identities()
+        ]
 
     @app.put('/api/identities/{name}')
     def api_rename_identity(name: str, body: RenameIdentityBody):
