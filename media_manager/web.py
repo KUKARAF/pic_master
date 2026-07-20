@@ -1377,6 +1377,34 @@ def create_app(data_root: str) -> FastAPI:
         row = _file_or_404(file_id)
         return {'results': _find_best_sets_for_file(file_id, row['checksum'])}
 
+    def _people_present_in_set(set_id, member_checksums):
+        """Everyone confirmed to appear in this set, for the "People present"
+        strip at the top of the set page: name, a representative face crop (if
+        any face for them exists anywhere), and their age/gender estimate for
+        that specific face (if one's been run) — else the file_id of a photo of
+        theirs, so the template can offer "Estimate age" against the existing
+        whole-photo endpoint instead. Order comes straight from
+        manual.get_people_present_in_set (manually assigned people first, then
+        detected-face-only people, each name once) — not re-sorted here."""
+        people = manual.get_people_present_in_set(set_id, member_checksums)
+        result = []
+        for identity, face_id in people.items():
+            entry = {'identity': identity, 'face_ref': None, 'age': None, 'gender': None, 'file_id': None}
+            if face_id is not None:
+                face_ref = f'manual:{face_id}'
+                entry['face_ref'] = face_ref
+                face_row = manual.get_face(face_id)
+                if face_row is not None:
+                    file_row = db.get_file_by_checksum(face_row['checksum'])
+                    if file_row is not None:
+                        entry['file_id'] = file_row['id']
+                estimate = manual.get_age_estimate_for_face_ref(face_ref)
+                if estimate is not None and estimate['age'] is not None:
+                    entry['age'] = estimate['age']
+                    entry['gender'] = estimate['gender']
+            result.append(entry)
+        return result
+
     @app.get('/sets/{set_id}', response_class=HTMLResponse)
     def set_detail_page(request: Request, set_id: int, sort: str = 'added', order: str = 'desc'):
         set_row = manual.get_set(set_id)
@@ -1389,12 +1417,14 @@ def create_app(data_root: str) -> FastAPI:
         files = _enrich_rows(rows)
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
+        people_present = _people_present_in_set(set_id, checksums)
         return templates.TemplateResponse(request, 'set_detail.html', {
             'set': dict(set_row),
             'files': files,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
+            'people_present': people_present,
             'sort': sort,
             'order': order,
         })

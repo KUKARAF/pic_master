@@ -493,6 +493,17 @@ class ManualDB(ThreadLocalDB):
         )
         return cur.fetchall()
 
+    def get_age_estimate_for_face_ref(self, face_ref):
+        """Single-face lookup — unlike get_age_estimates_for_checksum (every face on
+        one photo), this is for callers that already know exactly which face they
+        want (e.g. a set's "people present" representative face)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT age, gender FROM face_age_estimates WHERE face_ref = ? ORDER BY created_at DESC LIMIT 1',
+            (face_ref,)
+        )
+        return cur.fetchone()
+
     def get_average_ages_for_checksums(self, checksums):
         """Batched lookup: {checksum: average age} across every face with an estimate
         on that photo — feeds "sort by age" on gallery-style views. A photo with no
@@ -1165,6 +1176,64 @@ class ManualDB(ThreadLocalDB):
         while f'Unnamed {n}' in existing:
             n += 1
         return f'Unnamed {n}'
+
+    def get_people_present_in_set(self, set_id, member_checksums):
+        """Everyone confirmed to appear in this set, from all three sources a
+        confirmation can come from: a whole-photo assignment
+        (identity_photo_assignments) on one of the set's photos, a whole-set link
+        (identity_set_assignments) to this set itself, or a real named face on
+        one of the set's own photos. Returns an ordered {identity: representative
+        manual.db face id, or None if no crop-able face exists anywhere} dict —
+        manually *assigned* people (the first two sources) come first, then
+        everyone who's only there via a detected face, each name appearing
+        exactly once even if they came from more than one source (e.g. someone
+        both manually linked to this set AND separately detected in one of its
+        photos surfaces once, in the assigned group). A face id found directly
+        in this set is always preferred for the thumbnail; names that only came
+        from the manual sources fall back to any named face for them elsewhere
+        in the library, and get None only if no such face exists at all."""
+        cur = self.conn.cursor()
+        face_people = {}
+        if member_checksums:
+            placeholders = ','.join('?' for _ in member_checksums)
+            cur.execute(f'''
+                SELECT identity, MIN(id) FROM faces
+                WHERE checksum IN ({placeholders}) AND identity IS NOT NULL AND rejected = 0
+                GROUP BY identity
+            ''', tuple(member_checksums))
+            for identity, face_id in cur.fetchall():
+                face_people[identity] = face_id
+
+        assigned_names = set()
+        if member_checksums:
+            placeholders = ','.join('?' for _ in member_checksums)
+            cur.execute(f'''
+                SELECT DISTINCT identity FROM identity_photo_assignments
+                WHERE checksum IN ({placeholders})
+            ''', tuple(member_checksums))
+            assigned_names.update(row[0] for row in cur.fetchall())
+
+        cur.execute('SELECT identity FROM identity_set_assignments WHERE set_id = ?', (set_id,))
+        assigned_names.update(row[0] for row in cur.fetchall())
+
+        people = {}
+        for identity in sorted(assigned_names, key=str.lower):
+            people[identity] = face_people.get(identity)
+        for identity in sorted(face_people.keys(), key=str.lower):
+            people.setdefault(identity, face_people[identity])
+
+        missing = [name for name, face_id in people.items() if face_id is None]
+        if missing:
+            placeholders = ','.join('?' for _ in missing)
+            cur.execute(f'''
+                SELECT identity, MIN(id) FROM faces
+                WHERE identity IN ({placeholders}) AND rejected = 0
+                GROUP BY identity
+            ''', tuple(missing))
+            for identity, face_id in cur.fetchall():
+                people[identity] = face_id
+
+        return people
 
     # ------------------------------------------------------------------
     # Migration bookkeeping (kept for future one-off migrations; nothing uses this today)

@@ -14,6 +14,37 @@
   </h1>
   <a href="/sets" class="sub">← Back to sets</a>
 </div>
+
+{% if people_present %}
+<div class="section-title" style="margin-bottom:10px;">People present</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px;">
+  {% for p in people_present %}
+  <div style="display:flex;flex-direction:column;align-items:center;width:76px;text-align:center;">
+    <a href="/search?person={{ p.identity | urlencode }}">
+      {% if p.face_ref %}
+      <img src="/face-crop/{{ p.face_ref }}" alt="{{ p.identity }}" width="64" height="64"
+           style="border-radius:50%;object-fit:cover;display:block;">
+      {% else %}
+      <div style="width:64px;height:64px;border-radius:50%;background:#111811;border:1px solid #243024;
+                   display:flex;align-items:center;justify-content:center;font-size:1.3em;color:#728C72;">
+        {{ p.identity[0] | upper }}
+      </div>
+      {% endif %}
+    </a>
+    <a href="/search?person={{ p.identity | urlencode }}" style="font-size:0.8em;margin-top:4px;max-width:76px;
+       overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ p.identity }}">{{ p.identity }}</a>
+    {% if p.age is not none %}
+    <span class="face-age-gender {{ 'gender-male' if p.gender == 'male' else ('gender-female' if p.gender == 'female' else '') }}"
+          style="font-size:0.85em;">{{ p.age | round(0) | int }}</span>
+    {% elif p.file_id %}
+    <button type="button" class="btn-similar people-present-estimate-btn" data-file-id="{{ p.file_id }}"
+            style="font-size:0.65em;padding:2px 6px;margin-top:2px;">Estimate age</button>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
   <p class="sub">{{ files | length }} image(s)</p>
   {{ macros.sort_controls(sort, order) }}
@@ -118,6 +149,27 @@
 
   document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+  });
+
+  /* "People present" — estimating age re-runs the same whole-photo estimator
+     used everywhere else (there's no single-face-scoped variant), which can
+     also fill in ages for other people sharing that photo — a full reload is
+     the simplest way to reflect that correctly rather than patching just the
+     one entry that was clicked. */
+  document.querySelectorAll('.people-present-estimate-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = 'Estimating…';
+      fetch('/api/files/' + btn.dataset.fileId + '/estimate-age', { method: 'POST' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function() { location.reload(); })
+        .catch(function(err) {
+          btn.disabled = false;
+          btn.textContent = 'Estimate age';
+          alert('Failed to estimate age: ' + err.message);
+        });
+    });
   });
 
   /* Suggestions are shown entirely as a swipe stack (no separate page-1 grid+
