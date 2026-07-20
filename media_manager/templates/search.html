@@ -113,13 +113,14 @@
 
 {% if person %}
 <div class="section-title" style="margin-top:28px;margin-bottom:12px;">
-  Assign {{ person }} to an entire set
+  Link {{ person }} to a set
 </div>
 {% if available_sets %}
 <div id="identity-sets-list" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
   {% for s in available_sets %}
-  <button type="button" class="btn-similar identity-assign-set-btn" data-set-id="{{ s.id }}">
-    {{ s.name }}{% if s.studio %} ({{ s.studio }}){% endif %}
+  <button type="button" class="btn-similar identity-assign-set-btn {{ 'btn-primary' if s.id in linked_set_ids else '' }}"
+          data-set-id="{{ s.id }}" data-linked="{{ 'true' if s.id in linked_set_ids else 'false' }}">
+    {{ '✓ ' if s.id in linked_set_ids else '' }}{{ s.name }}{% if s.studio %} ({{ s.studio }}){% endif %}
   </button>
   {% endfor %}
 </div>
@@ -599,22 +600,27 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   document.querySelectorAll('.identity-assign-set-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
       if (btn.disabled) return;
+      const setId = btn.dataset.setId;
+      const linked = btn.dataset.linked === 'true';
+      const url = '/api/identities/' + encodeURIComponent(personName) + '/assign-set'
+        + (linked ? '/' + setId : '');
       btn.disabled = true;
-      const original = btn.textContent;
-      btn.textContent = 'Assigning…';
-      fetch('/api/identities/' + encodeURIComponent(personName) + '/assign-set', {
-        method: 'POST',
+      const label = btn.textContent.trim().replace(/^✓ /, '');
+      fetch(url, {
+        method: linked ? 'DELETE' : 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({set_id: parseInt(btn.dataset.setId, 10)}),
+        body: linked ? undefined : JSON.stringify({set_id: parseInt(setId, 10)}),
       })
         .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-        .then(function(data) {
-          btn.textContent = original + ' ✓ (' + data.assigned + ')';
+        .then(function() {
+          btn.dataset.linked = linked ? 'false' : 'true';
+          btn.classList.toggle('btn-primary', !linked);
+          btn.textContent = (linked ? '' : '✓ ') + label;
+          btn.disabled = false;
         })
         .catch(function(err) {
           btn.disabled = false;
-          btn.textContent = original;
-          alert('Failed to assign set: ' + err.message);
+          alert('Failed to update set link: ' + err.message);
         });
     });
   });

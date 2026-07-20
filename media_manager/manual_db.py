@@ -172,6 +172,21 @@ class ManualDB(ThreadLocalDB):
                 PRIMARY KEY (checksum, identity)
             )
         ''')
+        # A human-confirmed "this person appears in this set" — a single link, not
+        # one row per member photo. Deliberately dynamic: which photos that implies
+        # is resolved at read time from the set's current membership (see
+        # get_sets_linked_to_identity's callers), so adding a photo to a linked set
+        # later makes it "theirs" automatically, with no re-confirmation and no
+        # extra row written.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS identity_set_assignments (
+                set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+                identity TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (set_id, identity)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_set_assignments_identity ON identity_set_assignments (identity)')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -933,11 +948,16 @@ class ManualDB(ThreadLocalDB):
         return cur.rowcount
 
     def rename_identity(self, old_name, new_name):
-        """Renames a person everywhere they appear (every manual.db face row with this
-        identity), not just a single face — fixes a typo/renaming once instead of
-        re-naming each of that person's faces individually."""
+        """Renames a person everywhere they appear — every manual.db face row with
+        this identity, every whole-photo assignment (identity_photo_assignments),
+        and every set link (identity_set_assignments) — not just a single face,
+        fixing a typo/renaming once instead of hunting down each place this string
+        was written."""
+        new_name = new_name.strip()
         cur = self.conn.cursor()
-        cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name.strip(), old_name))
+        cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         self.conn.commit()
 
     def set_face_favorite(self, manual_face_id, favorite):
@@ -1070,8 +1090,8 @@ class ManualDB(ThreadLocalDB):
     def assign_identity_to_photo(self, checksum, identity):
         """See identity_photo_assignments' schema comment: a whole-photo, no-bbox
         identity confirmation, for photos where no individual face crop exists
-        to attach the identity to. `set_id`-style bulk assignment (every member
-        of a set) and single-photo assignment both funnel through this."""
+        to attach the identity to. Assigning to a whole set is a separate,
+        single-row mechanism — see link_identity_to_set — not a loop over this."""
         cur = self.conn.cursor()
         cur.execute('''
             INSERT OR IGNORE INTO identity_photo_assignments (checksum, identity, created_at)
@@ -1099,6 +1119,52 @@ class ManualDB(ThreadLocalDB):
             (identity, limit)
         )
         return [row[0] for row in cur.fetchall()]
+
+    def link_identity_to_set(self, set_id, identity):
+        """'This person appears in this set' — one row, not one per member photo.
+        Which photos that implies is resolved dynamically by callers (join against
+        the set's current membership at read time), so a photo added to this set
+        later is automatically "theirs" too, with nothing further to write here."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO identity_set_assignments (set_id, identity, created_at)
+            VALUES (?, ?, ?)
+        ''', (set_id, identity, int(time.time())))
+        self.conn.commit()
+
+    def unlink_identity_from_set(self, set_id, identity):
+        cur = self.conn.cursor()
+        cur.execute(
+            'DELETE FROM identity_set_assignments WHERE set_id = ? AND identity = ?',
+            (set_id, identity)
+        )
+        self.conn.commit()
+
+    def get_sets_linked_to_identity(self, identity):
+        """Every set this identity has been linked to (see link_identity_to_set),
+        as full set rows — callers resolve "files for this person" by expanding
+        each one's current membership, and mark these as already-linked in the
+        set picker UI."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT s.* FROM sets s
+            JOIN identity_set_assignments isa ON isa.set_id = s.id
+            WHERE isa.identity = ?
+            ORDER BY s.name
+        ''', (identity,))
+        return cur.fetchall()
+
+    def generate_placeholder_identity_name(self):
+        """The next 'Unnamed N' not currently in use — lets a face/identity get
+        confirmed without requiring a human-typed name up front (see
+        assign_identity/promote_auto_face callers in web.py). Renaming later just
+        goes through the normal rename_identity path; this only ever picks the
+        starting string."""
+        existing = {name for name, _count in self.get_all_identities()}
+        n = 1
+        while f'Unnamed {n}' in existing:
+            n += 1
+        return f'Unnamed {n}'
 
     # ------------------------------------------------------------------
     # Migration bookkeeping (kept for future one-off migrations; nothing uses this today)

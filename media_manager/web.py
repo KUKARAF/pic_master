@@ -50,7 +50,7 @@ class SetBody(BaseModel):
     set_id: Optional[int] = None
 
 class IdentityBody(BaseModel):
-    name: str
+    name: Optional[str] = None
 
 class ManualFaceBody(BaseModel):
     bbox: List[float]
@@ -654,6 +654,7 @@ def create_app(data_root: str) -> FastAPI:
             })
 
         name_query = person or face_id
+        linked_set_ids = set()
         if name_query:
             checksums = set(manual.get_files_by_face_identity(name_query, limit=200))
             if person:
@@ -661,6 +662,14 @@ def create_app(data_root: str) -> FastAPI:
                 # alongside the regular per-face identification — either one
                 # makes a file "this person's", and both need to show up here.
                 checksums |= set(manual.get_photos_assigned_to_identity(person, limit=200))
+                # Sets linked to this identity (manual.link_identity_to_set) aren't
+                # stamped onto individual photos — expand their *current* membership
+                # here instead, so a photo added to a linked set later shows up too
+                # without any extra row ever being written.
+                linked_sets = manual.get_sets_linked_to_identity(person)
+                linked_set_ids = {s['id'] for s in linked_sets}
+                for s in linked_sets:
+                    checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
             if not checksums:
                 message = f'No files found with person "{name_query}" — run <code>media faces</code> to detect faces first.'
             else:
@@ -671,10 +680,9 @@ def create_app(data_root: str) -> FastAPI:
                     files = _sort_cards_by_age(files, order)
 
             if person:
-                # Manual-only tools (no ML suggestion involved): bulk-assign this
-                # identity to every file in a chosen set, or to one file at a
-                # time from photos that aren't in any set — for photos face
-                # detection missed the person in entirely.
+                # Manual-only tools (no ML suggestion involved): link this identity
+                # to a whole set, or assign it to one unsorted photo at a time — for
+                # photos face detection missed the person in entirely.
                 available_sets = manual.list_sets()
                 already_linked = checksums | manual.get_all_set_member_checksums()
                 unsorted_candidate_photos = _unsorted_candidate_photos_for_identity(already_linked)
@@ -746,6 +754,7 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': all_categories,
             'similar_unknown_faces': similar_unknown_faces,
             'available_sets': available_sets,
+            'linked_set_ids': linked_set_ids,
             'unsorted_candidate_photos': unsorted_candidate_photos,
             'sort': sort,
             'order': order,
@@ -1946,27 +1955,33 @@ def create_app(data_root: str) -> FastAPI:
         return {'unassigned': unassigned}
 
     @app.post('/api/identities/{name}/assign-set')
-    def api_assign_identity_to_set(name: str, body: AssignIdentitySetBody):
-        """Bulk manual assignment: 'this person appears somewhere in every photo
-        in this set.' Writes a whole-photo identity_photo_assignments row per
-        member (see manual_db.assign_identity_to_photo) — no face crop involved,
-        so already-covered members (a real detected+named face, or a prior
-        assignment) are simply left as-is via INSERT OR IGNORE, not an error."""
+    def api_link_identity_to_set(name: str, body: AssignIdentitySetBody):
+        """'This person appears in this set' — one link row, not one per member
+        photo. Which photos that implies is resolved dynamically wherever "files
+        for this person" gets built (see manual.get_sets_linked_to_identity's
+        callers), so a photo added to this set later counts too, with nothing
+        further to write here."""
         set_row = manual.get_set(body.set_id)
         if set_row is None:
             raise HTTPException(status_code=404, detail='Set not found')
-        member_checksums = manual.get_files_by_set(body.set_id, limit=1000)
-        for checksum in member_checksums:
-            manual.assign_identity_to_photo(checksum, name)
-        return {'assigned': len(member_checksums)}
+        manual.link_identity_to_set(body.set_id, name)
+        return {'linked': True}
+
+    @app.delete('/api/identities/{name}/assign-set/{set_id}')
+    def api_unlink_identity_from_set(name: str, set_id: int):
+        manual.unlink_identity_from_set(set_id, name)
+        return {'linked': False}
 
     @app.post('/api/files/{file_id}/identity-assignments')
     def api_assign_identity_to_file(file_id: int, body: IdentityBody):
         """Manual, whole-photo 'this person is in this picture' — for a photo
         where no individual face crop exists to name (missed detection, face
-        turned away, etc.). See manual_db.assign_identity_to_photo."""
+        turned away, etc.). See manual_db.assign_identity_to_photo. Unlike the
+        face-confirm endpoint below, a name is still required here — there's no
+        face match driving this, so nothing to anchor an auto-generated
+        placeholder to."""
         row = _file_or_404(file_id)
-        name = body.name.strip()
+        name = (body.name or '').strip()
         if not name:
             raise HTTPException(status_code=400, detail='Name must not be empty')
         manual.assign_identity_to_photo(row['checksum'], name)
@@ -2134,9 +2149,12 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):
-        name = body.name.strip()
-        if not name:
-            raise HTTPException(status_code=400, detail='Name must not be empty')
+        # A blank/omitted name confirms "this is a distinct person" without
+        # requiring one to be typed — see manual.generate_placeholder_identity_name.
+        # A placeholder behaves exactly like a real name everywhere else (rename,
+        # suggestion matching, /search?person=, ...), it's just waiting to be
+        # renamed, or not.
+        name = (body.name or '').strip() or manual.generate_placeholder_identity_name()
         kind, raw_id = _parse_face_ref(face_id)
         if kind == 'manual':
             row = manual.get_face(raw_id)

@@ -909,13 +909,16 @@
       suggestBox.style.marginTop = '8px';
       box.appendChild(suggestBox);
 
+      // A blank name is a legal save: it confirms "this is a distinct person"
+      // without requiring one to be typed — the server auto-generates a
+      // placeholder ("Unnamed N"), renamable later exactly like any other name.
       function saveName(name) {
-        if (!name || input.disabled) return;
+        if (input.disabled) return;
         input.disabled = true;
         fetch('/api/faces/' + faceRef + '/identity', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: name }),
+          body: JSON.stringify({ name: name || null }),
         })
           .then(function (r) {
             if (!r.ok) throw new Error('Request failed: ' + r.status);
@@ -932,8 +935,21 @@
       }
 
       input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); saveName(input.value.trim()); }
+        // Enter only submits a typed name — an accidental empty Enter shouldn't
+        // silently create a placeholder identity; that's what the explicit
+        // "Save without a name" button below is for.
+        if (e.key === 'Enter' && input.value.trim()) { e.preventDefault(); saveName(input.value.trim()); }
       });
+
+      const noNameBtn = document.createElement('button');
+      noNameBtn.type = 'button';
+      noNameBtn.className = 'btn-similar';
+      noNameBtn.style.fontSize = '0.85em';
+      noNameBtn.style.marginBottom = '8px';
+      noNameBtn.textContent = 'Save without a name';
+      noNameBtn.title = 'Confirm this is a distinct person without naming them yet — rename anytime later.';
+      noNameBtn.addEventListener('click', function () { saveName(null); });
+      box.appendChild(noNameBtn);
 
       fetch('/api/identities')
         .then(function (r) { return r.json(); })
