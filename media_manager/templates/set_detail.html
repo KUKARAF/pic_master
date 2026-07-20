@@ -124,7 +124,7 @@
   function fetchMoreUrl(known, need) {
     const avoidToggle = document.getElementById('set-avoid-existing-toggle');
     return '/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
-      '&limit=' + (need || 10) + '&exclude=' + encodeURIComponent(Array.from(known).join(',')) +
+      '&limit=' + (need || 10) +
       '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked);
   }
 
@@ -194,7 +194,11 @@
   }
 
   function fetchAndLaunch() {
-    fetch(fetchMoreUrl(new Set(), 10))
+    fetch(fetchMoreUrl(new Set(), 10), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ exclude: [] }),
+    })
       .then(function(r) { return r.ok ? r.json() : { cards: [] }; })
       .then(function(data) { launchStack(data.cards || []); })
       .catch(function() { launchStack([]); });

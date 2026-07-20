@@ -140,28 +140,30 @@ window.initSwipeStack = function (config) {
     return queue[0] || null;
   }
 
-  // Bounds how much of `known` gets sent to the server as the exclude list —
-  // `known` itself grows forever over a long session (every card ever seen,
-  // decided or not), and a GET request with that whole set joined into the
-  // URL eventually exceeds the HTTP server's request-line size limit
-  // (confirmed failure around 64KB / ~15000 refs), after which every
-  // subsequent buffer refill fails silently and the stack just stops
-  // growing until a full page reload resets `known` back to empty. Sending
-  // only the most-recently-seen refs keeps the URL bounded regardless of
-  // session length; local dedup (below) still checks the full, uncapped set.
-  const EXCLUDE_SEND_CAP = 500;
-
+  // `known` grows forever over a long session (every card ever seen, decided
+  // or not) and must always be sent to the server in full: the ranking is
+  // recomputed from scratch every refill, so any already-seen card left out
+  // of the exclude list can resurface at the top of the ranked candidates.
+  // The client would then silently re-discard it as already-known (see the
+  // loop below), adding zero new cards — the buffer looks permanently stuck
+  // even though the server is "succeeding". This previously happened for
+  // real: `known` was sent as a GET query string, which both has a hard size
+  // limit (fails around 64KB / ~15000 refs) and was, for a while, truncated
+  // client-side to stay under it — the truncation itself caused exactly this
+  // stuck-buffer symptom well before the URL length limit ever came into
+  // play. Sending it as a POST body removes both problems at once.
   async function maybeFetchMore(biasKey, biasAction) {
     if (fetching || queue.length >= BUFFER_SIZE) return;
     fetching = true;
     try {
       const need = BUFFER_SIZE - queue.length;
-      const excludeForRequest = known.size > EXCLUDE_SEND_CAP
-        ? new Set(Array.from(known).slice(-EXCLUDE_SEND_CAP))
-        : known;
-      const url = config.fetchMoreUrl(excludeForRequest, biasKey, biasAction, need);
+      const url = config.fetchMoreUrl(known, biasKey, biasAction, need);
       if (!url) return;
-      const resp = await fetch(url);
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exclude: Array.from(known) }),
+      });
       if (!resp.ok) return;
       const data = await resp.json();
       for (const card of data.cards || []) {

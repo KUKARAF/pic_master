@@ -79,6 +79,22 @@ class CategoryBody(BaseModel):
     temperature: Optional[float] = None
     category_id: Optional[int] = None
 
+class SwipeExcludeBody(BaseModel):
+    """Shared body for every swipe stack's buffer-refill endpoint. Sent as a
+    POST body rather than a query-string `exclude` param because the client's
+    exclude set is the full list of every card ever seen this session, which
+    a long swiping session can grow past what a GET request line can hold
+    (previously ~64KB / ~15000 refs) — a POST body has no such constraint at
+    this scale, so it's just sent in full every time instead of being
+    truncated. Truncating it (an earlier fix) caused a worse bug: the server
+    would happily resurface already-seen top-ranked candidates that fell
+    outside the truncated set, which the client silently re-discards as
+    already-known, so the buffer would appear permanently stuck at 0 new
+    cards even though plenty of fresh (or even the same, still-valid)
+    candidates existed — exactly what a page reload (which resets the
+    client's known-set to empty) would then reveal."""
+    exclude: List[str] = []
+
 
 def _gray_placeholder() -> bytes:
     """Return a gray 400×400 JPEG as bytes (used when thumbnail generation fails)."""
@@ -1151,12 +1167,10 @@ def create_app(data_root: str) -> FastAPI:
             for row, score in qualifying[:count]
         ])
 
-    @app.get('/api/tags/{label}/suggestions/next')
-    def api_next_tag_suggestions(label: str, count: int = 10, exclude: str = '',
+    @app.post('/api/tags/{label}/suggestions/next')
+    def api_next_tag_suggestions(label: str, body: SwipeExcludeBody, count: int = 10,
                                   bias_file_id: str = '', bias: str = ''):
-        from media_manager.swipe_support import parse_exclude
-
-        exclude_ids = {int(x) for x in parse_exclude(exclude) if x.isdigit()}
+        exclude_ids = {int(x) for x in body.exclude if x.isdigit()}
         bias_id = int(bias_file_id) if bias_file_id.strip().isdigit() else None
         cards = _next_tag_suggestions(label, count, exclude_ids, bias_id, bias or None)
         return {'cards': cards}
@@ -1361,15 +1375,14 @@ def create_app(data_root: str) -> FastAPI:
             'order': order,
         })
 
-    @app.get('/api/sets/{set_id}/similar-files')
-    def api_similar_files_for_set(set_id: int, threshold: float = SET_SUGGEST_THRESHOLD, limit: int = 12, offset: int = 0,
-                                   exclude: str = '', avoid_existing: bool = True):
+    @app.post('/api/sets/{set_id}/similar-files')
+    def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
+                                   limit: int = 12, offset: int = 0, avoid_existing: bool = True):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
-        from media_manager.swipe_support import parse_exclude
-        exclude_ids = {int(r) for r in parse_exclude(exclude) if r.isdigit()} or None
+        exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
         results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids,
                                                 avoid_existing=avoid_existing)
         # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
@@ -1600,13 +1613,11 @@ def create_app(data_root: str) -> FastAPI:
             'order': order,
         })
 
-    @app.get('/api/categories/{category_id}/suggestions/next')
-    def api_next_category_suggestions(category_id: int, count: int = 10, exclude: str = ''):
-        from media_manager.swipe_support import parse_exclude
-
+    @app.post('/api/categories/{category_id}/suggestions/next')
+    def api_next_category_suggestions(category_id: int, body: SwipeExcludeBody, count: int = 10):
         if manual.get_category(category_id) is None:
             raise HTTPException(status_code=404, detail='Category not found')
-        exclude_refs = parse_exclude(exclude)
+        exclude_refs = set(body.exclude)
         cards = _next_category_suggestions(category_id, count, exclude_refs)
         return {'cards': cards}
 
@@ -2068,15 +2079,15 @@ def create_app(data_root: str) -> FastAPI:
         rather than 404ing them."""
         return RedirectResponse(url='/faces')
 
-    @app.get('/api/face-suggestions/next')
-    def api_next_face_suggestions(count: int = 10, exclude: str = '', bias_identity: str = '', bias: str = '',
+    @app.post('/api/face-suggestions/next')
+    def api_next_face_suggestions(body: SwipeExcludeBody, count: int = 10, bias_identity: str = '', bias: str = '',
                                    identity: str = '', avoid_existing: bool = True):
-        """Feeds the swipe-card stack's background buffer. `exclude` is a comma-joined
-        list of face refs the client already holds (queued or just-decided) so a
-        refill never repeats a card still in flight client-side. `identity` (distinct
-        from `bias_identity`) scopes the stream to one person's own confirmed faces,
-        for the person-search page's swipe stack."""
-        exclude_refs = {r for r in exclude.split(',') if r}
+        """Feeds the swipe-card stack's background buffer. `body.exclude` is the
+        full list of face refs the client already holds (queued or just-decided)
+        so a refill never repeats a card still in flight client-side. `identity`
+        (distinct from `bias_identity`) scopes the stream to one person's own
+        confirmed faces, for the person-search page's swipe stack."""
+        exclude_refs = set(body.exclude)
         cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
                                         identity_filter=identity or None, avoid_existing=avoid_existing)
         return {'cards': cards}

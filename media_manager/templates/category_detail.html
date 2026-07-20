@@ -123,9 +123,8 @@
     confirmBtnId: 'category-swipe-confirm-btn',
     rejectBtnId: 'category-swipe-reject-btn',
     initialCards: window.CATEGORY_DETAIL_INITIAL_CARDS || [],
-    fetchMoreUrl: (excludeSet /*, biasKey, biasAction */) =>
-      `/api/categories/${categoryId}/suggestions/next?count=10&exclude=`
-      + encodeURIComponent(Array.from(excludeSet).join(',')),
+    fetchMoreUrl: (excludeSet, biasKey, biasAction, need) =>
+      `/api/categories/${categoryId}/suggestions/next?count=${need || 10}`,
     renderCard: (card) => ({
       imageUrl: `/thumb/${card.file_id}`,
       questionHtml: `Does this belong in <strong>${escapeHtml(categoryName)}</strong>?`,

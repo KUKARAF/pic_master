@@ -7,15 +7,6 @@ CLIP centroid via similarity.py) — this module only handles what's identical
 across all of them."""
 
 
-def parse_exclude(exclude_str):
-    """Parse a comma-joined 'exclude' query param into a set of strings. Empty
-    entries (from a leading/trailing/doubled comma, or an empty string) are
-    dropped rather than producing a stray ''."""
-    if not exclude_str:
-        return set()
-    return {r for r in exclude_str.split(',') if r}
-
-
 def bias_reorder(candidates, key_fn, bias_key, bias_action):
     """Reorder a list of (already scored) candidates so the most recent
     confirm/reject decision steers what's suggested next — the same "sort tweak,

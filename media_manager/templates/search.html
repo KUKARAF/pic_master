@@ -505,7 +505,6 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const params = new URLSearchParams({
         count: String(need || 10),
-        exclude: Array.from(excludeSet).join(','),
       });
       if (biasKey) {
         params.set('bias_file_id', biasKey);
@@ -560,7 +559,6 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
       const avoidToggle = document.getElementById('similar-avoid-existing-toggle');
       const params = new URLSearchParams({
         count: String(need || 10),
-        exclude: Array.from(excludeSet).join(','),
         identity: personName,
         avoid_existing: String(!avoidToggle || avoidToggle.checked),
       });
