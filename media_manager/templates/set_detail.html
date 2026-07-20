@@ -49,6 +49,11 @@
   </div>
   <div class="swipe-hint">Swipe up to add, down to exclude (remembered), or left if not sure (or use ↑ / ↓ / ←) — press "o" to add to a different set instead</div>
 </div>
+
+<div id="similar-sets-section" style="margin-top:20px;display:none;">
+  <div class="section-title" style="margin-bottom:8px;">Similar Sets:</div>
+  <div id="similar-sets-panel" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+</div>
 {% endif %}
 {% endblock %}
 
@@ -213,24 +218,97 @@
     launchStack([]);
   }
 
-  /* "o" — add the current suggestion to a DIFFERENT set via the same search/
-     create picker the photo page and search page's bulk-add already use. Since
-     a file assigned elsewhere is implicitly not this set, a successful assign
-     auto-triggers the same reject path a manual down-swipe takes (persists an
-     exclusion for *this* set, advances to the next card) — one keypress covers
-     both actions instead of requiring "o" then a separate down-swipe. */
-  document.addEventListener('keydown', function(e) {
-    if (e.key !== 'o' && e.key !== 'O') return;
-    if (_isEditableTarget(e.target)) return;
+  /* "Similar Sets" quick-shortcuts — every set picked via "o" (below) gets
+     remembered for the rest of this tab, mapped to a number key 1-9, so
+     re-assigning to the same other set again is one keypress instead of a
+     search every time. Stored in sessionStorage (not localStorage): scoped to
+     this one tab and this one set's page, and gone once the tab closes —
+     there's no reason this needs to persist beyond that or sync elsewhere.
+     Numbers are permanent for the tab's lifetime once assigned: new sets only
+     ever fill remaining empty slots, never bump or renumber existing ones;
+     once all 9 are full, further distinct sets can still be assigned via "o",
+     they just don't get a shortcut. */
+  const SIMILAR_SETS_KEY = 'similar_sets_' + setId;
+  const SIMILAR_SETS_MAX = 9;
+
+  function loadSimilarSets() {
+    try {
+      const raw = sessionStorage.getItem(SIMILAR_SETS_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveSimilarSets() {
+    try { sessionStorage.setItem(SIMILAR_SETS_KEY, JSON.stringify(similarSets)); } catch (e) {}
+  }
+
+  let similarSets = loadSimilarSets();
+
+  function renderSimilarSets() {
+    const section = document.getElementById('similar-sets-section');
+    const panel = document.getElementById('similar-sets-panel');
+    if (!section || !panel) return;
+    if (!similarSets.length) {
+      section.style.display = 'none';
+      return;
+    }
+    section.style.display = 'block';
+    panel.innerHTML = '';
+    similarSets.forEach(function(s, i) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn-similar';
+      btn.style.fontSize = '0.85em';
+      btn.textContent = (i + 1) + ': ' + s.name;
+      btn.title = 'Add current suggestion to "' + s.name + '" (press ' + (i + 1) + ')';
+      btn.addEventListener('click', function() { addCurrentCardToSet(s); });
+      panel.appendChild(btn);
+    });
+  }
+
+  function rememberSimilarSet(otherSet) {
+    const alreadyKnown = similarSets.some(function(s) { return s.id === otherSet.id; });
+    if (alreadyKnown || similarSets.length >= SIMILAR_SETS_MAX) return;
+    similarSets.push({ id: otherSet.id, name: otherSet.name, studio: otherSet.studio });
+    saveSimilarSets();
+    renderSimilarSets();
+  }
+
+  /* Shared by "o"'s modal and the number-key/button shortcuts below — the
+     actual "assign to that other set, then auto-reject from this one" action,
+     so neither path duplicates the other's logic. */
+  function addCurrentCardToSet(otherSet) {
     if (!stackHandle) return;
     const card = stackHandle.getTopCard();
     if (!card) return;
-    e.preventDefault();
-    window.openSetSearchModal(function(otherSet) {
-      window.assignFileToSet(card.id, otherSet.id)
-        .then(function() { stackHandle.decide('reject'); })
-        .catch(function(err) { alert('Failed to add to set: ' + err.message); });
-    }, setId);
+    window.assignFileToSet(card.id, otherSet.id)
+      .then(function() {
+        rememberSimilarSet(otherSet);
+        stackHandle.decide('reject');
+      })
+      .catch(function(err) { alert('Failed to add to set: ' + err.message); });
+  }
+
+  renderSimilarSets();
+
+  document.addEventListener('keydown', function(e) {
+    if (_isEditableTarget(e.target)) return;
+
+    if (e.key === 'o' || e.key === 'O') {
+      if (!stackHandle || !stackHandle.getTopCard()) return;
+      e.preventDefault();
+      window.openSetSearchModal(function(otherSet) { addCurrentCardToSet(otherSet); }, setId);
+      return;
+    }
+
+    if (e.key >= '1' && e.key <= '9') {
+      const target = similarSets[Number(e.key) - 1];
+      if (!target || !stackHandle || !stackHandle.getTopCard()) return;
+      e.preventDefault();
+      addCurrentCardToSet(target);
+    }
   });
 })();
 </script>
