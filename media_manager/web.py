@@ -613,8 +613,6 @@ def create_app(data_root: str) -> FastAPI:
         all_categories = _all_categories_for_nav()
         similar_unknown_faces = []
         similar_faces = []
-        initial_similar_cards = []
-        tag_swipe_initial_cards = []
 
         if face_ref:
             # "Find similar faces" from a specific face chip — reuses the same
@@ -635,8 +633,6 @@ def create_app(data_root: str) -> FastAPI:
                 'all_tags': all_tags,
                 'all_categories': all_categories,
                 'similar_unknown_faces': similar_unknown_faces,
-                'initial_similar_cards': initial_similar_cards,
-                'tag_swipe_initial_cards': tag_swipe_initial_cards,
             })
 
         name_query = person or face_id
@@ -651,12 +647,6 @@ def create_app(data_root: str) -> FastAPI:
                 if sort == 'age':
                     files = _sort_cards_by_age(files, order)
 
-            # Unidentified auto-detected faces that look like this person, as a swipe
-            # stream scoped to just this identity (see _next_face_suggestions's
-            # identity_filter — bias is meaningless here since every candidate
-            # already shares this one identity, so no bias params are ever sent).
-            initial_similar_cards = _next_face_suggestions(10, set(), identity_filter=name_query)
-
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
             file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
@@ -664,11 +654,6 @@ def create_app(data_root: str) -> FastAPI:
             files = _enrich_rows(rows)
             if sort == 'age':
                 files = _sort_cards_by_age(files, order)
-
-            # Always computed (not gated on `files` being non-empty) so a brand-new
-            # or sparsely-tagged label still gets a swipe stream once it has at
-            # least one positively-tagged, embedded file.
-            tag_swipe_initial_cards = _next_tag_suggestions(tag, 10, set())
 
         elif category:
             cat_row = manual.find_category(category)
@@ -728,8 +713,6 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': all_categories,
             'similar_unknown_faces': similar_unknown_faces,
-            'initial_similar_cards': initial_similar_cards,
-            'tag_swipe_initial_cards': tag_swipe_initial_cards,
             'sort': sort,
             'order': order,
         })
@@ -1363,13 +1346,11 @@ def create_app(data_root: str) -> FastAPI:
         files = _enrich_rows(rows)
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
-        similar_files = _find_similar_files_for_set(set_id, SET_SUGGEST_THRESHOLD, limit=12, offset=0)
         return templates.TemplateResponse(request, 'set_detail.html', {
             'set': dict(set_row),
             'files': files,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
-            'similar_files': similar_files,
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
             'sort': sort,
             'order': order,
@@ -1565,12 +1546,11 @@ def create_app(data_root: str) -> FastAPI:
             return []
 
         all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
-        checksums = [c[3] for c in all_candidates]
-        overrides = manual.get_category_overrides_for_checksums(checksums)
+        overridden_checksums = manual.get_all_category_override_checksums()
 
         filtered = [
             c for c in all_candidates
-            if c[3] not in overrides and f"file:{c[0]}" not in exclude_refs
+            if c[3] not in overridden_checksums and f"file:{c[0]}" not in exclude_refs
         ]
         ranked = rank_by_similarity(centroid, filtered, embedding_index=2)
         threshold = cat['temperature']
@@ -1602,13 +1582,11 @@ def create_app(data_root: str) -> FastAPI:
         files = _enrich_rows(rows)
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
-        initial_cards = _next_category_suggestions(category_id, 10, set())
         return templates.TemplateResponse(request, 'category_detail.html', {
             'category': dict(cat),
             'files': files,
             'all_tags': all_tags,
             'all_categories': all_categories,
-            'initial_cards': initial_cards,
             'sort': sort,
             'order': order,
         })
@@ -1848,11 +1826,7 @@ def create_app(data_root: str) -> FastAPI:
                     'file_id': file_row['id'],
                     'identity': row['identity'],
                 })
-            faces = []
-            initial_cards = []
-        else:
-            faces = []
-            initial_cards = _next_face_suggestions(10, set())
+        faces = []
         return templates.TemplateResponse(request, 'faces.html', {
             'faces': faces,
             'identities': identities,
@@ -1860,7 +1834,6 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'favorite_faces': favorite_faces,
-            'initial_cards': initial_cards,
         })
 
     @app.get('/face-crop/{face_id}')

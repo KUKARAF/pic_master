@@ -76,7 +76,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script>window.FACES_SWIPE_INITIAL_CARDS = {{ initial_cards | tojson }};</script>
 <script src="/static/swipe-core.js"></script>
 <script>
 if (document.getElementById('faces-swipe-stack')) {
@@ -84,7 +83,7 @@ if (document.getElementById('faces-swipe-stack')) {
     stackElId: 'faces-swipe-stack',
     confirmBtnId: 'faces-swipe-confirm-btn',
     rejectBtnId: 'faces-swipe-reject-btn',
-    initialCards: window.FACES_SWIPE_INITIAL_CARDS || [],
+    initialCards: [],
     biasKeyFor: function(card) { return card.identity; },
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const avoidToggle = document.getElementById('faces-avoid-existing-toggle');

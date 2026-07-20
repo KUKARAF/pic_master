@@ -64,8 +64,7 @@ def get_resolved_checksums_for_category(manual, db, category_id, category_name, 
     auto_checksums -= manual_checksums
 
     if auto_checksums:
-        overridden = set(manual.get_category_overrides_for_checksums(list(auto_checksums)).keys())
-        auto_checksums -= overridden
+        auto_checksums -= manual.get_all_category_override_checksums()
 
     return list(manual_checksums | auto_checksums)[:limit]
 
@@ -84,10 +83,10 @@ def get_category_counts(manual, db):
     # Any checksum with a manual decision at all — assigned elsewhere, or an
     # explicit "no category" — must not also be counted via its (stale/
     # superseded) auto-match row.
-    overrides = manual.get_category_overrides_for_checksums([checksum for _fid, checksum, _n, _s in auto_matches])
+    overridden_checksums = manual.get_all_category_override_checksums()
 
     for _file_id, checksum, name, _score in auto_matches:
-        if checksum in overrides:
+        if checksum in overridden_checksums:
             continue
         counts[name] = counts.get(name, 0) + 1
 

@@ -79,6 +79,14 @@ window.initSwipeStack = function (config) {
   let queue = (config.initialCards || []).slice(0, BUFFER_SIZE);
   const known = new Set(queue.map(c => c.ref)); // queued or already-decided refs
   let fetching = false;
+  // Pages now start every stack with initialCards: [] and let the buffer-fill
+  // fetch below populate it right after load (keeps the page itself fast —
+  // no server-side ranking work blocks the initial HTML response). Until that
+  // first fetch resolves, an empty queue means "haven't heard back yet," not
+  // "genuinely out of suggestions" — renderEmptyState() below tells those
+  // apart so a slow-to-rank feature doesn't flash a misleading "nothing left,
+  // try lowering the threshold" message before its first real answer arrives.
+  let initialLoadDone = queue.length > 0;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
   const history = []; // [{card, action}, ...] — most recent decision last
 
@@ -115,6 +123,10 @@ window.initSwipeStack = function (config) {
   }
 
   function renderEmptyState() {
+    if (!initialLoadDone) {
+      stackEl.innerHTML = '<div class="swipe-empty">Loading suggestions…</div>';
+      return;
+    }
     if (typeof config.emptyStateHtml === 'function') {
       config.emptyStateHtml(stackEl);
     } else {
@@ -175,6 +187,14 @@ window.initSwipeStack = function (config) {
       // Silent — the buffer just stays smaller until the next swipe retries the fetch.
     } finally {
       fetching = false;
+      // Nothing else re-renders after an async fetch resolves (a card already on
+      // screen doesn't need to move just because more got queued behind it), but
+      // the very first fetch is different: it's what actually reveals content for
+      // a stack that started empty on purpose, so it needs its own paint.
+      if (!initialLoadDone) {
+        initialLoadDone = true;
+        render();
+      }
     }
   }
 
@@ -327,6 +347,11 @@ window.initSwipeStack = function (config) {
   });
 
   render();
+  // render()'s empty-queue branch only shows a state, it doesn't fetch (the
+  // non-empty branch's trailing maybeFetchMore() call is what normally keeps
+  // the buffer topped up) — so a stack that intentionally starts empty needs
+  // its own kick to ever load anything.
+  if (queue.length === 0) maybeFetchMore();
 
   return { refill: () => maybeFetchMore() };
 };

@@ -115,9 +115,10 @@
     wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
   });
 
-  /* Suggestions are shown entirely as a swipe stack, seeded directly from the
-     server-rendered similar_files (no separate page-1 grid+"Add" wall — the
-     whole suggestion experience is the swipe stack, not just "beyond page 1"). */
+  /* Suggestions are shown entirely as a swipe stack (no separate page-1 grid+
+     "Add" wall — the whole suggestion experience is the swipe stack, not just
+     "beyond page 1"), starting empty and fetching its first batch right after
+     load so this page itself never blocks on the ranking work. */
   const swipePage = document.getElementById('set-swipe-page');
   let currentThreshold = {{ set_suggest_threshold | default(0.75) }};
 
@@ -205,7 +206,7 @@
   }
 
   if (swipePage) {
-    launchStack({{ similar_files | tojson }});
+    launchStack([]);
   }
 })();
 </script>

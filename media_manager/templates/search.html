@@ -116,7 +116,6 @@
   Unidentified faces that look like {{ person or face_id }}
 </div>
 
-{% if initial_similar_cards %}
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
   <input type="checkbox" id="similar-avoid-existing-toggle" checked>
   Deprioritize photos that already have an identified face
@@ -129,19 +128,6 @@
   </div>
   <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
 </div>
-{% else %}
-<div class="alert" id="similar-empty-state">
-  <p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-    <label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>
-    <input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">
-    <span id="similar-threshold-value" class="sub">0.30</span>
-    <button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>
-  </div>
-  <div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>
-</div>
-<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>
-{% endif %}
 {% endif %}
 {% endif %}
 
@@ -421,77 +407,85 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   }
   document.querySelectorAll('.use-name-btn').forEach(wireUseNameButton);
 
-  /* Expand similar face search — shown when nothing matched at the default threshold.
-     Two modes share this one control: searching by an existing person's name (hits
-     /api/identities/{name}/similar-faces) or by a single face with no name yet
-     (hits /api/faces/{ref}/similar) — the button's data-face-ref tells them apart. */
-  const slider = document.getElementById('similar-threshold-slider');
-  const sliderValue = document.getElementById('similar-threshold-value');
-  const expandBtn = document.getElementById('expand-similar-btn');
-  const expandStatus = document.getElementById('expand-similar-status');
-  const similarGrid = document.getElementById('similar-unknown-grid');
+  /* Expand similar face search — one control shared by two modes: searching by
+     an existing person's name (hits /api/identities/{name}/similar-faces) or by
+     a single face with no name yet (hits /api/faces/{ref}/similar) — `byFaceRef`
+     tells them apart. Exposed on `window` (not just this IIFE) because the
+     person-search swipe stack's emptyStateHtml (a separate IIFE further below)
+     injects this same alert markup lazily, once it knows — after its own async
+     fetch — that there's really nothing to swipe, and needs to (re-)wire
+     whatever it just added to the DOM. Does fresh getElementById lookups every
+     call rather than closing over elements captured once, so it works whether
+     the markup was there at page load or added later. */
+  window.wireExpandSimilarSearch = function(byFaceRef) {
+    const slider = document.getElementById('similar-threshold-slider');
+    const sliderValue = document.getElementById('similar-threshold-value');
+    const expandBtn = document.getElementById('expand-similar-btn');
+    const expandStatus = document.getElementById('expand-similar-status');
+    const similarGrid = document.getElementById('similar-unknown-grid');
 
-  if (slider && sliderValue) {
-    slider.addEventListener('input', function() {
-      sliderValue.textContent = parseFloat(slider.value).toFixed(2);
-    });
-  }
+    if (slider && sliderValue) {
+      slider.addEventListener('input', function() {
+        sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+      });
+    }
 
-  if (expandBtn) {
-    expandBtn.addEventListener('click', function() {
-      const threshold = slider ? slider.value : 0.3;
-      const byFaceRef = expandBtn.dataset.faceRef;
-      const url = byFaceRef
-        ? '/api/faces/' + byFaceRef + '/similar?threshold=' + threshold
-        : '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
-      expandStatus.style.display = 'block';
-      expandStatus.textContent = 'Searching…';
-      fetch(url)
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function(data) {
-          const results = data.results || [];
-          if (!results.length) {
-            expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
-            return;
-          }
-          expandStatus.style.display = 'none';
-          similarGrid.innerHTML = '';
-          results.forEach(function(f) {
-            const card = document.createElement('div');
-            card.className = 'card';
-            card.id = 'unknown-card-' + f.ref;
-            card.dataset.faceRef = f.ref;
-            const actionHtml = byFaceRef
-              ? (f.identity
-                  ? '<button type="button" class="btn-similar use-name-btn" data-name="' + f.identity + '" ' +
-                    'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + f.identity + '"</button>'
-                  : '')
-              : '<button type="button" class="btn-similar merge-face-btn" data-face-ref="' + f.ref + '" ' +
-                'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>';
-            card.innerHTML =
-              '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
-                '<img src="/face-crop/' + f.ref + '" alt="' + f.filename + '" loading="lazy">' +
-              '</a>' +
-              '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
-              '<div class="card-body">' +
-                '<div class="card-name" title="' + f.path + '">' + (f.identity || f.filename) + '</div>' +
-                actionHtml +
-              '</div>';
-            similarGrid.appendChild(card);
-            const mergeBtn = card.querySelector('.merge-face-btn');
-            if (mergeBtn) wireMergeButton(mergeBtn);
-            const useNameBtn = card.querySelector('.use-name-btn');
-            if (useNameBtn) wireUseNameButton(useNameBtn);
+    if (expandBtn) {
+      expandBtn.addEventListener('click', function() {
+        const threshold = slider ? slider.value : 0.3;
+        const url = byFaceRef
+          ? '/api/faces/' + byFaceRef + '/similar?threshold=' + threshold
+          : '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
+        expandStatus.style.display = 'block';
+        expandStatus.textContent = 'Searching…';
+        fetch(url)
+          .then(function(r) {
+            if (!r.ok) throw new Error('Request failed: ' + r.status);
+            return r.json();
+          })
+          .then(function(data) {
+            const results = data.results || [];
+            if (!results.length) {
+              expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
+              return;
+            }
+            expandStatus.style.display = 'none';
+            similarGrid.innerHTML = '';
+            results.forEach(function(f) {
+              const card = document.createElement('div');
+              card.className = 'card';
+              card.id = 'unknown-card-' + f.ref;
+              card.dataset.faceRef = f.ref;
+              const actionHtml = byFaceRef
+                ? (f.identity
+                    ? '<button type="button" class="btn-similar use-name-btn" data-name="' + f.identity + '" ' +
+                      'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + f.identity + '"</button>'
+                    : '')
+                : '<button type="button" class="btn-similar merge-face-btn" data-face-ref="' + f.ref + '" ' +
+                  'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>';
+              card.innerHTML =
+                '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
+                  '<img src="/face-crop/' + f.ref + '" alt="' + f.filename + '" loading="lazy">' +
+                '</a>' +
+                '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
+                '<div class="card-body">' +
+                  '<div class="card-name" title="' + f.path + '">' + (f.identity || f.filename) + '</div>' +
+                  actionHtml +
+                '</div>';
+              similarGrid.appendChild(card);
+              const mergeBtn = card.querySelector('.merge-face-btn');
+              if (mergeBtn) wireMergeButton(mergeBtn);
+              const useNameBtn = card.querySelector('.use-name-btn');
+              if (useNameBtn) wireUseNameButton(useNameBtn);
+            });
+          })
+          .catch(function(err) {
+            expandStatus.textContent = 'Search error: ' + err.message;
           });
-        })
-        .catch(function(err) {
-          expandStatus.textContent = 'Search error: ' + err.message;
-        });
-    });
-  }
+      });
+    }
+  };
+  window.wireExpandSimilarSearch(queryFaceRef || null);
 })();
 
 (function() {
@@ -501,7 +495,7 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     stackElId: 'tag-swipe-stack',
     confirmBtnId: 'tag-swipe-confirm-btn',
     rejectBtnId: 'tag-swipe-reject-btn',
-    initialCards: {{ tag_swipe_initial_cards | tojson }},
+    initialCards: [],
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const params = new URLSearchParams({
         count: String(need || 10),
@@ -554,7 +548,7 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     stackElId: 'similar-swipe-stack',
     confirmBtnId: 'similar-swipe-confirm-btn',
     rejectBtnId: 'similar-swipe-reject-btn',
-    initialCards: {{ initial_similar_cards | tojson }},
+    initialCards: [],
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const avoidToggle = document.getElementById('similar-avoid-existing-toggle');
       const params = new URLSearchParams({
@@ -582,7 +576,24 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
     onUndo: function(card) {
       return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
     },
-    emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.</div>',
+    // Same "expand similar face search" alert the face_ref page renders
+    // synchronously, built here instead since this stack only knows whether
+    // there's really nothing to show after its own async fetch completes.
+    emptyStateHtml: function(stackEl) {
+      stackEl.innerHTML =
+        '<div class="alert" id="similar-empty-state">' +
+          '<p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>' +
+          '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+            '<label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
+            '<input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">' +
+            '<span id="similar-threshold-value" class="sub">0.30</span>' +
+            '<button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>' +
+          '</div>' +
+          '<div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>' +
+        '</div>' +
+        '<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>';
+      window.wireExpandSimilarSearch(null);
+    },
   });
 })();
 </script>

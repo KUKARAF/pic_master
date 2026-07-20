@@ -778,6 +778,17 @@ class ManualDB(ThreadLocalDB):
         ''', tuple(checksums))
         return {row[0]: {'category_id': row[1], 'name': row[2]} for row in cur.fetchall()}
 
+    def get_all_category_override_checksums(self):
+        """Every checksum with ANY manual category decision recorded (assigned to
+        some category, or an explicit "no category"), as a plain set() — one cheap
+        query independent of candidate-list size, unlike
+        get_category_overrides_for_checksums (which needs one bound SQL parameter
+        per checksum and blows past SQLite's variable limit when called with
+        every file in the library, as the category-suggestion stream does)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM file_category_overrides')
+        return {row[0] for row in cur.fetchall()}
+
     def get_example_checksums_for_category(self, category_id, limit=1000):
         """Files manually assigned to this category — the ML training examples
         used to build a similarity centroid (mirrors get_files_by_set)."""

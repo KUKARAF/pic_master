@@ -51,7 +51,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script>window.CATEGORY_DETAIL_INITIAL_CARDS = {{ initial_cards | tojson }};</script>
 <script src="/static/swipe-core.js"></script>
 <script>
 (function () {
@@ -122,7 +121,7 @@
     stackElId: 'category-swipe-stack',
     confirmBtnId: 'category-swipe-confirm-btn',
     rejectBtnId: 'category-swipe-reject-btn',
-    initialCards: window.CATEGORY_DETAIL_INITIAL_CARDS || [],
+    initialCards: [],
     fetchMoreUrl: (excludeSet, biasKey, biasAction, need) =>
       `/api/categories/${categoryId}/suggestions/next?count=${need || 10}`,
     renderCard: (card) => ({
