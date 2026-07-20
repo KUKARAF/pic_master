@@ -72,18 +72,15 @@
   <input type="checkbox" id="set-avoid-existing-toggle" checked>
   Deprioritize photos that already belong to a set
 </label>
-<div class="swipe-page" id="set-swipe-page">
-  <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
-  <div class="swipe-controls">
-    <button type="button" class="swipe-btn swipe-btn-reject" id="set-swipe-reject-btn" title="Not for this set (↓)">✕</button>
-    <button type="button" class="swipe-btn swipe-btn-confirm" id="set-swipe-confirm-btn" title="Add to set (↑)">✓</button>
+<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
+  <div class="swipe-page" id="set-swipe-page" style="flex:1;min-width:300px;">
+    <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
   </div>
-  <div class="swipe-hint">Swipe up to add, down to exclude (remembered), or left if not sure (or use ↑ / ↓ / ←) — press "o" to add to a different set instead</div>
-</div>
 
-<div id="similar-sets-section" style="margin-top:20px;display:none;">
-  <div class="section-title" style="margin-bottom:8px;">Similar Sets:</div>
-  <div id="similar-sets-panel" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+  <div id="similar-sets-section" style="min-width:160px;max-width:220px;display:none;">
+    <div class="section-title" style="margin-bottom:8px;">Similar Sets</div>
+    <div id="similar-sets-panel" style="display:flex;flex-wrap:wrap;gap:8px;"></div>
+  </div>
 </div>
 {% endif %}
 {% endblock %}
@@ -193,8 +190,6 @@
   function launchStack(initialCards) {
     stackHandle = initSwipeStack({
       stackElId: 'set-swipe-stack',
-      confirmBtnId: 'set-swipe-confirm-btn',
-      rejectBtnId: 'set-swipe-reject-btn',
       initialCards: initialCards,
       fetchMoreUrl: function(known, biasKey, biasAction, need) {
         return fetchMoreUrl(known, need);
