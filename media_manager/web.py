@@ -1325,6 +1325,8 @@ def create_app(data_root: str) -> FastAPI:
         suggestions = suggestions[:8]
 
         media = []
+        sets_result = []
+        people_result = []
         total_count = 0
         checksums = _intersect_chips(chips)
         if checksums is not None or q:
@@ -1339,7 +1341,40 @@ def create_app(data_root: str) -> FastAPI:
                 enriched_rows = [(r['id'], r['path'], False, r['checksum']) for r in rows]
                 media = _enrich_rows(enriched_rows)
 
-        return {'suggestions': suggestions, 'media': media, 'total_count': total_count}
+                # Which sets/people are actually represented in the current result
+                # set — shown as their own tiles alongside individual photos, so a
+                # result reads as "these sets / these people / these photos", not
+                # just an undifferentiated photo grid.
+                sets_map = {}
+                identities_map = {}
+                for chunk in _chunked(checksums):
+                    sets_map.update(manual.get_sets_for_checksums(chunk))
+                    identities_map.update(manual.get_identities_for_checksums(chunk))
+
+                set_agg = {}
+                for cs, sets_here in sets_map.items():
+                    for s in sets_here:
+                        agg = set_agg.setdefault(s['id'], {'id': s['id'], 'name': s['name'], 'count': 0, 'checksum': cs})
+                        agg['count'] += 1
+                sets_result = sorted(set_agg.values(), key=lambda s: s['count'], reverse=True)[:6]
+                for s in sets_result:
+                    thumb_rows = db.get_files_by_checksums([s.pop('checksum')])
+                    s['thumb_file_id'] = thumb_rows[0]['id'] if thumb_rows else None
+
+                people_agg = {}
+                for cs, names in identities_map.items():
+                    for name in names:
+                        people_agg[name] = people_agg.get(name, 0) + 1
+                face_ids = manual.get_representative_face_ids()
+                people_result = sorted(
+                    [{'name': n, 'count': c, 'face_id': face_ids.get(n)} for n, c in people_agg.items()],
+                    key=lambda p: p['count'], reverse=True
+                )[:6]
+
+        return {
+            'suggestions': suggestions, 'media': media, 'sets': sets_result,
+            'people': people_result, 'total_count': total_count,
+        }
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):

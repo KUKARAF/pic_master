@@ -602,6 +602,21 @@
 
     var FACET_LABELS = { category: 'CAT', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
 
+    /* "cat /outs" — everything up to the last "/" is leftover text the user is
+       composing (kept untouched), everything after it is the fragment actively
+       matched against suggestions. No "/" at all means the whole box is the
+       fragment (the common single-word case), matching plain typing. */
+    function fragmentText() {
+      var v = input.value;
+      var i = v.lastIndexOf('/');
+      return i === -1 ? v : v.slice(i + 1);
+    }
+    function leftoverText() {
+      var v = input.value;
+      var i = v.lastIndexOf('/');
+      return i === -1 ? '' : v.slice(0, i);
+    }
+
     function open() {
       overlay.style.display = 'flex';
       input.value = '';
@@ -673,36 +688,81 @@
       });
     }
 
-    function renderGrid(media) {
+    function section(label, count) {
+      var wrap = document.createElement('div');
+      wrap.className = 'palette-section';
+      var heading = document.createElement('div');
+      heading.className = 'palette-section-title';
+      heading.textContent = '> ' + label + ' (' + count + ')_';
+      wrap.appendChild(heading);
+      var tiles = document.createElement('div');
+      tiles.className = 'palette-tiles';
+      wrap.appendChild(tiles);
+      return { wrap: wrap, tiles: tiles };
+    }
+
+    function makeTile(href, thumbSrc, alt, caption, extraClass) {
+      var tile = document.createElement('div');
+      tile.className = 'card palette-tile' + (extraClass ? ' ' + extraClass : '');
+      var link = document.createElement('a');
+      link.className = 'card-img-link';
+      link.href = href;
+      var img = document.createElement('img');
+      img.loading = 'lazy';
+      img.src = thumbSrc;
+      img.alt = alt;
+      link.appendChild(img);
+      var name = document.createElement('span');
+      name.className = 'palette-tile-name';
+      name.textContent = caption;
+      tile.appendChild(link);
+      tile.appendChild(name);
+      return tile;
+    }
+
+    function renderGrid(data) {
       gridEl.innerHTML = '';
-      var summary = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (input.value.trim() || 'all');
-      gridEl.dataset.queueSource = 'Search: ' + summary;
-      if (!media.length) {
+      var summary = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (fragmentText().trim() || 'all');
+      var hasAny = data.media.length || data.sets.length || data.people.length;
+      if (!hasAny) {
         var empty = document.createElement('div');
         empty.className = 'palette-empty';
-        empty.textContent = chips.length || input.value.trim() ? '— no media matches this query —' : 'Type to search, or pick a suggestion…';
+        empty.textContent = chips.length || fragmentText().trim() ? '— no results for this query —' : 'Type to search, or pick a suggestion…';
         gridEl.appendChild(empty);
         return;
       }
-      media.forEach(function (m) {
-        var tile = document.createElement('div');
-        tile.className = 'card palette-tile';
-        tile.dataset.fileId = m.id;
-        var link = document.createElement('a');
-        link.className = 'card-img-link';
-        link.href = '/photo/' + m.id;
-        var img = document.createElement('img');
-        img.loading = 'lazy';
-        img.src = '/thumb/' + m.id;
-        img.alt = m.filename;
-        link.appendChild(img);
-        var name = document.createElement('span');
-        name.className = 'palette-tile-name';
-        name.textContent = m.title || m.filename;
-        tile.appendChild(link);
-        tile.appendChild(name);
-        gridEl.appendChild(tile);
-      });
+      if (data.sets.length) {
+        var setSec = section('SETS', data.sets.length);
+        data.sets.forEach(function (s) {
+          setSec.tiles.appendChild(makeTile(
+            '/sets/' + s.id,
+            s.thumb_file_id != null ? '/thumb/' + s.thumb_file_id : '',
+            s.name, s.name, 'palette-tile-set'
+          ));
+        });
+        gridEl.appendChild(setSec.wrap);
+      }
+      if (data.people.length) {
+        var peopleSec = section('PEOPLE', data.people.length);
+        data.people.forEach(function (p) {
+          peopleSec.tiles.appendChild(makeTile(
+            '/search?person=' + encodeURIComponent(p.name),
+            p.face_id != null ? '/face-crop/manual:' + p.face_id : '',
+            p.name, p.name, 'palette-tile-person'
+          ));
+        });
+        gridEl.appendChild(peopleSec.wrap);
+      }
+      if (data.media.length) {
+        var photoSec = section('PHOTOS', data.media.length);
+        data.media.forEach(function (m) {
+          var tile = makeTile('/photo/' + m.id, '/thumb/' + m.id, m.filename, m.title || m.filename);
+          tile.dataset.fileId = m.id;
+          photoSec.tiles.appendChild(tile);
+        });
+        photoSec.tiles.dataset.queueSource = 'Search: ' + summary;
+        gridEl.appendChild(photoSec.wrap);
+      }
     }
 
     function buildFilterHref() {
@@ -714,14 +774,17 @@
       var s = suggestions[Math.min(highlighted, suggestions.length - 1)];
       if (!s) return;
       chips.push({ type: s.type, value: s.value });
-      input.value = '';
+      input.value = leftoverText();
       highlighted = 0;
+      input.focus();
+      var len = input.value.length;
+      input.setSelectionRange(len, len);
       query();
     }
 
     function query() {
       var seq = ++requestSeq;
-      var q = input.value.trim();
+      var q = fragmentText().trim();
       fetch('/api/search-palette', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -734,9 +797,10 @@
           highlighted = 0;
           renderChips();
           renderSuggestions();
-          renderGrid(data.media);
+          renderGrid(data);
           countEl.textContent = data.total_count + ' RESULTS';
-          if (data.total_count > data.media.length) {
+          var shown = data.media.length + data.sets.length + data.people.length;
+          if (data.total_count > data.media.length && shown) {
             viewAllEl.style.display = '';
             viewAllEl.href = buildFilterHref();
             viewAllEl.textContent = 'View all ' + data.total_count + ' results →';
