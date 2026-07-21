@@ -5,7 +5,14 @@
 
 {% block content %}
 <div class="page-heading">
-  <h1>{{ name }}</h1>
+  <h1>
+    {{ name }}
+    <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }}">🔍</a>
+    <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
+  </h1>
+  {% if aliases %}
+  <span class="sub">also known as {{ aliases | join(', ') }}</span>
+  {% endif %}
   {% if total %}<span class="sub">{{ total }} photo(s)</span>{% endif %}
 </div>
 
@@ -176,6 +183,138 @@
   }
 
   loadMore();
+})();
+
+/* Pencil icon — rename this identity everywhere (existing PUT /api/identities/
+   {name}, propagates to every face/photo-assignment/set-link row) and manage
+   aliases (alternate lookup names, e.g. "babe" for "girlfriend" — purely a
+   /person/{alias} and /find-person/{alias} redirect-to-canonical convenience,
+   never written onto any face/assignment row itself). */
+(function() {
+  var editBtn = document.getElementById('person-edit-btn');
+  if (!editBtn) return;
+  var name = {{ name | tojson }};
+
+  editBtn.addEventListener('click', function() {
+    openModal('Edit ' + name, function(box) {
+      var nameLabel = document.createElement('div');
+      nameLabel.className = 'sub';
+      nameLabel.style.marginBottom = '4px';
+      nameLabel.textContent = 'Name';
+      box.appendChild(nameLabel);
+
+      var nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.value = name;
+      nameInput.style.width = '100%';
+      nameInput.style.marginBottom = '8px';
+      box.appendChild(nameInput);
+
+      var renameBtn = document.createElement('button');
+      renameBtn.type = 'button';
+      renameBtn.textContent = 'Save name';
+      renameBtn.addEventListener('click', function() {
+        var newName = nameInput.value.trim();
+        if (!newName || newName === name) return;
+        renameBtn.disabled = true;
+        fetch('/api/identities/' + encodeURIComponent(name), {
+          method: 'PUT',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: newName}),
+        })
+          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function() {
+            closeModal();
+            window.location.href = '/person/' + encodeURIComponent(newName);
+          })
+          .catch(function(err) {
+            renameBtn.disabled = false;
+            alert('Failed to rename: ' + err.message);
+          });
+      });
+      box.appendChild(renameBtn);
+
+      var aliasLabel = document.createElement('div');
+      aliasLabel.className = 'sub';
+      aliasLabel.style.margin = '14px 0 4px';
+      aliasLabel.textContent = 'Aliases (alternate names for the same person)';
+      box.appendChild(aliasLabel);
+
+      var aliasList = document.createElement('div');
+      aliasList.style.display = 'flex';
+      aliasList.style.flexWrap = 'wrap';
+      aliasList.style.gap = '6px';
+      aliasList.style.marginBottom = '8px';
+      box.appendChild(aliasList);
+
+      function renderAliases(aliases) {
+        aliasList.innerHTML = '';
+        if (!aliases.length) {
+          var empty = document.createElement('span');
+          empty.className = 'sub';
+          empty.textContent = 'No aliases yet.';
+          aliasList.appendChild(empty);
+          return;
+        }
+        aliases.forEach(function(alias) {
+          var chip = document.createElement('span');
+          chip.className = 'tag-removable';
+          chip.style.display = 'inline-flex';
+          chip.textContent = alias;
+          var rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'rm';
+          rm.title = 'Remove alias';
+          rm.textContent = '×';
+          rm.addEventListener('click', function() {
+            rm.disabled = true;
+            fetch('/api/identities/' + encodeURIComponent(name) + '/aliases/' + encodeURIComponent(alias), {method: 'DELETE'})
+              .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+              .then(function(data) { renderAliases(data.aliases || []); })
+              .catch(function(err) {
+                rm.disabled = false;
+                alert('Failed to remove alias: ' + err.message);
+              });
+          });
+          chip.appendChild(rm);
+          aliasList.appendChild(chip);
+        });
+      }
+      renderAliases({{ aliases | default([]) | tojson }});
+
+      var aliasInput = document.createElement('input');
+      aliasInput.type = 'text';
+      aliasInput.placeholder = 'e.g. babe…';
+      aliasInput.style.width = '100%';
+      aliasInput.style.marginBottom = '8px';
+      box.appendChild(aliasInput);
+
+      var addAliasBtn = document.createElement('button');
+      addAliasBtn.type = 'button';
+      addAliasBtn.textContent = '+ Add alias';
+      addAliasBtn.addEventListener('click', function() {
+        var alias = aliasInput.value.trim();
+        if (!alias) return;
+        addAliasBtn.disabled = true;
+        fetch('/api/identities/' + encodeURIComponent(name) + '/aliases', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({alias: alias}),
+        })
+          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function(data) {
+            addAliasBtn.disabled = false;
+            aliasInput.value = '';
+            renderAliases(data.aliases || []);
+          })
+          .catch(function(err) {
+            addAliasBtn.disabled = false;
+            alert('Failed to add alias: ' + err.message);
+          });
+      });
+      box.appendChild(addAliasBtn);
+    });
+  });
 })();
 </script>
 {% endblock %}

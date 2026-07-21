@@ -187,6 +187,22 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_set_assignments_identity ON identity_set_assignments (identity)')
+        # Alternate names for an identity ("girlfriend" / "babe" both meaning the
+        # same person) — purely a lookup convenience layered on top of the single
+        # canonical `identity` string every faces/assignment row actually stores;
+        # an alias is never written onto a face/assignment row itself, only
+        # resolved back to its canonical identity at lookup time (see
+        # resolve_identity_name), so renaming the canonical identity doesn't
+        # require touching every alias row's meaning, just its `identity` column.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS identity_aliases (
+                identity TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (alias)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_aliases_identity ON identity_aliases (identity)')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS categories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -969,7 +985,46 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))
         self.conn.commit()
+
+    def add_identity_alias(self, identity, alias):
+        """Record `alias` as an alternate name for `identity` ("babe" for
+        "girlfriend"). An alias is unique across the whole table (PRIMARY KEY on
+        alias alone) — it can't simultaneously mean two different people, and it
+        silently overwrites its own previous canonical identity if re-added
+        pointing elsewhere (INSERT OR REPLACE), matching "aliases are just a
+        lookup shortcut" rather than a decision worth erroring over."""
+        alias = alias.strip()
+        identity = identity.strip()
+        if not alias or alias == identity:
+            return
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT OR REPLACE INTO identity_aliases (identity, alias, created_at) VALUES (?, ?, ?)',
+            (identity, alias, int(time.time()))
+        )
+        self.conn.commit()
+
+    def remove_identity_alias(self, alias):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM identity_aliases WHERE alias = ?', (alias,))
+        self.conn.commit()
+
+    def get_aliases_for_identity(self, identity):
+        cur = self.conn.cursor()
+        cur.execute('SELECT alias FROM identity_aliases WHERE identity = ? ORDER BY alias', (identity,))
+        return [row[0] for row in cur.fetchall()]
+
+    def resolve_identity_name(self, name):
+        """If `name` is a known alias, return its canonical identity; otherwise
+        return `name` unchanged (it's either already canonical, or genuinely
+        unknown — callers that need to distinguish 'unknown' already check that
+        separately, e.g. via _identity_checksums coming back empty)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT identity FROM identity_aliases WHERE alias = ?', (name,))
+        row = cur.fetchone()
+        return row[0] if row else name
 
     def set_face_favorite(self, manual_face_id, favorite):
         cur = self.conn.cursor()

@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import time
+from urllib.parse import quote
 from pathlib import Path
 from typing import List, Optional
 
@@ -70,6 +71,9 @@ class TagLabelBody(BaseModel):
 
 class RenameIdentityBody(BaseModel):
     name: str
+
+class IdentityAliasBody(BaseModel):
+    alias: str
 
 class UnassignIdentityBody(BaseModel):
     file_ids: List[int]
@@ -886,6 +890,9 @@ def create_app(data_root: str) -> FastAPI:
         branch, which dumped an unpaginated grid mixed with generic
         bulk-select/add-to-set controls and manual set/photo assignment tools
         that belong on the set-detail and photo-detail pages instead."""
+        canonical = manual.resolve_identity_name(name)
+        if canonical != name:
+            return RedirectResponse(url=f'/person/{quote(canonical)}')
         checksums, linked_sets = _identity_checksums(name)
         message = ''
         tags = []
@@ -915,6 +922,7 @@ def create_app(data_root: str) -> FastAPI:
             'message': message,
             'tags': tags,
             'sets': sets,
+            'aliases': manual.get_aliases_for_identity(name),
             'total': len(checksums),
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
@@ -938,6 +946,25 @@ def create_app(data_root: str) -> FastAPI:
         else:
             page_cards = _enrich_rows(rows[offset:offset + limit])
         return {'cards': page_cards, 'total': len(rows), 'offset': offset, 'limit': limit}
+
+    @app.get('/find-person/{name}', response_class=HTMLResponse)
+    def find_person_page(request: Request, name: str):
+        """Person-scoped face-suggestion swipe stream — 'is this <name>?' cards
+        ranked by embedding similarity to their confirmed faces, same
+        /api/face-suggestions/next stream as /faces but scoped via the
+        `identity` param (see _next_face_suggestions' identity_filter). Split
+        out from /person/{name} (which is a static profile: tags/sets/photos)
+        so that page stays fast and this one can own the swipe/undo/threshold
+        UI without cluttering the profile. Reachable via the 🔍 icon next to
+        the name on /person/{name}."""
+        canonical = manual.resolve_identity_name(name)
+        if canonical != name:
+            return RedirectResponse(url=f'/find-person/{quote(canonical)}')
+        return templates.TemplateResponse(request, 'find_person.html', {
+            'name': name,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int):
@@ -2270,6 +2297,23 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=400, detail='Name must not be empty')
         manual.rename_identity(name, new_name)
         return {'name': new_name}
+
+    @app.get('/api/identities/{name}/aliases')
+    def api_list_identity_aliases(name: str):
+        return {'aliases': manual.get_aliases_for_identity(name)}
+
+    @app.post('/api/identities/{name}/aliases')
+    def api_add_identity_alias(name: str, body: IdentityAliasBody):
+        alias = (body.alias or '').strip()
+        if not alias:
+            raise HTTPException(status_code=400, detail='Alias must not be empty')
+        manual.add_identity_alias(name, alias)
+        return {'aliases': manual.get_aliases_for_identity(name)}
+
+    @app.delete('/api/identities/{name}/aliases/{alias}')
+    def api_remove_identity_alias(name: str, alias: str):
+        manual.remove_identity_alias(alias)
+        return {'aliases': manual.get_aliases_for_identity(name)}
 
     @app.post('/api/identities/{name}/unassign')
     def api_unassign_identity(name: str, body: UnassignIdentityBody):

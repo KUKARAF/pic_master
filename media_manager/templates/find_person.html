@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+
+{% block title %}Find {{ name }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Find {{ name }}</h1>
+  <a href="/person/{{ name | urlencode }}" class="sub">← Back to {{ name }}</a>
+</div>
+
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="find-person-avoid-existing-toggle" checked>
+  Deprioritize photos that already have an identified face
+</label>
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="find-person-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="find-person-swipe-reject-btn" title="Not same face (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="find-person-swipe-confirm-btn" title="Same face (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/swipe-core.js"></script>
+<script>
+/* Identity-scoped face-suggestion stream — same /api/face-suggestions/next
+   stream as /faces, but scoped via `identity` to just this one person's
+   confirmed embeddings (see _next_face_suggestions' identity_filter). Bias
+   is meaningless in this scoped mode (every candidate already shares this
+   identity), so fetchMoreUrl never sends bias params. */
+(function() {
+  const personName = {{ name | tojson }};
+  if (!personName || !window.initSwipeStack || !document.getElementById('find-person-swipe-stack')) return;
+
+  function wireExpandSimilarSearch() {
+    const slider = document.getElementById('similar-threshold-slider');
+    const sliderValue = document.getElementById('similar-threshold-value');
+    const expandBtn = document.getElementById('expand-similar-btn');
+    const expandStatus = document.getElementById('expand-similar-status');
+    const similarGrid = document.getElementById('similar-unknown-grid');
+    if (!expandBtn) return;
+
+    if (slider && sliderValue) {
+      slider.addEventListener('input', function() {
+        sliderValue.textContent = parseFloat(slider.value).toFixed(2);
+      });
+    }
+
+    expandBtn.addEventListener('click', function() {
+      const threshold = slider ? slider.value : 0.3;
+      const url = '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
+      expandStatus.style.display = 'block';
+      expandStatus.textContent = 'Searching…';
+      fetch(url)
+        .then(function(r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function(data) {
+          const results = data.results || [];
+          if (!results.length) {
+            expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
+            return;
+          }
+          expandStatus.style.display = 'none';
+          similarGrid.innerHTML = '';
+          results.forEach(function(f) {
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.id = 'unknown-card-' + f.ref;
+            card.dataset.faceRef = f.ref;
+            card.innerHTML =
+              '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
+                '<img src="/face-crop/' + f.ref + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
+              '</a>' +
+              '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
+              '<div class="card-body">' +
+                '<div class="card-name" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.identity || f.filename) + '</div>' +
+                '<button type="button" class="btn-similar use-name-btn" data-face-ref="' + f.ref + '" ' +
+                  'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + escapeHtml(personName) + '"</button>' +
+              '</div>';
+            similarGrid.appendChild(card);
+            card.querySelector('.use-name-btn').addEventListener('click', function(e) {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              fetch('/api/faces/' + encodeURIComponent(btn.dataset.faceRef) + '/identity', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({name: personName}),
+              })
+                .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+                .then(function() { card.remove(); })
+                .catch(function(err) {
+                  btn.disabled = false;
+                  alert('Failed to assign name: ' + err.message);
+                });
+            });
+          });
+        })
+        .catch(function(err) {
+          expandStatus.textContent = 'Search error: ' + err.message;
+        });
+    });
+  }
+
+  window.initSwipeStack({
+    stackElId: 'find-person-swipe-stack',
+    confirmBtnId: 'find-person-swipe-confirm-btn',
+    rejectBtnId: 'find-person-swipe-reject-btn',
+    initialCards: [],
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      const avoidToggle = document.getElementById('find-person-avoid-existing-toggle');
+      const params = new URLSearchParams({
+        count: String(need || 10),
+        identity: personName,
+        avoid_existing: String(!avoidToggle || avoidToggle.checked),
+      });
+      return '/api/face-suggestions/next?' + params.toString();
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+        questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
+        scoreText: 'match score ' + card.score.toFixed(2),
+        metaHtml: swipeCardMeta(card),
+        originalUrl: '/photo/' + card.file_id,
+      };
+    },
+    onConfirm: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
+    },
+    onReject: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+    },
+    onUndo: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+    },
+    emptyStateHtml: function(stackEl) {
+      stackEl.innerHTML =
+        '<div class="alert" id="similar-empty-state">' +
+          '<p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>' +
+          '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+            '<label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
+            '<input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">' +
+            '<span id="similar-threshold-value" class="sub">0.30</span>' +
+            '<button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>' +
+          '</div>' +
+          '<div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>' +
+        '</div>' +
+        '<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>';
+      wireExpandSimilarSearch();
+    },
+  });
+})();
+</script>
+{% endblock %}
