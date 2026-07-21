@@ -1204,7 +1204,17 @@ class ManualDB(ThreadLocalDB):
         photos surfaces once, in the assigned group). A face id found directly
         in this set is always preferred for the thumbnail; names that only came
         from the manual sources fall back to any named face for them elsewhere
-        in the library, and get None only if no such face exists at all."""
+        in the library, and get None only if no such face exists at all.
+
+        Each value is actually a (face_id, set_linked) pair — set_linked is True
+        only for the identity_set_assignments source (an explicit "person X is in
+        this set" link made via link_identity_to_set/the assign-set endpoint),
+        the one and only source unlink_identity_from_set can undo. A name present
+        via a whole-photo assignment or a detected face but with no set-link row
+        is set_linked=False — callers should only offer a "remove" action when
+        this is True, since there'd be nothing for the unlink call to actually
+        delete for the other two sources, and removing it wouldn't necessarily
+        make the person disappear from this list anyway."""
         cur = self.conn.cursor()
         face_people = {}
         if member_checksums:
@@ -1217,17 +1227,19 @@ class ManualDB(ThreadLocalDB):
             for identity, face_id in cur.fetchall():
                 face_people[identity] = face_id
 
-        assigned_names = set()
+        photo_assigned_names = set()
         if member_checksums:
             placeholders = ','.join('?' for _ in member_checksums)
             cur.execute(f'''
                 SELECT DISTINCT identity FROM identity_photo_assignments
                 WHERE checksum IN ({placeholders})
             ''', tuple(member_checksums))
-            assigned_names.update(row[0] for row in cur.fetchall())
+            photo_assigned_names.update(row[0] for row in cur.fetchall())
 
         cur.execute('SELECT identity FROM identity_set_assignments WHERE set_id = ?', (set_id,))
-        assigned_names.update(row[0] for row in cur.fetchall())
+        set_linked_names = {row[0] for row in cur.fetchall()}
+
+        assigned_names = photo_assigned_names | set_linked_names
 
         people = {}
         for identity in sorted(assigned_names, key=str.lower):
@@ -1246,7 +1258,7 @@ class ManualDB(ThreadLocalDB):
             for identity, face_id in cur.fetchall():
                 people[identity] = face_id
 
-        return people
+        return {identity: (face_id, identity in set_linked_names) for identity, face_id in people.items()}
 
     # ------------------------------------------------------------------
     # Migration bookkeeping (kept for future one-off migrations; nothing uses this today)

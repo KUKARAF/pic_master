@@ -1549,11 +1549,15 @@ def create_app(data_root: str) -> FastAPI:
         theirs, so the template can offer "Estimate age" against the existing
         whole-photo endpoint instead. Order comes straight from
         manual.get_people_present_in_set (manually assigned people first, then
-        detected-face-only people, each name once) — not re-sorted here."""
+        detected-face-only people, each name once) — not re-sorted here. Each
+        entry also carries 'set_linked': True only for an explicit
+        identity_set_assignments link, the one case the set page's "remove"
+        action (DELETE /api/identities/{name}/assign-set/{set_id}) applies to."""
         people = manual.get_people_present_in_set(set_id, member_checksums)
         result = []
-        for identity, face_id in people.items():
-            entry = {'identity': identity, 'face_ref': None, 'age': None, 'gender': None, 'file_id': None}
+        for identity, (face_id, set_linked) in people.items():
+            entry = {'identity': identity, 'face_ref': None, 'age': None, 'gender': None, 'file_id': None,
+                     'set_linked': set_linked}
             if face_id is not None:
                 face_ref = f'manual:{face_id}'
                 entry['face_ref'] = face_ref
