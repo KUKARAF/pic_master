@@ -419,15 +419,61 @@ def create_app(data_root: str) -> FastAPI:
             by_name.setdefault(name, set()).add(checksum)
         return by_name
 
-    def _checksums_for_chip(chip, category_map=None):
+    def _tag_checksums_by_label():
+        """{label: set(checksums)} for every positive tag, one query total. Same
+        reasoning as _category_checksums_by_name: get_files_by_tag is a cheap,
+        indexed single-tag query, but calling it once per tag *candidate* while
+        ranking suggestions still means one query per tag on every keystroke —
+        for a library with hundreds of tags that's hundreds of round trips just
+        to render a dropdown."""
+        cur = manual.conn.cursor()
+        cur.execute("SELECT checksum, label FROM tags WHERE polarity = 'positive'")
+        by_label = {}
+        for checksum, label in cur.fetchall():
+            by_label.setdefault(label, set()).add(checksum)
+        return by_label
+
+    def _set_checksums_by_id():
+        """{set_id: set(checksums)} for every set, one query total — same
+        reasoning as _tag_checksums_by_label, for get_files_by_set."""
+        cur = manual.conn.cursor()
+        cur.execute('SELECT checksum, set_id FROM file_sets')
+        by_id = {}
+        for checksum, set_id in cur.fetchall():
+            by_id.setdefault(set_id, set()).add(checksum)
+        return by_id
+
+    def _identity_checksums_by_name(set_map):
+        """{identity: set(checksums)} — own (named, non-rejected) faces, plus
+        whole-photo assignments, plus sets linked to that identity (expanded via
+        the already-computed set_map) — a handful of queries total instead of
+        ~2-4 queries per identity *candidate*. get_files_by_face_identity in
+        particular does a LOWER(identity) LIKE '%...%' scan with no usable index;
+        calling that once per identity on every keystroke was the single biggest
+        cost in ranking suggestions once the category scan was fixed."""
+        cur = manual.conn.cursor()
+        by_name = {}
+        cur.execute('SELECT DISTINCT checksum, identity FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        for checksum, identity in cur.fetchall():
+            by_name.setdefault(identity, set()).add(checksum)
+        cur.execute('SELECT checksum, identity FROM identity_photo_assignments')
+        for checksum, identity in cur.fetchall():
+            by_name.setdefault(identity, set()).add(checksum)
+        cur.execute('SELECT set_id, identity FROM identity_set_assignments')
+        for set_id, identity in cur.fetchall():
+            by_name.setdefault(identity, set()).update(set_map.get(set_id, ()))
+        return by_name
+
+    def _checksums_for_chip(chip, category_map=None, tag_map=None, set_map=None, identity_map=None):
         """Resolve one search-palette/multi-filter chip ({'type', 'value'}) to the
         set of checksums it matches. 'face' replicates the union search_page's
         person branch already does inline (own faces + whole-photo assignments +
         photos in sets linked to this identity) so the palette and /search share one
-        definition instead of drifting apart. `category_map`, when given (the
-        search palette's suggestion loop passes one precomputed for the whole
-        request), avoids re-resolving categories from scratch per call — see
-        _category_checksums_by_name."""
+        definition instead of drifting apart. The `*_map` args, when given (the
+        search palette precomputes all four once per request), avoid re-resolving
+        from scratch per call — see _category_checksums_by_name and friends above;
+        omitted (the /search f= path's case — a handful of chips, not a per-
+        keystroke ranking loop) falls back to the plain per-chip queries."""
         t, v = chip['type'], chip['value']
         if t == 'category':
             if category_map is not None:
@@ -437,26 +483,36 @@ def create_app(data_root: str) -> FastAPI:
                 return set()
             return set(get_resolved_checksums_for_category(manual, db, cat['id'], cat['name'], limit=500))
         if t == 'tag':
+            if tag_map is not None:
+                return set(tag_map.get(v, ()))
             return set(manual.get_files_by_tag(v, limit=1000))
         if t == 'face':
+            if identity_map is not None:
+                return set(identity_map.get(v, ()))
             checksums = set(manual.get_files_by_face_identity(v, limit=1000))
             checksums |= set(manual.get_photos_assigned_to_identity(v, limit=1000))
             for s in manual.get_sets_linked_to_identity(v):
                 checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
             return checksums
         if t == 'set':
+            if set_map is not None:
+                return set(set_map.get(int(v), ()))
             return set(manual.get_files_by_set(int(v), limit=1000))
         if t == 'file':
             return {row[2] for row in db.search_by_path_substring(v, limit=200)}
         return set()
 
-    def _intersect_chips(chips, category_map=None):
+    def _intersect_chips(chips, category_map=None, tag_map=None, set_map=None, identity_map=None):
         """None means 'no restriction' (caller decides what that means); an empty
         chip list always means None, never an empty set, so a chip-less query isn't
         mistaken for 'matches nothing'."""
         if not chips:
             return None
-        sets = [_checksums_for_chip(c, category_map=category_map) for c in chips]
+        sets = [
+            _checksums_for_chip(c, category_map=category_map, tag_map=tag_map,
+                                 set_map=set_map, identity_map=identity_map)
+            for c in chips
+        ]
         return set.intersection(*sets) if sets else set()
 
     def _attach_file_meta(cards, file_id_field='file_id'):
@@ -1311,53 +1367,32 @@ def create_app(data_root: str) -> FastAPI:
         vocab = merge_vocab(base_vocab, manual.get_all_positive_labels())
         return {'vocab': vocab}
 
-    def _palette_candidates(q):
-        """Every name-facet candidate (category/tag/face/set), plus filenames when q
-        is non-empty (filename matching only makes sense against typed text — there's
-        no 'top filenames' equivalent to a tag/category's count ranking)."""
-        candidates = []
-        for r in manual.list_categories():
-            candidates.append({'type': 'category', 'value': r['name'], 'label': r['name'], '_count': r['image_count']})
-        for label, cnt in manual.list_all_tags():
-            candidates.append({'type': 'tag', 'value': label, 'label': label, '_count': cnt})
-        for name, cnt in manual.get_all_identities():
-            candidates.append({'type': 'face', 'value': name, 'label': name, '_count': cnt})
-        for r in manual.list_sets():
-            candidates.append({'type': 'set', 'value': str(r['id']), 'label': r['name'], '_count': r['image_count']})
-        if q:
-            for row in db.search_by_path_substring(q, limit=20):
-                filename = os.path.basename(row[1])
-                candidates.append({'type': 'file', 'value': filename, 'label': filename, '_count': None})
-        return candidates
-
     @app.post('/api/search-palette')
     def api_search_palette(body: SearchPaletteBody):
+        """Resolves the current chip combination (+ an optional free-text filename
+        fallback) to a result grid. Suggestion *ranking* — matching what you're
+        typing against known tags/categories/faces/sets — no longer happens here
+        at all: the frontend preloads /api/tags, /api/categories, /api/identities,
+        /api/sets once and fuzzy-matches them client-side (same fuzzyScore used by
+        the entity picker), so that part is instant and needs no round trip. This
+        endpoint only has to do real checksum-set work, which is inherently a
+        server-side/DB job — but only once per call now, not once per candidate."""
         q = body.q.strip().lower()
         chips = [{'type': c.type, 'value': c.value} for c in body.chips]
-        active_keys = {(c['type'], c['value']) for c in chips}
-        # Computed once per request (not once per category candidate — see
-        # _category_checksums_by_name's docstring for why that distinction matters).
+        # Computed once per request — see each _*_checksums_by_* helper's
+        # docstring for why resolving per-chip from scratch (fine for the rare
+        # /search f= page load) doesn't scale to a call made on every keystroke.
         category_map = _category_checksums_by_name()
-
-        suggestions = []
-        for cand in _palette_candidates(q):
-            key = (cand['type'], cand['value'])
-            if key in active_keys:
-                continue
-            if q and q not in cand['label'].lower():
-                continue
-            count = len(_intersect_chips(chips + [{'type': cand['type'], 'value': cand['value']}], category_map=category_map))
-            if count == 0:
-                continue
-            suggestions.append({'type': cand['type'], 'value': cand['value'], 'label': cand['label'], 'count': count})
-        suggestions.sort(key=lambda s: s['count'], reverse=True)
-        suggestions = suggestions[:8]
+        tag_map = _tag_checksums_by_label()
+        set_map = _set_checksums_by_id()
+        identity_map = _identity_checksums_by_name(set_map)
 
         media = []
         sets_result = []
         people_result = []
         total_count = 0
-        checksums = _intersect_chips(chips, category_map=category_map)
+        checksums = _intersect_chips(chips, category_map=category_map, tag_map=tag_map,
+                                      set_map=set_map, identity_map=identity_map)
         if checksums is not None or q:
             if checksums is None:
                 # q alone (no chips yet) — filename substring is the only sensible
@@ -1400,10 +1435,7 @@ def create_app(data_root: str) -> FastAPI:
                     key=lambda p: p['count'], reverse=True
                 )[:6]
 
-        return {
-            'suggestions': suggestions, 'media': media, 'sets': sets_result,
-            'people': people_result, 'total_count': total_count,
-        }
+        return {'media': media, 'sets': sets_result, 'people': people_result, 'total_count': total_count}
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):

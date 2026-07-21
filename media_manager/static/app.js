@@ -583,6 +583,36 @@
   /* ranked together as suggestions, Enter locks the highlighted one into a  */
   /* removable chip, and chips AND-combine live against a preview grid.      */
   /* ------------------------------------------------------------------ */
+  /* Preloaded once, page-wide, the moment this script runs — not gated on the
+     palette ever being opened. Every tag/category/identity/set name+count is
+     small enough to hold entirely in memory, so suggestion ranking (fuzzy-
+     matching what's typed against these) never needs a network round trip;
+     only resolving a chip combination to actual matching photos/sets/people
+     needs the server (that's real checksum-set work). Reuses the same list
+     endpoints/shapes openEntitySearchModal's ENTITY_TYPE_CONFIGS already
+     fetches, so there's exactly one source of truth per entity type. */
+  var paletteCandidates = null; // [{type, value, label, count}, ...] once loaded
+  var paletteCandidatesPromise = (function () {
+    var sources = [
+      { type: 'category', url: '/api/categories', label: function (c) { return c.name; }, value: function (c) { return c.name; }, count: function (c) { return c.image_count || 0; } },
+      { type: 'tag', url: '/api/tags', label: function (t) { return t.tag; }, value: function (t) { return t.tag; }, count: function (t) { return t.count || 0; } },
+      { type: 'face', url: '/api/identities', label: function (i) { return i.name; }, value: function (i) { return i.name; }, count: function (i) { return i.count || 0; } },
+      { type: 'set', url: '/api/sets', label: function (s) { return s.name; }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
+    ];
+    return Promise.all(sources.map(function (src) {
+      return fetch(src.url).then(function (r) { return r.json(); }).then(function (data) {
+        return data.map(function (item) {
+          return { type: src.type, value: src.value(item), label: src.label(item), count: src.count(item) };
+        });
+      });
+    })).then(function (lists) {
+      paletteCandidates = [].concat.apply([], lists);
+    }).catch(function (err) {
+      console.error('failed to preload search palette candidates:', err);
+      paletteCandidates = [];
+    });
+  })();
+
   (function () {
     var overlay = document.getElementById('palette-overlay');
     var input = document.getElementById('palette-input');
@@ -596,9 +626,9 @@
     var viewAllEl = document.getElementById('palette-viewall');
 
     var chips = [];       // [{type, value}]
-    var suggestions = []; // last response's suggestion list
+    var suggestions = []; // current in-memory suggestion list
     var highlighted = 0;
-    var requestSeq = 0;   // guards against an in-flight request resolving out of order
+    var requestSeq = 0;   // guards against an in-flight grid request resolving out of order
 
     var FACET_LABELS = { category: 'CAT', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
 
@@ -621,7 +651,8 @@
       overlay.style.display = 'flex';
       input.value = '';
       input.focus();
-      query();
+      updateSuggestions();
+      updateGrid();
     }
     function close() {
       overlay.style.display = 'none';
@@ -649,7 +680,8 @@
         chip.title = 'remove';
         chip.addEventListener('click', function () {
           chips.splice(i, 1);
-          query();
+          updateSuggestions();
+          updateGrid();
         });
         chipsEl.appendChild(chip);
       });
@@ -770,19 +802,41 @@
       return '/search?' + parts.join('&');
     }
 
-    function commitHighlighted() {
-      var s = suggestions[Math.min(highlighted, suggestions.length - 1)];
-      if (!s) return;
-      chips.push({ type: s.type, value: s.value });
-      input.value = leftoverText();
-      highlighted = 0;
-      input.focus();
-      var len = input.value.length;
-      input.setSelectionRange(len, len);
-      query();
+    /* Instant, offline, client-side suggestion ranking — no network call. Uses
+       the same subsequence fuzzy matcher as openEntitySearchModal (fuzzyScore,
+       above). Empty fragment shows the top candidates by their own global
+       count (a quick browse/entry point); a typed fragment fuzzy-filters and
+       sorts by match quality. Counts shown are each candidate's own total —
+       not intersected with the currently active chips, which would need the
+       server; the grid (updateGrid) is the actual live combined result. */
+    function computeSuggestions() {
+      var fragment = fragmentText().trim();
+      var activeKeys = {};
+      chips.forEach(function (c) { activeKeys[c.type + ':' + c.value] = true; });
+      var pool = (paletteCandidates || []).filter(function (c) {
+        return !activeKeys[c.type + ':' + c.value];
+      });
+      if (!fragment) {
+        pool = pool.slice().sort(function (a, b) { return b.count - a.count; });
+        return pool.slice(0, 8);
+      }
+      var scored = [];
+      pool.forEach(function (c) {
+        var score = fuzzyScore(fragment, c.label);
+        if (score !== null) scored.push({ item: c, score: score });
+      });
+      scored.sort(function (a, b) { return a.score - b.score; });
+      return scored.slice(0, 8).map(function (s) { return s.item; });
     }
 
-    function query() {
+    function updateSuggestions() {
+      suggestions = paletteCandidates === null ? [] : computeSuggestions();
+      highlighted = 0;
+      renderChips();
+      renderSuggestions();
+    }
+
+    function updateGrid() {
       var seq = ++requestSeq;
       var q = fragmentText().trim();
       fetch('/api/search-palette', {
@@ -799,11 +853,7 @@
           return r.json();
         })
         .then(function (data) {
-          if (seq !== requestSeq) return; // a newer keystroke's request already landed
-          suggestions = data.suggestions;
-          highlighted = 0;
-          renderChips();
-          renderSuggestions();
+          if (seq !== requestSeq) return; // a newer request already landed
           renderGrid(data);
           countEl.textContent = data.total_count + ' RESULTS';
           var shown = data.media.length + data.sets.length + data.people.length;
@@ -817,19 +867,39 @@
         })
         .catch(function (err) {
           if (seq !== requestSeq) return;
-          console.error('search palette query failed:', err);
-          suggestionsEl.innerHTML = '';
+          console.error('search palette grid query failed:', err);
+          gridEl.innerHTML = '';
           var errEl = document.createElement('div');
           errEl.className = 'palette-empty';
           errEl.textContent = 'search error — see browser console for details';
-          suggestionsEl.appendChild(errEl);
+          gridEl.appendChild(errEl);
         });
     }
 
-    var debounceTimer = null;
+    function commitHighlighted() {
+      var s = suggestions[Math.min(highlighted, suggestions.length - 1)];
+      if (!s) return;
+      chips.push({ type: s.type, value: s.value });
+      input.value = leftoverText();
+      input.focus();
+      var len = input.value.length;
+      input.setSelectionRange(len, len);
+      updateSuggestions();
+      updateGrid();
+    }
+
+    var gridDebounceTimer = null;
     input.addEventListener('input', function () {
-      clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(query, 150);
+      updateSuggestions(); // instant, no debounce needed — it's pure in-memory work
+      clearTimeout(gridDebounceTimer);
+      gridDebounceTimer = setTimeout(updateGrid, 150);
+    });
+
+    // paletteCandidates may still be loading the first time the palette opens
+    // (a handful of small GETs, normally done well before that) — refresh
+    // suggestions once they land so an early keystroke isn't stuck empty.
+    paletteCandidatesPromise.then(function () {
+      if (overlay.style.display === 'flex') updateSuggestions();
     });
 
     input.addEventListener('keydown', function (e) {
@@ -848,7 +918,8 @@
         if (chips.length) {
           e.preventDefault();
           chips.pop();
-          query();
+          updateSuggestions();
+          updateGrid();
         }
       } else if (e.key === 'Escape') {
         e.preventDefault();
