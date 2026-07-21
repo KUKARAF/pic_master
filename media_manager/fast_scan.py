@@ -11,7 +11,7 @@ from .ignore import IgnoreRules
 from .formats import IMAGE_EXTENSIONS
 from .hasher import FileHasher
 
-def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False):
+def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False, manual=None):
     """
     Call GNU find, parse '%p|%s|%T@\n' lines, hash each candidate, upsert into DB.
     Reads .mediaignore (git-ignore syntax) in repo-root if present.
@@ -27,7 +27,14 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     reindex:         if True, files found already-tracked at the same path (see
                      already_indexed below) have their primary ML data (detections,
                      faces, frame-0 embedding) cleared, so the next index/embed/faces
-                     run reprocesses them instead of skipping them as already-done.
+                     run reprocesses them instead of skipping them as already-done —
+                     except faces for a checksum with any manual.db face decision
+                     already on it (see manual param), which are left alone.
+    manual:          ManualDB instance, used only when reindex=True to look up which
+                     checksums already have a human face decision and must keep their
+                     existing face detections untouched by the clear below. Optional —
+                     omitting it (or passing reindex=False) just means nothing is
+                     locked, matching the old unconditional-clear behavior.
     Returns (written_count, duplicate_count, already_indexed_count).
     """
     root_path = os.path.abspath(root_path)
@@ -118,6 +125,9 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     duplicates = []
     written = 0
     already_indexed = 0
+    # Computed once up front, not per file — a big rescan shouldn't turn into an
+    # extra manual.db query per already-tracked file just to check this.
+    locked_checksums = manual.get_all_checksums_with_manual_face_decision() if (reindex and manual is not None) else set()
     for rel_path, size, mtime, checksum in hashed:
         existing_file_id = db.find_file_id_by_checksum(checksum)
         if existing_file_id is not None:
@@ -128,7 +138,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
             already_indexed += 1
             db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
             if reindex:
-                db.clear_primary_ml_data(existing_file_id)
+                db.clear_primary_ml_data(existing_file_id, skip_faces=checksum in locked_checksums)
             continue
         db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
         written += 1

@@ -1009,15 +1009,24 @@ class Database(ThreadLocalDB):
         ''')
         return cursor.fetchall()
 
-    def clear_primary_ml_data(self, file_id):
+    def clear_primary_ml_data(self, file_id, skip_faces=False):
         """Delete primary-frame (frame_index NULL/0) detections, faces, body
         embeddings, and the frame-0 embedding for a file, so the next
         index/embed/faces run reprocesses it from scratch. Used by 'media
         add/commit --reindex' for files that were already tracked at the same path.
-        Frame-specific rows from 'scan all frames' are left untouched."""
+        Frame-specific rows from 'scan all frames' are left untouched.
+
+        skip_faces=True leaves the faces table alone entirely — for a file
+        with a manual.db face decision already on it, wiping and letting
+        `media faces` regenerate fresh auto-detected rows would break the
+        source_face_id link that ties the decision to a specific detection,
+        orphaning it and letting the same physical face resurface as a brand
+        new, undecided candidate. Everything else (detections/embeddings/body)
+        still reindexes normally — only face detection is locked."""
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM detections WHERE file_id = ? AND frame_index IS NULL', (file_id,))
-        cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
+        if not skip_faces:
+            cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         self.conn.commit()

@@ -1016,6 +1016,18 @@ class ManualDB(ThreadLocalDB):
         cur.execute("SELECT DISTINCT checksum FROM faces WHERE identity IS NOT NULL AND rejected = 0")
         return {row[0] for row in cur.fetchall()}
 
+    def get_all_checksums_with_manual_face_decision(self):
+        """Every checksum with at least one manual.db faces row at all —
+        confirmed, rejected, or otherwise manually touched. Broader than
+        get_all_checksums_with_named_face (which excludes rejected rows): a
+        rejected-but-undecided face still represents real human work that a
+        `--reindex` rescan must not silently discard by regenerating the
+        underlying auto-detected face rows out from under it (see
+        database.py's clear_primary_ml_data `skip_faces` param)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM faces')
+        return {row[0] for row in cur.fetchall()}
+
     def get_favorite_faces(self):
         """Non-rejected, favorited manual.db face rows (always named or hand-drawn,
         since only manual rows can be favorited)."""

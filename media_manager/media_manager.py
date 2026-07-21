@@ -49,7 +49,7 @@ class MediaManager:
         at the same path — see fast_scan.py.
         """
         abs_path = os.path.join(self.data_root, path)
-        return fast_scan(abs_path, self.db, self.data_root, recursive, reindex=reindex)
+        return fast_scan(abs_path, self.db, self.data_root, recursive, reindex=reindex, manual=self.manual)
 
     def get_file_info(self, path):
         return self.db.get_file_by_path(path)
