@@ -1131,6 +1131,19 @@ class ManualDB(ThreadLocalDB):
         )
         self.conn.commit()
 
+    def get_identities_assigned_to_photo(self, checksum):
+        """Reverse of get_photos_assigned_to_identity: every name manually,
+        faceless-ly assigned to this one photo — what photo.html's "Assigned
+        without a face" list renders. Ordered by assignment time so the most
+        recently confirmed name shows last, matching face-chip ordering
+        elsewhere."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT identity FROM identity_photo_assignments WHERE checksum = ? ORDER BY created_at',
+            (checksum,)
+        )
+        return [row[0] for row in cur.fetchall()]
+
     def get_photos_assigned_to_identity(self, identity, limit=1000):
         """Checksums manually whole-photo-assigned to this identity (exact match,
         unlike get_files_by_face_identity's substring search — these are written
