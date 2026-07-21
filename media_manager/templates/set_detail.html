@@ -10,6 +10,7 @@
     <button type="button" id="set-heart-btn" class="heart-btn-inline {{ 'is-favorite' if set.favorite else '' }}"
             title="Favorite this set">{{ '♥' if set.favorite else '♡' }}</button>
     <button type="button" id="set-edit-btn" class="heart-btn-inline" title="Rename set">✏️</button>
+    <button type="button" id="set-add-folder-btn" class="heart-btn-inline" title="Add all photos under a folder">📁</button>
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>
   </h1>
   <a href="/sets" class="sub">← Back to sets</a>
@@ -149,6 +150,101 @@
             .catch(function(err) { alert('Failed to rename set: ' + err.message); });
         });
         box.appendChild(saveBtn);
+      });
+    });
+  }
+
+  /* "Add folder" — bulk-adds every currently-tracked photo whose stored path
+     falls under a given folder to this set. Suggestions come from the parent
+     folders of photos already in the set (ranked by how many current members
+     live there), server-computed in _folder_suggestions_for_set and passed in
+     as `folderSuggestions` below — clicking one fills the input (rather than
+     firing immediately) so the user can still edit/confirm before submitting.
+     A plain text input, no fuzzy picker: there's no finite list of folders to
+     search against, matching the same "keep it simple" call the rename-set
+     modal already makes for its two fields. */
+  const folderSuggestions = {{ folder_suggestions | default([]) | tojson }};
+  const addFolderBtn = document.getElementById('set-add-folder-btn');
+  if (addFolderBtn) {
+    addFolderBtn.addEventListener('click', function() {
+      openModal('Add folder to set', function(box) {
+        const help = document.createElement('p');
+        help.className = 'sub';
+        help.style.marginTop = '0';
+        help.textContent = 'Every currently-tracked photo under this folder will be added to the set.';
+        box.appendChild(help);
+
+        const pathInput = document.createElement('input');
+        pathInput.type = 'text';
+        pathInput.placeholder = 'e.g. vacation/john/2023';
+        pathInput.style.width = '100%';
+        pathInput.style.marginBottom = '8px';
+        box.appendChild(pathInput);
+
+        if (folderSuggestions.length) {
+          const suggestLabel = document.createElement('p');
+          suggestLabel.className = 'sub';
+          suggestLabel.style.margin = '0 0 6px 0';
+          suggestLabel.textContent = 'Suggested (from photos already in this set):';
+          box.appendChild(suggestLabel);
+
+          const suggestWrap = document.createElement('div');
+          suggestWrap.style.display = 'flex';
+          suggestWrap.style.flexWrap = 'wrap';
+          suggestWrap.style.gap = '6px';
+          suggestWrap.style.marginBottom = '10px';
+          folderSuggestions.forEach(function(s) {
+            const chip = document.createElement('button');
+            chip.type = 'button';
+            chip.className = 'btn-similar';
+            chip.style.fontSize = '0.8em';
+            chip.textContent = s.path + ' (' + s.count + ')';
+            chip.title = 'Fill in "' + s.path + '"';
+            chip.addEventListener('click', function() {
+              pathInput.value = s.path;
+              pathInput.focus();
+            });
+            suggestWrap.appendChild(chip);
+          });
+          box.appendChild(suggestWrap);
+        }
+
+        const statusEl = document.createElement('p');
+        statusEl.className = 'sub';
+        statusEl.style.margin = '0 0 8px 0';
+        box.appendChild(statusEl);
+
+        const addBtn = document.createElement('button');
+        addBtn.type = 'button';
+        addBtn.textContent = 'Add folder';
+        addBtn.addEventListener('click', function() {
+          const path = pathInput.value.trim();
+          if (!path) return;
+          addBtn.disabled = true;
+          statusEl.textContent = 'Adding…';
+          fetch('/api/sets/' + setId + '/add-folder', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: path}),
+          })
+            .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+            .then(function(data) {
+              if (!data.matched) {
+                addBtn.disabled = false;
+                statusEl.textContent = 'No tracked photos found under "' + path + '". Check the path and try again.';
+                return;
+              }
+              closeModal();
+              alert('Added ' + data.added + ' photo(s) to this set' +
+                (data.already_present ? ' (' + data.already_present + ' were already in it).' : '.'));
+              location.reload();
+            })
+            .catch(function(err) {
+              addBtn.disabled = false;
+              statusEl.textContent = 'Failed to add folder: ' + err.message;
+            });
+        });
+        box.appendChild(addBtn);
       });
     });
   }
