@@ -2,10 +2,12 @@
 Main MediaManager class providing the primary interface for media management operations.
 """
 import os
+import sys
 from .database import Database
 from .fast_scan import fast_scan
 from .broken_finder import find_broken
 from .error_log import ErrorLog
+from .folder_markers import apply_folder_markers, discover_folder_markers
 from .manual_db import ManualDB
 
 _STOPWORDS = {'a', 'an', 'the', 'at', 'in', 'on', 'of', 'with', 'and', 'or', 'to', 'is', 'are', 'for', 'by', 'from'}
@@ -47,9 +49,22 @@ class MediaManager:
         see database.py), upsert into the DB. Path is relative to media_root.
         reindex: force reprocessing (clear primary ML data) for files already tracked
         at the same path — see fast_scan.py.
+
+        After the scan, discovers and applies any .noface/.categories/.set marker
+        files under `path` (see folder_markers.py) — every scanned file is already
+        tracked/hashed by this point, so markers apply to the current state of the
+        tree, not last scan's. Runs on every `media add`/`media commit`, same as
+        .mediaignore is consulted on every scan; idempotent, so re-scanning an
+        unchanged tree is a safe no-op for markers too.
         """
         abs_path = os.path.join(self.data_root, path)
-        return fast_scan(abs_path, self.db, self.data_root, recursive, reindex=reindex, manual=self.manual)
+        result = fast_scan(abs_path, self.db, self.data_root, recursive, reindex=reindex, manual=self.manual)
+        markers = discover_folder_markers(abs_path)
+        if markers:
+            warnings = apply_folder_markers(self.db, self.manual, self.data_root, markers)
+            for warning in warnings:
+                print(f"folder_markers: {warning}", file=sys.stderr)
+        return result
 
     def get_file_info(self, path):
         return self.db.get_file_by_path(path)

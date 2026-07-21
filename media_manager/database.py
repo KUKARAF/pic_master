@@ -85,6 +85,15 @@ class Database(ThreadLocalDB):
                 first_seen INTEGER NOT NULL
             )
         ''')
+        # noface: set by a .noface marker file (folder_markers.py) found in an
+        # ancestor directory at scan time — "assume there are no faces here",
+        # so `media faces` never selects this content for detection at all (see
+        # get_unface_indexed_files below). Checksum-scoped like everything else
+        # in this table, not per-path: the same content found again somewhere
+        # else is still the same "no faces here" photo.
+        files_cols = {row[1] for row in cursor.execute('PRAGMA table_info(files)')}
+        if 'noface' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN noface INTEGER NOT NULL DEFAULT 0')
         # file_paths: every location this content has been seen at. One-to-many — this
         # is where duplicates (same checksum, multiple paths) live. last_seen_at is
         # bumped on every scan that still finds the path on disk, so a path whose
@@ -808,19 +817,32 @@ class Database(ThreadLocalDB):
 
     def get_unface_indexed_files(self, limit=None) -> list:
         """Return (id, path) for files that have no primary (frame_index IS NULL)
-        row in faces table — independent of whether frame-specific rows exist."""
+        row in faces table — independent of whether frame-specific rows exist.
+        Excludes noface=1 files entirely (see set_noface_for_checksums) — a
+        .noface-marked photo is never even offered as a detection candidate,
+        rather than being detected and its results discarded."""
         cursor = self.conn.cursor()
         sql = '''
             SELECT f.id, f.path
             FROM files_with_path f
             LEFT JOIN faces fa ON fa.file_id = f.id AND fa.frame_index IS NULL
-            WHERE fa.file_id IS NULL
+            WHERE fa.file_id IS NULL AND f.noface = 0
         '''
         if limit is not None:
             cursor.execute(sql + ' LIMIT ?', (limit,))
         else:
             cursor.execute(sql)
         return cursor.fetchall()
+
+    def set_noface_for_checksums(self, checksums):
+        """Mark every one of `checksums` as noface=1 (see get_unface_indexed_files) —
+        applied by folder_markers.py for every file under a .noface-marked folder."""
+        if not checksums:
+            return
+        cursor = self.conn.cursor()
+        placeholders = ','.join('?' for _ in checksums)
+        cursor.execute(f'UPDATE files SET noface = 1 WHERE checksum IN ({placeholders})', tuple(checksums))
+        self.conn.commit()
 
     def get_faces_for_file(self, file_id: int) -> list:
         """Return all non-sentinel face rows for a file (excludes embedding blob),
