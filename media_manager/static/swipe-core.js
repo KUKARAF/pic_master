@@ -79,14 +79,6 @@ window.initSwipeStack = function (config) {
   let queue = (config.initialCards || []).slice(0, BUFFER_SIZE);
   const known = new Set(queue.map(c => c.ref)); // queued or already-decided refs
   let fetching = false;
-  // Pages now start every stack with initialCards: [] and let the buffer-fill
-  // fetch below populate it right after load (keeps the page itself fast —
-  // no server-side ranking work blocks the initial HTML response). Until that
-  // first fetch resolves, an empty queue means "haven't heard back yet," not
-  // "genuinely out of suggestions" — renderEmptyState() below tells those
-  // apart so a slow-to-rank feature doesn't flash a misleading "nothing left,
-  // try lowering the threshold" message before its first real answer arrives.
-  let initialLoadDone = queue.length > 0;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
   const history = []; // [{card, action}, ...] — most recent decision last
 
@@ -123,14 +115,21 @@ window.initSwipeStack = function (config) {
   }
 
   function renderEmptyState() {
-    if (!initialLoadDone) {
-      stackEl.innerHTML = '<div class="swipe-empty">Loading suggestions…</div>';
+    // `fetching` (not "is this the very first load") is what actually
+    // distinguishes "still waiting on results" from "genuinely nothing left" —
+    // it's true for the initial buffer-fill exactly the same as any later
+    // refill, so one flag covers both without a separate first-load tracker.
+    // Relies on maybeFetchMore() having already been kicked off (and its
+    // synchronous fetching=true already set) before this ever runs — see the
+    // call-order note at the bottom of initSwipeStack.
+    if (fetching) {
+      stackEl.innerHTML = '<div class="swipe-empty swipe-searching">SEARCHING<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></div>';
       return;
     }
     if (typeof config.emptyStateHtml === 'function') {
       config.emptyStateHtml(stackEl);
     } else {
-      stackEl.innerHTML = config.emptyStateHtml || '<div class="swipe-empty">No more suggestions right now.</div>';
+      stackEl.innerHTML = config.emptyStateHtml || '<div class="swipe-empty">This is not the photo you are looking for.</div>';
     }
   }
 
@@ -202,7 +201,6 @@ window.initSwipeStack = function (config) {
         queue.push(card);
       }
       if (wasEmpty) {
-        initialLoadDone = true;
         render();
       }
     }
@@ -356,12 +354,16 @@ window.initSwipeStack = function (config) {
     }
   });
 
-  render();
   // render()'s empty-queue branch only shows a state, it doesn't fetch (the
   // non-empty branch's trailing maybeFetchMore() call is what normally keeps
   // the buffer topped up) — so a stack that intentionally starts empty needs
-  // its own kick to ever load anything.
+  // its own kick to ever load anything. Called *before* the first render()
+  // (not after) so its synchronous fetching=true is already set by the time
+  // renderEmptyState() runs — otherwise the very first paint would
+  // momentarily show "genuinely done" instead of "searching" for the split
+  // second before the initial fetch is even in flight.
   if (queue.length === 0) maybeFetchMore();
+  render();
 
   // getTopCard/decide let a page-specific script drive the stack externally
   // (e.g. set_detail.html's "add to a different set" flow, which needs to
