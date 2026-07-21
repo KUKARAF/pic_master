@@ -201,65 +201,121 @@
     });
   }
 
-  function openStudioPromptModal(setName, onResolved) {
-    openModal('Studio for "' + setName + '"', function (box) {
-      const input = document.createElement('input');
-      input.type = 'text';
-      input.placeholder = 'Studio (optional)…';
-      input.setAttribute('list', 'studio-prompt-datalist');
-      input.autocomplete = 'off';
-      input.style.width = '100%';
-      input.style.fontSize = '1.2rem';
-      input.style.padding = '10px 12px';
-      input.style.marginBottom = '8px';
-      box.appendChild(input);
+  /* A plain <input> backed by a native <datalist> — the shared shape both the
+     studio and person fields in openNewSetDetailsModal use. Populates from
+     `listUrl`, calling `labelFn` per item for the datalist option text. */
+  function wireDatalistField(box, opts) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = opts.placeholder;
+    input.setAttribute('list', opts.datalistId);
+    input.autocomplete = 'off';
+    input.style.width = '100%';
+    input.style.fontSize = '1.2rem';
+    input.style.padding = '10px 12px';
+    input.style.marginBottom = '8px';
+    box.appendChild(input);
 
-      const datalist = document.createElement('datalist');
-      datalist.id = 'studio-prompt-datalist';
-      box.appendChild(datalist);
+    const datalist = document.createElement('datalist');
+    datalist.id = opts.datalistId;
+    box.appendChild(datalist);
 
-      const status = document.createElement('div');
-      status.className = 'modal-empty';
-      status.textContent = 'Loading studios…';
-      box.appendChild(status);
+    const status = document.createElement('div');
+    status.className = 'modal-empty';
+    status.style.marginBottom = '10px';
+    status.textContent = 'Loading ' + opts.noun + 's…';
+    box.appendChild(status);
+
+    fetch(opts.listUrl)
+      .then(function (r) { return r.json(); })
+      .then(function (items) {
+        datalist.innerHTML = '';
+        items.forEach(function (item) {
+          const opt = document.createElement('option');
+          opt.value = opts.labelFn(item);
+          datalist.appendChild(opt);
+        });
+        status.textContent = items.length
+          ? 'Type to search ' + items.length + ' existing ' + opts.noun + '(s), or a new one.'
+          : 'No ' + opts.noun + 's yet — type one, or leave blank.';
+      })
+      .catch(function () {
+        status.textContent = 'Failed to load ' + opts.noun + 's.';
+      });
+
+    return input;
+  }
+
+  function openNewSetDetailsModal(setName, onResolved) {
+    openModal('Details for "' + setName + '"', function (box) {
+      const studioLabel = document.createElement('div');
+      studioLabel.className = 'sub';
+      studioLabel.style.marginBottom = '4px';
+      studioLabel.textContent = 'Studio';
+      box.appendChild(studioLabel);
+      const studioInput = wireDatalistField(box, {
+        placeholder: 'Studio (optional)…',
+        datalistId: 'studio-prompt-datalist',
+        listUrl: '/api/studios',
+        labelFn: function (s) { return s.name; },
+        noun: 'studio',
+      });
+
+      const personLabel = document.createElement('div');
+      personLabel.className = 'sub';
+      personLabel.style.marginBottom = '4px';
+      personLabel.textContent = 'Person';
+      box.appendChild(personLabel);
+      const personInput = wireDatalistField(box, {
+        placeholder: 'Person to link to this set (optional)…',
+        datalistId: 'person-prompt-datalist',
+        listUrl: '/api/identities',
+        labelFn: function (i) { return i.name; },
+        noun: 'person',
+      });
 
       let submitted = false;
       function submit() {
         if (submitted) return;
         submitted = true;
-        input.disabled = true;
-        createSet(setName, input.value.trim() || null)
+        studioInput.disabled = true;
+        personInput.disabled = true;
+        createSet(setName, studioInput.value.trim() || null)
+          .then(function (data) {
+            const personName = personInput.value.trim();
+            if (!personName) return data;
+            return fetch('/api/identities/' + encodeURIComponent(personName) + '/assign-set', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ set_id: data.id }),
+            }).then(function (r) {
+              // The set itself is already created successfully at this point —
+              // a failure to link the person shouldn't lose that or block the
+              // caller, just surface it and move on.
+              if (!r.ok) alert('Set created, but failed to link person "' + personName + '".');
+              return data;
+            }).catch(function () {
+              alert('Set created, but failed to link person "' + personName + '".');
+              return data;
+            });
+          })
           .then(function (data) { closeModal(); onResolved(data); })
           .catch(function (err) {
             submitted = false;
-            input.disabled = false;
+            studioInput.disabled = false;
+            personInput.disabled = false;
             alert('Failed to create set: ' + err.message);
           });
       }
 
-      input.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); submit(); }
-        else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; submit(); }
+      [studioInput, personInput].forEach(function (input) {
+        input.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter') { e.preventDefault(); submit(); }
+          else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; submit(); }
+        });
       });
 
-      fetch('/api/studios')
-        .then(function (r) { return r.json(); })
-        .then(function (studios) {
-          datalist.innerHTML = '';
-          studios.forEach(function (s) {
-            const opt = document.createElement('option');
-            opt.value = s.name;
-            datalist.appendChild(opt);
-          });
-          status.textContent = studios.length
-            ? 'Type to search ' + studios.length + ' existing studio(s), or a new one — Enter to confirm, Escape to skip.'
-            : 'No studios yet — type one, or press Escape to skip.';
-        })
-        .catch(function () {
-          status.textContent = 'Failed to load studios — Enter to confirm, Escape to skip.';
-        });
-
-      setTimeout(function () { input.focus(); }, 0);
+      setTimeout(function () { studioInput.focus(); }, 0);
     });
   }
 
@@ -296,7 +352,7 @@
       // Matches today's exact chained behavior: a new set's studio is its own
       // keyboard-first step, not folded into this one.
       createFn: function (typedName) {
-        return new Promise(function (resolve) { openStudioPromptModal(typedName, resolve); });
+        return new Promise(function (resolve) { openNewSetDetailsModal(typedName, resolve); });
       },
     },
     category: {
