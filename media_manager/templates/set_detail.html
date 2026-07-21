@@ -27,7 +27,7 @@
     <button type="button" class="heart-btn-inline people-present-remove-btn" title="Remove {{ p.identity }} from this set"
             style="position:absolute;top:-6px;right:2px;font-size:0.75em;line-height:1;padding:1px 4px;">×</button>
     {% endif %}
-    <a href="/search?person={{ p.identity | urlencode }}">
+    <a href="/person/{{ p.identity | urlencode }}">
       {% if p.face_ref %}
       <img src="/face-crop/{{ p.face_ref }}" alt="{{ p.identity }}" width="64" height="64"
            style="border-radius:50%;object-fit:cover;display:block;">
@@ -38,7 +38,7 @@
       </div>
       {% endif %}
     </a>
-    <a href="/search?person={{ p.identity | urlencode }}" style="font-size:0.8em;margin-top:4px;max-width:76px;
+    <a href="/person/{{ p.identity | urlencode }}" style="font-size:0.8em;margin-top:4px;max-width:76px;
        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ p.identity }}">{{ p.identity }}</a>
     {% if p.age is not none %}
     <span class="face-age-gender {{ 'gender-male' if p.gender == 'male' else ('gender-female' if p.gender == 'female' else '') }}"

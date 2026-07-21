@@ -734,21 +734,23 @@ def create_app(data_root: str) -> FastAPI:
             'current_sets': current_sets,
         })
 
-    def _unsorted_candidate_photos_for_identity(exclude_checksums, limit=60, overfetch=300):
-        """Plain, unranked browse list for the person page's manual "assign to an
-        individual photo" picker: recent files that belong to no set at all and
-        aren't already linked to this identity by any means (a real face or a
-        prior whole-photo assignment). Deliberately not ML-ranked — this path is
-        for photos face detection/suggestion missed entirely, so there's nothing
-        principled to rank by; `overfetch` just needs to be generous enough that
-        filtering out excluded checksums still leaves `limit` candidates in a
-        typical personal library."""
-        rows = db.list_files_with_embedding_flag(limit=overfetch, sort='added', order='desc')
-        candidates = [row for row in rows if row[3] not in exclude_checksums][:limit]
-        return _enrich_rows(candidates)
+    def _identity_checksums(name):
+        """All checksums this identity is associated with: own detected faces
+        (substring name match), whole-photo manual assignments, plus every
+        current member of any set linked to this identity (membership is
+        resolved live, not stored per-photo — see get_sets_linked_to_identity).
+        Shared by /person/{name} and its /api/person/{name}/photos pagination
+        endpoint, and mirrors the union _checksums_for_chip's 'face' chip type
+        already does for the search palette."""
+        checksums = set(manual.get_files_by_face_identity(name, limit=1000))
+        checksums |= set(manual.get_photos_assigned_to_identity(name, limit=1000))
+        linked_sets = manual.get_sets_linked_to_identity(name)
+        for s in linked_sets:
+            checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
+        return checksums, linked_sets
 
     @app.get('/search', response_class=HTMLResponse)
-    def search_page(request: Request, q: str = '', tag: str = '', face_id: str = '', person: str = '',
+    def search_page(request: Request, q: str = '', tag: str = '',
                      face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc',
                      f: List[str] = Query([])):
         files = []
@@ -757,8 +759,6 @@ def create_app(data_root: str) -> FastAPI:
         all_categories = _all_categories_for_nav()
         similar_unknown_faces = []
         similar_faces = []
-        available_sets = []
-        unsorted_candidate_photos = []
         queue_label = 'Search'
 
         if f:
@@ -791,8 +791,6 @@ def create_app(data_root: str) -> FastAPI:
                 'files': files,
                 'q': q,
                 'tag': tag,
-                'face_id': face_id,
-                'person': person,
                 'face_ref': face_ref,
                 'category': category,
                 'query_face_file_id': _get_face_file_id(face_ref),
@@ -803,43 +801,8 @@ def create_app(data_root: str) -> FastAPI:
                 'similar_unknown_faces': similar_unknown_faces,
             })
 
-        name_query = person or face_id
-        linked_set_ids = set()
         if f:
             pass
-        elif name_query:
-            checksums = set(manual.get_files_by_face_identity(name_query, limit=200))
-            if person:
-                # Union in whole-photo manual assignments (no face crop involved)
-                # alongside the regular per-face identification — either one
-                # makes a file "this person's", and both need to show up here.
-                checksums |= set(manual.get_photos_assigned_to_identity(person, limit=200))
-                # Sets linked to this identity (manual.link_identity_to_set) aren't
-                # stamped onto individual photos — expand their *current* membership
-                # here instead, so a photo added to a linked set later shows up too
-                # without any extra row ever being written.
-                linked_sets = manual.get_sets_linked_to_identity(person)
-                linked_set_ids = {s['id'] for s in linked_sets}
-                for s in linked_sets:
-                    checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
-            if not checksums:
-                message = f'No files found with person "{name_query}" — run <code>media faces</code> to detect faces first.'
-            else:
-                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
-                rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-                files = _enrich_rows(rows)
-                if sort == 'age':
-                    files = _sort_cards_by_age(files, order)
-
-            if person:
-                # Manual-only tools (no ML suggestion involved): link this identity
-                # to a whole set, or assign it to one unsorted photo at a time — for
-                # photos face detection missed the person in entirely.
-                available_sets = manual.list_sets()
-                already_linked = checksums | manual.get_all_set_member_checksums()
-                unsorted_candidate_photos = _unsorted_candidate_photos_for_identity(already_linked)
-            queue_label = f'Person: {name_query}'
-
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
             file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
@@ -900,8 +863,6 @@ def create_app(data_root: str) -> FastAPI:
             'files': files,
             'q': q,
             'tag': tag,
-            'face_id': face_id,
-            'person': person,
             'face_ref': '',
             'category': category,
             'query_face_file_id': None,
@@ -909,13 +870,71 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': all_categories,
             'similar_unknown_faces': similar_unknown_faces,
-            'available_sets': available_sets,
-            'linked_set_ids': linked_set_ids,
-            'unsorted_candidate_photos': unsorted_candidate_photos,
             'sort': sort,
             'order': order,
             'queue_label': queue_label,
         })
+
+    @app.get('/person/{name}', response_class=HTMLResponse)
+    def person_page(request: Request, name: str):
+        """Per-person profile page: common tags across their photos, sets they
+        appear in, and (via person.html's own JS + /api/person/{name}/photos)
+        a lazily-paginated grid of their photos. Replaces the old /search?person=
+        branch, which dumped an unpaginated grid mixed with generic
+        bulk-select/add-to-set controls and manual set/photo assignment tools
+        that belong on the set-detail and photo-detail pages instead."""
+        checksums, linked_sets = _identity_checksums(name)
+        message = ''
+        tags = []
+        sets = []
+        if not checksums:
+            message = f'No files found with person "{name}" — run <code>media faces</code> to detect faces first.'
+        else:
+            tag_map = manual.list_tags_for_checksums(checksums)
+            tag_counts = {}
+            for labels in tag_map.values():
+                for label in labels:
+                    tag_counts[label] = tag_counts.get(label, 0) + 1
+            tags = sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+
+            # Sets: everything directly linked to this identity, plus any set
+            # that actually contains one of their photos (covers sets a photo
+            # was added to individually, without the identity ever being
+            # explicitly linked to that set).
+            sets_by_id = {s['id']: {'id': s['id'], 'name': s['name'], 'studio': s['studio']} for s in linked_sets}
+            for lst in manual.get_sets_for_checksums(list(checksums)).values():
+                for s in lst:
+                    sets_by_id.setdefault(s['id'], s)
+            sets = sorted(sets_by_id.values(), key=lambda s: s['name'].lower())
+
+        return templates.TemplateResponse(request, 'person.html', {
+            'name': name,
+            'message': message,
+            'tags': tags,
+            'sets': sets,
+            'total': len(checksums),
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/api/person/{name}/photos')
+    def api_person_photos(name: str, offset: int = 0, limit: int = 20, sort: str = 'added', order: str = 'desc'):
+        """Paginated card feed backing person.html's infinite-scroll photo list.
+        Mirrors gallery_page's approach: 'age' needs every card enriched first
+        (ages live in manual.db, not the SQL-sortable columns) so it enriches
+        everything then slices; other sorts slice the raw rows first and only
+        enrich the one page actually being returned."""
+        checksums, _ = _identity_checksums(name)
+        if not checksums:
+            return {'cards': [], 'total': 0, 'offset': offset, 'limit': limit}
+        file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
+        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+        if sort == 'age':
+            all_cards = _sort_cards_by_age(_enrich_rows(rows), order)
+            page_cards = all_cards[offset:offset + limit]
+        else:
+            page_cards = _enrich_rows(rows[offset:offset + limit])
+        return {'cards': page_cards, 'total': len(rows), 'offset': offset, 'limit': limit}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int):
@@ -2086,8 +2105,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_unknown_faces(name, threshold, limit=20):
         """Unidentified auto-detected faces whose embedding is within `threshold` cosine
-        similarity of any of `name`'s confirmed faces — powers both the initial /search?person=
-        render and the "expand similar face search" slider when nothing is found at the default."""
+        similarity of any of `name`'s confirmed faces — powers /api/identities/{name}/similar-faces."""
         ref_embeddings = manual.get_embeddings_for_identity(name)
         unidentified = _unpromoted_auto_faces(limit=None)
         results = []
@@ -2417,7 +2435,7 @@ def create_app(data_root: str) -> FastAPI:
         # A blank/omitted name confirms "this is a distinct person" without
         # requiring one to be typed — see manual.generate_placeholder_identity_name.
         # A placeholder behaves exactly like a real name everywhere else (rename,
-        # suggestion matching, /search?person=, ...), it's just waiting to be
+        # suggestion matching, /person/{name}, ...), it's just waiting to be
         # renamed, or not.
         name = (body.name or '').strip() or manual.generate_placeholder_identity_name()
         kind, raw_id = _parse_face_ref(face_id)

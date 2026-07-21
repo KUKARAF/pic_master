@@ -204,7 +204,7 @@
           {% for name in whole_photo_identities %}
           <div class="face-chip identity-photo-chip" data-identity-name="{{ name }}">
             <span class="face-name">
-              <a href="/search?person={{ name | urlencode }}">{{ name }}</a>
+              <a href="/person/{{ name | urlencode }}">{{ name }}</a>
               <a class="heart-btn-inline" href="/body-similar/{{ file.id }}"
                  title="No face for {{ name }} — search other photos by body instead" style="font-size:0.85em;">⛶ by body</a>
             </span>
@@ -225,7 +225,7 @@
             <a class="heart-btn-inline" href="/search?face_ref={{ face.ref | urlencode }}"
                title="Find similar faces" style="font-size:0.85em;">🔎</a>
             {% if face.identity %}
-              <a href="/search?person={{ face.identity | urlencode }}">{{ face.identity }}</a>
+              <a href="/person/{{ face.identity | urlencode }}">{{ face.identity }}</a>
               <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}" title="Rename this face" style="font-size:0.85em;">✏️</a>
             {% else %}
               <a href="#" class="unknown face-name-btn" data-face-ref="{{ face.ref }}">Unknown</a>
