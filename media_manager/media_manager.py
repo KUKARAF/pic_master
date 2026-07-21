@@ -297,15 +297,20 @@ class MediaManager:
 
     def match_categories(self, path='.', dry_run=False):
         """
-        For every embedded file under `path` that has no manual category override
-        (assigned OR explicit "no category" — manual always wins, see
-        category_resolver.py), score it against every category's centroid (mean
-        of that category's manually-assigned example files' embeddings) and, if
-        the best-scoring category clears *that category's own* temperature
-        threshold, record it as media.db's auto-match — overwriting any earlier
-        auto-match for that file. Files with a manual override are always
-        skipped untouched.
-        Returns (matched_count, skipped_count, considered_count).
+        Categories are multi-valued: for every embedded file under `path`, score
+        it independently against every category's centroid (mean of that
+        category's manually-assigned example files' embeddings) and record an
+        auto-match for *every* category whose own temperature threshold is
+        cleared — not just the single best one. A category a file is already
+        manually assigned to, or has been explicitly rejected for (see
+        category_resolver.py), is skipped for that category specifically; the
+        same file can still gain auto-matches for other categories it has no
+        manual decision on. Existing auto-matches for a file are cleared and
+        rebuilt each run so a category that no longer clears threshold doesn't
+        leave a stale match behind.
+        Returns (matched_count, skipped_count, considered_count) — matched is a
+        count of (file, category) matches, not files; skipped is files that
+        matched zero categories this run.
         """
         import numpy as np
         from .similarity import mean_normalized_centroid
@@ -315,8 +320,12 @@ class MediaManager:
             return 0, 0, 0
 
         category_centroids = []  # [(name, temperature, centroid_vector)]
+        category_examples = {}
+        category_rejections = {}
         for cat in categories:
             example_checksums = self.manual.get_example_checksums_for_category(cat['id'])
+            category_examples[cat['name']] = set(example_checksums)
+            category_rejections[cat['name']] = self.manual.get_excluded_checksums_for_category(cat['id'])
             example_ids = [r['id'] for r in self.db.get_files_by_checksums(example_checksums)]
             centroid = mean_normalized_centroid(
                 [e for _fid, e in self.db.get_embeddings_for_files(example_ids)]
@@ -333,25 +342,25 @@ class MediaManager:
             if os.path.join(self.data_root, rel_path).startswith(abs_path)
         ]
 
-        overrides = self.manual.get_category_overrides_for_checksums([c[2] for c in candidates])
-
         considered = matched = skipped = 0
         for file_id, emb, checksum in candidates:
             considered += 1
-            if checksum in overrides:
-                skipped += 1
-                continue
             vec = np.frombuffer(emb, dtype=np.float32)
-            best_name, best_score = None, -1.0
+            file_matches = []
             for name, threshold, centroid in category_centroids:
+                if checksum in category_examples.get(name, ()) or checksum in category_rejections.get(name, ()):
+                    continue
                 score = float(centroid.dot(vec))
-                if score >= threshold and score > best_score:
-                    best_name, best_score = name, score
-            if best_name is None:
-                continue
-            matched += 1
+                if score >= threshold:
+                    file_matches.append((name, score))
+            if file_matches:
+                matched += len(file_matches)
+            else:
+                skipped += 1
             if not dry_run:
-                self.db.set_file_category_match(file_id, best_name, best_score, model='clip-centroid-v1')
+                self.db.clear_file_category_match(file_id)
+                for name, score in file_matches:
+                    self.db.set_file_category_match(file_id, name, score, model='clip-centroid-v1')
 
         return matched, skipped, considered
 

@@ -740,6 +740,18 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .chip-person:hover { border-color: var(--accent); color: var(--accent-hover); }
 
+.chip-category {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: var(--radius);
+  background: rgba(255, 177, 61, .1);
+  border: 1px solid rgba(255, 177, 61, .35);
+  color: var(--orange);
+  font-size: 14px;
+}
+.chip-category:hover { border-color: var(--orange); color: var(--orange); }
+
 /* ------------------------------------------------------------------ */
 /* Sort controls                                                        */
 /* ------------------------------------------------------------------ */

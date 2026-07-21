@@ -75,7 +75,7 @@
     const parts = [];
     if (card.filename) parts.push(escapeHtml(card.filename));
     if (card.people && card.people.length) parts.push('with ' + card.people.map(escapeHtml).join(', '));
-    if (card.category && card.category.name) parts.push('category: ' + escapeHtml(card.category.name));
+    if (card.categories && card.categories.length) parts.push('categories: ' + card.categories.map(function (c) { return escapeHtml(c.name); }).join(', '));
     if (card.sets && card.sets.length) parts.push('in ' + card.sets.map(function (s) { return escapeHtml(s.name); }).join(', '));
     if (card.tags && card.tags.length) parts.push('tags: ' + card.tags.map(escapeHtml).join(', '));
     return parts.join(' · ');
@@ -1749,25 +1749,26 @@
     });
   }
 
-  /* Category assignment — single-valued, unlike sets. Manual assign/clear
-     always wins over whatever the ML auto-match set (see category_resolver.py). */
+  /* Category assignment — a photo can belong to any number of categories,
+     mirroring how sets already work (see wireSetChip/appendSetChip below). */
   const categoryCurrent = document.getElementById('category-current');
   const categoryPickerBtn = document.getElementById('category-picker-btn');
 
-  function renderCategory(category) {
-    if (!categoryCurrent) return;
-    categoryCurrent.innerHTML = '';
-    if (!category || !category.name) {
-      const span = document.createElement('span');
-      span.className = 'sub';
-      span.textContent = 'Uncategorized.';
-      categoryCurrent.appendChild(span);
-      return;
+  function wireCategoryChip(span) {
+    const removeBtn = span.querySelector('.category-remove-btn');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', function () {
+        removeFileCategory(span.dataset.categoryId);
+      });
     }
+  }
+
+  function buildCategoryChip(category) {
     const span = document.createElement('span');
     span.className = 'tag-removable';
     span.style.marginBottom = '4px';
     span.style.display = 'inline-flex';
+    span.dataset.categoryId = category.id;
 
     const link = document.createElement('a');
     link.href = '/search?category=' + encodeURIComponent(category.name);
@@ -1783,51 +1784,81 @@
     }
 
     const removeBtn = document.createElement('button');
-    removeBtn.className = 'rm';
+    removeBtn.className = 'rm category-remove-btn';
     removeBtn.type = 'button';
-    removeBtn.id = 'category-remove-btn';
-    removeBtn.title = 'Clear category';
+    removeBtn.title = 'Remove this category';
     removeBtn.textContent = '×';
-    removeBtn.addEventListener('click', clearFileCategory);
     span.appendChild(removeBtn);
 
-    categoryCurrent.appendChild(span);
+    wireCategoryChip(span);
+    return span;
   }
 
-  function assignFileCategory(categoryId) {
-    return fetch('/api/files/' + fileId + '/category', {
+  function renderCategories(categories) {
+    if (!categoryCurrent) return;
+    categoryCurrent.innerHTML = '';
+    if (!categories || !categories.length) {
+      const span = document.createElement('span');
+      span.className = 'sub';
+      span.textContent = 'Uncategorized.';
+      categoryCurrent.appendChild(span);
+      return;
+    }
+    categories.forEach(function (category) {
+      categoryCurrent.appendChild(buildCategoryChip(category));
+    });
+  }
+
+  function appendCategoryChip(category) {
+    // Drop the "Uncategorized." placeholder if it's the only thing there.
+    if (categoryCurrent.children.length === 1 && categoryCurrent.firstElementChild.tagName === 'SPAN'
+        && !categoryCurrent.firstElementChild.dataset.categoryId) {
+      categoryCurrent.innerHTML = '';
+    }
+    if (categoryCurrent.querySelector('[data-category-id="' + category.id + '"]')) return;
+    categoryCurrent.appendChild(buildCategoryChip(category));
+  }
+
+  function addFileCategory(categoryId) {
+    return fetch('/api/files/' + fileId + '/categories', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ category_id: categoryId }),
     }).then(function (r) {
       if (!r.ok) throw new Error('Request failed: ' + r.status);
       return r.json();
-    }).then(function (data) { renderCategory(data.category); });
+    });
   }
 
-  function clearFileCategory() {
-    fetch('/api/files/' + fileId + '/category', { method: 'DELETE' })
+  function removeFileCategory(categoryId) {
+    fetch('/api/files/' + fileId + '/categories/' + categoryId, { method: 'DELETE' })
       .then(function (r) {
         if (!r.ok) throw new Error('Request failed: ' + r.status);
         return r.json();
       })
-      .then(function () { renderCategory(null); })
-      .catch(function (err) { alert('Failed to clear category: ' + err.message); });
+      .then(function () {
+        const chip = categoryCurrent.querySelector('[data-category-id="' + categoryId + '"]');
+        if (chip) chip.remove();
+        if (!categoryCurrent.children.length) renderCategories([]);
+      })
+      .catch(function (err) {
+        alert('Failed to remove category: ' + err.message);
+      });
   }
 
   function openCategoryPickerModal() {
     openEntitySearchModal({
       type: 'category',
       onResolved: function (entity) {
-        assignFileCategory(entity.id)
-          .catch(function (err) { alert('Failed to set category: ' + err.message); });
+        addFileCategory(entity.id)
+          .then(function () { appendCategoryChip({ id: entity.id, name: entity.name }); })
+          .catch(function (err) { alert('Failed to add category: ' + err.message); });
       },
     });
   }
 
-  const categoryRemoveBtn = document.getElementById('category-remove-btn');
-  if (categoryRemoveBtn) categoryRemoveBtn.addEventListener('click', clearFileCategory);
   if (categoryPickerBtn) categoryPickerBtn.addEventListener('click', openCategoryPickerModal);
+  if (categoryCurrent) categoryCurrent.querySelectorAll('[data-category-id]').forEach(wireCategoryChip);
 
   /* Set assignment — a photo can belong to any number of sets */
   const setCurrent = document.getElementById('set-current');

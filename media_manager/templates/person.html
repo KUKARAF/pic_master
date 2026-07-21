@@ -82,13 +82,19 @@
 
   function cardHtml(f) {
     var tagsHtml = '';
-    if ((f.tags && f.tags.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
+    if ((f.tags && f.tags.length) || (f.categories && f.categories.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
       tagsHtml += '<div class="card-tags">';
       (f.tags || []).slice(0, 3).forEach(function (t) {
         tagsHtml += '<a class="tag" href="/search?tag=' + encodeURIComponent(t) + '">' + escapeHtml(t) + '</a>';
       });
       if (f.tags && f.tags.length > 3) {
         tagsHtml += '<span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.tags.length - 3) + '</span>';
+      }
+      (f.categories || []).slice(0, 3).forEach(function (c) {
+        tagsHtml += '<a class="chip-category" href="/search?category=' + encodeURIComponent(c.name) + '" title="Category">' + escapeHtml(c.name) + '</a>';
+      });
+      if (f.categories && f.categories.length > 3) {
+        tagsHtml += '<span class="chip-category" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.categories.length - 3) + '</span>';
       }
       (f.sets || []).slice(0, 3).forEach(function (s) {
         tagsHtml += '<a class="chip-set" href="/sets/' + s.id + '" title="Set">' + escapeHtml(s.name) + '</a>';

@@ -211,18 +211,50 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
-        # category_id NULL is a legal, meaningful value here — it records a human's
-        # explicit "this file has no category" decision (see set_file_category),
-        # which must still block ML auto-matching from claiming the file. Absence
-        # of a row entirely (not this) means "no manual decision ever made".
+        # Categories are multi-valued: a file can carry any number of manual
+        # category assignments (one row per (checksum, category_id) pair), plus
+        # per-category rejections — "confirmed NOT in category X" — recorded the
+        # same way file_set_exclusions already records "confirmed not in set X"
+        # (see exclude_file_from_set's docstring for the same reasoning: this is
+        # the category-suggestion swipe stream's reject action, permanent ground
+        # truth, not a session-only convenience).
+        #
+        # file_category_overrides used to be the single table here: checksum as a
+        # bare PRIMARY KEY (one category per file), with a category_id IS NULL row
+        # meaning "human explicitly said no category" (a global flag, since only
+        # one category could ever apply anyway). That shape can't hold more than
+        # one real category per file, so it's split into the two tables below and
+        # migrated once if the old table is still present — the old global
+        # "no category" rows have no clean per-category equivalent to migrate
+        # into and are simply dropped (a rare edge case; the file just starts
+        # fresh with no manual categories and no exclusions instead).
+        old_overrides_exists = cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='file_category_overrides'"
+        ).fetchone() is not None
         cur.execute('''
-            CREATE TABLE IF NOT EXISTS file_category_overrides (
-                checksum TEXT PRIMARY KEY,
-                category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
-                created_at INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS file_categories (
+                checksum TEXT NOT NULL,
+                category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, category_id)
             )
         ''')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_category_overrides_category ON file_category_overrides (category_id)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_categories_category ON file_categories (category_id)')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_category_exclusions (
+                checksum TEXT NOT NULL,
+                category_id INTEGER NOT NULL REFERENCES categories(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, category_id)
+            )
+        ''')
+        if old_overrides_exists:
+            cur.execute('''
+                INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
+                SELECT checksum, category_id, created_at FROM file_category_overrides
+                WHERE category_id IS NOT NULL
+            ''')
+            cur.execute('DROP TABLE file_category_overrides')
 
         cur.execute('''
             CREATE TABLE IF NOT EXISTS faces (
@@ -745,15 +777,15 @@ class ManualDB(ThreadLocalDB):
 
     def list_categories(self):
         """Return category rows with id, name, temperature, created_at, image_count —
-        image_count here is manual-assignment-only (file_category_overrides rows
-        with a non-NULL category_id), mirroring list_sets's image_count."""
+        image_count here is manual-assignment-only (file_categories rows), mirroring
+        list_sets's image_count."""
         cur = self.conn.cursor()
         cur.execute('''
             SELECT c.id, c.name, c.temperature, c.created_at,
-                   COUNT(fco.checksum) as image_count
+                   COUNT(fc.checksum) as image_count
             FROM categories c
-            LEFT JOIN file_category_overrides fco
-                ON fco.category_id = c.id
+            LEFT JOIN file_categories fc
+                ON fc.category_id = c.id
             GROUP BY c.id
             ORDER BY c.name
         ''')
@@ -773,87 +805,108 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
 
     def delete_category(self, category_id):
-        """Deletes the category entity only. Any file_category_overrides row that
-        pointed at it becomes category_id=NULL via ON DELETE SET NULL — i.e. those
-        files become explicitly uncategorized, NOT reverted to 'no decision made'.
-        Once a human has touched a file's category, ML must never silently reclaim
-        it just because the specific category they picked was later removed."""
+        """Deletes the category entity only. Any file_categories row that pointed
+        at it is removed automatically via ON DELETE CASCADE — those files simply
+        lose this one category (they may still have others) rather than being
+        pushed into "explicitly no categories" (file_category_excluded is a
+        separate, unrelated decision — see its own docstring)."""
         cur = self.conn.cursor()
         cur.execute('DELETE FROM categories WHERE id = ?', (category_id,))
         self.conn.commit()
 
-    def set_file_category(self, checksum, category_id):
-        """Upsert a file's manual category override. category_id=None is a
-        legitimate call — it records an explicit 'no category' human decision,
-        which still outranks any ML auto-match (see category_resolver.py). This
-        single method serves both 'assign' and 'clear' from the CLI/web UI."""
+    def add_file_category(self, checksum, category_id):
+        """Add category_id to this file's manual categories — additive, never
+        replaces any category the file already has (mirrors assign_file_to_set)."""
         cur = self.conn.cursor()
         cur.execute('''
-            INSERT INTO file_category_overrides (checksum, category_id, created_at)
+            INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
             VALUES (?, ?, ?)
-            ON CONFLICT(checksum) DO UPDATE SET category_id=excluded.category_id, created_at=excluded.created_at
         ''', (checksum, category_id, int(time.time())))
         self.conn.commit()
 
-    def clear_category_override(self, checksum):
-        """Hard-delete the override row entirely — distinct from
-        set_file_category(checksum, None), which UPSERTS an explicit 'no
-        category' row. This restores "no manual decision was ever made", used
-        to undo a category swipe decision (confirm or reject) back to the
-        pre-decision state — safe because the suggestion stream only ever
-        offers files that had no override to begin with."""
+    def remove_file_category(self, checksum, category_id):
+        """Remove just this one category from the file — any other categories it
+        has are untouched (mirrors remove_file_from_set)."""
         cur = self.conn.cursor()
-        cur.execute('DELETE FROM file_category_overrides WHERE checksum = ?', (checksum,))
+        cur.execute('DELETE FROM file_categories WHERE checksum = ? AND category_id = ?', (checksum, category_id))
         self.conn.commit()
 
-    def get_category_override(self, checksum):
-        """Return None if no manual decision was ever made for this file, else
-        {'category_id', 'name'} — name is None for an explicit 'no category' row."""
+    def get_categories_for_checksum(self, checksum):
+        """Every category manually assigned to this file — {'id', 'name'} per row."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT fco.category_id, c.name
-            FROM file_category_overrides fco
-            LEFT JOIN categories c ON c.id = fco.category_id
-            WHERE fco.checksum = ?
+            SELECT c.id, c.name FROM file_categories fc JOIN categories c ON c.id = fc.category_id
+            WHERE fc.checksum = ? ORDER BY c.name
         ''', (checksum,))
-        row = cur.fetchone()
-        if row is None:
-            return None
-        return {'category_id': row[0], 'name': row[1]}
+        return [{'id': row[0], 'name': row[1]} for row in cur.fetchall()]
 
-    def get_category_overrides_for_checksums(self, checksums):
-        """Batched lookup: {checksum: {'category_id','name'}} for whichever of
-        `checksums` have a manual decision recorded — a checksum missing from the
-        result had no decision made at all (mirrors get_sets_for_checksums)."""
+    def get_categories_for_checksums(self, checksums):
+        """Batched lookup: {checksum: [{'id','name'}, ...]} — avoids N+1 queries on
+        list pages (mirrors get_sets_for_checksums)."""
         if not checksums:
             return {}
         placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
         cur.execute(f'''
-            SELECT fco.checksum, fco.category_id, c.name
-            FROM file_category_overrides fco
-            LEFT JOIN categories c ON c.id = fco.category_id
-            WHERE fco.checksum IN ({placeholders})
+            SELECT fc.checksum, c.id, c.name
+            FROM file_categories fc JOIN categories c ON c.id = fc.category_id
+            WHERE fc.checksum IN ({placeholders}) ORDER BY c.name
         ''', tuple(checksums))
-        return {row[0]: {'category_id': row[1], 'name': row[2]} for row in cur.fetchall()}
+        result = {}
+        for checksum, cat_id, name in cur.fetchall():
+            result.setdefault(checksum, []).append({'id': cat_id, 'name': name})
+        return result
 
-    def get_all_category_override_checksums(self):
-        """Every checksum with ANY manual category decision recorded (assigned to
-        some category, or an explicit "no category"), as a plain set() — one cheap
-        query independent of candidate-list size, unlike
-        get_category_overrides_for_checksums (which needs one bound SQL parameter
-        per checksum and blows past SQLite's variable limit when called with
-        every file in the library, as the category-suggestion stream does)."""
+    def exclude_file_from_category(self, checksum, category_id):
+        """Record a human's 'not this category' decision for this file — the
+        category-suggestion stream's reject action. Permanent ground truth, same
+        shape/reasoning as exclude_file_from_set: a file rejected for category X
+        is never offered as a suggestion for X again, but remains fully eligible
+        for every other category."""
         cur = self.conn.cursor()
-        cur.execute('SELECT DISTINCT checksum FROM file_category_overrides')
+        cur.execute('''
+            INSERT OR IGNORE INTO file_category_exclusions (checksum, category_id, created_at) VALUES (?, ?, ?)
+        ''', (checksum, category_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_category_exclusion(self, checksum, category_id):
+        """Undo a prior exclude_file_from_category call (the reject-swipe's Ctrl+Z)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_category_exclusions WHERE checksum = ? AND category_id = ?', (checksum, category_id))
+        self.conn.commit()
+
+    def get_excluded_checksums_for_category(self, category_id):
+        """Every checksum a human has confirmed does NOT belong in this category —
+        used to permanently filter these out of future suggestion candidates for
+        this category (mirrors get_excluded_checksums_for_set)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_category_exclusions WHERE category_id = ?', (category_id,))
         return {row[0] for row in cur.fetchall()}
+
+    def get_category_exclusions_for_checksums(self, checksums):
+        """Batched lookup: {checksum: {category_id, ...}} — which categories each
+        of `checksums` has been rejected for, used by the resolver to suppress
+        just those specific auto-matches (mirrors get_categories_for_checksums'
+        batching shape)."""
+        if not checksums:
+            return {}
+        placeholders = ','.join('?' for _ in checksums)
+        cur = self.conn.cursor()
+        cur.execute(
+            f'SELECT checksum, category_id FROM file_category_exclusions WHERE checksum IN ({placeholders})',
+            tuple(checksums)
+        )
+        result = {}
+        for checksum, category_id in cur.fetchall():
+            result.setdefault(checksum, set()).add(category_id)
+        return result
 
     def get_example_checksums_for_category(self, category_id, limit=1000):
         """Files manually assigned to this category — the ML training examples
         used to build a similarity centroid (mirrors get_files_by_set)."""
         cur = self.conn.cursor()
         cur.execute(
-            'SELECT checksum FROM file_category_overrides WHERE category_id = ? LIMIT ?',
+            'SELECT checksum FROM file_categories WHERE category_id = ? LIMIT ?',
             (category_id, limit)
         )
         return [row[0] for row in cur.fetchall()]

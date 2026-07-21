@@ -2,13 +2,19 @@
    from the `card()` macro below or one of the JS-built cards (set-detail's
    "suggested images" infinite scroll) that mirror this exact markup. #}
 {% macro card_chips(f) %}
-{% if f.tags or f.sets or f.people %}
+{% if f.tags or f.categories or f.sets or f.people %}
 <div class="card-tags">
   {% for tag in f.tags[:3] %}
   <a class="tag" href="/search?tag={{ tag | urlencode }}">{{ tag }}</a>
   {% endfor %}
   {% if f.tags | length > 3 %}
   <span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.tags | length - 3 }}</span>
+  {% endif %}
+  {% for c in f.categories[:3] %}
+  <a class="chip-category" href="/search?category={{ c.name | urlencode }}" title="Category">{{ c.name }}</a>
+  {% endfor %}
+  {% if f.categories | length > 3 %}
+  <span class="chip-category" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.categories | length - 3 }}</span>
   {% endif %}
   {% for s in f.sets[:3] %}
   <a class="chip-set" href="/sets/{{ s.id }}" title="Set">{{ s.name }}</a>

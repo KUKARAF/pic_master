@@ -181,7 +181,7 @@ def main():
 
     # media category <create|ls|assign|clear|files|match> - single-value,
     # ML-assisted classification (e.g. Outside/Convention/Anime)
-    category_cmd = sub.add_parser('category', help='Manage image categories (single-value, ML-assisted classification)')
+    category_cmd = sub.add_parser('category', help='Manage image categories (multi-value, ML-assisted classification)')
     category_sub = category_cmd.add_subparsers(dest='category_cmd', required=True)
 
     category_create = category_sub.add_parser('create', help='Create a category')
@@ -198,9 +198,10 @@ def main():
 
     category_clear = category_sub.add_parser(
         'clear',
-        help="Manually clear a file's category (marks it explicitly uncategorized; "
-             "blocks future auto-matching until reassigned)")
+        help="Remove one category from a file (a file can have several; other "
+             "categories it has are untouched)")
     category_clear.add_argument('path', help='File path (relative to repo root)')
+    category_clear.add_argument('name', help='Category name to remove')
 
     category_files = category_sub.add_parser('files', help='List files resolved to a category (manual + auto-matched)')
     category_files.add_argument('name', help='Category name')
@@ -460,7 +461,7 @@ def main():
                 m.close()
                 sys.exit(1)
             category_id = m.manual.create_category(args.name)
-            m.manual.set_file_category(file_row['checksum'], category_id)
+            m.manual.add_file_category(file_row['checksum'], category_id)
             print(f"Assigned '{args.path}' to category '{args.name}'")
 
         elif args.category_cmd == 'clear':
@@ -469,8 +470,13 @@ def main():
                 print(f"ERROR: '{args.path}' not tracked — run 'media add' first", file=sys.stderr)
                 m.close()
                 sys.exit(1)
-            m.manual.set_file_category(file_row['checksum'], None)
-            print(f"Cleared category for '{args.path}' (explicitly marked uncategorized)")
+            cat_row = m.manual.find_category(args.name)
+            if cat_row is None:
+                print(f"ERROR: no category named '{args.name}'", file=sys.stderr)
+                m.close()
+                sys.exit(1)
+            m.manual.remove_file_category(file_row['checksum'], cat_row['id'])
+            print(f"Removed category '{args.name}' from '{args.path}'")
 
         elif args.category_cmd == 'files':
             row = m.manual.find_category(args.name)

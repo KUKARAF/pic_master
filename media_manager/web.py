@@ -24,7 +24,7 @@ from media_manager.category_resolver import (
     get_category_counts,
     get_resolved_checksums_for_category,
     resolve_categories_for_checksums,
-    resolve_category_for_file,
+    resolve_categories_for_file,
 )
 
 # ---------------------------------------------------------------------------
@@ -398,7 +398,7 @@ def create_app(data_root: str) -> FastAPI:
                 'title': title_map.get(checksum),
                 'sets': sets_map.get(checksum, []),
                 'people': identities_map.get(checksum, []),
-                'category': category_map.get(checksum),
+                'categories': category_map.get(checksum, []),
             }
             if scores is not None and file_id in scores:
                 card['score'] = scores[file_id]
@@ -416,12 +416,14 @@ def create_app(data_root: str) -> FastAPI:
         *candidate* while ranking suggestions, so re-scanning per category turned
         one keystroke into O(categories) full-library scans."""
         by_name = {}
+        excluded_by_category = {}
         for row in manual.list_categories():
             by_name[row['name']] = set(manual.get_example_checksums_for_category(row['id'], limit=1000))
-        all_manual_checksums = set().union(*by_name.values()) if by_name else set()
-        overridden = manual.get_all_category_override_checksums()
+            excluded_by_category[row['name']] = manual.get_excluded_checksums_for_category(row['id'])
         for _file_id, checksum, name, _score in db.get_all_file_category_matches():
-            if checksum in all_manual_checksums or checksum in overridden:
+            if checksum in by_name.get(name, ()):
+                continue
+            if checksum in excluded_by_category.get(name, ()):
                 continue
             by_name.setdefault(name, set()).add(checksum)
         return by_name
@@ -545,7 +547,7 @@ def create_app(data_root: str) -> FastAPI:
             card['tags'] = tag_map.get(checksum, [])
             card['sets'] = sets_map.get(checksum, [])
             card['people'] = identities_map.get(checksum, [])
-            card['category'] = category_map.get(checksum)
+            card['categories'] = category_map.get(checksum, [])
         return cards
 
     def _chunked(items, size=500):
@@ -720,7 +722,7 @@ def create_app(data_root: str) -> FastAPI:
             {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'favorite': bool(s['favorite'])}
             for s in manual.get_sets_for_file(checksum)
         ]
-        file_info['category'] = resolve_category_for_file(manual, db, file_id, checksum)
+        file_info['categories'] = resolve_categories_for_file(manual, db, file_id, checksum)
         all_categories = _all_categories_for_nav()
         # Age/gender estimates (experimental — see age_estimator.py) are shown inline
         # next to each face's name, not as a separate section, so merge them directly
@@ -1884,34 +1886,41 @@ def create_app(data_root: str) -> FastAPI:
         manual.delete_category(category_id)
         return {'ok': True}
 
-    @app.post('/api/files/{file_id}/category')
-    def api_set_file_category(file_id: int, body: CategoryBody):
+    @app.post('/api/files/{file_id}/categories')
+    def api_add_file_category(file_id: int, body: CategoryBody):
+        """Adds a category — a file can belong to any number of categories, so
+        this never replaces an existing one (mirrors api_assign_set)."""
         row = _file_or_404(file_id)
         if body.category_id is None:
             raise HTTPException(status_code=400, detail='category_id is required')
         cat = manual.get_category(body.category_id)
         if cat is None:
             raise HTTPException(status_code=404, detail='Category not found')
-        manual.set_file_category(row['checksum'], body.category_id)
-        return {'category': {'name': cat['name'], 'source': 'manual', 'score': None}}
+        manual.add_file_category(row['checksum'], body.category_id)
+        return {'category': {'id': cat['id'], 'name': cat['name'], 'source': 'manual', 'score': None}}
 
-    @app.delete('/api/files/{file_id}/category')
-    def api_clear_file_category(file_id: int):
-        """Explicit clear — records an explicit 'no category' override, not a
-        revert to whatever the ML auto-match would otherwise suggest."""
+    @app.delete('/api/files/{file_id}/categories/{category_id}')
+    def api_remove_file_category(file_id: int, category_id: int):
+        """Removes just this one category from the file — any other categories
+        it has are untouched."""
         row = _file_or_404(file_id)
-        manual.set_file_category(row['checksum'], None)
-        return {'category': None}
+        manual.remove_file_category(row['checksum'], category_id)
+        return {'ok': True}
 
-    @app.delete('/api/files/{file_id}/category/decision')
-    def api_undo_file_category_decision(file_id: int):
-        """Undo a confirm or reject made via the category-suggestion swipe
-        stream — hard-deletes the override row entirely (unlike the plain
-        DELETE above, which upserts an explicit 'no category' row), restoring
-        'no manual decision was ever made'. Safe because the suggestion stream
-        never offers a file that already had an override."""
+    @app.post('/api/files/{file_id}/categories/{category_id}/exclude')
+    def api_exclude_file_category(file_id: int, category_id: int):
+        """Category-suggestion swipe stream's reject action — 'confirmed NOT in
+        this category', permanent, scoped to just this one category (mirrors
+        exclude_file_from_set)."""
         row = _file_or_404(file_id)
-        manual.clear_category_override(row['checksum'])
+        manual.exclude_file_from_category(row['checksum'], category_id)
+        return {'ok': True}
+
+    @app.delete('/api/files/{file_id}/categories/{category_id}/exclude')
+    def api_undo_exclude_file_category(file_id: int, category_id: int):
+        """Undo a reject made via the category-suggestion swipe stream (Ctrl+Z)."""
+        row = _file_or_404(file_id)
+        manual.remove_category_exclusion(row['checksum'], category_id)
         return {'ok': True}
 
     def _next_category_suggestions(category_id, count, exclude_refs):
@@ -1921,14 +1930,14 @@ def create_app(data_root: str) -> FastAPI:
         one-at-a-time instead of batch-write). Returns up to `count` dicts, best
         score first: [{'ref': str, 'file_id': int, 'score': float}, ...].
 
-        A file is excluded from candidacy if it has ANY manual category override —
-        assigned to this category, assigned to a DIFFERENT category, or an explicit
-        "no category" decision — manual decisions must never be re-suggested,
-        matching match_categories' own skip rule exactly.
+        A file is excluded from candidacy if it already manually has THIS category,
+        or has been explicitly rejected for THIS category before — categories are
+        multi-valued now, so having some OTHER manual category doesn't exclude a
+        file from also being suggested this one.
 
         A file that already has an ML auto-match to a DIFFERENT category IS still
         offered here: auto-matches are provisional machine guesses, not human
-        decisions, and confirming here always writes a manual override that
+        decisions, and confirming here always writes a manual assignment that
         outranks any auto-match per category_resolver.py's precedence rules."""
         from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
         from media_manager.swipe_support import bias_reorder
@@ -1946,11 +1955,13 @@ def create_app(data_root: str) -> FastAPI:
             return []
 
         all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
-        overridden_checksums = manual.get_all_category_override_checksums()
+        already_has_this = set(example_checksums)
+        rejected_for_this = manual.get_excluded_checksums_for_category(category_id)
 
         filtered = [
             c for c in all_candidates
-            if c[3] not in overridden_checksums and f"file:{c[0]}" not in exclude_refs
+            if c[3] not in already_has_this and c[3] not in rejected_for_this
+            and f"file:{c[0]}" not in exclude_refs
         ]
         ranked = rank_by_similarity(centroid, filtered, embedding_index=2)
         threshold = cat['temperature']

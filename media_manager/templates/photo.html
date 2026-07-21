@@ -131,22 +131,25 @@
       {% endif %}
     </div>
 
-    <!-- Category — single-valued, unlike tags/sets. Manual assignment always
-         wins over an ML auto-match (see category_resolver.py). -->
+    <!-- Categories — a photo can belong to any number of categories, same as
+         tags/sets. Each chip is either a manual assignment or an unsuppressed
+         ML auto-match (see category_resolver.py). -->
     <div class="sidebar-panel">
-      <div class="section-title">Category</div>
+      <div class="section-title">Categories</div>
       <div id="category-current">
-        {% if file.category and file.category.name %}
-        <span class="tag-removable" style="margin-bottom:4px;display:inline-flex;">
-          <a href="/search?category={{ file.category.name | urlencode }}">{{ file.category.name }}</a>
-          {% if file.category.source == 'auto' %}<span style="opacity:.7;">(auto)</span>{% endif %}
-          <button class="rm" type="button" id="category-remove-btn" title="Clear category">×</button>
+        {% if file.categories %}
+        {% for c in file.categories %}
+        <span class="tag-removable" data-category-id="{{ c.id or '' }}" style="margin-bottom:4px;display:inline-flex;">
+          <a href="/search?category={{ c.name | urlencode }}">{{ c.name }}</a>
+          {% if c.source == 'auto' %}<span style="opacity:.7;">(auto)</span>{% endif %}
+          {% if c.source == 'manual' %}<button class="rm category-remove-btn" type="button" title="Remove this category">×</button>{% endif %}
         </span>
+        {% endfor %}
         {% else %}
         <span class="sub">Uncategorized.</span>
         {% endif %}
       </div>
-      <button type="button" id="category-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Set category</button>
+      <button type="button" id="category-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add category</button>
     </div>
 
     <!-- Sets — a photo can belong to any number of sets -->

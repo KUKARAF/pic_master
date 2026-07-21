@@ -207,14 +207,38 @@ class Database(ThreadLocalDB):
         # this table at read time (see category_resolver.py).
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS file_category_matches (
-                file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 category_name TEXT NOT NULL,
                 score REAL NOT NULL,
                 model TEXT NOT NULL,
-                matched_at INTEGER NOT NULL
+                matched_at INTEGER NOT NULL,
+                PRIMARY KEY (file_id, category_name)
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_category_matches_name ON file_category_matches (category_name)')
+        # file_category_matches' PK changed shape (file_id -> (file_id, category_name)) —
+        # categories are multi-valued now, so a file can independently clear threshold
+        # for several categories at once instead of the ML matcher picking one winner.
+        # Same rebuild-in-place pattern as embeddings' own PK-shape migration above.
+        category_matches_pk_cols = {row[1] for row in cursor.execute('PRAGMA table_info(file_category_matches)') if row[5] > 0}
+        if category_matches_pk_cols == {'file_id'}:
+            cursor.execute('ALTER TABLE file_category_matches RENAME TO file_category_matches_old')
+            cursor.execute('''
+                CREATE TABLE file_category_matches (
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    category_name TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    model TEXT NOT NULL,
+                    matched_at INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, category_name)
+                )
+            ''')
+            cursor.execute('''
+                INSERT INTO file_category_matches (file_id, category_name, score, model, matched_at)
+                SELECT file_id, category_name, score, model, matched_at FROM file_category_matches_old
+            ''')
+            cursor.execute('DROP TABLE file_category_matches_old')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_category_matches_name ON file_category_matches (category_name)')
 
         # Migrate DBs created before frame_index existed (nullable ADD COLUMN is safe
         # in-place — every existing row correctly becomes "primary frame" = NULL).
@@ -997,17 +1021,20 @@ class Database(ThreadLocalDB):
         cursor.execute('DELETE FROM file_category_matches WHERE file_id = ?', (file_id,))
         self.conn.commit()
 
-    def get_file_category_match(self, file_id):
+    def get_file_category_matches(self, file_id):
+        """Every ML auto-match for this file — a file can independently clear
+        threshold for several categories at once now, so this returns a list,
+        not a single best match."""
         cursor = self.conn.cursor()
         cursor.execute(
             'SELECT category_name, score, model FROM file_category_matches WHERE file_id = ?',
             (file_id,)
         )
-        return cursor.fetchone()
+        return cursor.fetchall()
 
     def get_file_category_matches_for_files(self, file_ids):
-        """Batched lookup: {file_id: (category_name, score, model)} — mirrors
-        get_embeddings_for_files."""
+        """Batched lookup: {file_id: [(category_name, score, model), ...]} — mirrors
+        get_embeddings_for_files, but list-valued now (see get_file_category_matches)."""
         if not file_ids:
             return {}
         placeholders = ','.join('?' for _ in file_ids)
@@ -1016,7 +1043,10 @@ class Database(ThreadLocalDB):
             f'SELECT file_id, category_name, score, model FROM file_category_matches WHERE file_id IN ({placeholders})',
             tuple(file_ids)
         )
-        return {row[0]: (row[1], row[2], row[3]) for row in cursor.fetchall()}
+        result = {}
+        for file_id, category_name, score, model in cursor.fetchall():
+            result.setdefault(file_id, []).append((category_name, score, model))
+        return result
 
     def get_all_file_category_matches(self):
         """Return [(file_id, checksum, category_name, score), ...] joined for

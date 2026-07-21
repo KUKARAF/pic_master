@@ -132,18 +132,17 @@
       originalUrl: `/photo/${card.file_id}`,
     }),
     onConfirm: (card) => ({
-      url: `/api/files/${card.file_id}/category`,
+      url: `/api/files/${card.file_id}/categories`,
       method: 'POST',
       body: { category_id: categoryId },
     }),
     onReject: (card) => ({
-      url: `/api/files/${card.file_id}/category`,
-      method: 'DELETE',
+      url: `/api/files/${card.file_id}/categories/${categoryId}/exclude`,
+      method: 'POST',
     }),
-    onUndo: (card) => ({
-      url: `/api/files/${card.file_id}/category/decision`,
-      method: 'DELETE',
-    }),
+    onUndo: (card, action) => action === 'confirm'
+      ? { url: `/api/files/${card.file_id}/categories/${categoryId}`, method: 'DELETE' }
+      : { url: `/api/files/${card.file_id}/categories/${categoryId}/exclude`, method: 'DELETE' },
     emptyStateHtml: 'No more suggestions for this category right now.<br>'
       + 'Assign a few more example files above, or come back after indexing more photos.',
   });
