@@ -790,7 +790,14 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ q: q, chips: chips }),
       })
-        .then(function (r) { return r.json(); })
+        .then(function (r) {
+          if (!r.ok) {
+            return r.text().then(function (body) {
+              throw new Error('search-palette ' + r.status + ': ' + body);
+            });
+          }
+          return r.json();
+        })
         .then(function (data) {
           if (seq !== requestSeq) return; // a newer keystroke's request already landed
           suggestions = data.suggestions;
@@ -808,7 +815,15 @@
             viewAllEl.style.display = 'none';
           }
         })
-        .catch(function () { /* transient network hiccup — next keystroke retries */ });
+        .catch(function (err) {
+          if (seq !== requestSeq) return;
+          console.error('search palette query failed:', err);
+          suggestionsEl.innerHTML = '';
+          var errEl = document.createElement('div');
+          errEl.className = 'palette-empty';
+          errEl.textContent = 'search error — see browser console for details';
+          suggestionsEl.appendChild(errEl);
+        });
     }
 
     var debounceTimer = null;

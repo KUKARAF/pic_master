@@ -398,14 +398,40 @@ def create_app(data_root: str) -> FastAPI:
             result.append(card)
         return result
 
-    def _checksums_for_chip(chip):
+    def _category_checksums_by_name():
+        """{category_name: set(checksums)} for every category, resolved once —
+        manual assignments plus unsuppressed auto-matches, mirroring
+        get_resolved_checksums_for_category's own manual-wins-over-auto logic but
+        computed in a single pass over the whole auto-match table instead of one
+        full-table scan per category. get_resolved_checksums_for_category does its
+        own fresh db.get_all_file_category_matches() scan every call — fine for a
+        single lookup, but the search palette calls this once per category
+        *candidate* while ranking suggestions, so re-scanning per category turned
+        one keystroke into O(categories) full-library scans."""
+        by_name = {}
+        for row in manual.list_categories():
+            by_name[row['name']] = set(manual.get_example_checksums_for_category(row['id'], limit=1000))
+        all_manual_checksums = set().union(*by_name.values()) if by_name else set()
+        overridden = manual.get_all_category_override_checksums()
+        for _file_id, checksum, name, _score in db.get_all_file_category_matches():
+            if checksum in all_manual_checksums or checksum in overridden:
+                continue
+            by_name.setdefault(name, set()).add(checksum)
+        return by_name
+
+    def _checksums_for_chip(chip, category_map=None):
         """Resolve one search-palette/multi-filter chip ({'type', 'value'}) to the
         set of checksums it matches. 'face' replicates the union search_page's
         person branch already does inline (own faces + whole-photo assignments +
         photos in sets linked to this identity) so the palette and /search share one
-        definition instead of drifting apart."""
+        definition instead of drifting apart. `category_map`, when given (the
+        search palette's suggestion loop passes one precomputed for the whole
+        request), avoids re-resolving categories from scratch per call — see
+        _category_checksums_by_name."""
         t, v = chip['type'], chip['value']
         if t == 'category':
+            if category_map is not None:
+                return set(category_map.get(v, ()))
             cat = manual.find_category(v)
             if cat is None:
                 return set()
@@ -424,13 +450,13 @@ def create_app(data_root: str) -> FastAPI:
             return {row[2] for row in db.search_by_path_substring(v, limit=200)}
         return set()
 
-    def _intersect_chips(chips):
+    def _intersect_chips(chips, category_map=None):
         """None means 'no restriction' (caller decides what that means); an empty
         chip list always means None, never an empty set, so a chip-less query isn't
         mistaken for 'matches nothing'."""
         if not chips:
             return None
-        sets = [_checksums_for_chip(c) for c in chips]
+        sets = [_checksums_for_chip(c, category_map=category_map) for c in chips]
         return set.intersection(*sets) if sets else set()
 
     def _attach_file_meta(cards, file_id_field='file_id'):
@@ -1309,6 +1335,9 @@ def create_app(data_root: str) -> FastAPI:
         q = body.q.strip().lower()
         chips = [{'type': c.type, 'value': c.value} for c in body.chips]
         active_keys = {(c['type'], c['value']) for c in chips}
+        # Computed once per request (not once per category candidate — see
+        # _category_checksums_by_name's docstring for why that distinction matters).
+        category_map = _category_checksums_by_name()
 
         suggestions = []
         for cand in _palette_candidates(q):
@@ -1317,7 +1346,7 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             if q and q not in cand['label'].lower():
                 continue
-            count = len(_intersect_chips(chips + [{'type': cand['type'], 'value': cand['value']}]))
+            count = len(_intersect_chips(chips + [{'type': cand['type'], 'value': cand['value']}], category_map=category_map))
             if count == 0:
                 continue
             suggestions.append({'type': cand['type'], 'value': cand['value'], 'label': cand['label'], 'count': count})
@@ -1328,7 +1357,7 @@ def create_app(data_root: str) -> FastAPI:
         sets_result = []
         people_result = []
         total_count = 0
-        checksums = _intersect_chips(chips)
+        checksums = _intersect_chips(chips, category_map=category_map)
         if checksums is not None or q:
             if checksums is None:
                 # q alone (no chips yet) — filename substring is the only sensible
