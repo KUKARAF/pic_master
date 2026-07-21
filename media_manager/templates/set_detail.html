@@ -20,7 +20,7 @@
 <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:20px;">
   {% for p in people_present %}
   <div style="display:flex;flex-direction:column;align-items:center;width:76px;text-align:center;">
-    <a href="/search?person={{ p.identity | urlencode }}">
+    <a href="/person/{{ p.identity | urlencode }}">
       {% if p.face_ref %}
       <img src="/face-crop/{{ p.face_ref }}" alt="{{ p.identity }}" width="64" height="64"
            style="border-radius:50%;object-fit:cover;display:block;">
@@ -31,7 +31,7 @@
       </div>
       {% endif %}
     </a>
-    <a href="/search?person={{ p.identity | urlencode }}" style="font-size:0.8em;margin-top:4px;max-width:76px;
+    <a href="/person/{{ p.identity | urlencode }}" style="font-size:0.8em;margin-top:4px;max-width:76px;
        overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="{{ p.identity }}">{{ p.identity }}</a>
     {% if p.age is not none %}
     <span class="face-age-gender {{ 'gender-male' if p.gender == 'male' else ('gender-female' if p.gender == 'female' else '') }}"

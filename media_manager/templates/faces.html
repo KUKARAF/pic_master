@@ -62,7 +62,7 @@
     <ul style="list-style:none;padding:0;margin:0;">
       {% for name, count in identities %}
       <li style="margin-bottom:6px;" data-identity="{{ name }}">
-        <a href="/search?person={{ name | urlencode }}" style="font-weight:500;">{{ name }}</a>
+        <a href="/person/{{ name | urlencode }}" style="font-weight:500;">{{ name }}</a>
         <span style="color:#728C72;font-size:0.85em;"> ({{ count }})</span>
         <button type="button" class="identity-rename-btn heart-btn-inline" data-identity="{{ name }}"
                 title="Rename this person everywhere" style="font-size:0.8em;">✏️</button>

@@ -746,7 +746,7 @@
         var peopleSec = section('PEOPLE', data.people.length);
         data.people.forEach(function (p) {
           peopleSec.tiles.appendChild(makeTile(
-            '/search?person=' + encodeURIComponent(p.name),
+            '/person/' + encodeURIComponent(p.name),
             p.face_id != null ? '/face-crop/manual:' + p.face_id : '',
             p.name, p.name, 'palette-tile-person'
           ));

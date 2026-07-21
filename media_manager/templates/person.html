@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}{{ name }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>{{ name }}</h1>
+  {% if total %}<span class="sub">{{ total }} photo(s)</span>{% endif %}
+</div>
+
+{% if message %}
+<div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
+{% else %}
+
+{% if tags %}
+<div class="section-title" style="margin-bottom:10px;">Common tags</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;">
+  {% for label, count in tags %}
+  <a class="tag" href="/search?tag={{ label | urlencode }}" title="{{ count }} photo(s)">{{ label }} <span class="sub" style="margin-left:4px;">{{ count }}</span></a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if sets %}
+<div class="section-title" style="margin-bottom:10px;">Sets</div>
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;">
+  {% for s in sets %}
+  <a class="chip-set" href="/sets/{{ s.id }}" title="{{ s.studio or '' }}" style="font-size:15px;padding:4px 10px;">
+    {{ s.name }}{% if s.studio %} <span class="sub">— {{ s.studio }}</span>{% endif %}
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+<div class="section-title" style="margin-bottom:10px;">Photos</div>
+<div class="grid" id="person-photo-grid" data-queue-source="Person: {{ name }}"></div>
+<div id="person-photo-sentinel" style="height:1px;"></div>
+<p id="person-photo-loading" class="sub" style="text-align:center;margin-top:16px;display:none;">Loading…</p>
+<p id="person-photo-empty" class="empty-state" style="display:none;">
+  <span class="icon">🖼️</span>
+  <br>No photos found for this person yet.
+</p>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* Lazily-paginated photo grid for this person, loaded 20 at a time via
+   /api/person/{name}/photos as the page is scrolled toward the bottom.
+   Cards are appended with the exact markup _macros.html's card() macro
+   produces (same .card/.card-img-link/.card-name shape) so the click-capture
+   watch-queue script in base.html (which re-reads the grid at click time)
+   works for lazily-appended cards without any extra wiring — the grid's
+   data-queue-source attribute is all it needs. */
+(function() {
+  var grid = document.getElementById('person-photo-grid');
+  if (!grid) return;
+  var name = {{ name | tojson }};
+  var loadingEl = document.getElementById('person-photo-loading');
+  var emptyEl = document.getElementById('person-photo-empty');
+  var sentinel = document.getElementById('person-photo-sentinel');
+  var limit = 20;
+  var offset = 0;
+  var total = Infinity;
+  var loading = false;
+  var done = false;
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function cardHtml(f) {
+    var tagsHtml = '';
+    if ((f.tags && f.tags.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
+      tagsHtml += '<div class="card-tags">';
+      (f.tags || []).slice(0, 3).forEach(function (t) {
+        tagsHtml += '<a class="tag" href="/search?tag=' + encodeURIComponent(t) + '">' + escapeHtml(t) + '</a>';
+      });
+      if (f.tags && f.tags.length > 3) {
+        tagsHtml += '<span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.tags.length - 3) + '</span>';
+      }
+      (f.sets || []).slice(0, 3).forEach(function (s) {
+        tagsHtml += '<a class="chip-set" href="/sets/' + s.id + '" title="Set">' + escapeHtml(s.name) + '</a>';
+      });
+      if (f.sets && f.sets.length > 3) {
+        tagsHtml += '<span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.sets.length - 3) + '</span>';
+      }
+      (f.people || []).slice(0, 3).forEach(function (p) {
+        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p) + '" title="Recognized person">' + escapeHtml(p) + '</a>';
+      });
+      if (f.people && f.people.length > 3) {
+        tagsHtml += '<span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.people.length - 3) + '</span>';
+      }
+      tagsHtml += '</div>';
+    }
+    var title = f.title || f.filename;
+    return (
+      '<div class="card" data-file-id="' + f.id + '">' +
+        '<a class="card-img-link" href="/photo/' + f.id + '">' +
+          '<img src="/thumb/' + f.id + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
+        '</a>' +
+        '<a class="star-btn" href="/similar/' + f.id + '" title="I am feeling lucky — find similar images">⭐</a>' +
+        '<button type="button" class="heart-btn file-heart-btn ' + (f.favorite ? 'is-favorite' : '') + '" ' +
+          'data-file-id="' + f.id + '" title="Favorite this photo">' + (f.favorite ? '♥' : '♡') + '</button>' +
+        '<div class="card-body">' +
+          '<a class="card-name" href="/photo/' + f.id + '" title="' + escapeHtml(f.path) + '">' + escapeHtml(title) + '</a>' +
+          tagsHtml +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function loadMore() {
+    if (loading || done) return;
+    loading = true;
+    loadingEl.style.display = 'block';
+    var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=' + offset + '&limit=' + limit;
+    fetch(url)
+      .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function (data) {
+        total = data.total;
+        var cards = data.cards || [];
+        cards.forEach(function (f) {
+          var wrap = document.createElement('div');
+          wrap.innerHTML = cardHtml(f);
+          var cardEl = wrap.firstElementChild;
+          grid.appendChild(cardEl);
+          var heartBtn = cardEl.querySelector('.file-heart-btn');
+          if (heartBtn && window.wireHeartButton) wireHeartButton(heartBtn, '/api/files/' + heartBtn.dataset.fileId + '/favorite');
+        });
+        offset += cards.length;
+        if (offset === 0 && total === 0) {
+          emptyEl.style.display = 'block';
+        }
+        if (cards.length < limit || offset >= total) {
+          done = true;
+        }
+      })
+      .catch(function (err) {
+        loadingEl.textContent = 'Failed to load more photos: ' + err.message;
+      })
+      .finally(function () {
+        loading = false;
+        loadingEl.style.display = 'none';
+        // The sentinel can still be sitting inside the viewport (or the
+        // rootMargin lookahead) right after a page of cards is appended —
+        // e.g. a short results list, or a tall viewport — in which case its
+        // intersection state never flips from true, so the observer below
+        // won't fire again on its own. Re-checking here after every load
+        // keeps pulling in pages until the sentinel is actually scrolled
+        // past, without relying on a state *change* that may never happen.
+        if (!done && sentinel) {
+          var rect = sentinel.getBoundingClientRect();
+          if (rect.top < window.innerHeight + 400) loadMore();
+        }
+      });
+  }
+
+  if (window.IntersectionObserver && sentinel) {
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (entry.isIntersecting) loadMore();
+      });
+    }, { rootMargin: '400px' });
+    observer.observe(sentinel);
+  } else {
+    // No IntersectionObserver support — fall back to a scroll-position check.
+    window.addEventListener('scroll', function () {
+      if (done || loading) return;
+      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) loadMore();
+    });
+  }
+
+  loadMore();
+})();
+</script>
+{% endblock %}

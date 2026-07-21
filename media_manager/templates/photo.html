@@ -203,7 +203,7 @@
             <a class="heart-btn-inline" href="/search?face_ref={{ face.ref | urlencode }}"
                title="Find similar faces" style="font-size:0.85em;">🔎</a>
             {% if face.identity %}
-              <a href="/search?person={{ face.identity | urlencode }}">{{ face.identity }}</a>
+              <a href="/person/{{ face.identity | urlencode }}">{{ face.identity }}</a>
               <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}" title="Rename this face" style="font-size:0.85em;">✏️</a>
             {% else %}
               <a href="#" class="unknown face-name-btn" data-face-ref="{{ face.ref }}">Unknown</a>
