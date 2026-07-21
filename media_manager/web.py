@@ -692,6 +692,7 @@ def create_app(data_root: str) -> FastAPI:
         negated = manual.get_negated_labels(checksum)
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
         faces = _combined_faces_for_file(file_id, checksum)
+        whole_photo_identities = manual.get_identities_assigned_to_photo(checksum)
         file_info = dict(row)
         file_info['filename'] = os.path.basename(file_info['path'])
         file_info['tags'] = whole_tags
@@ -726,6 +727,7 @@ def create_app(data_root: str) -> FastAPI:
             'file': file_info,
             'detected_classes': detected_classes,
             'faces': faces,
+            'whole_photo_identities': whole_photo_identities,
             'spatial_tags': spatial_tags,
             'all_tags': all_tags,
             'all_categories': all_categories,

@@ -178,6 +178,10 @@
         <button type="button" id="detect-faces-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;">🔍 Detect</button>
         <button type="button" id="estimate-age-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;">🎂 Age / gender</button>
         <button type="button" id="add-face-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;">＋ Add face</button>
+        <button type="button" id="assign-identity-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;"
+                title="Confirm this person is in the photo even with no face crop (missed detection, turned away, etc.)">
+          ＋ This is… (no face)
+        </button>
         {% if file.frame_count and file.frame_count > 1 %}
         <button type="button" id="scan-all-frames-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;"
                 title="Run face/object/embedding detection across all {{ file.frame_count }} frames">
@@ -191,6 +195,24 @@
       <div id="add-face-status" class="sub" style="display:none;"></div>
       <div id="detect-faces-status" class="sub" style="display:none;"></div>
       <div id="estimate-age-status" class="sub" style="display:none;"></div>
+      <div id="assign-identity-status" class="sub" style="display:none;"></div>
+      {% endif %}
+      {% if whole_photo_identities or file.is_image %}
+      <div id="identity-photo-chips-wrap" {% if not whole_photo_identities %}style="display:none;"{% endif %}>
+        <div class="sub" style="margin-bottom:4px;">Assigned without a face:</div>
+        <div class="face-chips" id="identity-photo-chips">
+          {% for name in whole_photo_identities %}
+          <div class="face-chip identity-photo-chip" data-identity-name="{{ name }}">
+            <span class="face-name">
+              <a href="/search?person={{ name | urlencode }}">{{ name }}</a>
+              <a class="heart-btn-inline" href="/body-similar/{{ file.id }}"
+                 title="No face for {{ name }} — search other photos by body instead" style="font-size:0.85em;">⛶ by body</a>
+            </span>
+            <button class="rm identity-photo-remove-btn" type="button" data-identity-name="{{ name }}" title="Remove this assignment">×</button>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
       {% endif %}
       {% if faces %}
       <div class="face-chips" id="face-chips">

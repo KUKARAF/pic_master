@@ -1496,6 +1496,128 @@
     });
   });
 
+  /* Whole-photo identity assignment — "this person is in this photo" with no
+     face crop at all (missed detection, face turned away, back of the head,
+     etc.). Goes through the same shared entity picker as face naming, minus
+     the face-crop preview (there is none) and minus allowEmpty (an empty name
+     has no meaning here — face naming's "Save without a name" placeholder
+     exists to name a distinct-but-unidentified *face*; there's no face object
+     here to attach a placeholder to). Since this path exists specifically for
+     the no-face case, every successful assignment is exactly the case where
+     face-based similarity search can't find this person elsewhere — so the
+     confirmation also surfaces a direct link into body/outfit similarity
+     search (/body-similar/{file_id}) as the next step, right where the
+     assignment happened. */
+  const assignIdentityBtn = document.getElementById('assign-identity-btn');
+  const assignIdentityStatus = document.getElementById('assign-identity-status');
+  const identityChipsWrap = document.getElementById('identity-photo-chips-wrap');
+  const identityChipsContainer = document.getElementById('identity-photo-chips');
+
+  function wireIdentityPhotoChip(chip) {
+    const removeBtn = chip.querySelector('.identity-photo-remove-btn');
+    if (!removeBtn) return;
+    removeBtn.addEventListener('click', function () {
+      const name = chip.dataset.identityName;
+      removeBtn.disabled = true;
+      fetch('/api/files/' + fileId + '/identity-assignments/' + encodeURIComponent(name), { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        })
+        .then(function () {
+          chip.remove();
+          if (identityChipsContainer && !identityChipsContainer.children.length && identityChipsWrap) {
+            identityChipsWrap.style.display = 'none';
+          }
+        })
+        .catch(function (err) {
+          removeBtn.disabled = false;
+          alert('Failed to remove assignment: ' + err.message);
+        });
+    });
+  }
+
+  function appendIdentityPhotoChip(name) {
+    if (!identityChipsContainer) return;
+    if (identityChipsContainer.querySelector('[data-identity-name="' + name + '"]')) return;
+    const chip = document.createElement('div');
+    chip.className = 'face-chip identity-photo-chip';
+    chip.dataset.identityName = name;
+
+    const nameSpan = document.createElement('span');
+    nameSpan.className = 'face-name';
+
+    const link = document.createElement('a');
+    link.href = '/search?person=' + encodeURIComponent(name);
+    link.textContent = name;
+    nameSpan.appendChild(link);
+
+    const bodyLink = document.createElement('a');
+    bodyLink.className = 'heart-btn-inline';
+    bodyLink.href = '/body-similar/' + fileId;
+    bodyLink.title = 'No face for ' + name + ' — search other photos by body instead';
+    bodyLink.style.fontSize = '0.85em';
+    bodyLink.textContent = '⛶ by body';
+    nameSpan.appendChild(bodyLink);
+
+    chip.appendChild(nameSpan);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'rm identity-photo-remove-btn';
+    removeBtn.type = 'button';
+    removeBtn.title = 'Remove this assignment';
+    removeBtn.textContent = '×';
+    chip.appendChild(removeBtn);
+
+    identityChipsContainer.appendChild(chip);
+    wireIdentityPhotoChip(chip);
+    if (identityChipsWrap) identityChipsWrap.style.display = 'block';
+  }
+
+  if (identityChipsContainer) {
+    identityChipsContainer.querySelectorAll('.identity-photo-chip').forEach(wireIdentityPhotoChip);
+  }
+
+  if (assignIdentityBtn) {
+    assignIdentityBtn.addEventListener('click', function () {
+      openEntitySearchModal({
+        type: 'identity',
+        title: 'This is… (no face crop)',
+        onResolved: function (entity) {
+          const name = entity.name;
+          if (!name) return;
+          assignIdentityStatus.style.display = 'block';
+          assignIdentityStatus.textContent = 'Saving…';
+          fetch('/api/files/' + fileId + '/identity-assignments', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name }),
+          })
+            .then(function (r) {
+              if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
+              return r.json();
+            })
+            .then(function () {
+              appendIdentityPhotoChip(name);
+              assignIdentityStatus.textContent =
+                'Saved. No face found for ' + name + ' — search other photos by body instead?';
+              const cta = document.createElement('a');
+              cta.href = '/body-similar/' + fileId;
+              cta.className = 'btn-similar';
+              cta.style.marginLeft = '6px';
+              cta.style.fontSize = '0.9em';
+              cta.textContent = '⛶ Search by body';
+              assignIdentityStatus.appendChild(document.createElement('br'));
+              assignIdentityStatus.appendChild(cta);
+            })
+            .catch(function (err) {
+              assignIdentityStatus.textContent = 'Failed: ' + err.message;
+            });
+        },
+      });
+    });
+  }
+
   /* "Find similar faces" (🔎 next to each face chip) is now a plain navigation
      link to /search?face_ref=... — see search.html for the results page, which
      reuses the same similar-faces grid/slider UI as searching by person name. */

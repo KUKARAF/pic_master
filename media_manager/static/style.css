@@ -1296,6 +1296,12 @@ input[type="range"] { accent-color: var(--accent); }
   padding: 0;
 }
 .face-chip .rm:hover { color: var(--danger); }
+/* Faceless whole-photo identity assignment ("this person is in this photo",
+   no detected face crop to anchor to) — visually distinct from a real
+   detected-face chip via a dashed left accent instead of an image thumbnail. */
+.identity-photo-chip {
+  border-left: 3px dashed var(--text-muted);
+}
 .face-label-card {
   display: flex;
   flex-direction: column;
