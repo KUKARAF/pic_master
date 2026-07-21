@@ -98,8 +98,7 @@
   {% endif %}
 </div>
 
-<div class="grid" id="results-grid"
-     data-queue-source="{% if tag %}Tag: {{ tag }}{% elif person or face_id %}Person: {{ person or face_id }}{% elif q %}Search: {{ q }}{% else %}Search{% endif %}">
+<div class="grid" id="results-grid" data-queue-source="{{ queue_label }}">
   {% for f in files %}
   {{ macros.card(f, selectable=True) }}
   {% endfor %}

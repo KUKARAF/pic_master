@@ -19,7 +19,7 @@
   <a class="nav-link" href="/duplicates">Duplicates</a>
 
   <form class="nav-search" action="/search" method="get">
-    <input type="text" name="q" placeholder="search photos, tags, people…" value="{{ request.query_params.get('q', '') }}">
+    <input type="text" id="nav-search-input" name="q" placeholder="search photos, tags, people… ( / )" value="{{ request.query_params.get('q', '') }}">
     <button type="submit">Search</button>
   </form>
 
@@ -40,6 +40,26 @@
 
 <div class="modal-overlay" id="modal-overlay" style="display:none;">
   <div class="modal-box" id="modal-box"></div>
+</div>
+
+<div class="palette-overlay" id="palette-overlay" style="display:none;">
+  <div class="palette-box" id="palette-box">
+    <div class="palette-input-row">
+      <span class="palette-caret">&gt;</span>
+      <div class="palette-chips" id="palette-chips"></div>
+      <input type="text" id="palette-input" class="palette-in" autocomplete="off"
+             placeholder="type anything — a tag, category, person, set, filename…">
+      <span class="palette-count" id="palette-count"></span>
+    </div>
+    <div class="palette-body">
+      <div class="palette-suggestions" id="palette-suggestions"></div>
+      <div class="palette-grid" id="palette-grid"></div>
+    </div>
+    <div class="palette-footer">
+      <a href="#" id="palette-viewall" class="sub" style="display:none;">View all results →</a>
+      <span class="sub palette-hint">↑↓ select · Enter add chip · Backspace remove chip · Esc close</span>
+    </div>
+  </div>
 </div>
 
 <script>

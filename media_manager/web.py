@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -81,6 +81,14 @@ class CategoryBody(BaseModel):
     name: Optional[str] = None
     temperature: Optional[float] = None
     category_id: Optional[int] = None
+
+class SearchChip(BaseModel):
+    type: str
+    value: str
+
+class SearchPaletteBody(BaseModel):
+    q: str = ''
+    chips: List[SearchChip] = []
 
 class SwipeExcludeBody(BaseModel):
     """Shared body for every swipe stack's buffer-refill endpoint. Sent as a
@@ -390,6 +398,41 @@ def create_app(data_root: str) -> FastAPI:
             result.append(card)
         return result
 
+    def _checksums_for_chip(chip):
+        """Resolve one search-palette/multi-filter chip ({'type', 'value'}) to the
+        set of checksums it matches. 'face' replicates the union search_page's
+        person branch already does inline (own faces + whole-photo assignments +
+        photos in sets linked to this identity) so the palette and /search share one
+        definition instead of drifting apart."""
+        t, v = chip['type'], chip['value']
+        if t == 'category':
+            cat = manual.find_category(v)
+            if cat is None:
+                return set()
+            return set(get_resolved_checksums_for_category(manual, db, cat['id'], cat['name'], limit=500))
+        if t == 'tag':
+            return set(manual.get_files_by_tag(v, limit=1000))
+        if t == 'face':
+            checksums = set(manual.get_files_by_face_identity(v, limit=1000))
+            checksums |= set(manual.get_photos_assigned_to_identity(v, limit=1000))
+            for s in manual.get_sets_linked_to_identity(v):
+                checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
+            return checksums
+        if t == 'set':
+            return set(manual.get_files_by_set(int(v), limit=1000))
+        if t == 'file':
+            return {row[2] for row in db.search_by_path_substring(v, limit=200)}
+        return set()
+
+    def _intersect_chips(chips):
+        """None means 'no restriction' (caller decides what that means); an empty
+        chip list always means None, never an empty set, so a chip-less query isn't
+        mistaken for 'matches nothing'."""
+        if not chips:
+            return None
+        sets = [_checksums_for_chip(c) for c in chips]
+        return set.intersection(*sets) if sets else set()
+
     def _attach_file_meta(cards, file_id_field='file_id'):
         """Merge filename/tags/sets/category/people onto swipe-suggestion cards that
         weren't already built via _enrich_rows (faces/categories/tags suggestions —
@@ -622,7 +665,8 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/search', response_class=HTMLResponse)
     def search_page(request: Request, q: str = '', tag: str = '', face_id: str = '', person: str = '',
-                     face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc'):
+                     face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc',
+                     f: List[str] = Query([])):
         files = []
         message = ''
         all_tags = manual.list_all_tags()
@@ -631,8 +675,30 @@ def create_app(data_root: str) -> FastAPI:
         similar_faces = []
         available_sets = []
         unsorted_candidate_photos = []
+        queue_label = 'Search'
 
-        if face_ref:
+        if f:
+            # Multi-facet AND search from the search palette — each entry is
+            # "type:value" (built by the palette's chip list); resolved via the same
+            # per-chip checksum resolver the palette itself uses for live counts, so
+            # this and /api/search-palette never drift apart.
+            chips = []
+            for part in f:
+                chip_type, _, chip_value = part.partition(':')
+                if chip_type and chip_value:
+                    chips.append({'type': chip_type, 'value': chip_value})
+            checksums = _intersect_chips(chips) or set()
+            if not checksums:
+                message = 'No files match this combination of filters.'
+            else:
+                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
+                rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+                files = _enrich_rows(rows)
+                if sort == 'age':
+                    files = _sort_cards_by_age(files, order)
+            queue_label = 'Search: ' + ' + '.join(f'{c["type"]}:{c["value"]}' for c in chips)
+
+        elif face_ref:
             # "Find similar faces" from a specific face chip — reuses the same
             # grid+expand-slider UI as searching by person name, but seeded from one
             # face's embedding instead of a name, so it works on faces with no name yet.
@@ -655,7 +721,9 @@ def create_app(data_root: str) -> FastAPI:
 
         name_query = person or face_id
         linked_set_ids = set()
-        if name_query:
+        if f:
+            pass
+        elif name_query:
             checksums = set(manual.get_files_by_face_identity(name_query, limit=200))
             if person:
                 # Union in whole-photo manual assignments (no face crop involved)
@@ -686,6 +754,7 @@ def create_app(data_root: str) -> FastAPI:
                 available_sets = manual.list_sets()
                 already_linked = checksums | manual.get_all_set_member_checksums()
                 unsorted_candidate_photos = _unsorted_candidate_photos_for_identity(already_linked)
+            queue_label = f'Person: {name_query}'
 
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
@@ -694,8 +763,10 @@ def create_app(data_root: str) -> FastAPI:
             files = _enrich_rows(rows)
             if sort == 'age':
                 files = _sort_cards_by_age(files, order)
+            queue_label = f'Tag: {tag}'
 
         elif category:
+            queue_label = f'Category: {category}'
             cat_row = manual.find_category(category)
             if cat_row is None:
                 message = f'No category named "{category}".'
@@ -711,6 +782,7 @@ def create_app(data_root: str) -> FastAPI:
                         files = _sort_cards_by_age(files, order)
 
         elif q:
+            queue_label = f'Search: {q}'
             # YOLO-World object detection search, plus a filename/path substring
             # search — both kinds of matches are merged into one results grid.
             try:
@@ -758,6 +830,7 @@ def create_app(data_root: str) -> FastAPI:
             'unsorted_candidate_photos': unsorted_candidate_photos,
             'sort': sort,
             'order': order,
+            'queue_label': queue_label,
         })
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
@@ -1211,6 +1284,62 @@ def create_app(data_root: str) -> FastAPI:
         base_vocab = load_vocab_from_file(vocab_path)
         vocab = merge_vocab(base_vocab, manual.get_all_positive_labels())
         return {'vocab': vocab}
+
+    def _palette_candidates(q):
+        """Every name-facet candidate (category/tag/face/set), plus filenames when q
+        is non-empty (filename matching only makes sense against typed text — there's
+        no 'top filenames' equivalent to a tag/category's count ranking)."""
+        candidates = []
+        for r in manual.list_categories():
+            candidates.append({'type': 'category', 'value': r['name'], 'label': r['name'], '_count': r['image_count']})
+        for label, cnt in manual.list_all_tags():
+            candidates.append({'type': 'tag', 'value': label, 'label': label, '_count': cnt})
+        for name, cnt in manual.get_all_identities():
+            candidates.append({'type': 'face', 'value': name, 'label': name, '_count': cnt})
+        for r in manual.list_sets():
+            candidates.append({'type': 'set', 'value': str(r['id']), 'label': r['name'], '_count': r['image_count']})
+        if q:
+            for row in db.search_by_path_substring(q, limit=20):
+                filename = os.path.basename(row[1])
+                candidates.append({'type': 'file', 'value': filename, 'label': filename, '_count': None})
+        return candidates
+
+    @app.post('/api/search-palette')
+    def api_search_palette(body: SearchPaletteBody):
+        q = body.q.strip().lower()
+        chips = [{'type': c.type, 'value': c.value} for c in body.chips]
+        active_keys = {(c['type'], c['value']) for c in chips}
+
+        suggestions = []
+        for cand in _palette_candidates(q):
+            key = (cand['type'], cand['value'])
+            if key in active_keys:
+                continue
+            if q and q not in cand['label'].lower():
+                continue
+            count = len(_intersect_chips(chips + [{'type': cand['type'], 'value': cand['value']}]))
+            if count == 0:
+                continue
+            suggestions.append({'type': cand['type'], 'value': cand['value'], 'label': cand['label'], 'count': count})
+        suggestions.sort(key=lambda s: s['count'], reverse=True)
+        suggestions = suggestions[:8]
+
+        media = []
+        total_count = 0
+        checksums = _intersect_chips(chips)
+        if checksums is not None or q:
+            if checksums is None:
+                # q alone (no chips yet) — filename substring is the only sensible
+                # "just typed text" match; there's no free-text object-detection
+                # search here (that's what the plain /search q= path is for).
+                checksums = {row[2] for row in db.search_by_path_substring(q, limit=200)}
+            total_count = len(checksums)
+            if checksums:
+                rows = db.get_files_by_checksums(list(checksums)[:16])
+                enriched_rows = [(r['id'], r['path'], False, r['checksum']) for r in rows]
+                media = _enrich_rows(enriched_rows)
+
+        return {'suggestions': suggestions, 'media': media, 'total_count': total_count}
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):

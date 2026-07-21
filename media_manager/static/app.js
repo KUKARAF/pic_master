@@ -569,6 +569,233 @@
     });
   };
 
+  /* Shared "is the user typing somewhere" guard for page-global keyboard
+     shortcuts (search palette's "/", photo viewer's arrow keys). */
+  function isTypingTarget(el) {
+    if (!el) return false;
+    var tag = el.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Search palette — multi-facet chip search, every page.                 */
+  /* Type free text; matches across category/tag/face/set/filename are      */
+  /* ranked together as suggestions, Enter locks the highlighted one into a  */
+  /* removable chip, and chips AND-combine live against a preview grid.      */
+  /* ------------------------------------------------------------------ */
+  (function () {
+    var overlay = document.getElementById('palette-overlay');
+    var input = document.getElementById('palette-input');
+    var navInput = document.getElementById('nav-search-input');
+    if (!overlay || !input) return;
+
+    var chipsEl = document.getElementById('palette-chips');
+    var countEl = document.getElementById('palette-count');
+    var suggestionsEl = document.getElementById('palette-suggestions');
+    var gridEl = document.getElementById('palette-grid');
+    var viewAllEl = document.getElementById('palette-viewall');
+
+    var chips = [];       // [{type, value}]
+    var suggestions = []; // last response's suggestion list
+    var highlighted = 0;
+    var requestSeq = 0;   // guards against an in-flight request resolving out of order
+
+    var FACET_LABELS = { category: 'CAT', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
+
+    function open() {
+      overlay.style.display = 'flex';
+      input.value = '';
+      input.focus();
+      query();
+    }
+    function close() {
+      overlay.style.display = 'none';
+      chips = [];
+      suggestions = [];
+      highlighted = 0;
+    }
+
+    function renderChips() {
+      chipsEl.innerHTML = '';
+      chips.forEach(function (c, i) {
+        var chip = document.createElement('span');
+        chip.className = 'palette-chip palette-chip-' + c.type;
+        var tag = document.createElement('span');
+        tag.className = 'palette-chip-tag';
+        tag.textContent = FACET_LABELS[c.type] || c.type.toUpperCase();
+        var val = document.createElement('span');
+        val.textContent = c.value;
+        var x = document.createElement('span');
+        x.className = 'palette-chip-x';
+        x.textContent = '×';
+        chip.appendChild(tag);
+        chip.appendChild(val);
+        chip.appendChild(x);
+        chip.title = 'remove';
+        chip.addEventListener('click', function () {
+          chips.splice(i, 1);
+          query();
+        });
+        chipsEl.appendChild(chip);
+      });
+    }
+
+    function renderSuggestions() {
+      suggestionsEl.innerHTML = '';
+      if (!suggestions.length) {
+        var empty = document.createElement('div');
+        empty.className = 'palette-empty';
+        empty.textContent = '— no matches —';
+        suggestionsEl.appendChild(empty);
+        return;
+      }
+      suggestions.forEach(function (s, i) {
+        var row = document.createElement('div');
+        row.className = 'palette-suggestion-item' + (i === highlighted ? ' is-highlighted' : '');
+        row.style.borderLeftColor = i === highlighted ? 'var(--accent)' : 'transparent';
+        var tag = document.createElement('span');
+        tag.className = 'palette-suggestion-tag palette-chip-' + s.type;
+        tag.textContent = FACET_LABELS[s.type] || s.type.toUpperCase();
+        var label = document.createElement('span');
+        label.className = 'palette-suggestion-label';
+        label.textContent = s.label;
+        var count = document.createElement('span');
+        count.className = 'palette-suggestion-count';
+        count.textContent = s.count;
+        row.appendChild(tag);
+        row.appendChild(label);
+        row.appendChild(count);
+        row.addEventListener('click', function () {
+          highlighted = i;
+          commitHighlighted();
+        });
+        suggestionsEl.appendChild(row);
+      });
+    }
+
+    function renderGrid(media) {
+      gridEl.innerHTML = '';
+      var summary = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (input.value.trim() || 'all');
+      gridEl.dataset.queueSource = 'Search: ' + summary;
+      if (!media.length) {
+        var empty = document.createElement('div');
+        empty.className = 'palette-empty';
+        empty.textContent = chips.length || input.value.trim() ? '— no media matches this query —' : 'Type to search, or pick a suggestion…';
+        gridEl.appendChild(empty);
+        return;
+      }
+      media.forEach(function (m) {
+        var tile = document.createElement('div');
+        tile.className = 'card palette-tile';
+        tile.dataset.fileId = m.id;
+        var link = document.createElement('a');
+        link.className = 'card-img-link';
+        link.href = '/photo/' + m.id;
+        var img = document.createElement('img');
+        img.loading = 'lazy';
+        img.src = '/thumb/' + m.id;
+        img.alt = m.filename;
+        link.appendChild(img);
+        var name = document.createElement('span');
+        name.className = 'palette-tile-name';
+        name.textContent = m.title || m.filename;
+        tile.appendChild(link);
+        tile.appendChild(name);
+        gridEl.appendChild(tile);
+      });
+    }
+
+    function buildFilterHref() {
+      var parts = chips.map(function (c) { return 'f=' + encodeURIComponent(c.type + ':' + c.value); });
+      return '/search?' + parts.join('&');
+    }
+
+    function commitHighlighted() {
+      var s = suggestions[Math.min(highlighted, suggestions.length - 1)];
+      if (!s) return;
+      chips.push({ type: s.type, value: s.value });
+      input.value = '';
+      highlighted = 0;
+      query();
+    }
+
+    function query() {
+      var seq = ++requestSeq;
+      var q = input.value.trim();
+      fetch('/api/search-palette', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ q: q, chips: chips }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (seq !== requestSeq) return; // a newer keystroke's request already landed
+          suggestions = data.suggestions;
+          highlighted = 0;
+          renderChips();
+          renderSuggestions();
+          renderGrid(data.media);
+          countEl.textContent = data.total_count + ' RESULTS';
+          if (data.total_count > data.media.length) {
+            viewAllEl.style.display = '';
+            viewAllEl.href = buildFilterHref();
+            viewAllEl.textContent = 'View all ' + data.total_count + ' results →';
+          } else {
+            viewAllEl.style.display = 'none';
+          }
+        })
+        .catch(function () { /* transient network hiccup — next keystroke retries */ });
+    }
+
+    var debounceTimer = null;
+    input.addEventListener('input', function () {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(query, 150);
+    });
+
+    input.addEventListener('keydown', function (e) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        highlighted = Math.min(highlighted + 1, Math.max(0, suggestions.length - 1));
+        renderSuggestions();
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        highlighted = Math.max(highlighted - 1, 0);
+        renderSuggestions();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (suggestions.length) commitHighlighted();
+      } else if (e.key === 'Backspace' && input.value === '') {
+        if (chips.length) {
+          e.preventDefault();
+          chips.pop();
+          query();
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        close();
+      }
+    });
+
+    overlay.addEventListener('click', function (e) {
+      if (e.target === overlay) close();
+    });
+
+    if (navInput) {
+      navInput.addEventListener('focus', function (e) {
+        e.target.blur();
+        open();
+      });
+    }
+    document.addEventListener('keydown', function (e) {
+      if (e.key !== '/') return;
+      if (isTypingTarget(document.activeElement)) return;
+      if (e.altKey || e.ctrlKey || e.metaKey) return;
+      e.preventDefault();
+      open();
+    });
+  })();
+
   const fileId = window.MEDIA_FILE_ID;
   if (!fileId) return;
 
