@@ -49,6 +49,9 @@ class SetBody(BaseModel):
     studio: Optional[str] = None
     set_id: Optional[int] = None
 
+class AddFolderBody(BaseModel):
+    path: str
+
 class IdentityBody(BaseModel):
     name: Optional[str] = None
 
@@ -1655,6 +1658,28 @@ def create_app(data_root: str) -> FastAPI:
             result.append(entry)
         return result
 
+    def _folder_suggestions_for_set(file_rows, limit=8):
+        """Candidate folder paths to prime the "+ Add folder" modal with: the parent
+        directory of every photo already in this set, deduplicated and ranked by how
+        many of the set's current photos live there (most first) — if 3 of 5 photos
+        already in a set live under 'vacation/john/2023/', that's almost certainly
+        the folder the user wants to bulk-add the rest of. Paths are stored relative
+        to data_root with '/' separators (see upsert_file_path); a file directly at
+        the root (no '/') has no parent folder and is skipped."""
+        counts = {}
+        order = []
+        for r in file_rows:
+            path = r['path'] if 'path' in r.keys() else None
+            if not path or '/' not in path:
+                continue
+            folder = path.rsplit('/', 1)[0]
+            if folder not in counts:
+                counts[folder] = 0
+                order.append(folder)
+            counts[folder] += 1
+        ranked = sorted(order, key=lambda f: (-counts[f], f))
+        return [{'path': f, 'count': counts[f]} for f in ranked[:limit]]
+
     @app.get('/sets/{set_id}', response_class=HTMLResponse)
     def set_detail_page(request: Request, set_id: int, sort: str = 'added', order: str = 'desc'):
         set_row = manual.get_set(set_id)
@@ -1668,6 +1693,7 @@ def create_app(data_root: str) -> FastAPI:
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
         people_present = _people_present_in_set(set_id, checksums)
+        folder_suggestions = _folder_suggestions_for_set(file_rows)
         return templates.TemplateResponse(request, 'set_detail.html', {
             'set': dict(set_row),
             'files': files,
@@ -1675,9 +1701,33 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
             'people_present': people_present,
+            'folder_suggestions': folder_suggestions,
             'sort': sort,
             'order': order,
         })
+
+    @app.post('/api/sets/{set_id}/add-folder')
+    def api_add_folder_to_set(set_id: int, body: AddFolderBody):
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        folder_path = (body.path or '').strip().strip('/')
+        if not folder_path:
+            raise HTTPException(status_code=400, detail='Folder path must not be empty')
+        matches = db.find_files_under_folder(folder_path)
+        if not matches:
+            return {'matched': 0, 'added': 0, 'already_present': 0}
+        existing = {c for c in manual.get_files_by_set(set_id, limit=100000)}
+        added = 0
+        already_present = 0
+        for row in matches:
+            checksum = row['checksum']
+            if checksum in existing:
+                already_present += 1
+                continue
+            manual.assign_file_to_set(checksum, set_id)
+            existing.add(checksum)
+            added += 1
+        return {'matched': len(matches), 'added': added, 'already_present': already_present}
 
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,

@@ -710,6 +710,27 @@ class Database(ThreadLocalDB):
         ''', (f'%{query}%', limit))
         return cursor.fetchall()
 
+    def find_files_under_folder(self, folder_path):
+        """
+        Return (file_id, path, checksum) rows for every currently-tracked file whose
+        stored path is under `folder_path`, matched as a real path-segment prefix (not
+        a substring) — 'vacation/john/2023' matches 'vacation/john/2023/img1.jpg' but
+        NOT the sibling 'vacation/john/2023-backup/img1.jpg'. Powers "add folder to
+        set". Paths are stored relative to data_root with '/' separators (see
+        upsert_file_path / fast_scan.py), so folder_path is expected in that same
+        form; leading/trailing slashes are stripped from both sides before comparing.
+        """
+        folder_path = (folder_path or '').strip().strip('/')
+        if not folder_path:
+            return []
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT id, path, checksum
+            FROM files_with_path
+            WHERE path = ? OR path LIKE ?
+        ''', (folder_path, f'{folder_path}/%'))
+        return cursor.fetchall()
+
     def count_detected(self):
         """Return count of distinct files with a primary (frame_index IS NULL) detections row."""
         cursor = self.conn.cursor()
