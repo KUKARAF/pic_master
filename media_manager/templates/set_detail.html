@@ -109,6 +109,7 @@
 <script>
 (function() {
   const setId = {{ set.id }};
+  const setName = {{ set.name | tojson }};
 
   const setHeartBtn = document.getElementById('set-heart-btn');
   if (setHeartBtn) wireHeartButton(setHeartBtn, '/api/sets/' + setId + '/favorite');
@@ -171,7 +172,128 @@
      firing immediately) so the user can still edit/confirm before submitting.
      A plain text input, no fuzzy picker: there's no finite list of folders to
      search against, matching the same "keep it simple" call the rename-set
-     modal already makes for its two fields. */
+     modal already makes for its two fields.
+
+     Above FOLDER_PREVIEW_CAROUSEL_THRESHOLD new photos, adding is blind
+     otherwise — you'd have no idea what you just bulk-added until reviewing
+     the set afterward — so instead of committing immediately the modal shows
+     a browsable carousel (left/right arrow keys or the on-screen arrows) of
+     every photo about to be added, with one "Add N photos" button to commit
+     once you've looked through them. At or under the threshold, the previous
+     instant-add behavior is unchanged — reviewing 5 or fewer isn't worth an
+     extra step. */
+  const FOLDER_PREVIEW_CAROUSEL_THRESHOLD = 5;
+
+  function commitAddFolder(path, triggerBtn, statusEl) {
+    if (triggerBtn) triggerBtn.disabled = true;
+    if (statusEl) statusEl.textContent = 'Adding…';
+    fetch('/api/sets/' + setId + '/add-folder', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path: path}),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function(data) {
+        closeModal();
+        alert('Added ' + data.added + ' photo(s) to this set' +
+          (data.already_present ? ' (' + data.already_present + ' were already in it).' : '.'));
+        location.reload();
+      })
+      .catch(function(err) {
+        if (triggerBtn) triggerBtn.disabled = false;
+        if (statusEl) statusEl.textContent = 'Failed to add folder: ' + err.message;
+      });
+  }
+
+  function openFolderPreviewCarousel(files, path) {
+    openModal('Review ' + files.length + ' photo' + (files.length === 1 ? '' : 's'), function(box) {
+      box.style.width = '540px';
+      let idx = 0;
+
+      const counter = document.createElement('p');
+      counter.className = 'sub';
+      counter.style.textAlign = 'center';
+      counter.style.margin = '0 0 8px';
+      box.appendChild(counter);
+
+      const stage = document.createElement('div');
+      stage.className = 'folder-preview-stage';
+      const img = document.createElement('img');
+      stage.appendChild(img);
+
+      const prevBtn = document.createElement('button');
+      prevBtn.type = 'button';
+      prevBtn.className = 'folder-preview-nav folder-preview-nav-prev';
+      prevBtn.style.fontFamily = 'inherit';
+      prevBtn.style.fontSize = '20px';
+      prevBtn.title = 'Previous (←)';
+      prevBtn.textContent = '‹';
+      const nextBtn = document.createElement('button');
+      nextBtn.type = 'button';
+      nextBtn.className = 'folder-preview-nav folder-preview-nav-next';
+      nextBtn.style.fontFamily = 'inherit';
+      nextBtn.style.fontSize = '20px';
+      nextBtn.title = 'Next (→)';
+      nextBtn.textContent = '›';
+      stage.appendChild(prevBtn);
+      stage.appendChild(nextBtn);
+      box.appendChild(stage);
+
+      const filenameEl = document.createElement('p');
+      filenameEl.className = 'sub';
+      filenameEl.style.textAlign = 'center';
+      filenameEl.style.margin = '8px 0 14px';
+      filenameEl.style.overflow = 'hidden';
+      filenameEl.style.textOverflow = 'ellipsis';
+      filenameEl.style.whiteSpace = 'nowrap';
+      box.appendChild(filenameEl);
+
+      function render() {
+        const f = files[idx];
+        img.src = '/thumb/' + f.id;
+        img.alt = f.filename;
+        counter.textContent = (idx + 1) + ' / ' + files.length;
+        filenameEl.textContent = f.filename;
+        filenameEl.title = f.path;
+      }
+      function go(delta) {
+        idx = (idx + delta + files.length) % files.length;
+        render();
+      }
+      prevBtn.addEventListener('click', function() { go(-1); });
+      nextBtn.addEventListener('click', function() { go(1); });
+
+      // Self-cleaning: once this modal closes (× button, overlay click, or
+      // the confirm button below), `img` is detached from the DOM the next
+      // time closeModal() clears modalBox's contents, so this stops itself
+      // instead of leaking a document-level listener across the rest of the
+      // session.
+      function keyHandler(e) {
+        if (!img.isConnected) { document.removeEventListener('keydown', keyHandler); return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); go(1); }
+      }
+      document.addEventListener('keydown', keyHandler);
+
+      const statusEl = document.createElement('p');
+      statusEl.className = 'sub';
+      statusEl.style.margin = '0 0 8px 0';
+      box.appendChild(statusEl);
+
+      const confirmBtn = document.createElement('button');
+      confirmBtn.type = 'button';
+      confirmBtn.className = 'btn-similar btn-primary';
+      confirmBtn.style.width = '100%';
+      confirmBtn.textContent = 'Add ' + files.length + ' photo' + (files.length === 1 ? '' : 's') + ' to "' + setName + '"';
+      confirmBtn.addEventListener('click', function() {
+        commitAddFolder(path, confirmBtn, statusEl);
+      });
+      box.appendChild(confirmBtn);
+
+      render();
+    });
+  }
+
   const folderSuggestions = {{ folder_suggestions | default([]) | tojson }};
   const addFolderBtn = document.getElementById('set-add-folder-btn');
   if (addFolderBtn) {
@@ -230,12 +352,8 @@
           const path = pathInput.value.trim();
           if (!path) return;
           addBtn.disabled = true;
-          statusEl.textContent = 'Adding…';
-          fetch('/api/sets/' + setId + '/add-folder', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({path: path}),
-          })
+          statusEl.textContent = 'Checking…';
+          fetch('/api/sets/' + setId + '/add-folder/preview?path=' + encodeURIComponent(path))
             .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
             .then(function(data) {
               if (!data.matched) {
@@ -243,14 +361,15 @@
                 statusEl.textContent = 'No tracked photos found under "' + path + '". Check the path and try again.';
                 return;
               }
-              closeModal();
-              alert('Added ' + data.added + ' photo(s) to this set' +
-                (data.already_present ? ' (' + data.already_present + ' were already in it).' : '.'));
-              location.reload();
+              if (data.new_count > FOLDER_PREVIEW_CAROUSEL_THRESHOLD) {
+                openFolderPreviewCarousel(data.files, path);
+                return;
+              }
+              commitAddFolder(path, addBtn, statusEl);
             })
             .catch(function(err) {
               addBtn.disabled = false;
-              statusEl.textContent = 'Failed to add folder: ' + err.message;
+              statusEl.textContent = 'Failed to check folder: ' + err.message;
             });
         });
         box.appendChild(addBtn);

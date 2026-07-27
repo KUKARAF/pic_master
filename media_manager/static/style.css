@@ -392,6 +392,39 @@ input[type="range"] { accent-color: var(--accent); }
   border-radius: var(--radius);
 }
 
+/* "Add folder" review carousel — lets you browse every photo about to be
+   added (left/right arrow keys or the on-screen arrows) before committing,
+   instead of bulk-adding a big folder blind. */
+.folder-preview-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 360px;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+}
+.folder-preview-stage img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.folder-preview-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(5, 7, 5, .55);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.folder-preview-nav:hover { border-color: var(--accent); color: var(--accent); }
+.folder-preview-nav-prev { left: 10px; }
+.folder-preview-nav-next { right: 10px; }
+
 /* ------------------------------------------------------------------ */
 /* Search palette — multi-facet chip search, opened via nav search box   */
 /* or the "/" shortcut. Same corner-bracket/backdrop language as         */

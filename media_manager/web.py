@@ -1814,6 +1814,29 @@ def create_app(data_root: str) -> FastAPI:
             'order': order,
         })
 
+    @app.get('/api/sets/{set_id}/add-folder/preview')
+    def api_preview_add_folder_to_set(set_id: int, path: str):
+        """Read-only counterpart to add-folder — lets the "add folder" modal show
+        what it's about to do (a review carousel, when there's more than a
+        handful of new photos) before actually committing any membership."""
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        folder_path = (path or '').strip().strip('/')
+        if not folder_path:
+            raise HTTPException(status_code=400, detail='Folder path must not be empty')
+        matches = db.find_files_under_folder(folder_path)
+        existing = set(manual.get_files_by_set(set_id, limit=100000))
+        new_files = [
+            {'id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path']}
+            for r in matches if r['checksum'] not in existing
+        ]
+        return {
+            'matched': len(matches),
+            'already_present': len(matches) - len(new_files),
+            'new_count': len(new_files),
+            'files': new_files,
+        }
+
     @app.post('/api/sets/{set_id}/add-folder')
     def api_add_folder_to_set(set_id: int, body: AddFolderBody):
         if manual.get_set(set_id) is None:
