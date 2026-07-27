@@ -6,13 +6,14 @@
 {% block content %}
 <div class="page-heading">
   <h1>
-    {{ set.name }}{% if set.studio %} <span class="sub">— {{ set.studio }}</span>{% endif %}
+    {{ set.name }}
     <button type="button" id="set-heart-btn" class="heart-btn-inline {{ 'is-favorite' if set.favorite else '' }}"
             title="Favorite this set">{{ '♥' if set.favorite else '♡' }}</button>
     <button type="button" id="set-edit-btn" class="heart-btn-inline" title="Rename set">✏️</button>
     <button type="button" id="set-add-folder-btn" class="heart-btn-inline" title="Add all photos under a folder">📁</button>
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>
   </h1>
+  {{ macros.set_meta_line(set) }}
   <a href="/sets" class="sub">← Back to sets</a>
 </div>
 
@@ -459,7 +460,9 @@
       btn.className = 'btn-similar';
       btn.style.fontSize = '0.85em';
       btn.textContent = (i + 1) + ': ' + s.name;
-      btn.title = 'Add current suggestion to "' + s.name + '" (press ' + (i + 1) + ')';
+      const studioText = s.studio ? ' — ' + s.studio : '';
+      const peopleText = (s.people || []).map(function (p) { return ' @' + p.name; }).join('');
+      btn.title = 'Add current suggestion to "' + s.name + '"' + studioText + peopleText + ' (press ' + (i + 1) + ')';
       btn.addEventListener('click', function() { addCurrentCardToSet(s); });
       panel.appendChild(btn);
     });
@@ -468,7 +471,7 @@
   function rememberSimilarSet(otherSet) {
     const alreadyKnown = similarSets.some(function(s) { return s.id === otherSet.id; });
     if (alreadyKnown || similarSets.length >= SIMILAR_SETS_MAX) return;
-    similarSets.push({ id: otherSet.id, name: otherSet.name, studio: otherSet.studio });
+    similarSets.push({ id: otherSet.id, name: otherSet.name, studio: otherSet.studio, people: otherSet.people });
     saveSimilarSets();
     renderSimilarSets();
   }

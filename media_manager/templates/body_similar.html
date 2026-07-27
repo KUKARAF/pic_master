@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% import "_macros.html" as macros %}
 
 {% block title %}Find by body — {{ source_filename }} — media{% endblock %}
 
@@ -20,45 +19,150 @@
           style="display:inline-block;width:auto;margin-left:10px;">Build body index</button>
 </div>
 
-{% if message %}
-<div class="alert" style="margin-bottom:20px;">{{ message }}</div>
-{% endif %}
+<p id="body-similar-loading" class="sub" style="text-align:center;margin:24px 0;">
+  <span class="spinner" aria-hidden="true"></span> Looking for similar people… this can take a while the first time.
+</p>
 
-{% if crops | length > 1 %}
-<div class="section-title">Pick a person</div>
-<div class="body-crop-picker">
-  {% for c in crops %}
-  <a href="/body-similar/{{ source_id }}?body_id={{ c.id }}"
-     class="body-crop-choice {{ 'selected' if c.id == selected_id else '' }}">
-    <img src="/body-crop/{{ c.id }}" alt="person {{ loop.index }}">
-  </a>
-  {% endfor %}
-</div>
-{% endif %}
+<div id="body-similar-message" class="alert" style="display:none;margin-bottom:20px;"></div>
 
-{% if results %}
-<div class="grid" data-queue-source="Similar to #{{ source_id }}">
-  {% for f in results %}
-  {{ macros.card(f,
-       img_src='/body-crop/' ~ f.body_id,
-       star_href='/body-similar/' ~ f.id ~ '?body_id=' ~ f.body_id,
-       star_title='Find bodies similar to this one',
-       star_icon='🧍') }}
-  {% endfor %}
+<div id="body-crop-picker-wrap" style="display:none;">
+  <div class="section-title">Pick a person</div>
+  <div class="body-crop-picker" id="body-crop-picker"></div>
 </div>
 
-{% elif selected_id and not message %}
-<div class="empty-state">
+<div class="grid" id="body-similar-grid" data-queue-source="Similar to #{{ source_id }}"></div>
+
+<div id="body-similar-empty" class="empty-state" style="display:none;">
   <div class="icon">🕵️</div>
   <p>No similar bodies found. If the body index isn't built yet, build it above.</p>
 </div>
-{% endif %}
 {% endblock %}
 
 {% block scripts %}
 <script>
-document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
-  wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
-});
+/* The find-by-body match needs a YOLO-World + CLIP pass over this photo the
+   first time it's opened (see _ensure_own_bodies in web.py) — too slow to run
+   inline in the page request, so the page renders instantly with a loading
+   spinner and this fetches the actual result afterward (mirrors person.html's
+   lazily-loaded photo grid). */
+(function() {
+  var sourceId = {{ source_id | tojson }};
+  var bodyId = {{ body_id | tojson }};
+  var loadingEl = document.getElementById('body-similar-loading');
+  var messageEl = document.getElementById('body-similar-message');
+  var pickerWrap = document.getElementById('body-crop-picker-wrap');
+  var picker = document.getElementById('body-crop-picker');
+  var grid = document.getElementById('body-similar-grid');
+  var emptyEl = document.getElementById('body-similar-empty');
+
+  // A set's studio + linked-face "@name" tags, on their own line under its
+  // name (mirrors _macros.html's set_meta_line macro). '' when neither exists.
+  function setMetaLineHtml(s) {
+    if (!s.studio && !(s.people && s.people.length)) return '';
+    var inner = s.studio ? '<span class="set-studio">' + escapeHtml(s.studio) + '</span>' : '';
+    inner += (s.people || []).map(function (p) {
+      var age = p.age != null
+        ? '<span class="set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '') + '">' + Math.round(p.age) + '</span>'
+        : '';
+      return '<span class="set-people-tag">@' + escapeHtml(p.name) + age + '</span>';
+    }).join('');
+    return '<span class="set-meta-line">' + inner + '</span>';
+  }
+
+  function cardHtml(f) {
+    var tagsHtml = '';
+    if ((f.tags && f.tags.length) || (f.categories && f.categories.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
+      tagsHtml += '<div class="card-tags">';
+      (f.tags || []).slice(0, 3).forEach(function (t) {
+        tagsHtml += '<a class="tag" href="/search?tag=' + encodeURIComponent(t) + '">' + escapeHtml(t) + '</a>';
+      });
+      if (f.tags && f.tags.length > 3) {
+        tagsHtml += '<span class="tag" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.tags.length - 3) + '</span>';
+      }
+      (f.categories || []).slice(0, 3).forEach(function (c) {
+        tagsHtml += '<a class="chip-category" href="/search?category=' + encodeURIComponent(c.name) + '" title="Category">' + escapeHtml(c.name) + '</a>';
+      });
+      if (f.categories && f.categories.length > 3) {
+        tagsHtml += '<span class="chip-category" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.categories.length - 3) + '</span>';
+      }
+      (f.sets || []).slice(0, 3).forEach(function (s) {
+        tagsHtml += '<a class="chip-set" href="/sets/' + s.id + '" title="Set">' +
+          '<span class="chip-set-name">' + escapeHtml(s.name) + '</span>' + setMetaLineHtml(s) + '</a>';
+      });
+      if (f.sets && f.sets.length > 3) {
+        tagsHtml += '<span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.sets.length - 3) + '</span>';
+      }
+      (f.people || []).slice(0, 3).forEach(function (p) {
+        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p) + '" title="Recognized person">' + escapeHtml(p) + '</a>';
+      });
+      if (f.people && f.people.length > 3) {
+        tagsHtml += '<span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.people.length - 3) + '</span>';
+      }
+      tagsHtml += '</div>';
+    }
+    var title = f.title || f.filename;
+    return (
+      '<div class="card" data-file-id="' + f.id + '">' +
+        '<a class="card-img-link" href="/photo/' + f.id + '">' +
+          '<img src="/body-crop/' + f.body_id + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
+        '</a>' +
+        '<a class="star-btn" href="/body-similar/' + f.id + '?body_id=' + f.body_id + '" title="Find bodies similar to this one">🧍</a>' +
+        '<button type="button" class="heart-btn file-heart-btn ' + (f.favorite ? 'is-favorite' : '') + '" ' +
+          'data-file-id="' + f.id + '" title="Favorite this photo">' + (f.favorite ? '♥' : '♡') + '</button>' +
+        (f.score !== undefined ? '<span class="score-badge">' + f.score.toFixed(3) + '</span>' : '') +
+        '<div class="card-body">' +
+          '<a class="card-name" href="/photo/' + f.id + '" title="' + escapeHtml(f.path) + '">' + escapeHtml(title) + '</a>' +
+          tagsHtml +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  var url = '/api/files/' + sourceId + '/body-similar' + (bodyId != null ? '?body_id=' + bodyId : '');
+  fetch(url)
+    .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+    .then(function (data) {
+      if (data.message) {
+        messageEl.textContent = data.message;
+        messageEl.style.display = 'block';
+      }
+
+      var crops = data.crops || [];
+      if (crops.length > 1) {
+        crops.forEach(function (c, i) {
+          var a = document.createElement('a');
+          a.href = '/body-similar/' + sourceId + '?body_id=' + c.id;
+          a.className = 'body-crop-choice' + (c.id === data.selected_id ? ' selected' : '');
+          var img = document.createElement('img');
+          img.src = '/body-crop/' + c.id;
+          img.alt = 'person ' + (i + 1);
+          a.appendChild(img);
+          picker.appendChild(a);
+        });
+        pickerWrap.style.display = 'block';
+      }
+
+      var results = data.results || [];
+      results.forEach(function (f) {
+        var wrap = document.createElement('div');
+        wrap.innerHTML = cardHtml(f);
+        var cardEl = wrap.firstElementChild;
+        grid.appendChild(cardEl);
+        var heartBtn = cardEl.querySelector('.file-heart-btn');
+        if (heartBtn && window.wireHeartButton) wireHeartButton(heartBtn, '/api/files/' + heartBtn.dataset.fileId + '/favorite');
+      });
+
+      if (!results.length && data.selected_id && !data.message) {
+        emptyEl.style.display = 'block';
+      }
+    })
+    .catch(function (err) {
+      messageEl.textContent = 'Failed to load similar people: ' + err.message;
+      messageEl.style.display = 'block';
+    })
+    .finally(function () {
+      loadingEl.style.display = 'none';
+    });
+})();
 </script>
 {% endblock %}

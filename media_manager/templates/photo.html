@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}{{ file.filename }} — media{% endblock %}
 
@@ -158,11 +159,14 @@
       <div id="set-current">
         {% if current_sets %}
         {% for s in current_sets %}
-        <span class="tag-removable" data-set-id="{{ s.id }}" style="margin-bottom:4px;display:inline-flex;">
-          <a href="/sets/{{ s.id }}">{{ s.name }}</a>{% if s.studio %} <span style="opacity:.8;">({{ s.studio }})</span>{% endif %}
-          <button class="heart-btn-inline set-heart-btn {{ 'is-favorite' if s.favorite else '' }}" type="button"
-                  data-set-id="{{ s.id }}" title="Favorite this set" style="font-size:0.85em;">{{ '♥' if s.favorite else '♡' }}</button>
-          <button class="rm set-remove-btn" type="button" data-set-id="{{ s.id }}" title="Remove from this set">×</button>
+        <span class="tag-removable" data-set-id="{{ s.id }}" style="margin-bottom:4px;display:inline-flex;flex-direction:column;align-items:flex-start;gap:2px;">
+          <span style="display:flex;align-items:center;gap:5px;">
+            <a href="/sets/{{ s.id }}">{{ s.name }}</a>
+            <button class="heart-btn-inline set-heart-btn {{ 'is-favorite' if s.favorite else '' }}" type="button"
+                    data-set-id="{{ s.id }}" title="Favorite this set" style="font-size:0.85em;">{{ '♥' if s.favorite else '♡' }}</button>
+            <button class="rm set-remove-btn" type="button" data-set-id="{{ s.id }}" title="Remove from this set">×</button>
+          </span>
+          {{ macros.set_meta_line(s) }}
         </span>
         {% endfor %}
         {% else %}

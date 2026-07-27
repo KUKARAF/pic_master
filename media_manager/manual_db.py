@@ -552,6 +552,32 @@ class ManualDB(ThreadLocalDB):
         )
         return cur.fetchone()
 
+    def get_ages_for_identities(self, identities):
+        """Best-effort {identity: {'age': float, 'gender': str}} for every identity in
+        `identities` that has an age/gender estimate on at least one of their faces
+        (see face_age_estimates) — most identities won't, since estimating is a
+        manual per-photo action, not automatic; callers should treat a missing key
+        as "no estimate yet". An identity with estimates from more than one face
+        uses the single most recently created one (mirrors
+        get_age_estimate_for_face_ref's single-face resolution, just resolved
+        across all of an identity's faces instead of one caller-chosen face)."""
+        if not identities:
+            return {}
+        placeholders = ','.join('?' for _ in identities)
+        cur = self.conn.cursor()
+        cur.execute(f'''
+            SELECT f.identity, fae.age, fae.gender
+            FROM faces f
+            JOIN face_age_estimates fae ON fae.face_ref = 'manual:' || f.id
+            WHERE f.identity IN ({placeholders}) AND f.rejected = 0 AND fae.age IS NOT NULL
+            ORDER BY fae.created_at DESC
+        ''', tuple(identities))
+        result = {}
+        for identity, age, gender in cur.fetchall():
+            if identity not in result:
+                result[identity] = {'age': age, 'gender': gender}
+        return result
+
     def get_average_ages_for_checksums(self, checksums):
         """Batched lookup: {checksum: average age} across every face with an estimate
         on that photo — feeds "sort by age" on gallery-style views. A photo with no
@@ -1310,6 +1336,26 @@ class ManualDB(ThreadLocalDB):
             ORDER BY s.name
         ''', (identity,))
         return cur.fetchall()
+
+    def get_identities_for_sets(self, set_ids):
+        """Batched reverse of get_sets_linked_to_identity: {set_id: [identity, ...]}
+        (sorted, case-insensitively) for every set id given — avoids N+1 queries
+        when a page renders many sets at once (mirrors get_sets_for_checksums)."""
+        if not set_ids:
+            return {}
+        placeholders = ','.join('?' for _ in set_ids)
+        cur = self.conn.cursor()
+        cur.execute(
+            f'''SELECT set_id, identity FROM identity_set_assignments
+                WHERE set_id IN ({placeholders})''',
+            tuple(set_ids)
+        )
+        result = {}
+        for set_id, identity in cur.fetchall():
+            result.setdefault(set_id, []).append(identity)
+        for identities in result.values():
+            identities.sort(key=str.lower)
+        return result
 
     def generate_placeholder_identity_name(self):
         """The next 'Unnamed N' not currently in use — lets a face/identity get

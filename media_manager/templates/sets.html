@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}Sets — media{% endblock %}
 
@@ -49,8 +50,8 @@
     <div class="card-body">
       <div class="card-name" title="{{ s.name }}">
         <a href="/sets/{{ s.id }}">{{ s.name }}</a>
-        {% if s.studio %} <span class="sub">({{ s.studio }})</span>{% endif %}
       </div>
+      {{ macros.set_meta_line(s) }}
       <div class="sub" style="font-size:0.78rem;">{{ s.image_count }} image(s)</div>
     </div>
   </div>

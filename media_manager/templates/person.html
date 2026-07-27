@@ -34,7 +34,8 @@
 <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px;">
   {% for s in sets %}
   <a class="chip-set" href="/sets/{{ s.id }}" title="{{ s.studio or '' }}" style="font-size:15px;padding:4px 10px;">
-    {{ s.name }}{% if s.studio %} <span class="sub">— {{ s.studio }}</span>{% endif %}
+    <span class="chip-set-name">{{ s.name }}</span>
+    {{ macros.set_meta_line(s) }}
   </a>
   {% endfor %}
 </div>
@@ -80,6 +81,20 @@
     });
   }
 
+  // A set's studio + linked-face "@name" tags, on their own line under its
+  // name (mirrors _macros.html's set_meta_line macro). '' when neither exists.
+  function setMetaLineHtml(s) {
+    if (!s.studio && !(s.people && s.people.length)) return '';
+    var inner = s.studio ? '<span class="set-studio">' + escapeHtml(s.studio) + '</span>' : '';
+    inner += (s.people || []).map(function (p) {
+      var age = p.age != null
+        ? '<span class="set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '') + '">' + Math.round(p.age) + '</span>'
+        : '';
+      return '<span class="set-people-tag">@' + escapeHtml(p.name) + age + '</span>';
+    }).join('');
+    return '<span class="set-meta-line">' + inner + '</span>';
+  }
+
   function cardHtml(f) {
     var tagsHtml = '';
     if ((f.tags && f.tags.length) || (f.categories && f.categories.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
@@ -97,7 +112,8 @@
         tagsHtml += '<span class="chip-category" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.categories.length - 3) + '</span>';
       }
       (f.sets || []).slice(0, 3).forEach(function (s) {
-        tagsHtml += '<a class="chip-set" href="/sets/' + s.id + '" title="Set">' + escapeHtml(s.name) + '</a>';
+        tagsHtml += '<a class="chip-set" href="/sets/' + s.id + '" title="Set">' +
+          '<span class="chip-set-name">' + escapeHtml(s.name) + '</span>' + setMetaLineHtml(s) + '</a>';
       });
       if (f.sets && f.sets.length > 3) {
         tagsHtml += '<span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.sets.length - 3) + '</span>';

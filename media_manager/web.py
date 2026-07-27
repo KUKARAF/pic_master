@@ -379,6 +379,7 @@ def create_app(data_root: str) -> FastAPI:
         favorite_checksums = manual.get_favorite_checksums(checksums)
         title_map = manual.get_titles_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
+        _attach_set_people(sets_map.values())
         identities_map = manual.get_identities_for_checksums(checksums)
         category_map = resolve_categories_for_checksums(manual, db, [(row[0], row[3]) for row in rows])
         result = []
@@ -404,6 +405,26 @@ def create_app(data_root: str) -> FastAPI:
                 card['score'] = scores[file_id]
             result.append(card)
         return result
+
+    def _attach_set_people(sets_lists):
+        """Given an iterable of set-dict lists (e.g. a sets_map's values()), attaches
+        a 'people' key to each set dict in place — one {'name', 'age', 'gender'}
+        entry per identity linked to that set via link_identity_to_set ('age'/
+        'gender' are None when that identity has no estimate yet, see
+        get_ages_for_identities). Batches both the set->identity lookup and the
+        identity->age/gender lookup across every set involved instead of querying
+        per set (mirrors the batching _enrich_rows already does for tags/sets/
+        people)."""
+        all_sets = [s for lst in sets_lists for s in lst]
+        set_ids = {s['id'] for s in all_sets}
+        people_map = manual.get_identities_for_sets(set_ids)
+        all_identities = {name for names in people_map.values() for name in names}
+        ages_map = manual.get_ages_for_identities(all_identities)
+        for s in all_sets:
+            s['people'] = [
+                {'name': name, 'age': ages_map.get(name, {}).get('age'), 'gender': ages_map.get(name, {}).get('gender')}
+                for name in people_map.get(s['id'], [])
+            ]
 
     def _category_checksums_by_name():
         """{category_name: set(checksums)} for every category, resolved once —
@@ -534,6 +555,7 @@ def create_app(data_root: str) -> FastAPI:
         checksums = [r['checksum'] for r in file_rows.values()]
         tag_map = manual.list_tags_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
+        _attach_set_people(sets_map.values())
         identities_map = manual.get_identities_for_checksums(checksums)
         category_map = resolve_categories_for_checksums(
             manual, db, [(r['id'], r['checksum']) for r in file_rows.values()]
@@ -722,6 +744,7 @@ def create_app(data_root: str) -> FastAPI:
             {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'favorite': bool(s['favorite'])}
             for s in manual.get_sets_for_file(checksum)
         ]
+        _attach_set_people([current_sets])
         file_info['categories'] = resolve_categories_for_file(manual, db, file_id, checksum)
         all_categories = _all_categories_for_nav()
         # Age/gender estimates (experimental — see age_estimator.py) are shown inline
@@ -918,6 +941,7 @@ def create_app(data_root: str) -> FastAPI:
                 for s in lst:
                     sets_by_id.setdefault(s['id'], s)
             sets = sorted(sets_by_id.values(), key=lambda s: s['name'].lower())
+            _attach_set_people([sets])
 
         return templates.TemplateResponse(request, 'person.html', {
             'name': name,
@@ -1097,8 +1121,28 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/body-similar/{file_id}', response_class=HTMLResponse)
     def body_similar_page(request: Request, file_id: int, body_id: Optional[int] = None):
+        """Page shell only — deliberately does NOT call _ensure_own_bodies/_body_search
+        here. The first visit to this page for a not-yet-indexed photo needs a full
+        YOLO-World + CLIP pass (see _ensure_own_bodies), which is too slow to run
+        inline in a page request; the template's JS fetches
+        /api/files/{file_id}/body-similar after render instead, showing a loading
+        state meanwhile (mirrors person.html's lazily-loaded photo grid)."""
         row = _file_or_404(file_id)
-        filename = os.path.basename(row['path'])
+        return templates.TemplateResponse(request, 'body_similar.html', {
+            'source_id': file_id,
+            'source_filename': os.path.basename(row['path']),
+            'body_id': body_id,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/api/files/{file_id}/body-similar')
+    def api_body_similar(file_id: int, body_id: Optional[int] = None):
+        """The actual find-by-body work (see body_similar_page's docstring for why
+        it's not inline in the page route): ensures this photo's body crops are
+        embedded (on-demand, first call only — see _ensure_own_bodies), then ranks
+        every other photo's body crops against the chosen one."""
+        row = _file_or_404(file_id)
         message = ''
         results = []
         selected_id = None
@@ -1124,16 +1168,12 @@ def create_app(data_root: str) -> FastAPI:
                 selected_id = chosen[0]
                 results = _body_search(chosen, file_id)
 
-        return templates.TemplateResponse(request, 'body_similar.html', {
-            'source_id': file_id,
-            'source_filename': filename,
+        return {
             'crops': crops,
             'selected_id': selected_id,
             'results': results,
             'message': message,
-            'all_tags': manual.list_all_tags(),
-            'all_categories': _all_categories_for_nav(),
-        })
+        }
 
     @app.get('/body-crop/{body_id}')
     def serve_body_crop(body_id: int):
@@ -1471,12 +1511,13 @@ def create_app(data_root: str) -> FastAPI:
                 set_agg = {}
                 for cs, sets_here in sets_map.items():
                     for s in sets_here:
-                        agg = set_agg.setdefault(s['id'], {'id': s['id'], 'name': s['name'], 'count': 0, 'checksum': cs})
+                        agg = set_agg.setdefault(s['id'], {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'count': 0, 'checksum': cs})
                         agg['count'] += 1
                 sets_result = sorted(set_agg.values(), key=lambda s: s['count'], reverse=True)[:6]
                 for s in sets_result:
                     thumb_rows = db.get_files_by_checksums([s.pop('checksum')])
                     s['thumb_file_id'] = thumb_rows[0]['id'] if thumb_rows else None
+                _attach_set_people([sets_result])
 
                 people_agg = {}
                 for cs, names in identities_map.items():
@@ -1519,6 +1560,7 @@ def create_app(data_root: str) -> FastAPI:
                 'image_count': r['image_count'], 'favorite': bool(r['favorite']),
                 'thumb_id': thumb_id,
             })
+        _attach_set_people([sets])
         return templates.TemplateResponse(request, 'sets.html', {
             'sets': sets,
             'all_tags': all_tags,
@@ -1645,10 +1687,12 @@ def create_app(data_root: str) -> FastAPI:
                 scored.append((set_row, score))
 
         scored.sort(key=lambda item: item[1], reverse=True)
-        return [
+        results = [
             {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'score': round(score, 3)}
             for s, score in scored[:limit]
         ]
+        _attach_set_people([results])
+        return results
 
     @app.get('/api/files/{file_id}/suggested-sets')
     def api_suggested_sets_for_file(file_id: int):
@@ -1723,8 +1767,10 @@ def create_app(data_root: str) -> FastAPI:
             files = _sort_cards_by_age(files, order)
         people_present = _people_present_in_set(set_id, checksums)
         folder_suggestions = _folder_suggestions_for_set(file_rows)
+        set_dict = dict(set_row)
+        _attach_set_people([[set_dict]])
         return templates.TemplateResponse(request, 'set_detail.html', {
-            'set': dict(set_row),
+            'set': set_dict,
             'files': files,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
@@ -1775,11 +1821,13 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/sets')
     def api_list_sets(favorite: bool = False):
-        return [
+        sets = [
             {'id': r['id'], 'name': r['name'], 'studio': r['studio'],
              'image_count': r['image_count'], 'favorite': bool(r['favorite'])}
             for r in manual.list_sets(favorite_only=favorite)
         ]
+        _attach_set_people([sets])
+        return sets
 
     @app.post('/api/sets')
     def api_create_set(body: SetBody):
@@ -2021,7 +2069,8 @@ def create_app(data_root: str) -> FastAPI:
             if set_row is None:
                 raise HTTPException(status_code=404, detail='Set not found')
             manual.assign_file_to_set(checksum, set_row['id'])
-            return {'id': set_row['id'], 'name': set_row['name'], 'studio': set_row['studio']}
+            return {'id': set_row['id'], 'name': set_row['name'], 'studio': set_row['studio'],
+                    'people': manual.get_identities_for_sets([set_row['id']]).get(set_row['id'], [])}
 
         name = (body.name or '').strip()
         if not name:
@@ -2029,7 +2078,7 @@ def create_app(data_root: str) -> FastAPI:
         studio = body.studio.strip() if body.studio else None
         set_id = manual.create_set(name, studio)
         manual.assign_file_to_set(checksum, set_id)
-        return {'id': set_id, 'name': name, 'studio': studio}
+        return {'id': set_id, 'name': name, 'studio': studio, 'people': []}
 
     @app.delete('/api/files/{file_id}/sets/{set_id}')
     def api_remove_set(file_id: int, set_id: int):

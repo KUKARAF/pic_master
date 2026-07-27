@@ -76,7 +76,13 @@
     if (card.filename) parts.push(escapeHtml(card.filename));
     if (card.people && card.people.length) parts.push('with ' + card.people.map(escapeHtml).join(', '));
     if (card.categories && card.categories.length) parts.push('categories: ' + card.categories.map(function (c) { return escapeHtml(c.name); }).join(', '));
-    if (card.sets && card.sets.length) parts.push('in ' + card.sets.map(function (s) { return escapeHtml(s.name); }).join(', '));
+    if (card.sets && card.sets.length) parts.push('in ' + card.sets.map(function (s) {
+      const studioText = s.studio ? ' — ' + escapeHtml(s.studio) : '';
+      const peopleTags = (s.people || []).map(function (p) {
+        return ' @' + escapeHtml(p.name) + (p.age != null ? Math.round(p.age) : '');
+      }).join('');
+      return escapeHtml(s.name) + studioText + peopleTags;
+    }).join(', '));
     if (card.tags && card.tags.length) parts.push('tags: ' + card.tags.map(escapeHtml).join(', '));
     return parts.join(' · ');
   };
@@ -263,16 +269,77 @@
 
       const personLabel = document.createElement('div');
       personLabel.className = 'sub';
-      personLabel.style.marginBottom = '4px';
-      personLabel.textContent = 'Person';
+      personLabel.style.margin = '10px 0 4px';
+      personLabel.textContent = 'People (optional)';
       box.appendChild(personLabel);
       const personInput = wireDatalistField(box, {
-        placeholder: 'Person to link to this set (optional)…',
+        placeholder: 'Add a person…',
         datalistId: 'person-prompt-datalist',
         listUrl: '/api/identities',
         labelFn: function (i) { return i.name; },
         noun: 'person',
       });
+
+      const addPersonBtn = document.createElement('button');
+      addPersonBtn.type = 'button';
+      addPersonBtn.className = 'btn-similar';
+      addPersonBtn.style.marginBottom = '8px';
+      addPersonBtn.textContent = '+ Add';
+      box.appendChild(addPersonBtn);
+
+      const personChipList = document.createElement('div');
+      personChipList.style.display = 'flex';
+      personChipList.style.flexWrap = 'wrap';
+      personChipList.style.gap = '6px';
+      personChipList.style.marginBottom = '10px';
+      box.appendChild(personChipList);
+
+      // Nothing here is persisted until the whole modal is submitted — this
+      // is a local accumulation, POSTed in a loop only from submit() (unlike
+      // person.html's alias editor, which persists each add/remove
+      // immediately since it's editing an already-existing identity).
+      const pendingPeople = [];
+
+      function renderPeopleChips() {
+        personChipList.innerHTML = '';
+        pendingPeople.forEach(function (name, idx) {
+          const chip = document.createElement('span');
+          chip.className = 'tag-removable';
+          chip.style.display = 'inline-flex';
+          chip.textContent = name;
+          const rm = document.createElement('button');
+          rm.type = 'button';
+          rm.className = 'rm';
+          rm.title = 'Remove';
+          rm.textContent = '×';
+          rm.addEventListener('click', function () {
+            pendingPeople.splice(idx, 1);
+            renderPeopleChips();
+          });
+          chip.appendChild(rm);
+          personChipList.appendChild(chip);
+        });
+      }
+
+      function addPerson() {
+        const name = personInput.value.trim();
+        if (!name) return;
+        const exists = pendingPeople.some(function (p) {
+          return p.toLowerCase() === name.toLowerCase();
+        });
+        personInput.value = '';
+        if (exists) return;
+        pendingPeople.push(name);
+        renderPeopleChips();
+        personInput.focus();
+      }
+      addPersonBtn.addEventListener('click', addPerson);
+
+      const createBtn = document.createElement('button');
+      createBtn.type = 'button';
+      createBtn.className = 'btn-similar btn-primary';
+      createBtn.textContent = 'Create set';
+      box.appendChild(createBtn);
 
       let submitted = false;
       function submit() {
@@ -280,22 +347,34 @@
         submitted = true;
         studioInput.disabled = true;
         personInput.disabled = true;
+        addPersonBtn.disabled = true;
+        createBtn.disabled = true;
         createSet(setName, studioInput.value.trim() || null)
           .then(function (data) {
-            const personName = personInput.value.trim();
-            if (!personName) return data;
-            return fetch('/api/identities/' + encodeURIComponent(personName) + '/assign-set', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ set_id: data.id }),
-            }).then(function (r) {
+            const failures = [];
+            // Sequential, not Promise.all — the backend uses one shared
+            // SQLite connection per database with no locking, so firing
+            // these all at once from separate request threads corrupts
+            // cursor state (mirrors search.html's bulk-add-to-set).
+            return pendingPeople.reduce(function (chain, personName) {
+              return chain.then(function () {
+                return fetch('/api/identities/' + encodeURIComponent(personName) + '/assign-set', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ set_id: data.id }),
+                }).then(function (r) {
+                  if (!r.ok) failures.push(personName);
+                }).catch(function () {
+                  failures.push(personName);
+                });
+              });
+            }, Promise.resolve()).then(function () {
               // The set itself is already created successfully at this point —
-              // a failure to link the person shouldn't lose that or block the
-              // caller, just surface it and move on.
-              if (!r.ok) alert('Set created, but failed to link person "' + personName + '".');
-              return data;
-            }).catch(function () {
-              alert('Set created, but failed to link person "' + personName + '".');
+              // a failure to link one or more people shouldn't lose that or
+              // block the caller, just surface it and move on.
+              if (failures.length) {
+                alert('Set created, but failed to link: ' + failures.join(', '));
+              }
               return data;
             });
           })
@@ -304,15 +383,22 @@
             submitted = false;
             studioInput.disabled = false;
             personInput.disabled = false;
+            addPersonBtn.disabled = false;
+            createBtn.disabled = false;
             alert('Failed to create set: ' + err.message);
           });
       }
 
-      [studioInput, personInput].forEach(function (input) {
-        input.addEventListener('keydown', function (e) {
-          if (e.key === 'Enter') { e.preventDefault(); submit(); }
-          else if (e.key === 'Escape') { e.preventDefault(); input.value = ''; submit(); }
-        });
+      createBtn.addEventListener('click', submit);
+
+      studioInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); submit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); studioInput.value = ''; submit(); }
+      });
+
+      personInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); addPerson(); }
+        else if (e.key === 'Escape') { e.preventDefault(); personInput.value = ''; }
       });
 
       setTimeout(function () { studioInput.focus(); }, 0);
@@ -347,7 +433,12 @@
       placeholder: 'Search or create a set…',
       fetchAll: function () { return fetch('/api/sets').then(function (r) { return r.json(); }); },
       label: function (s) { return s.name; },
-      secondary: function (s) { return s.studio || ''; },
+      secondary: function (s) {
+        const peopleText = s.people && s.people.length ? s.people.map(function (p) {
+          return '@' + p.name + (p.age != null ? ' (' + Math.round(p.age) + (p.gender === 'male' ? 'm' : p.gender === 'female' ? 'f' : '') + ')' : '');
+        }).join(' ') : '';
+        return [s.studio || '', peopleText].filter(Boolean).join(' — ');
+      },
       image: null,
       // Matches today's exact chained behavior: a new set's studio is its own
       // keyboard-first step, not folded into this one.
@@ -653,7 +744,10 @@
       { type: 'category', url: '/api/categories', label: function (c) { return c.name; }, value: function (c) { return c.name; }, count: function (c) { return c.image_count || 0; } },
       { type: 'tag', url: '/api/tags', label: function (t) { return t.tag; }, value: function (t) { return t.tag; }, count: function (t) { return t.count || 0; } },
       { type: 'face', url: '/api/identities', label: function (i) { return i.name; }, value: function (i) { return i.name; }, count: function (i) { return i.count || 0; } },
-      { type: 'set', url: '/api/sets', label: function (s) { return s.name; }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
+      { type: 'set', url: '/api/sets', label: function (s) {
+        var peopleText = (s.people || []).map(function (p) { return '@' + p.name + (p.age != null ? Math.round(p.age) : ''); }).join(' ');
+        return [s.name, s.studio || '', peopleText].filter(Boolean).join(' — ');
+      }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
     ];
     return Promise.all(sources.map(function (src) {
       return fetch(src.url).then(function (r) { return r.json(); }).then(function (data) {
@@ -789,7 +883,7 @@
       return { wrap: wrap, tiles: tiles };
     }
 
-    function makeTile(href, thumbSrc, alt, caption, extraClass) {
+    function makeTile(href, thumbSrc, alt, caption, extraClass, metaEl) {
       var tile = document.createElement('div');
       tile.className = 'card palette-tile' + (extraClass ? ' ' + extraClass : '');
       var link = document.createElement('a');
@@ -805,7 +899,36 @@
       name.textContent = caption;
       tile.appendChild(link);
       tile.appendChild(name);
+      if (metaEl) tile.appendChild(metaEl);
       return tile;
+    }
+
+    // A set's studio + linked-face "@name" (+ age/gender when known) tags, on
+    // their own line under the tile's name — mirrors _macros.html's
+    // set_meta_line. null when the set has neither.
+    function buildSetTileMeta(s) {
+      if (!s.studio && !(s.people && s.people.length)) return null;
+      var meta = document.createElement('span');
+      meta.className = 'set-meta-line';
+      if (s.studio) {
+        var studioSpan = document.createElement('span');
+        studioSpan.className = 'set-studio';
+        studioSpan.textContent = s.studio;
+        meta.appendChild(studioSpan);
+      }
+      (s.people || []).forEach(function (p) {
+        var tag = document.createElement('span');
+        tag.className = 'set-people-tag';
+        tag.textContent = '@' + p.name;
+        if (p.age != null) {
+          var ageSpan = document.createElement('span');
+          ageSpan.className = 'set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '');
+          ageSpan.textContent = Math.round(p.age);
+          tag.appendChild(ageSpan);
+        }
+        meta.appendChild(tag);
+      });
+      return meta;
     }
 
     function renderGrid(data) {
@@ -825,7 +948,7 @@
           setSec.tiles.appendChild(makeTile(
             '/sets/' + s.id,
             s.thumb_file_id != null ? '/thumb/' + s.thumb_file_id : '',
-            s.name, s.name, 'palette-tile-set'
+            s.name, s.name, 'palette-tile-set', buildSetTileMeta(s)
           ));
         });
         gridEl.appendChild(setSec.wrap);
@@ -1864,6 +1987,36 @@
   const setCurrent = document.getElementById('set-current');
   const setPickerBtn = document.getElementById('set-picker-btn');
 
+  // A set's studio + linked-face "@name" tags (each an {name, age, gender}
+  // object — age/gender only when that identity has an estimate), always
+  // rendered together on their own line directly under the set's name
+  // (mirrors _macros.html's set_meta_line). Returns null when the set has
+  // neither, so callers can skip appending an empty line.
+  function buildSetMetaLine(set) {
+    if (!set.studio && !(set.people && set.people.length)) return null;
+    const meta = document.createElement('span');
+    meta.className = 'set-meta-line';
+    if (set.studio) {
+      const studioSpan = document.createElement('span');
+      studioSpan.className = 'set-studio';
+      studioSpan.textContent = set.studio;
+      meta.appendChild(studioSpan);
+    }
+    (set.people || []).forEach(function (p) {
+      const tag = document.createElement('span');
+      tag.className = 'set-people-tag';
+      tag.textContent = '@' + p.name;
+      if (p.age != null) {
+        const ageSpan = document.createElement('span');
+        ageSpan.className = 'set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '');
+        ageSpan.textContent = Math.round(p.age);
+        tag.appendChild(ageSpan);
+      }
+      meta.appendChild(tag);
+    });
+    return meta;
+  }
+
   function wireSetChip(span) {
     const heartBtn = span.querySelector('.set-heart-btn');
     if (heartBtn) wireHeartButton(heartBtn, '/api/sets/' + span.dataset.setId + '/favorite');
@@ -1889,19 +2042,21 @@
       span.className = 'tag-removable';
       span.style.marginBottom = '4px';
       span.style.display = 'inline-flex';
+      span.style.flexDirection = 'column';
+      span.style.alignItems = 'flex-start';
+      span.style.gap = '2px';
       span.dataset.setId = set.id;
+
+      const row = document.createElement('span');
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '5px';
 
       const link = document.createElement('a');
       link.href = '/sets/' + set.id;
       link.style.color = '#fff';
       link.textContent = set.name;
-      span.appendChild(link);
-      if (set.studio) {
-        const studioSpan = document.createElement('span');
-        studioSpan.style.opacity = '.8';
-        studioSpan.textContent = ' (' + set.studio + ')';
-        span.appendChild(studioSpan);
-      }
+      row.appendChild(link);
 
       const heartBtn = document.createElement('button');
       heartBtn.type = 'button';
@@ -1909,14 +2064,18 @@
       heartBtn.style.fontSize = '0.85em';
       heartBtn.title = 'Favorite this set';
       heartBtn.textContent = set.favorite ? '♥' : '♡';
-      span.appendChild(heartBtn);
+      row.appendChild(heartBtn);
 
       const removeBtn = document.createElement('button');
       removeBtn.className = 'rm set-remove-btn';
       removeBtn.type = 'button';
       removeBtn.title = 'Remove from this set';
       removeBtn.textContent = '×';
-      span.appendChild(removeBtn);
+      row.appendChild(removeBtn);
+
+      span.appendChild(row);
+      const metaLine = buildSetMetaLine(set);
+      if (metaLine) span.appendChild(metaLine);
 
       setCurrent.appendChild(span);
       wireSetChip(span);
@@ -1945,31 +2104,41 @@
     span.className = 'tag-removable';
     span.style.marginBottom = '4px';
     span.style.display = 'inline-flex';
+    span.style.flexDirection = 'column';
+    span.style.alignItems = 'flex-start';
+    span.style.gap = '2px';
     span.dataset.setId = set.id;
+
+    const row = document.createElement('span');
+    row.style.display = 'flex';
+    row.style.alignItems = 'center';
+    row.style.gap = '5px';
+
     const link = document.createElement('a');
     link.href = '/sets/' + set.id;
     link.style.color = '#fff';
     link.textContent = set.name;
-    span.appendChild(link);
-    if (set.studio) {
-      const studioSpan = document.createElement('span');
-      studioSpan.style.opacity = '.8';
-      studioSpan.textContent = ' (' + set.studio + ')';
-      span.appendChild(studioSpan);
-    }
+    row.appendChild(link);
+
     const heartBtn = document.createElement('button');
     heartBtn.type = 'button';
     heartBtn.className = 'heart-btn-inline set-heart-btn';
     heartBtn.style.fontSize = '0.85em';
     heartBtn.title = 'Favorite this set';
     heartBtn.textContent = '♡';
-    span.appendChild(heartBtn);
+    row.appendChild(heartBtn);
+
     const removeBtn = document.createElement('button');
     removeBtn.className = 'rm set-remove-btn';
     removeBtn.type = 'button';
     removeBtn.title = 'Remove from this set';
     removeBtn.textContent = '×';
-    span.appendChild(removeBtn);
+    row.appendChild(removeBtn);
+
+    span.appendChild(row);
+    const metaLine = buildSetMetaLine(set);
+    if (metaLine) span.appendChild(metaLine);
+
     setCurrent.appendChild(span);
     wireSetChip(span);
   }
@@ -2021,21 +2190,25 @@
           chip.href = '#';
           chip.style.marginRight = '6px';
           chip.style.marginBottom = '4px';
-          chip.style.display = 'inline-flex';
-          chip.style.alignItems = 'center';
-          chip.style.gap = '4px';
           chip.title = 'Suggested match — click to add';
           chip.dataset.setId = set.id;
 
+          const row = document.createElement('span');
+          row.style.display = 'flex';
+          row.style.alignItems = 'center';
+          row.style.gap = '4px';
           const nameSpan = document.createElement('span');
-          nameSpan.textContent = set.name + (set.studio ? ' (' + set.studio + ')' : '');
-          chip.appendChild(nameSpan);
-
+          nameSpan.textContent = set.name;
+          row.appendChild(nameSpan);
           const scoreSpan = document.createElement('span');
           scoreSpan.className = 'score-badge';
           scoreSpan.style.position = 'static';
           scoreSpan.textContent = set.score.toFixed(2);
-          chip.appendChild(scoreSpan);
+          row.appendChild(scoreSpan);
+          chip.appendChild(row);
+
+          const metaLine = buildSetMetaLine(set);
+          if (metaLine) chip.appendChild(metaLine);
 
           chip.addEventListener('click', function (e) {
             e.preventDefault();
