@@ -1594,7 +1594,8 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True):
+    def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
+                                     honor_negatives=False, exclude_non_matching_faces=False):
         """Images not yet in the set whose CLIP embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
@@ -1616,18 +1617,42 @@ def create_app(data_root: str) -> FastAPI:
         applied across the whole ranked pool before slicing to `limit`, not
         just within whatever page/buffer size was requested, so it can
         actually pull in fresh candidates rather than just reordering a
-        handful already selected."""
-        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+        handful already selected.
+
+        `honor_negatives` (default False — a UI toggle, off by default):
+        rejected photos (file_set_exclusions) are always hard-excluded from the
+        candidate pool regardless of this flag — what it controls is whether
+        they *also* pull the ranking centroid away from their own embeddings
+        (Rocchio-style relevance feedback, see similarity.adjusted_centroid),
+        so photos that merely resemble something already rejected rank lower
+        too, not just literal re-suggestions of the same rejected photo.
+
+        `exclude_non_matching_faces` (default False — a UI toggle, off by
+        default): drops any threshold-passing candidate that has a recognized
+        face belonging to someone who isn't already confirmed in this set (see
+        get_people_present_in_set — manually assigned people plus anyone with a
+        named face on one of the set's own photos). A candidate with no
+        recognized face at all is never dropped by this — there's nothing to
+        judge a mismatch against. If the set has no confirmed people yet
+        either, this is a no-op (same reason)."""
+        from media_manager.similarity import mean_normalized_centroid, adjusted_centroid, rank_by_similarity
 
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
-        member_embeddings = db.get_embeddings_for_files(member_ids)
-        centroid = mean_normalized_centroid([e for _fid, e in member_embeddings])
-        if centroid is None:
-            return []
+        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
 
         member_checksum_set = set(member_checksums)
         excluded_checksum_set = manual.get_excluded_checksums_for_set(set_id)
+
+        if honor_negatives and excluded_checksum_set:
+            excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
+            excluded_embeddings = [e for _fid, e in db.get_embeddings_for_files(excluded_ids)]
+            centroid = adjusted_centroid(member_embeddings, excluded_embeddings)
+        else:
+            centroid = mean_normalized_centroid(member_embeddings)
+        if centroid is None:
+            return []
+
         candidates = [
             row for row in db.get_all_embeddings()
             if row[3] not in member_checksum_set and row[3] not in excluded_checksum_set
@@ -1636,6 +1661,14 @@ def create_app(data_root: str) -> FastAPI:
             return []
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+        if exclude_non_matching_faces and passing:
+            set_people = set(manual.get_people_present_in_set(set_id, member_checksums).keys())
+            if set_people:
+                identities_map = manual.get_identities_for_checksums([item[0][2] for item in passing])
+                passing = [
+                    item for item in passing
+                    if not (set(identities_map.get(item[0][2], [])) - set_people)
+                ]
         if avoid_existing and passing:
             member_checksums_anywhere = manual.get_all_set_member_checksums()
             passing.sort(key=lambda item: item[0][2] in member_checksums_anywhere)
@@ -1806,14 +1839,16 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
-                                   limit: int = 12, offset: int = 0, avoid_existing: bool = True):
+                                   limit: int = 12, offset: int = 0, avoid_existing: bool = True,
+                                   honor_negatives: bool = False, exclude_non_matching_faces: bool = False):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
         results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids,
-                                                avoid_existing=avoid_existing)
+                                                avoid_existing=avoid_existing, honor_negatives=honor_negatives,
+                                                exclude_non_matching_faces=exclude_non_matching_faces)
         # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
         # response contract expects; 'results' stays for the pre-existing grid
         # (offset-based load-more + threshold-expand) callers, unchanged.

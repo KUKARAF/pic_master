@@ -79,9 +79,17 @@
   Suggested images for this set
 </div>
 
-<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
   <input type="checkbox" id="set-avoid-existing-toggle" checked>
   Deprioritize photos that already belong to a set
+</label>
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+  <input type="checkbox" id="set-honor-negatives-toggle">
+  Honor negatives as suggestions (steer ranking away from rejected photos, not just hide them)
+</label>
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="set-exclude-non-matching-faces-toggle">
+  Exclude photos showing a recognized face not already confirmed in this set
 </label>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="set-swipe-page" style="flex:1;min-width:300px;">
@@ -333,9 +341,13 @@
 
   function fetchMoreUrl(known, need) {
     const avoidToggle = document.getElementById('set-avoid-existing-toggle');
+    const honorNegativesToggle = document.getElementById('set-honor-negatives-toggle');
+    const excludeNonMatchingFacesToggle = document.getElementById('set-exclude-non-matching-faces-toggle');
     return '/api/sets/' + setId + '/similar-files?threshold=' + currentThreshold +
       '&limit=' + (need || 10) +
-      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked);
+      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
+      '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked) +
+      '&exclude_non_matching_faces=' + String(!!excludeNonMatchingFacesToggle && excludeNonMatchingFacesToggle.checked);
   }
 
   function launchStack(initialCards) {

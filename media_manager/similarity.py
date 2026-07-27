@@ -15,6 +15,26 @@ def mean_normalized_centroid(embedding_bytes_list):
     return None if norm == 0 else centroid / norm
 
 
+def adjusted_centroid(positive_embeddings, negative_embeddings, negative_weight=0.5):
+    """Rocchio-style relevance-feedback centroid: the plain positive centroid
+    (mean_normalized_centroid of positive_embeddings), pulled away from the
+    mean direction of negative_embeddings when there are any, then
+    re-normalized. `negative_weight` controls how hard: 0 reduces to the plain
+    positive centroid, 1 subtracts the negative centroid at full strength.
+    None if positive_embeddings is empty (mirrors mean_normalized_centroid);
+    falls back to the plain positive centroid if negative_embeddings is empty
+    or its own mean is the zero vector."""
+    positive_centroid = mean_normalized_centroid(positive_embeddings)
+    if positive_centroid is None or not negative_embeddings:
+        return positive_centroid
+    negative_centroid = mean_normalized_centroid(negative_embeddings)
+    if negative_centroid is None:
+        return positive_centroid
+    adjusted = positive_centroid - negative_weight * negative_centroid
+    norm = np.linalg.norm(adjusted)
+    return positive_centroid if norm == 0 else adjusted / norm
+
+
 def rank_by_similarity(centroid, candidates, embedding_index=2):
     """candidates: rows containing embedding bytes at embedding_index (matches
     the shape of db.get_all_embeddings()/get_embeddings_for_files() rows).
