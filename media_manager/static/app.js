@@ -58,6 +58,32 @@
   window.openModal = openModal;
   window.closeModal = closeModal;
 
+  // Programmatically seed the watch-queue arrow-key browsing session (see the
+  // queue-nav IIFE further down, and base.html's click-capture path which is
+  // the only other writer of this sessionStorage key) — lets a page build a
+  // queue from an arbitrary list of ids instead of only from clicking a card
+  // in a data-queue-source grid.
+  window.setPhotoQueue = function (ids, label, cursor) {
+    sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor || 0, label: label }));
+  };
+
+  // "Custom action" — a declarative, one-shot action shown as a button at the
+  // very top of the photo page's sidebar (see the renderer IIFE further down).
+  // Declarative (not a callback) because it has to survive a real page
+  // navigation via sessionStorage, not just an in-memory closure. `request`
+  // is a plain {method, url, body} fetch spec; `successMessage` may use
+  // {{key}} placeholders resolved against the JSON response.
+  window.setPhotoCustomAction = function (action) {
+    sessionStorage.setItem('photoCustomAction', JSON.stringify(action));
+  };
+
+  // Shared with the queue-thumbnail-grid overlay further down (Space on the
+  // photo page) — a plain outer-scope flag rather than event-registration-
+  // order/stopImmediatePropagation tricks, so the existing Left/Right queue,
+  // "/" palette, and F/Esc handlers below can each just check it and no-op
+  // while the grid is open, instead of the grid needing to race them.
+  let photoGridOpen = false;
+
   // Exposed globally so any per-page inline <script> (including swipe-core.js
   // config blocks) can escape user-controlled strings before dropping them into
   // innerHTML, without each page reimplementing this.
@@ -1117,6 +1143,7 @@
       });
     }
     document.addEventListener('keydown', function (e) {
+      if (photoGridOpen) return;
       if (e.key !== '/') return;
       if (isTypingTarget(document.activeElement)) return;
       if (e.altKey || e.ctrlKey || e.metaKey) return;
@@ -1164,7 +1191,7 @@
     const hintEl = document.getElementById('stage-hint');
     if (hintEl) {
       hintEl.textContent = queue
-        ? queue.label + ' · ' + (queue.cursor + 1) + '/' + queue.ids.length + ' · ← → BROWSE · F FIT · ESC PANEL'
+        ? queue.label + ' · ' + (queue.cursor + 1) + '/' + queue.ids.length + ' · ← → BROWSE · SPACE GRID · F FIT · ESC PANEL'
         : 'F FIT · ESC PANEL';
     }
 
@@ -1179,6 +1206,7 @@
     }
 
     document.addEventListener('keydown', function (e) {
+      if (photoGridOpen) return;
       if (!queue) return;
       if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       if (isTypingTarget(document.activeElement)) return;
@@ -1194,6 +1222,167 @@
       sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
       goTo(queue.ids[queue.cursor]);
     });
+  })();
+
+  /* Space — a 3-wide thumbnail grid of every photo in the current watch
+     queue (window.__photoQueue, set up by the IIFE just above), so a long
+     queue can be jumped into directly instead of stepping through it one
+     Left/Right at a time. Built entirely client-side from ids already in
+     memory — no fetches, since this exists specifically to be the fast
+     alternative to a network-heavy preview. Toggles via `photoGridOpen`
+     (declared near the top of this file), which the Left/Right, "/", and
+     F/Esc handlers above/below already check to no-op while this is open. */
+  (function () {
+    let overlay = null;
+    let cellEls = [];
+    let selectedIndex = 0;
+
+    function goTo(id) {
+      window.location.href = '/photo/' + id;
+    }
+
+    function isTypingTarget(el) {
+      if (!el) return false;
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable;
+    }
+
+    function buildOverlay() {
+      const el = document.createElement('div');
+      el.className = 'queue-grid-overlay';
+      el.addEventListener('click', function (e) {
+        if (e.target === el) closeGrid();
+      });
+      const panel = document.createElement('div');
+      panel.className = 'queue-grid-panel';
+      el.appendChild(panel);
+      document.body.appendChild(el);
+      return { el: el, panel: panel };
+    }
+
+    function render() {
+      const queue = window.__photoQueue;
+      overlay.panel.innerHTML = '';
+      cellEls = queue.ids.map(function (id, i) {
+        const cell = document.createElement('button');
+        cell.type = 'button';
+        cell.className = 'queue-grid-cell' + (i === queue.cursor ? ' is-current' : '');
+        const img = document.createElement('img');
+        img.src = '/thumb/' + id;
+        img.loading = 'lazy';
+        cell.appendChild(img);
+        cell.addEventListener('click', function () { goTo(id); });
+        overlay.panel.appendChild(cell);
+        return cell;
+      });
+      setSelected(queue.cursor);
+    }
+
+    function setSelected(i) {
+      if (cellEls[selectedIndex]) cellEls[selectedIndex].classList.remove('is-selected');
+      selectedIndex = i;
+      const cell = cellEls[selectedIndex];
+      if (cell) {
+        cell.classList.add('is-selected');
+        cell.scrollIntoView({ block: 'center' });
+      }
+    }
+
+    function moveSelection(delta) {
+      const next = Math.max(0, Math.min(cellEls.length - 1, selectedIndex + delta));
+      setSelected(next);
+    }
+
+    function openGrid() {
+      const queue = window.__photoQueue;
+      if (!queue || !queue.ids.length) return;
+      if (!overlay) overlay = buildOverlay();
+      render();
+      overlay.el.classList.add('open');
+      photoGridOpen = true;
+    }
+
+    function closeGrid() {
+      if (overlay) overlay.el.classList.remove('open');
+      photoGridOpen = false;
+    }
+
+    document.addEventListener('keydown', function (e) {
+      if (e.key === ' ' || e.key === 'Spacebar') {
+        if (isTypingTarget(document.activeElement)) return;
+        if (e.altKey || e.ctrlKey || e.metaKey) return;
+        if (!photoGridOpen && !window.__photoQueue) return;
+        e.preventDefault();
+        if (photoGridOpen) closeGrid(); else openGrid();
+        return;
+      }
+      if (!photoGridOpen) return;
+      if (e.key === 'Escape') { e.preventDefault(); closeGrid(); return; }
+      if (e.key === 'Enter') { e.preventDefault(); goTo(window.__photoQueue.ids[selectedIndex]); return; }
+      if (e.key === 'ArrowLeft') { e.preventDefault(); moveSelection(-1); return; }
+      if (e.key === 'ArrowRight') { e.preventDefault(); moveSelection(1); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-3); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(3); return; }
+    });
+  })();
+
+  /* "Custom action" banner — renders whatever setPhotoCustomAction() last
+     stashed as a persistent button at the very top of the sidebar (see
+     #sidebar-custom-action in photo.html). One-shot: cleared from
+     sessionStorage as soon as its request succeeds, so it doesn't reappear
+     on the next photo/reload. */
+  (function () {
+    const raw = sessionStorage.getItem('photoCustomAction');
+    if (!raw) return;
+    let action;
+    try {
+      action = JSON.parse(raw);
+    } catch (e) {
+      sessionStorage.removeItem('photoCustomAction');
+      return;
+    }
+    if (!action || !action.buttonLabel || !action.request) {
+      sessionStorage.removeItem('photoCustomAction');
+      return;
+    }
+
+    const mount = document.getElementById('sidebar-custom-action');
+    if (!mount) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-similar btn-primary';
+    btn.textContent = action.buttonLabel;
+    const status = document.createElement('div');
+    status.className = 'sub';
+    status.style.marginTop = '6px';
+    status.style.display = 'none';
+
+    btn.addEventListener('click', function () {
+      btn.disabled = true;
+      fetch(action.request.url, {
+        method: action.request.method || 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: action.request.body ? JSON.stringify(action.request.body) : undefined,
+      })
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) {
+          sessionStorage.removeItem('photoCustomAction');
+          status.textContent = (action.successMessage || 'Done.').replace(/\{\{(\w+)\}\}/g, function (_, key) {
+            return data[key] !== undefined ? data[key] : '';
+          });
+          status.style.display = 'block';
+          btn.style.display = 'none';
+        })
+        .catch(function (err) {
+          btn.disabled = false;
+          status.textContent = 'Failed: ' + err.message;
+          status.style.display = 'block';
+        });
+    });
+
+    mount.appendChild(btn);
+    mount.appendChild(status);
   })();
 
   const tagList = document.getElementById('tag-list');
@@ -2431,6 +2620,7 @@
     if (sidebarCloseBtn) sidebarCloseBtn.addEventListener('click', function () { setSidebar(false); });
 
     window.addEventListener('keydown', function (e) {
+      if (photoGridOpen) return;
       const tag = (e.target && e.target.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       if (e.key === 'f' || e.key === 'F') cycleFit();
