@@ -63,6 +63,14 @@ def main():
     mv.add_argument('src', help='Old path (relative to repo root)')
     mv.add_argument('dst', help='New path (relative to repo root)')
 
+    # media rm <path> - untrack a file or directory (like `git rm --cached`): removes
+    # it from the index (media.db) so it stops showing up anywhere, but never touches
+    # the file on disk and never touches manual.db's curated data (tags/faces/sets/
+    # etc, keyed by content checksum) — re-running `media add` on the same content
+    # later reattaches all of that automatically.
+    rm_cmd = sub.add_parser('rm', help='Untrack a file or directory (index only — never deletes from disk)')
+    rm_cmd.add_argument('path', help='Tracked file or directory path (relative to repo root) to untrack')
+
     # media commit [path] [--with-full-ml] - scan, optionally followed by the full
     # ML pipeline (metadata, YOLO index, CLIP embed, face detect) in one go
     commit = sub.add_parser('commit', help='Scan a directory, optionally running the full ML pipeline too')
@@ -301,6 +309,16 @@ def main():
         print("'media mv' is retired — content is tracked by hash now, not path, so "
               "a plain 'media add' after moving/renaming a file re-links it to its "
               "existing tags/faces/sets automatically. Nothing to record.", file=sys.stderr)
+        return 0
+
+    elif args.cmd == 'rm':
+        m = MediaManager()
+        paths_removed, files_removed = m.db.remove_paths_under(args.path)
+        m.close()
+        if paths_removed == 0:
+            print(f"No tracked file or directory found at '{args.path}'.", file=sys.stderr)
+            return 1
+        print(f"Untracked {paths_removed} path(s) ({files_removed} file(s) fully removed from the index).")
         return 0
 
     elif args.cmd == 'commit':

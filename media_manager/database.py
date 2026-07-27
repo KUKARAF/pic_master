@@ -764,6 +764,59 @@ class Database(ThreadLocalDB):
         ''', (folder_path, f'{folder_path}/%'))
         return cursor.fetchall()
 
+    def remove_paths_under(self, path_prefix):
+        """Untrack every currently-tracked path at or under `path_prefix` — a real
+        path-segment prefix match, like find_files_under_folder above
+        ('vacation/2023' matches 'vacation/2023/img.jpg' but not the sibling
+        'vacation/2023-backup/img.jpg'), or an exact single-file path.
+
+        Only removes rows from THIS database (file_paths, and — for any content
+        whose last remaining tracked path was just removed — the owning `files`
+        row plus every table keyed off its file_id: embeddings/tags/detections/
+        faces/body_embeddings/file_category_matches). This connection never sets
+        `PRAGMA foreign_keys=ON` (see ThreadLocalDB), so the schema's
+        `ON DELETE CASCADE` declarations are not actually enforced — cleanup is
+        done explicitly here instead of relying on them, to avoid leaving
+        orphaned rows referencing a deleted file_id. Content that still has
+        another tracked path elsewhere (a duplicate) keeps its `files` row and
+        all derived data untouched.
+
+        Deliberately does NOT touch manual.db — that database keys everything
+        (tags, favorites, titles, sets, faces/identities) by checksum, not
+        file_id, so untracking here doesn't lose any of it: re-adding the same
+        content later (a fresh `media add`) reattaches it automatically. Nothing
+        on disk is touched either — this is an untrack-only operation, mirroring
+        `git rm --cached`, not a delete.
+
+        Returns (paths_removed, files_removed)."""
+        path_prefix = (path_prefix or '').strip().strip('/')
+        if not path_prefix:
+            return (0, 0)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, file_id FROM file_paths WHERE path = ? OR path LIKE ?',
+            (path_prefix, f'{path_prefix}/%')
+        )
+        rows = cursor.fetchall()
+        if not rows:
+            return (0, 0)
+        file_path_ids = [r[0] for r in rows]
+        affected_file_ids = {r[1] for r in rows}
+        placeholders = ','.join('?' for _ in file_path_ids)
+        cursor.execute(f'DELETE FROM file_paths WHERE id IN ({placeholders})', tuple(file_path_ids))
+
+        files_removed = 0
+        for file_id in affected_file_ids:
+            cursor.execute('SELECT COUNT(*) FROM file_paths WHERE file_id = ?', (file_id,))
+            if cursor.fetchone()[0] > 0:
+                continue  # still tracked at another path (a duplicate) — keep its content row
+            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings', 'file_category_matches'):
+                cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
+            cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+            files_removed += 1
+        self.conn.commit()
+        return (len(file_path_ids), files_removed)
+
     def count_detected(self):
         """Return count of distinct files with a primary (frame_index IS NULL) detections row."""
         cursor = self.conn.cursor()
