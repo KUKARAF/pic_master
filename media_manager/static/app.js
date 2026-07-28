@@ -423,8 +423,15 @@
       });
 
       personInput.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') { e.preventDefault(); addPerson(); }
-        else if (e.key === 'Escape') { e.preventDefault(); personInput.value = ''; }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          // Nothing typed here yet — Enter means "done", not "add a blank
+          // person", so it confirms creation the same as Enter in the studio
+          // field does, instead of silently no-op'ing via addPerson's own
+          // empty-value guard.
+          if (personInput.value.trim()) addPerson();
+          else submit();
+        } else if (e.key === 'Escape') { e.preventDefault(); personInput.value = ''; }
       });
 
       setTimeout(function () { studioInput.focus(); }, 0);
