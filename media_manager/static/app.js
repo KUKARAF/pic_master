@@ -457,6 +457,12 @@
     set: {
       title: 'Choose a set',
       placeholder: 'Search or create a set…',
+      // Recognizes a capitalized word that matches a known person (e.g.
+      // "Joe") as you type it, pulling it out of the text box into its own
+      // removable chip so the rest of what you type (e.g. "trip 2022") keeps
+      // filtering set names/studios as usual, now narrowed to sets linked to
+      // that person too. See openEntitySearchModal's personAware handling.
+      personAware: true,
       fetchAll: function () { return fetch('/api/sets').then(function (r) { return r.json(); }); },
       label: function (s) { return s.name; },
       secondary: function (s) {
@@ -566,6 +572,69 @@
       input.style.marginBottom = '8px';
       box.appendChild(input);
 
+      // Person chips — only wired up for types that opt in (currently just
+      // 'set'). identityNames is populated once, below, alongside the entity
+      // list itself; personChips holds the confirmed (exact, canonical-case)
+      // identity names currently filtering the results.
+      let identityNames = null;
+      const personChips = [];
+      let personChipsEl = null;
+      if (config.personAware) {
+        personChipsEl = document.createElement('div');
+        personChipsEl.className = 'palette-chips';
+        personChipsEl.style.marginBottom = '8px';
+        box.appendChild(personChipsEl);
+      }
+
+      function renderPersonChips() {
+        if (!personChipsEl) return;
+        personChipsEl.innerHTML = '';
+        personChips.forEach(function (nameValue, i) {
+          const chip = document.createElement('span');
+          chip.className = 'palette-chip palette-chip-face';
+          const tag = document.createElement('span');
+          tag.className = 'palette-chip-tag';
+          tag.textContent = 'FACE';
+          const val = document.createElement('span');
+          val.textContent = nameValue;
+          const x = document.createElement('span');
+          x.className = 'palette-chip-x';
+          x.textContent = '×';
+          chip.appendChild(tag);
+          chip.appendChild(val);
+          chip.appendChild(x);
+          chip.title = 'Remove this person filter';
+          chip.addEventListener('click', function () {
+            personChips.splice(i, 1);
+            renderPersonChips();
+            applyFilter();
+          });
+          personChipsEl.appendChild(chip);
+        });
+      }
+
+      // Called on every keystroke, before applyFilter: if the word just
+      // finished (i.e. the box now ends in whitespace) starts with a capital
+      // letter and exactly matches (case-insensitively) a known person's
+      // name, pull it out of the input and turn it into a chip instead —
+      // "Joe " becomes chip "Joe" + an empty box ready for "trip 2022".
+      function extractPersonChipIfComplete() {
+        if (!config.personAware || !identityNames || !identityNames.length) return;
+        const val = input.value;
+        if (!/\s$/.test(val)) return;
+        const trimmed = val.replace(/\s+$/, '');
+        if (!trimmed) return;
+        const parts = trimmed.split(/\s+/);
+        const lastWord = parts[parts.length - 1];
+        if (!lastWord || !/^[A-Z]/.test(lastWord)) return;
+        const canonical = identityNames.find(function (n) { return n.toLowerCase() === lastWord.toLowerCase(); });
+        if (!canonical) return;
+        parts.pop();
+        if (personChips.indexOf(canonical) === -1) personChips.push(canonical);
+        input.value = parts.join(' ') + (parts.length ? ' ' : '');
+        renderPersonChips();
+      }
+
       const status = document.createElement('div');
       status.className = 'modal-empty';
       status.textContent = 'Loading…';
@@ -653,11 +722,20 @@
 
       function applyFilter() {
         const query = input.value.trim();
+        let pool = allItems;
+        if (personChips.length) {
+          pool = pool.filter(function (item) {
+            const people = item.people || [];
+            return personChips.every(function (chipName) {
+              return people.some(function (p) { return p.name.toLowerCase() === chipName.toLowerCase(); });
+            });
+          });
+        }
         let matched;
         if (!query) {
-          matched = allItems.slice(0, 50);
+          matched = pool.slice(0, 50);
         } else {
-          matched = allItems
+          matched = pool
             .map(function (item) { return { item: item, score: fuzzyScore(query, config.label(item)) }; })
             .filter(function (x) { return x.score !== null; })
             .sort(function (a, b) { return a.score - b.score; })
@@ -665,12 +743,18 @@
             .map(function (x) { return x.item; });
         }
         visible = matched.map(function (item) { return { kind: 'existing', item: item }; });
-        if (query) visible.push({ kind: 'create', text: query });
+        // Once a person chip is narrowing the set, "＋ Create" would create an
+        // unrelated brand-new set instead of picking from the (already
+        // filtered) matches — only offer it with no active person filter.
+        if (query && !personChips.length) visible.push({ kind: 'create', text: query });
         highlighted = visible.length ? 0 : -1;
         renderList();
       }
 
-      input.addEventListener('input', applyFilter);
+      input.addEventListener('input', function () {
+        extractPersonChipIfComplete();
+        applyFilter();
+      });
 
       input.addEventListener('keydown', function (e) {
         if (e.key === 'ArrowDown') {
@@ -700,12 +784,17 @@
         box.appendChild(noNameBtn);
       }
 
-      config.fetchAll()
-        .then(function (items) {
+      Promise.all([
+        config.fetchAll(),
+        config.personAware ? fetch('/api/identities').then(function (r) { return r.json(); }) : Promise.resolve([]),
+      ])
+        .then(function (results) {
+          let items = results[0];
           if (excludeIds.length) {
             items = items.filter(function (item) { return excludeIds.indexOf(item.id) === -1; });
           }
           allItems = items;
+          identityNames = results[1].map(function (i) { return i.name; });
           status.textContent = items.length
             ? 'Type to search ' + items.length + ' — Enter to pick, or create a new one.'
             : 'Nothing yet — type a name and press Enter to create one.';
