@@ -82,26 +82,15 @@
 
 {% block scripts %}
 <script>
-document.getElementById('set-create-form').addEventListener('submit', async function(e) {
+document.getElementById('set-create-form').addEventListener('submit', function(e) {
   e.preventDefault();
   const name = document.getElementById('set-name-input').value.trim();
   const studio = document.getElementById('set-studio-input').value.trim();
   const msg = document.getElementById('set-create-msg');
   if (!name) return;
-  try {
-    const resp = await fetch('/api/sets', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: name, studio: studio || null}),
-    });
-    if (resp.ok) {
-      location.reload();
-    } else {
-      msg.textContent = 'Error creating set.';
-    }
-  } catch (err) {
-    msg.textContent = 'Network error.';
-  }
+  createSet(name, studio || null)
+    .then(function() { location.reload(); })
+    .catch(function(err) { msg.textContent = 'Error creating set: ' + err.message; });
 });
 
 document.querySelectorAll('.set-heart-btn').forEach(function(btn) {

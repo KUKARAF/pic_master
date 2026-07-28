@@ -465,11 +465,17 @@
       personAware: true,
       fetchAll: function () { return fetch('/api/sets').then(function (r) { return r.json(); }); },
       label: function (s) { return s.name; },
+      // Matching includes aliases (an alias is never shown as the primary
+      // label — only name is — but typing one still has to surface the set).
+      matchText: function (s) {
+        return [s.name, s.studio || '', (s.aliases || []).join(' ')].filter(Boolean).join(' ');
+      },
       secondary: function (s) {
         const peopleText = s.people && s.people.length ? s.people.map(function (p) {
           return '@' + p.name + (p.age != null ? ' (' + Math.round(p.age) + (p.gender === 'male' ? 'm' : p.gender === 'female' ? 'f' : '') + ')' : '');
         }).join(' ') : '';
-        return [s.studio || '', peopleText].filter(Boolean).join(' — ');
+        const aliasText = s.aliases && s.aliases.length ? 'aka ' + s.aliases.join(', ') : '';
+        return [s.studio || '', peopleText, aliasText].filter(Boolean).join(' — ');
       },
       image: null,
       // Matches today's exact chained behavior: a new set's studio is its own
@@ -736,7 +742,7 @@
           matched = pool.slice(0, 50);
         } else {
           matched = pool
-            .map(function (item) { return { item: item, score: fuzzyScore(query, config.label(item)) }; })
+            .map(function (item) { return { item: item, score: fuzzyScore(query, config.matchText ? config.matchText(item) : config.label(item)) }; })
             .filter(function (x) { return x.score !== null; })
             .sort(function (a, b) { return a.score - b.score; })
             .slice(0, 50)
@@ -818,21 +824,65 @@
 
   window.openSetSearchModal = openSetSearchModal;
 
+  /* Shown when a set's studio matches an existing one under a different exact
+     spelling only (studios have no id to merge — just reusing the existing
+     spelling so it groups on /studios instead of fragmenting). Declining
+     keeps whatever the user actually typed; either way the caller re-sends
+     with confirm_studio_merge so this check isn't repeated forever. */
+  function confirmStudioSpelling(typedStudio, existing) {
+    const wantsExisting = confirm(
+      'A studio named "' + existing.studio + '" already exists (you typed "' + typedStudio + '") ' +
+      'across ' + existing.set_count + ' set(s).\n\nUse "' + existing.studio + '" instead, so this set groups with them?'
+    );
+    return wantsExisting ? existing.studio : typedStudio;
+  }
+
+  /* Used by both the "+ Create set" modal (openNewSetDetailsModal) and the
+     plain create-set form on sets.html. POST /api/sets 409s when the studio
+     matches an existing one under a different spelling — see
+     confirmStudioSpelling. */
+  function createSet(name, studio, confirmStudioMerge) {
+    return fetch('/api/sets', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name, studio: studio || null, confirm_studio_merge: !!confirmStudioMerge }),
+    }).then(function (r) {
+      if (r.status === 409) {
+        return r.json().then(function (data) {
+          const finalStudio = confirmStudioSpelling(studio, data.existing_studio);
+          return createSet(name, finalStudio, true);
+        });
+      }
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    });
+  }
+  window.createSet = createSet;
+
   /* Shared by both rename-set modals (sets.html's per-card editor and
-     set_detail.html's page-level one). PUT /api/sets/{id} 409s with the
-     colliding set when the new name already belongs to a different set;
-     this asks the user whether to merge into it and, if so, re-sends the
-     request with confirm_merge — the caller only ever sees the final
-     resolved result (or an Error if the user declined). */
+     set_detail.html's page-level one). PUT /api/sets/{id} 409s either with
+     the colliding set (asks to merge into it) or, once that's clear, with a
+     differently-spelled existing studio (asks to reuse its spelling) — the
+     caller only ever sees the final resolved result (or an Error if the user
+     declined a name-merge; declining a studio-spelling prompt just keeps
+     what was typed and continues). */
   window.renameSetWithMergePrompt = function (setId, name, studio) {
-    function attempt(confirmMerge) {
+    function attempt(confirmMerge, confirmStudioMerge, studioOverride) {
+      const effectiveStudio = studioOverride !== undefined ? studioOverride : studio;
       return fetch('/api/sets/' + setId, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name, studio: studio, confirm_merge: !!confirmMerge }),
+        body: JSON.stringify({
+          name: name, studio: effectiveStudio,
+          confirm_merge: !!confirmMerge, confirm_studio_merge: !!confirmStudioMerge,
+        }),
       }).then(function (r) {
         if (r.status === 409) {
           return r.json().then(function (data) {
+            if (data.conflict === 'studio') {
+              const finalStudio = confirmStudioSpelling(effectiveStudio, data.existing_studio);
+              return attempt(confirmMerge, true, finalStudio);
+            }
             const existing = data.existing_set;
             const wantsMerge = confirm(
               'A set named "' + existing.name + '" already exists' +
@@ -840,6 +890,36 @@
               ' with ' + existing.image_count + ' photo(s).\n\nMerge this set into it?'
             );
             if (!wantsMerge) throw new Error('canceled — a set with that name already exists');
+            return attempt(true, confirmStudioMerge, effectiveStudio);
+          });
+        }
+        if (!r.ok) throw new Error('Request failed: ' + r.status);
+        return r.json();
+      });
+    }
+    return attempt(false, false);
+  };
+
+  /* Same shape as renameSetWithMergePrompt but for identities: PUT
+     /api/identities/{name} 409s when the new name matches an existing person
+     under a different exact spelling only (an exact-spelling rename already
+     merges automatically server-side, since identity is just a shared
+     string). Used by person.html's rename modal. */
+  window.renameIdentityWithMergePrompt = function (oldName, newName) {
+    function attempt(confirmMerge) {
+      return fetch('/api/identities/' + encodeURIComponent(oldName), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: newName, confirm_merge: !!confirmMerge }),
+      }).then(function (r) {
+        if (r.status === 409) {
+          return r.json().then(function (data) {
+            const existing = data.existing_identity;
+            const wantsMerge = confirm(
+              'A person named "' + existing.name + '" already exists (' + existing.count + ' photo(s)).' +
+              '\n\nMerge "' + oldName + '" into "' + existing.name + '"?'
+            );
+            if (!wantsMerge) throw new Error('canceled — a person with that name already exists');
             return attempt(true);
           });
         }
@@ -893,7 +973,8 @@
       { type: 'face', url: '/api/identities', label: function (i) { return i.name; }, value: function (i) { return i.name; }, count: function (i) { return i.count || 0; } },
       { type: 'set', url: '/api/sets', label: function (s) {
         var peopleText = (s.people || []).map(function (p) { return '@' + p.name + (p.age != null ? Math.round(p.age) : ''); }).join(' ');
-        return [s.name, s.studio || '', peopleText].filter(Boolean).join(' — ');
+        var aliasText = (s.aliases || []).map(function (a) { return 'aka ' + a; }).join(' ');
+        return [s.name, s.studio || '', peopleText, aliasText].filter(Boolean).join(' — ');
       }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
     ];
     return Promise.all(sources.map(function (src) {

@@ -187,6 +187,20 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_set_assignments_identity ON identity_set_assignments (identity)')
+        # Alternate names for a set ("bts22" for "Behind The Scenes 2022") — same
+        # shape/reasoning as identity_aliases below: a lookup convenience only,
+        # never written onto the set's own name/studio columns, resolved back to
+        # the owning set_id at search time (see resolve_set_alias). PK on alias
+        # alone keeps an alias unambiguous across every set, same as identities.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS set_aliases (
+                set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+                alias TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (alias)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_set_aliases_set_id ON set_aliases (set_id)')
         # Alternate names for an identity ("girlfriend" / "babe" both meaning the
         # same person) — purely a lookup convenience layered on top of the single
         # canonical `identity` string every faces/assignment row actually stores;
@@ -681,6 +695,50 @@ class ManualDB(ThreadLocalDB):
         cur.execute(query, params)
         return cur.fetchall()
 
+    def find_studio_variant(self, studio, exclude_set_id=None):
+        """If a studio already exists elsewhere under a different exact
+        spelling (case-insensitive match, different exact string — e.g. typed
+        "acme" when sets already use "Acme"), return its existing spelling +
+        how many sets/images use it. Studios have no separate table/id (just
+        a free-text column on `sets`), so there's nothing to "merge" in the
+        database sense — this only backs a prompt offering to reuse the
+        existing spelling instead of fragmenting the same studio across two
+        differently-cased entries on /studios."""
+        if not studio:
+            return None
+        cur = self.conn.cursor()
+        query = '''
+            SELECT s.studio as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
+            FROM sets s LEFT JOIN file_sets fs ON fs.set_id = s.id
+            WHERE LOWER(s.studio) = LOWER(?) AND s.studio != ?
+        '''
+        params = [studio, studio]
+        if exclude_set_id is not None:
+            query += ' AND s.id != ?'
+            params.append(exclude_set_id)
+        query += ' GROUP BY s.studio'
+        cur.execute(query, params)
+        return cur.fetchone()
+
+    def find_identity_variant(self, name):
+        """If a different person is already known under this name's exact
+        case-insensitive spelling but a different exact string (e.g. renaming
+        onto "joe" when "Joe" already exists), return that identity + its
+        face count. A rename onto an *exact*-spelling match already merges
+        automatically (identity is just a shared string key with no separate
+        id — every face row simply now reads the same string) — this only
+        catches the case-differs case, which wouldn't share that string and
+        so wouldn't otherwise merge, backing a warn-before-rename prompt."""
+        if not name:
+            return None
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT identity, COUNT(*) as cnt FROM faces
+            WHERE identity IS NOT NULL AND rejected = 0 AND LOWER(identity) = LOWER(?) AND identity != ?
+            GROUP BY identity
+        ''', (name, name))
+        return cur.fetchone()
+
     def merge_sets(self, source_id, dest_id):
         """Folds source_id into dest_id: every member photo, exclusion, and
         linked identity moves over (skipped, not errored, wherever dest_id
@@ -695,6 +753,7 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE OR IGNORE file_sets SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
         cur.execute('UPDATE OR IGNORE file_set_exclusions SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
         cur.execute('UPDATE OR IGNORE identity_set_assignments SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
+        cur.execute('UPDATE OR IGNORE set_aliases SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
         source = self.get_set(source_id)
         if source is not None and source['favorite']:
             cur.execute('UPDATE sets SET favorite = 1 WHERE id = ?', (dest_id,))
@@ -713,6 +772,53 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('UPDATE sets SET favorite = ? WHERE id = ?', (1 if favorite else 0, set_id))
         self.conn.commit()
+
+    def add_set_alias(self, set_id, alias):
+        """Record `alias` as an alternate name for this set — same shape/
+        reasoning as add_identity_alias: unique across every set (PRIMARY KEY
+        on alias alone), silently repointed to this set_id if re-added
+        elsewhere (INSERT OR REPLACE)."""
+        alias = alias.strip()
+        if not alias:
+            return
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT OR REPLACE INTO set_aliases (set_id, alias, created_at) VALUES (?, ?, ?)',
+            (set_id, alias, int(time.time()))
+        )
+        self.conn.commit()
+
+    def remove_set_alias(self, alias):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM set_aliases WHERE alias = ?', (alias,))
+        self.conn.commit()
+
+    def get_aliases_for_set(self, set_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT alias FROM set_aliases WHERE set_id = ? ORDER BY alias', (set_id,))
+        return [row[0] for row in cur.fetchall()]
+
+    def get_aliases_for_sets(self, set_ids):
+        """{set_id: [alias, ...]} for every set_id in set_ids, one query total —
+        same batching reasoning as _attach_set_people's get_identities_for_sets,
+        for /api/sets attaching aliases to every set at once."""
+        if not set_ids:
+            return {}
+        cur = self.conn.cursor()
+        placeholders = ','.join('?' for _ in set_ids)
+        cur.execute(f'SELECT set_id, alias FROM set_aliases WHERE set_id IN ({placeholders}) ORDER BY alias', tuple(set_ids))
+        result = {}
+        for set_id, alias in cur.fetchall():
+            result.setdefault(set_id, []).append(alias)
+        return result
+
+    def find_set_id_by_alias(self, alias):
+        """Resolves an alias to its owning set_id, or None if unknown — the
+        set-alias counterpart to resolve_identity_name."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT set_id FROM set_aliases WHERE alias = ?', (alias,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
     def assign_file_to_set(self, checksum, set_id):
         """A file can belong to any number of sets — this adds a membership, it never

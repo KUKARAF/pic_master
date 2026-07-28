@@ -50,6 +50,7 @@ class SetBody(BaseModel):
     studio: Optional[str] = None
     set_id: Optional[int] = None
     confirm_merge: bool = False
+    confirm_studio_merge: bool = False
 
 class AddFolderBody(BaseModel):
     path: str
@@ -72,8 +73,12 @@ class TagLabelBody(BaseModel):
 
 class RenameIdentityBody(BaseModel):
     name: str
+    confirm_merge: bool = False
 
 class IdentityAliasBody(BaseModel):
+    alias: str
+
+class SetAliasBody(BaseModel):
     alias: str
 
 class UnassignIdentityBody(BaseModel):
@@ -426,6 +431,16 @@ def create_app(data_root: str) -> FastAPI:
                 {'name': name, 'age': ages_map.get(name, {}).get('age'), 'gender': ages_map.get(name, {}).get('gender')}
                 for name in people_map.get(s['id'], [])
             ]
+
+    def _attach_set_aliases(sets_lists):
+        """Given an iterable of set-dict lists, attaches an 'aliases' key to each
+        set dict in place — same batching shape as _attach_set_people, one query
+        total across every set involved rather than one per set."""
+        all_sets = [s for lst in sets_lists for s in lst]
+        set_ids = {s['id'] for s in all_sets}
+        aliases_map = manual.get_aliases_for_sets(set_ids)
+        for s in all_sets:
+            s['aliases'] = aliases_map.get(s['id'], [])
 
     def _category_checksums_by_name():
         """{category_name: set(checksums)} for every category, resolved once —
@@ -1827,6 +1842,7 @@ def create_app(data_root: str) -> FastAPI:
         folder_suggestions = _folder_suggestions_for_set(file_rows)
         set_dict = dict(set_row)
         _attach_set_people([[set_dict]])
+        set_dict['aliases'] = manual.get_aliases_for_set(set_id)
         return templates.TemplateResponse(request, 'set_detail.html', {
             'set': set_dict,
             'files': files,
@@ -1910,6 +1926,7 @@ def create_app(data_root: str) -> FastAPI:
             for r in manual.list_sets(favorite_only=favorite)
         ]
         _attach_set_people([sets])
+        _attach_set_aliases([sets])
         return sets
 
     @app.post('/api/sets')
@@ -1918,6 +1935,18 @@ def create_app(data_root: str) -> FastAPI:
         if not name:
             raise HTTPException(status_code=400, detail='Set name must not be empty')
         studio = body.studio.strip() if body.studio else None
+
+        if studio and not body.confirm_studio_merge:
+            variant = manual.find_studio_variant(studio)
+            if variant is not None:
+                return JSONResponse(status_code=409, content={
+                    'conflict': 'studio',
+                    'existing_studio': {
+                        'studio': variant['studio'], 'set_count': variant['set_count'],
+                        'image_count': variant['image_count'],
+                    },
+                })
+
         set_id = manual.create_set(name, studio)
         return {'id': set_id, 'name': name, 'studio': studio}
 
@@ -1935,11 +1964,20 @@ def create_app(data_root: str) -> FastAPI:
         # than a deliberate second set sharing a name — ask before silently
         # creating a name collision, unless the client already confirmed the
         # merge (confirm_merge, set after the user accepts the prompt below).
+        # An existing *alias* of another set counts the same way — aliases are
+        # meant to be an equally valid way to find that set, so renaming onto
+        # one is just as much a collision as renaming onto its literal name.
         collisions = manual.find_sets_by_name(name, exclude_id=set_id)
+        if not collisions:
+            alias_set_id = manual.find_set_id_by_alias(name)
+            if alias_set_id is not None and alias_set_id != set_id:
+                alias_set = manual.get_set(alias_set_id)
+                if alias_set is not None:
+                    collisions = [alias_set]
         if collisions and not body.confirm_merge:
             existing = collisions[0]
             return JSONResponse(status_code=409, content={
-                'conflict': True,
+                'conflict': 'name',
                 'existing_set': {
                     'id': existing['id'], 'name': existing['name'], 'studio': existing['studio'],
                     'image_count': len(manual.get_files_by_set(existing['id'], limit=100000)),
@@ -1951,6 +1989,22 @@ def create_app(data_root: str) -> FastAPI:
             # rename call needed, and set_id itself no longer exists.
             merged = manual.get_set(dest_id)
             return {'id': dest_id, 'name': merged['name'], 'studio': merged['studio'], 'merged': True, 'merged_from': set_id}
+
+        # Only reached with no name collision (a merge above already returned) —
+        # here it's worth also checking whether the studio being saved matches
+        # an existing one under a different exact spelling, same reasoning as
+        # the name check but nothing to merge in the DB (studio's just a
+        # free-text column), so this only offers to reuse the existing spelling.
+        if studio and not body.confirm_studio_merge:
+            variant = manual.find_studio_variant(studio, exclude_set_id=set_id)
+            if variant is not None:
+                return JSONResponse(status_code=409, content={
+                    'conflict': 'studio',
+                    'existing_studio': {
+                        'studio': variant['studio'], 'set_count': variant['set_count'],
+                        'image_count': variant['image_count'],
+                    },
+                })
 
         manual.rename_set(set_id, name, studio)
         return {'id': set_id, 'name': name, 'studio': studio}
@@ -1968,6 +2022,25 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='Set not found')
         manual.set_set_favorite(set_id, body.favorite)
         return {'id': set_id, 'favorite': body.favorite}
+
+    @app.get('/api/sets/{set_id}/aliases')
+    def api_list_set_aliases(set_id: int):
+        return {'aliases': manual.get_aliases_for_set(set_id)}
+
+    @app.post('/api/sets/{set_id}/aliases')
+    def api_add_set_alias(set_id: int, body: SetAliasBody):
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        alias = (body.alias or '').strip()
+        if not alias:
+            raise HTTPException(status_code=400, detail='Alias must not be empty')
+        manual.add_set_alias(set_id, alias)
+        return {'aliases': manual.get_aliases_for_set(set_id)}
+
+    @app.delete('/api/sets/{set_id}/aliases/{alias}')
+    def api_remove_set_alias(set_id: int, alias: str):
+        manual.remove_set_alias(alias)
+        return {'aliases': manual.get_aliases_for_set(set_id)}
 
     # ------------------------------------------------------------------
     # Categories (single-value, ML-assisted classification)
@@ -2457,10 +2530,28 @@ def create_app(data_root: str) -> FastAPI:
     @app.put('/api/identities/{name}')
     def api_rename_identity(name: str, body: RenameIdentityBody):
         """Renames a person everywhere — every face tagged with this identity, not
-        just one — since a name typo/correction should apply to the whole person."""
+        just one — since a name typo/correction should apply to the whole person.
+        Renaming onto an exact-spelling existing identity already merges
+        automatically (it's just a shared string key); renaming onto one that
+        only matches case-insensitively (a likely typo, e.g. "joe" vs "Joe")
+        warns first, since that silently combines two people who today read as
+        distinct everywhere identity names are compared exactly."""
         new_name = body.name.strip()
         if not new_name:
             raise HTTPException(status_code=400, detail='Name must not be empty')
+        if new_name != name:
+            variant = manual.find_identity_variant(new_name)
+            if variant is not None:
+                if not body.confirm_merge:
+                    return JSONResponse(status_code=409, content={
+                        'conflict': 'identity',
+                        'existing_identity': {'name': variant['identity'], 'count': variant['cnt']},
+                    })
+                # Merge onto the existing identity's actual spelling, not
+                # whatever case the user typed — renaming onto the typed
+                # spelling instead would leave two distinct identities
+                # differing only by case rather than actually combining them.
+                new_name = variant['identity']
         manual.rename_identity(name, new_name)
         return {'name': new_name}
 

@@ -456,15 +456,13 @@
         var newName = nameInput.value.trim();
         if (!newName || newName === name) return;
         renameBtn.disabled = true;
-        fetch('/api/identities/' + encodeURIComponent(name), {
-          method: 'PUT',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name: newName}),
-        })
-          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-          .then(function() {
+        renameIdentityWithMergePrompt(name, newName)
+          .then(function(result) {
             closeModal();
-            window.location.href = '/person/' + encodeURIComponent(newName);
+            // A confirmed merge lands on the existing identity's actual
+            // spelling, not necessarily what was typed here — redirect to
+            // whatever the server says the final name is.
+            window.location.href = '/person/' + encodeURIComponent(result.name);
           })
           .catch(function(err) {
             renameBtn.disabled = false;

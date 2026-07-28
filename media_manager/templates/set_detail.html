@@ -14,6 +14,9 @@
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>
   </h1>
   {{ macros.set_meta_line(set) }}
+  {% if set.aliases %}
+  <span class="sub">also known as {{ set.aliases | join(', ') }}</span>
+  {% endif %}
   <a href="/sets" class="sub">← Back to sets</a>
 </div>
 
@@ -165,6 +168,86 @@
             .catch(function(err) { alert('Failed to rename set: ' + err.message); });
         });
         box.appendChild(saveBtn);
+
+        const aliasLabel = document.createElement('div');
+        aliasLabel.className = 'sub';
+        aliasLabel.style.margin = '14px 0 4px';
+        aliasLabel.textContent = 'Aliases (alternate names this set can also be found by)';
+        box.appendChild(aliasLabel);
+
+        const aliasList = document.createElement('div');
+        aliasList.style.display = 'flex';
+        aliasList.style.flexWrap = 'wrap';
+        aliasList.style.gap = '6px';
+        aliasList.style.marginBottom = '8px';
+        box.appendChild(aliasList);
+
+        function renderAliases(aliases) {
+          aliasList.innerHTML = '';
+          if (!aliases.length) {
+            const empty = document.createElement('span');
+            empty.className = 'sub';
+            empty.textContent = 'No aliases yet.';
+            aliasList.appendChild(empty);
+            return;
+          }
+          aliases.forEach(function(alias) {
+            const chip = document.createElement('span');
+            chip.className = 'tag-removable';
+            chip.style.display = 'inline-flex';
+            chip.textContent = alias;
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'rm';
+            rm.title = 'Remove alias';
+            rm.textContent = '×';
+            rm.addEventListener('click', function() {
+              rm.disabled = true;
+              fetch('/api/sets/' + setId + '/aliases/' + encodeURIComponent(alias), {method: 'DELETE'})
+                .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+                .then(function(data) { renderAliases(data.aliases || []); })
+                .catch(function(err) {
+                  rm.disabled = false;
+                  alert('Failed to remove alias: ' + err.message);
+                });
+            });
+            chip.appendChild(rm);
+            aliasList.appendChild(chip);
+          });
+        }
+        renderAliases({{ set.aliases | default([]) | tojson }});
+
+        const aliasInput = document.createElement('input');
+        aliasInput.type = 'text';
+        aliasInput.placeholder = 'e.g. bts22…';
+        aliasInput.style.width = '100%';
+        aliasInput.style.marginBottom = '8px';
+        box.appendChild(aliasInput);
+
+        const addAliasBtn = document.createElement('button');
+        addAliasBtn.type = 'button';
+        addAliasBtn.textContent = '+ Add alias';
+        addAliasBtn.addEventListener('click', function() {
+          const alias = aliasInput.value.trim();
+          if (!alias) return;
+          addAliasBtn.disabled = true;
+          fetch('/api/sets/' + setId + '/aliases', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({alias: alias}),
+          })
+            .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+            .then(function(data) {
+              addAliasBtn.disabled = false;
+              aliasInput.value = '';
+              renderAliases(data.aliases || []);
+            })
+            .catch(function(err) {
+              addAliasBtn.disabled = false;
+              alert('Failed to add alias: ' + err.message);
+            });
+        });
+        box.appendChild(addAliasBtn);
       });
     });
   }
