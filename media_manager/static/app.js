@@ -977,6 +977,17 @@
             s.name, s.name, 'palette-tile-set', buildSetTileMeta(s)
           ));
         });
+        // Only meaningful once at least one chip is confirmed (e.g. a "joe"
+        // person chip) — /sets' own f= filtering only understands chips, not
+        // the free-text fragment still being typed.
+        if (chips.length) {
+          var viewSetsLink = document.createElement('a');
+          viewSetsLink.className = 'sub palette-section-viewall';
+          viewSetsLink.style.marginLeft = '10px';
+          viewSetsLink.href = buildSetsFilterHref();
+          viewSetsLink.textContent = 'View as list →';
+          setSec.wrap.querySelector('.palette-section-title').appendChild(viewSetsLink);
+        }
         gridEl.appendChild(setSec.wrap);
       }
       if (data.people.length) {
@@ -1005,6 +1016,14 @@
     function buildFilterHref() {
       var parts = chips.map(function (c) { return 'f=' + encodeURIComponent(c.type + ':' + c.value); });
       return '/search?' + parts.join('&');
+    }
+
+    // Same chip encoding as buildFilterHref, but targeting /sets' own f=
+    // filtering (added alongside its existing favorite/studio filters) rather
+    // than /search — used by the palette's "View as list" link under SETS.
+    function buildSetsFilterHref() {
+      var parts = chips.map(function (c) { return 'f=' + encodeURIComponent(c.type + ':' + c.value); });
+      return '/sets?' + parts.join('&');
     }
 
     /* Instant, offline, client-side suggestion ranking — no network call. Uses

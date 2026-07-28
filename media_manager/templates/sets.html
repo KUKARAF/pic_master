@@ -14,6 +14,17 @@
 </div>
 {% endif %}
 
+{% if chips %}
+<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px;">
+  {% for chip in chips %}
+  <span class="tag-removable">
+    {{ chip.type }}: {{ chip.value }}
+    <a class="rm" title="Remove filter" href="/sets?{% if favorite_only %}favorite=1&amp;{% endif %}{% if studio_filter %}studio={{ studio_filter | urlencode }}&amp;{% endif %}{% for other in chips %}{% if other != chip %}f={{ (other.type ~ ':' ~ other.value) | urlencode }}&amp;{% endif %}{% endfor %}">×</a>
+  </span>
+  {% endfor %}
+</div>
+{% endif %}
+
 <form id="set-create-form" style="display:flex;gap:8px;align-items:center;margin-bottom:16px;flex-wrap:wrap;" autocomplete="off">
   <input type="text" id="set-name-input" placeholder="Set name…" required style="min-width:180px;">
   <input type="text" id="set-studio-input" placeholder="Studio (optional)…" style="min-width:180px;">

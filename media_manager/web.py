@@ -1544,11 +1544,34 @@ def create_app(data_root: str) -> FastAPI:
         return templates.TemplateResponse(request, 'duplicates.html', {'groups': groups})
 
     @app.get('/sets', response_class=HTMLResponse)
-    def sets_page(request: Request, favorite: bool = False, studio: str = ''):
+    def sets_page(request: Request, favorite: bool = False, studio: str = '',
+                  f: List[str] = Query([])):
         all_tags = manual.list_all_tags()
         studio_filter = studio or None
+
+        # Chips from the search palette (currently just 'face', e.g. "joe" ->
+        # a confirmed person chip) narrow the set list down to sets that
+        # actually contain a photo matching every chip — same chip format and
+        # resolver as /search's f= handling, so this and the palette never
+        # drift apart. None means "no restriction" (all sets), not "match
+        # nothing", to match _intersect_chips' own convention.
+        chips = []
+        for part in f:
+            chip_type, _, chip_value = part.partition(':')
+            if chip_type and chip_value:
+                chips.append({'type': chip_type, 'value': chip_value})
+        matching_checksums = _intersect_chips(chips)
+        matching_set_ids = None
+        if matching_checksums is not None:
+            matching_set_ids = set()
+            if matching_checksums:
+                for sets_here in manual.get_sets_for_checksums(list(matching_checksums)).values():
+                    matching_set_ids.update(s['id'] for s in sets_here)
+
         sets = []
         for r in manual.list_sets(favorite_only=favorite, studio=studio_filter):
+            if matching_set_ids is not None and r['id'] not in matching_set_ids:
+                continue
             thumb_id = None
             first_checksums = manual.get_files_by_set(r['id'], limit=1)
             if first_checksums:
@@ -1567,6 +1590,7 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'studio_filter': studio_filter,
+            'chips': chips,
         })
 
     @app.get('/studios', response_class=HTMLResponse)

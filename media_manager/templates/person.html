@@ -9,11 +9,13 @@
     {{ name }}
     <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }}">🔍</a>
     <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
+    <button type="button" id="estimate-all-age-btn" class="heart-btn-inline" title="Estimate age &amp; gender for every photo of {{ name }}">🎂</button>
   </h1>
   {% if aliases %}
   <span class="sub">also known as {{ aliases | join(', ') }}</span>
   {% endif %}
   {% if total %}<span class="sub">{{ total }} photo(s)</span>{% endif %}
+  <div><span id="estimate-all-age-status" class="sub"></span></div>
 </div>
 
 {% if message %}
@@ -41,7 +43,25 @@
 </div>
 {% endif %}
 
-<div class="section-title" style="margin-bottom:10px;">Photos</div>
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:10px;">
+  <div class="section-title" style="margin-bottom:0;">Photos</div>
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <button type="button" id="select-many-btn" class="btn-similar">Select many</button>
+    <button type="button" id="bulk-set-btn" class="btn-similar">+ Add to set</button>
+    <span id="bulk-set-status" class="sub"></span>
+    <label class="sub" style="display:inline-flex;align-items:center;gap:4px;">
+      Sort
+      <select id="person-sort-select">
+        <option value="added">Added</option>
+        <option value="age">Age</option>
+      </select>
+    </label>
+    <select id="person-order-select">
+      <option value="desc" data-added-label="Newest first" data-age-label="Oldest first">Newest first</option>
+      <option value="asc" data-added-label="Oldest first" data-age-label="Youngest first">Oldest first</option>
+    </select>
+  </div>
+</div>
 <div class="grid" id="person-photo-grid" data-queue-source="Person: {{ name }}"></div>
 <div id="person-photo-sentinel" style="height:1px;"></div>
 <p id="person-photo-loading" class="sub" style="text-align:center;margin-top:16px;display:none;">Loading…</p>
@@ -74,6 +94,8 @@
   var total = Infinity;
   var loading = false;
   var done = false;
+  var sort = 'added';
+  var order = 'desc';
 
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -96,6 +118,7 @@
   }
 
   function cardHtml(f) {
+    var checkboxHtml = '<input type="checkbox" class="card-select-checkbox" data-file-id="' + f.id + '">';
     var tagsHtml = '';
     if ((f.tags && f.tags.length) || (f.categories && f.categories.length) || (f.sets && f.sets.length) || (f.people && f.people.length)) {
       tagsHtml += '<div class="card-tags">';
@@ -129,6 +152,7 @@
     var title = f.title || f.filename;
     return (
       '<div class="card" data-file-id="' + f.id + '">' +
+        checkboxHtml +
         '<a class="card-img-link" href="/photo/' + f.id + '">' +
           '<img src="/thumb/' + f.id + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
         '</a>' +
@@ -147,7 +171,8 @@
     if (loading || done) return;
     loading = true;
     loadingEl.style.display = 'block';
-    var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=' + offset + '&limit=' + limit;
+    var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=' + offset + '&limit=' + limit +
+      '&sort=' + encodeURIComponent(sort) + '&order=' + encodeURIComponent(order);
     fetch(url)
       .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
       .then(function (data) {
@@ -205,6 +230,198 @@
   }
 
   loadMore();
+
+  // Used by the sort control below to reload the grid from scratch, and by
+  // the "estimate all" button to know how many photos to fetch in one go.
+  window.__personPhotoGrid = {
+    setSort: function (newSort, newOrder) {
+      sort = newSort;
+      order = newOrder;
+      grid.innerHTML = '';
+      offset = 0;
+      total = Infinity;
+      done = false;
+      emptyEl.style.display = 'none';
+      loadMore();
+    },
+    getTotal: function () { return total; },
+    fetchAllFileIds: function () {
+      var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=0&limit=' +
+        (total === Infinity ? 10000 : total);
+      return fetch(url)
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) { return (data.cards || []).map(function (f) { return f.id; }); });
+    },
+  };
+})();
+
+/* Sort control — reuses /api/person/{name}/photos' existing sort=/order=
+   support (age sorting already implemented server-side) by reloading the
+   grid from scratch rather than reloading the whole page, since the grid is
+   otherwise driven entirely by infinite-scroll fetches. */
+(function() {
+  var sortSelect = document.getElementById('person-sort-select');
+  var orderSelect = document.getElementById('person-order-select');
+  if (!sortSelect || !orderSelect) return;
+
+  function refreshOrderLabels() {
+    var isAge = sortSelect.value === 'age';
+    Array.prototype.forEach.call(orderSelect.options, function (opt) {
+      opt.textContent = isAge ? opt.dataset.ageLabel : opt.dataset.addedLabel;
+    });
+  }
+
+  function apply() {
+    refreshOrderLabels();
+    if (window.__personPhotoGrid) window.__personPhotoGrid.setSort(sortSelect.value, orderSelect.value);
+  }
+
+  refreshOrderLabels();
+  sortSelect.addEventListener('change', apply);
+  orderSelect.addEventListener('change', apply);
+})();
+
+/* Bulk selection — mirrors search.html's "Select many" / shift-click
+   range-select behavior verbatim, retargeted at this page's grid. Works for
+   cards appended later by infinite scroll too, since selection is handled by
+   one delegated click listener on the grid rather than per-card. */
+(function() {
+  var grid = document.getElementById('person-photo-grid');
+  if (!grid) return;
+
+  var selectManyBtn = document.getElementById('select-many-btn');
+  var lastClicked = null;
+
+  function setSelectMode(active) {
+    grid.classList.toggle('select-mode', active);
+    if (selectManyBtn) selectManyBtn.textContent = active ? 'Unselect many' : 'Select many';
+    if (!active) {
+      grid.querySelectorAll('.card-select-checkbox:checked').forEach(function(cb) { cb.checked = false; });
+      lastClicked = null;
+    }
+  }
+
+  if (selectManyBtn) {
+    selectManyBtn.addEventListener('click', function() {
+      setSelectMode(!grid.classList.contains('select-mode'));
+    });
+  }
+
+  grid.addEventListener('click', function(e) {
+    if (!grid.classList.contains('select-mode')) return;
+    var card = e.target.closest('.card');
+    var cb = card ? card.querySelector('.card-select-checkbox') : null;
+    if (!cb) return;
+    e.preventDefault();
+
+    if (e.shiftKey && lastClicked) {
+      var all = Array.from(grid.querySelectorAll('.card-select-checkbox'));
+      var start = all.indexOf(lastClicked);
+      var end = all.indexOf(cb);
+      if (start !== -1 && end !== -1) {
+        var lo = Math.min(start, end), hi = Math.max(start, end);
+        for (var i = lo; i <= hi; i++) all[i].checked = true;
+        lastClicked = cb;
+        return;
+      }
+    }
+    cb.checked = !cb.checked;
+    lastClicked = cb;
+  });
+
+  window.__personPhotoGridSelectMode = { setSelectMode: setSelectMode };
+})();
+
+/* Bulk "Add to set" — same flow as search.html: pick/create a target set,
+   then check any number of cards and add them all at once. Sequential, not
+   Promise.all, for the same reason as search.html (one shared, unlocked
+   SQLite connection — concurrent writes from separate requests corrupt it). */
+(function() {
+  var bulkBtn = document.getElementById('bulk-set-btn');
+  var bulkStatus = document.getElementById('bulk-set-status');
+  var grid = document.getElementById('person-photo-grid');
+  if (!bulkBtn || !grid) return;
+
+  var targetSet = null;
+
+  bulkBtn.addEventListener('click', function() {
+    if (!targetSet) {
+      openSetSearchModal(function(set) {
+        targetSet = set;
+        bulkBtn.textContent = 'Add to "' + set.name + '"';
+        window.__personPhotoGridSelectMode.setSelectMode(true);
+        bulkStatus.textContent = 'Select photos, then click the button again to add them.';
+      });
+      return;
+    }
+
+    var checked = Array.from(grid.querySelectorAll('.card-select-checkbox:checked'));
+    if (!checked.length) {
+      bulkStatus.textContent = 'Select at least one photo first.';
+      return;
+    }
+    bulkBtn.disabled = true;
+    var addedCount = 0;
+    var firstError = null;
+    checked.reduce(function(chain, cb) {
+      return chain.then(function() {
+        return assignFileToSet(cb.dataset.fileId, targetSet.id)
+          .then(function() { addedCount++; cb.checked = false; })
+          .catch(function(err) { if (!firstError) firstError = err; });
+      });
+    }, Promise.resolve())
+      .then(function() {
+        bulkBtn.disabled = false;
+        if (firstError) {
+          bulkStatus.textContent = 'Added ' + addedCount + ' of ' + checked.length +
+            ' photo(s) to "' + targetSet.name + '" — failed: ' + firstError.message;
+        } else {
+          bulkStatus.textContent = 'Added ' + addedCount + ' photo(s) to "' + targetSet.name + '".';
+        }
+      });
+  });
+})();
+
+/* 🎂 Estimate all — runs the existing single-photo age/gender estimate
+   endpoint (POST /api/files/{id}/estimate-age) for every photo of this
+   person, one at a time (same sequential reasoning as the bulk add-to-set
+   handler above). */
+(function() {
+  var btn = document.getElementById('estimate-all-age-btn');
+  var status = document.getElementById('estimate-all-age-status');
+  if (!btn || !window.__personPhotoGrid) return;
+
+  btn.addEventListener('click', function() {
+    btn.disabled = true;
+    status.textContent = 'Loading photo list…';
+    window.__personPhotoGrid.fetchAllFileIds().then(function(ids) {
+      if (!ids.length) {
+        status.textContent = 'No photos to estimate.';
+        btn.disabled = false;
+        return;
+      }
+      var done = 0;
+      status.textContent = 'Estimated 0/' + ids.length + '…';
+      return ids.reduce(function(chain, fileId) {
+        return chain.then(function() {
+          return fetch('/api/files/' + fileId + '/estimate-age', { method: 'POST' })
+            .catch(function() { /* keep going even if one photo fails/times out */ })
+            .then(function() {
+              done++;
+              status.textContent = 'Estimated ' + done + '/' + ids.length + '…';
+            });
+        });
+      }, Promise.resolve());
+    })
+      .then(function() {
+        status.textContent = 'Done estimating age/gender for ' + name + '.';
+        btn.disabled = false;
+      })
+      .catch(function(err) {
+        status.textContent = 'Failed: ' + err.message;
+        btn.disabled = false;
+      });
+  });
 })();
 
 /* Pencil icon — rename this identity everywhere (existing PUT /api/identities/
