@@ -13,6 +13,13 @@
   Deprioritize photos that already have an identified face
 </label>
 
+<label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+  Keep searching until
+  <input type="range" id="find-person-buffer-size-slider" min="10" max="200" step="10" value="10">
+  <span id="find-person-buffer-size-value">10</span>
+  are found
+</label>
+
 <div class="swipe-page">
   <div class="swipe-stack-wrap" id="find-person-swipe-stack"></div>
   <div class="swipe-controls">
@@ -106,10 +113,14 @@
     });
   }
 
-  window.initSwipeStack({
+  const bufferSizeSlider = document.getElementById('find-person-buffer-size-slider');
+  const bufferSizeValue = document.getElementById('find-person-buffer-size-value');
+
+  const stack = window.initSwipeStack({
     stackElId: 'find-person-swipe-stack',
     confirmBtnId: 'find-person-swipe-confirm-btn',
     rejectBtnId: 'find-person-swipe-reject-btn',
+    bufferSize: bufferSizeSlider ? parseInt(bufferSizeSlider.value, 10) : 10,
     initialCards: [],
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const avoidToggle = document.getElementById('find-person-avoid-existing-toggle');
@@ -154,6 +165,18 @@
       wireExpandSimilarSearch();
     },
   });
+
+  if (bufferSizeSlider && bufferSizeValue) {
+    // Live-update the number while dragging; only actually resize the buffer
+    // (and kick off a refill fetch) once the slider settles, so dragging
+    // through the range doesn't fire a fetch per tick.
+    bufferSizeSlider.addEventListener('input', function() {
+      bufferSizeValue.textContent = bufferSizeSlider.value;
+    });
+    bufferSizeSlider.addEventListener('change', function() {
+      stack.setBufferSize(parseInt(bufferSizeSlider.value, 10));
+    });
+  }
 })();
 </script>
 {% endblock %}

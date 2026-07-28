@@ -62,7 +62,13 @@ function _isEditableTarget(target) {
 }
 
 window.initSwipeStack = function (config) {
-  const BUFFER_SIZE = 10;
+  // How many not-yet-decided candidates the stack tries to keep buffered
+  // ahead of you — every swipe tops it back up via fetchMoreUrl. Defaults to
+  // 10 (today's behavior everywhere) unless a page passes its own
+  // config.bufferSize (find_person.html's "keep searching until X are found"
+  // slider, via the returned handle's setBufferSize). `let`, not `const`, so
+  // that slider can adjust it without tearing down/re-creating the stack.
+  let BUFFER_SIZE = config.bufferSize || 10;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
   // Cards size themselves to their photo's own aspect ratio (see .swipe-card
   // img's fixed height in style.css) rather than a uniform box, so this is
@@ -369,5 +375,15 @@ window.initSwipeStack = function (config) {
   // (e.g. set_detail.html's "add to a different set" flow, which needs to
   // inspect the current card and then trigger the same reject path a manual
   // down-swipe takes) without duplicating any queue/history/re-render logic.
-  return { refill: () => maybeFetchMore(), getTopCard: () => topCard(), decide: (action) => decide(action) };
+  // setBufferSize backs find_person.html's "keep searching until X are
+  // found" slider — raising the target immediately kicks off a refill (the
+  // existing maybeFetchMore already only fetches while queue.length is below
+  // BUFFER_SIZE, so a lower target just lets the buffer drain down to it
+  // naturally rather than discarding already-fetched cards).
+  return {
+    refill: () => maybeFetchMore(),
+    getTopCard: () => topCard(),
+    decide: (action) => decide(action),
+    setBufferSize: (n) => { BUFFER_SIZE = Math.max(1, n); maybeFetchMore(); },
+  };
 };
