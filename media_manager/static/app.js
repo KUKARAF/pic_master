@@ -72,10 +72,30 @@
   // Declarative (not a callback) because it has to survive a real page
   // navigation via sessionStorage, not just an in-memory closure. `request`
   // is a plain {method, url, body} fetch spec; `successMessage` may use
-  // {{key}} placeholders resolved against the JSON response.
+  // {{key}} placeholders resolved against the JSON response. `count` and
+  // `targetLabel` (e.g. 42 and "Vacation 2022") back the cancel-confirmation
+  // and the tab-close warning below — both spell out "N photos will NOT be
+  // added to X" rather than a generic message.
   window.setPhotoCustomAction = function (action) {
     sessionStorage.setItem('photoCustomAction', JSON.stringify(action));
   };
+
+  // Warn before closing the tab, reloading, or navigating away entirely
+  // (following a link to another site) while a custom action is still
+  // pending — this was previously silent, so an abandoned "add 42 photos to
+  // X" banner just stuck around across every photo view in the tab forever,
+  // with no way to tell it was still live short of clicking it. Browsers
+  // don't allow customizing beforeunload's dialog text (a security
+  // restriction, not an oversight here) — this only gets the browser's own
+  // generic "leave site?" prompt. The custom-worded "N photos will NOT be
+  // added to X, proceed?" confirmation lives on the banner's own Cancel
+  // button instead (see the renderer IIFE further down), for in-app
+  // dismissal rather than actually leaving.
+  window.addEventListener('beforeunload', function (e) {
+    if (!sessionStorage.getItem('photoCustomAction')) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
 
   // Shared with the queue-thumbnail-grid overlay further down (Space on the
   // photo page) — a plain outer-scope flag rather than event-registration-
@@ -1558,7 +1578,10 @@
      stashed as a persistent button at the very top of the sidebar (see
      #sidebar-custom-action in photo.html). One-shot: cleared from
      sessionStorage as soon as its request succeeds, so it doesn't reappear
-     on the next photo/reload. */
+     on the next photo/reload. Also offers an explicit Cancel — previously
+     the only way to stop seeing an abandoned action was to complete it or
+     manually clear storage, so a "never mind" banner just followed you
+     through every photo view in the tab indefinitely. */
   (function () {
     const raw = sessionStorage.getItem('photoCustomAction');
     if (!raw) return;
@@ -1581,6 +1604,11 @@
     btn.type = 'button';
     btn.className = 'btn-similar btn-primary';
     btn.textContent = action.buttonLabel;
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn-similar';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.style.marginLeft = '6px';
     const status = document.createElement('div');
     status.className = 'sub';
     status.style.marginTop = '6px';
@@ -1588,6 +1616,7 @@
 
     btn.addEventListener('click', function () {
       btn.disabled = true;
+      cancelBtn.disabled = true;
       fetch(action.request.url, {
         method: action.request.method || 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1601,15 +1630,30 @@
           });
           status.style.display = 'block';
           btn.style.display = 'none';
+          cancelBtn.style.display = 'none';
         })
         .catch(function (err) {
           btn.disabled = false;
+          cancelBtn.disabled = false;
           status.textContent = 'Failed: ' + err.message;
           status.style.display = 'block';
         });
     });
 
+    cancelBtn.addEventListener('click', function () {
+      const subject = action.count != null && action.targetLabel
+        ? action.count + ' photo(s) will NOT be added to "' + action.targetLabel + '"'
+        : 'This action will NOT be completed';
+      if (!confirm(subject + ' if you cancel.\n\nProceed?')) return;
+      sessionStorage.removeItem('photoCustomAction');
+      btn.remove();
+      cancelBtn.remove();
+      status.textContent = 'Canceled.';
+      status.style.display = 'block';
+    });
+
     mount.appendChild(btn);
+    mount.appendChild(cancelBtn);
     mount.appendChild(status);
   })();
 

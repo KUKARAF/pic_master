@@ -370,6 +370,8 @@
                   buttonLabel: 'Add ' + ids.length + ' photo' + (ids.length === 1 ? '' : 's') + ' to "' + setName + '"',
                   request: { method: 'POST', url: '/api/sets/' + setId + '/add-folder', body: { path: path } },
                   successMessage: 'Added {% raw %}{{added}}{% endraw %} photo(s) to this set ({% raw %}{{already_present}}{% endraw %} already there).',
+                  count: ids.length,
+                  targetLabel: setName,
                 });
                 closeModal();
                 window.location.href = '/photo/' + ids[0];
