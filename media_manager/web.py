@@ -58,6 +58,9 @@ class AddFolderBody(BaseModel):
 class IdentityBody(BaseModel):
     name: Optional[str] = None
 
+class ConfirmAboveThresholdBody(BaseModel):
+    threshold: float
+
 class ManualFaceBody(BaseModel):
     bbox: List[float]
 
@@ -2419,14 +2422,25 @@ def create_app(data_root: str) -> FastAPI:
             for score, ref, file_id_, path_, identity in scored[:limit]
         ]
 
-    def _find_similar_unknown_faces(name, threshold, limit=20):
+    def _find_similar_unknown_faces(name, threshold, limit=20, ceiling=None, ascending=False):
         """Unidentified auto-detected faces whose embedding is within `threshold` cosine
-        similarity of any of `name`'s confirmed faces — powers /api/identities/{name}/similar-faces."""
+        similarity of any of `name`'s confirmed faces — powers /api/identities/{name}/similar-faces
+        and the auto-calibrate-threshold feature's per-round batches/bulk-confirm.
+
+        `ceiling`, if given, excludes score >= ceiling — scopes a calibration round to
+        the still-unverified band below whatever threshold was already proven clean.
+        `ascending`, when True, sorts lowest-score-first instead of the default
+        best-first, so a calibration round samples the riskiest (closest to the
+        threshold) candidates rather than the easy, already-confident ones.
+        `limit=None` returns every qualifying row (used by the bulk-confirm endpoint).
+
+        Returns {'results': [...limit], 'total': N} — `total` is the full count of
+        qualifying rows before the limit slice, needed both for a round's "is this
+        band empty" check and the final bulk-add candidate count."""
         ref_embeddings = manual.get_embeddings_for_identity(name)
         unidentified = _unpromoted_auto_faces(limit=None)
-        results = []
         if not ref_embeddings or not unidentified:
-            return results
+            return {'results': [], 'total': 0}
         import numpy as np
         ref_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
         scored = []
@@ -2436,18 +2450,21 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             vec = np.frombuffer(emb_bytes, dtype=np.float32)
             score = float(ref_matrix.dot(vec).max())
-            if score >= threshold:
+            if score >= threshold and (ceiling is None or score < ceiling):
                 scored.append((score, face_id_, file_id_, path_))
-        scored.sort(reverse=True)
-        for score, face_id_, file_id_, path_ in scored[:limit]:
-            results.append({
+        scored.sort(reverse=not ascending)
+        sliced = scored if limit is None else scored[:limit]
+        results = [
+            {
                 'ref': f"auto:{face_id_}",
                 'file_id': file_id_,
                 'path': path_,
                 'filename': os.path.basename(path_),
                 'score': round(score, 3),
-            })
-        return results
+            }
+            for score, face_id_, file_id_, path_ in sliced
+        ]
+        return {'results': results, 'total': len(scored)}
 
     @app.get('/faces', response_class=HTMLResponse)
     def faces_page(request: Request, favorite: bool = False):
@@ -2630,7 +2647,17 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/identities/{name}/similar-faces')
     def api_similar_unknown_faces(name: str, threshold: float = SUGGEST_THRESHOLD, limit: int = 20):
         threshold = max(0.0, min(1.0, threshold))
-        return {'results': _find_similar_unknown_faces(name, threshold, limit=limit)}
+        return {'results': _find_similar_unknown_faces(name, threshold, limit=limit)['results']}
+
+    @app.get('/api/identities/{name}/calibration-batch')
+    def api_calibration_batch(name: str, floor: float = 0.10, ceiling: float = 1.0, count: int = 8):
+        """Feeds the auto-calibrate-threshold feature's per-round review batch: the
+        `count` riskiest (lowest-scoring) still-unreviewed candidates in [floor,
+        ceiling), plus the true total count in that band (before `count` truncates
+        it) so the client can tell an empty band apart from a merely-small one."""
+        floor = max(0.0, min(1.0, floor))
+        ceiling = max(floor, min(1.0, ceiling))
+        return _find_similar_unknown_faces(name, floor, limit=count, ceiling=ceiling, ascending=True)
 
     @app.get('/api/faces/{face_id}/suggestions')
     def api_face_suggestions(face_id: str):
@@ -2781,6 +2808,23 @@ def create_app(data_root: str) -> FastAPI:
                                         identity_filter=identity or None, avoid_existing=avoid_existing)
         return {'cards': cards}
 
+    def _confirm_auto_face(raw_id, name):
+        """Core of confirming an auto-detected (media.db) face as `name`: looks up
+        its file/bbox/embedding and promotes it into manual.db. Returns the new
+        manual-face id, or None if the source auto face no longer exists. Shared
+        by the single-face confirm endpoint below and the auto-calibrate-
+        threshold feature's bulk-confirm-above-threshold endpoint."""
+        cursor = db.conn.cursor()
+        cursor.execute('SELECT file_id, bbox, embedding FROM faces WHERE id = ?', (raw_id,))
+        src = cursor.fetchone()
+        if src is None:
+            return None
+        src_file = db.get_file_by_id(src['file_id'])
+        if src_file is None:
+            return None
+        bbox = json.loads(src['bbox'])
+        return manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None)
+
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):
         # A blank/omitted name confirms "this is a distinct person" without
@@ -2797,16 +2841,9 @@ def create_app(data_root: str) -> FastAPI:
             manual.assign_identity(raw_id, name)
             return {'face_id': face_id, 'identity': name}
 
-        cursor = db.conn.cursor()
-        cursor.execute('SELECT file_id, bbox, embedding FROM faces WHERE id = ?', (raw_id,))
-        src = cursor.fetchone()
-        if src is None:
+        new_id = _confirm_auto_face(raw_id, name)
+        if new_id is None:
             raise HTTPException(status_code=404, detail='Face not found')
-        src_file = db.get_file_by_id(src['file_id'])
-        if src_file is None:
-            raise HTTPException(status_code=404, detail='File not found')
-        bbox = json.loads(src['bbox'])
-        new_id = manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None)
         return {'face_id': f"manual:{new_id}", 'identity': name}
 
     @app.post('/api/faces/{face_id}/reject')
@@ -2834,6 +2871,22 @@ def create_app(data_root: str) -> FastAPI:
         bbox = json.loads(src['bbox'])
         manual.reject_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], None, None)
         return {'ok': True}
+
+    @app.post('/api/identities/{name}/confirm-above-threshold')
+    def api_confirm_above_threshold(name: str, body: ConfirmAboveThresholdBody):
+        """Bulk finish of the auto-calibrate-threshold feature: once the client's
+        binary search has settled on a threshold with no observed false
+        positives, confirm every remaining unreviewed candidate at or above it
+        as `name` in one request, reusing the same _confirm_auto_face path the
+        single-face confirm endpoint uses (no separate promotion logic)."""
+        threshold = max(0.0, min(1.0, body.threshold))
+        data = _find_similar_unknown_faces(name, threshold, limit=None, ascending=False)
+        confirmed = 0
+        for r in data['results']:
+            kind, raw_id = _parse_face_ref(r['ref'])
+            if kind == 'auto' and _confirm_auto_face(raw_id, name) is not None:
+                confirmed += 1
+        return {'confirmed': confirmed, 'threshold': threshold}
 
     @app.delete('/api/faces/{face_id}/decision')
     def api_undo_face_decision(face_id: str):
