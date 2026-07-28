@@ -818,6 +818,38 @@
 
   window.openSetSearchModal = openSetSearchModal;
 
+  /* Shared by both rename-set modals (sets.html's per-card editor and
+     set_detail.html's page-level one). PUT /api/sets/{id} 409s with the
+     colliding set when the new name already belongs to a different set;
+     this asks the user whether to merge into it and, if so, re-sends the
+     request with confirm_merge — the caller only ever sees the final
+     resolved result (or an Error if the user declined). */
+  window.renameSetWithMergePrompt = function (setId, name, studio) {
+    function attempt(confirmMerge) {
+      return fetch('/api/sets/' + setId, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name, studio: studio, confirm_merge: !!confirmMerge }),
+      }).then(function (r) {
+        if (r.status === 409) {
+          return r.json().then(function (data) {
+            const existing = data.existing_set;
+            const wantsMerge = confirm(
+              'A set named "' + existing.name + '" already exists' +
+              (existing.studio ? ' (studio: ' + existing.studio + ')' : '') +
+              ' with ' + existing.image_count + ' photo(s).\n\nMerge this set into it?'
+            );
+            if (!wantsMerge) throw new Error('canceled — a set with that name already exists');
+            return attempt(true);
+          });
+        }
+        if (!r.ok) throw new Error('Request failed: ' + r.status);
+        return r.json();
+      });
+    }
+    return attempt(false);
+  };
+
   /* Generic "add file X to set Y" — used by the search page's bulk-select flow,
      which isn't tied to a single "current" file the way the photo page is. */
   window.assignFileToSet = function (fileIdToAssign, setId) {

@@ -666,6 +666,42 @@ class ManualDB(ThreadLocalDB):
         )
         self.conn.commit()
 
+    def find_sets_by_name(self, name, exclude_id=None):
+        """Case-insensitive name match, ignoring studio — the `sets` table's own
+        UNIQUE(name, studio) constraint doesn't actually stop duplicates in
+        practice (SQLite treats every NULL studio as distinct for UNIQUE
+        purposes, and studio is NULL on most sets), so this is what backs the
+        rename-time "a set with this name already exists, merge them?" prompt."""
+        cur = self.conn.cursor()
+        query = 'SELECT * FROM sets WHERE LOWER(name) = LOWER(?)'
+        params = [name]
+        if exclude_id is not None:
+            query += ' AND id != ?'
+            params.append(exclude_id)
+        cur.execute(query, params)
+        return cur.fetchall()
+
+    def merge_sets(self, source_id, dest_id):
+        """Folds source_id into dest_id: every member photo, exclusion, and
+        linked identity moves over (skipped, not errored, wherever dest_id
+        already has that same row — see the UPDATE OR IGNORE calls below),
+        dest_id's favorite flag is OR'd with source's, then source_id itself
+        is deleted. Deleting it cascades away whatever file_sets/
+        file_set_exclusions/identity_set_assignments rows still point at it —
+        exactly the ones skipped above because dest_id already had that same
+        (checksum/identity) pairing, so it's correct for them to just vanish
+        rather than raise a duplicate-key error. Returns dest_id."""
+        cur = self.conn.cursor()
+        cur.execute('UPDATE OR IGNORE file_sets SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
+        cur.execute('UPDATE OR IGNORE file_set_exclusions SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
+        cur.execute('UPDATE OR IGNORE identity_set_assignments SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
+        source = self.get_set(source_id)
+        if source is not None and source['favorite']:
+            cur.execute('UPDATE sets SET favorite = 1 WHERE id = ?', (dest_id,))
+        cur.execute('DELETE FROM sets WHERE id = ?', (source_id,))
+        self.conn.commit()
+        return dest_id
+
     def delete_set(self, set_id):
         """Deletes the set entity only — member files are untouched, `file_sets` rows
         for it are removed automatically via ON DELETE CASCADE."""

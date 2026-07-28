@@ -149,12 +149,7 @@ document.querySelectorAll('.set-edit-btn').forEach(function(btn) {
       saveBtn.addEventListener('click', function() {
         const name = nameInput.value.trim();
         if (!name) return;
-        fetch('/api/sets/' + btn.dataset.setId, {
-          method: 'PUT',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name: name, studio: studioInput.value.trim() || null}),
-        })
-          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        renameSetWithMergePrompt(btn.dataset.setId, name, studioInput.value.trim() || null)
           .then(function() { closeModal(); location.reload(); })
           .catch(function(err) { alert('Failed to rename set: ' + err.message); });
       });

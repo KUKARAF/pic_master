@@ -49,6 +49,7 @@ class SetBody(BaseModel):
     name: Optional[str] = None
     studio: Optional[str] = None
     set_id: Optional[int] = None
+    confirm_merge: bool = False
 
 class AddFolderBody(BaseModel):
     path: str
@@ -1928,6 +1929,29 @@ def create_app(data_root: str) -> FastAPI:
         if not name:
             raise HTTPException(status_code=400, detail='Set name must not be empty')
         studio = body.studio.strip() if body.studio else None
+
+        # Renaming onto an already-existing name is very likely the same set
+        # under a slightly different name (or a straight-up duplicate) rather
+        # than a deliberate second set sharing a name — ask before silently
+        # creating a name collision, unless the client already confirmed the
+        # merge (confirm_merge, set after the user accepts the prompt below).
+        collisions = manual.find_sets_by_name(name, exclude_id=set_id)
+        if collisions and not body.confirm_merge:
+            existing = collisions[0]
+            return JSONResponse(status_code=409, content={
+                'conflict': True,
+                'existing_set': {
+                    'id': existing['id'], 'name': existing['name'], 'studio': existing['studio'],
+                    'image_count': len(manual.get_files_by_set(existing['id'], limit=100000)),
+                },
+            })
+        if collisions and body.confirm_merge:
+            dest_id = manual.merge_sets(source_id=set_id, dest_id=collisions[0]['id'])
+            # dest_id already has the name we're renaming to — no separate
+            # rename call needed, and set_id itself no longer exists.
+            merged = manual.get_set(dest_id)
+            return {'id': dest_id, 'name': merged['name'], 'studio': merged['studio'], 'merged': True, 'merged_from': set_id}
+
         manual.rename_set(set_id, name, studio)
         return {'id': set_id, 'name': name, 'studio': studio}
 
