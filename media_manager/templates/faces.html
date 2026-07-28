@@ -8,17 +8,19 @@
   <span class="sub">{{ identities | length }} known people</span>
 </div>
 
-<div style="margin-bottom:16px;">
+<div style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
   {% if favorite_only %}
   <a href="/faces" class="sub">← All faces</a>
   {% else %}
   <a href="/faces?favorite=1" class="sub">♥ Favorites only</a>
+  <button type="button" id="find-new-faces-btn" class="btn-similar">🔍 Find new faces</button>
+  <button type="button" id="cleanup-low-confidence-btn" class="btn-similar">🧹 Cleanup low confidence matches</button>
   {% endif %}
 </div>
 
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
 
-  <!-- Face grid -->
+  <!-- Main content -->
   <div style="flex:1;min-width:300px;">
     {% if favorite_only %}
     <div class="section-title" style="margin-bottom:12px;">Favorited faces</div>
@@ -39,18 +41,32 @@
     <div class="alert">No favorited faces yet.</div>
     {% endif %}
     {% else %}
-    <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
-    <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
-      <input type="checkbox" id="faces-avoid-existing-toggle" checked>
-      Deprioritize photos that already have an identified face
-    </label>
-    <div class="swipe-page">
-      <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
-      <div class="swipe-controls">
-        <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not same face (↓)">✕</button>
-        <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Same face (↑)">✓</button>
+
+    <!-- Confirmed-faces grid — the main view -->
+    <div class="section-title" style="margin-bottom:12px;">Confirmed faces</div>
+    <div class="grid" id="confirmed-faces-grid"></div>
+    <div id="confirmed-faces-sentinel" style="height:1px;"></div>
+    <p id="confirmed-faces-loading" class="sub" style="text-align:center;margin-top:16px;display:none;">Loading…</p>
+    <p id="confirmed-faces-empty" class="empty-state" style="display:none;">
+      <span class="icon">🖼️</span>
+      <br>No confirmed faces yet.
+    </p>
+
+    <!-- "Find new faces" swipe stream — hidden until requested, unchanged behavior -->
+    <div id="find-new-faces-section" style="display:none;margin-top:28px;">
+      <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
+      <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+        <input type="checkbox" id="faces-avoid-existing-toggle" checked>
+        Deprioritize photos that already have an identified face
+      </label>
+      <div class="swipe-page">
+        <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
+        <div class="swipe-controls">
+          <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not same face (↓)">✕</button>
+          <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Same face (↑)">✓</button>
+        </div>
+        <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
       </div>
-      <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
     </div>
     {% endif %}
   </div>
@@ -78,46 +94,261 @@
 {% block scripts %}
 <script src="/static/swipe-core.js"></script>
 <script>
-if (document.getElementById('faces-swipe-stack')) {
-  initSwipeStack({
-    stackElId: 'faces-swipe-stack',
-    confirmBtnId: 'faces-swipe-confirm-btn',
-    rejectBtnId: 'faces-swipe-reject-btn',
-    initialCards: [],
-    biasKeyFor: function(card) { return card.identity; },
-    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
-      const avoidToggle = document.getElementById('faces-avoid-existing-toggle');
-      const params = new URLSearchParams({
-        count: String(need),
-        avoid_existing: String(!avoidToggle || avoidToggle.checked),
+/* Confirmed-faces grid — same lazily-paginated pattern as person.html's
+   photo grid, pointed at /api/faces/confirmed instead. */
+(function() {
+  var grid = document.getElementById('confirmed-faces-grid');
+  if (!grid) return;
+  var loadingEl = document.getElementById('confirmed-faces-loading');
+  var emptyEl = document.getElementById('confirmed-faces-empty');
+  var sentinel = document.getElementById('confirmed-faces-sentinel');
+  var limit = 20;
+  var offset = 0;
+  var total = Infinity;
+  var loading = false;
+  var done = false;
+
+  function cardHtml(f) {
+    return (
+      '<div class="card" data-file-id="' + f.file_id + '">' +
+        '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
+          '<img src="/face-crop/' + encodeURIComponent(f.ref) + '" alt="' + escapeHtml(f.identity || 'face') + '" loading="lazy">' +
+        '</a>' +
+        '<div class="card-body">' +
+          '<a class="card-name" href="/person/' + encodeURIComponent(f.identity) + '">' + escapeHtml(f.identity) + '</a>' +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function loadMore() {
+    if (loading || done) return;
+    loading = true;
+    loadingEl.style.display = 'block';
+    fetch('/api/faces/confirmed?offset=' + offset + '&limit=' + limit)
+      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function(data) {
+        total = data.total;
+        var cards = data.cards || [];
+        cards.forEach(function(f) {
+          var wrap = document.createElement('div');
+          wrap.innerHTML = cardHtml(f);
+          grid.appendChild(wrap.firstElementChild);
+        });
+        offset += cards.length;
+        if (offset === 0 && total === 0) emptyEl.style.display = 'block';
+        if (cards.length < limit || offset >= total) done = true;
+      })
+      .catch(function(err) {
+        loadingEl.textContent = 'Failed to load more faces: ' + err.message;
+      })
+      .finally(function() {
+        loading = false;
+        loadingEl.style.display = 'none';
+        if (!done && sentinel) {
+          var rect = sentinel.getBoundingClientRect();
+          if (rect.top < window.innerHeight + 400) loadMore();
+        }
       });
-      if (biasKey) {
-        params.set('bias_identity', biasKey);
-        params.set('bias', biasAction);
-      }
-      return '/api/face-suggestions/next?' + params.toString();
-    },
-    renderCard: function(card) {
-      return {
-        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
-        questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
-        scoreText: 'match score ' + card.score.toFixed(2),
-        metaHtml: swipeCardMeta(card),
-        originalUrl: '/photo/' + card.file_id,
-      };
-    },
-    onConfirm: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
-    },
-    onReject: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
-    },
-    onUndo: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
-    },
-    emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces or come back later.</div>',
+  }
+
+  if (window.IntersectionObserver && sentinel) {
+    var observer = new IntersectionObserver(function(entries) {
+      entries.forEach(function(entry) { if (entry.isIntersecting) loadMore(); });
+    }, { rootMargin: '400px' });
+    observer.observe(sentinel);
+  } else {
+    window.addEventListener('scroll', function() {
+      if (done || loading) return;
+      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) loadMore();
+    });
+  }
+
+  loadMore();
+})();
+
+/* "Find new faces" — reveals the existing unidentified-faces swipe stream
+   (unchanged), lazily initialized on first reveal so a plain /faces visit
+   never fires its stream request. */
+(function() {
+  var btn = document.getElementById('find-new-faces-btn');
+  var section = document.getElementById('find-new-faces-section');
+  if (!btn || !section) return;
+  var initialized = false;
+
+  btn.addEventListener('click', function() {
+    section.style.display = section.style.display === 'none' ? 'block' : 'none';
+    if (section.style.display === 'none' || initialized) return;
+    initialized = true;
+    initSwipeStack({
+      stackElId: 'faces-swipe-stack',
+      confirmBtnId: 'faces-swipe-confirm-btn',
+      rejectBtnId: 'faces-swipe-reject-btn',
+      initialCards: [],
+      biasKeyFor: function(card) { return card.identity; },
+      fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+        var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
+        var params = new URLSearchParams({
+          count: String(need),
+          avoid_existing: String(!avoidToggle || avoidToggle.checked),
+        });
+        if (biasKey) {
+          params.set('bias_identity', biasKey);
+          params.set('bias', biasAction);
+        }
+        return '/api/face-suggestions/next?' + params.toString();
+      },
+      renderCard: function(card) {
+        return {
+          imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+          questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
+          scoreText: 'match score ' + card.score.toFixed(2),
+          metaHtml: swipeCardMeta(card),
+          originalUrl: '/photo/' + card.file_id,
+        };
+      },
+      onConfirm: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
+      },
+      onReject: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+      },
+      onUndo: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+      },
+      emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces or come back later.</div>',
+    });
   });
-}
+})();
+
+/* "Cleanup low confidence matches" — reviews already-confirmed faces one at
+   a time, worst-first, via /api/faces/cleanup-queue. Deliberately built as
+   plain buttons + arrow keys rather than a swipe-core.js stream: "down" has
+   to pause for a search-modal sub-flow (reassign or remove) before it can
+   resolve, which doesn't fit a fling-and-refill buffer, and this keeps
+   swipe-core.js (shared by 5 other pages) completely untouched. */
+(function() {
+  var btn = document.getElementById('cleanup-low-confidence-btn');
+  if (!btn) return;
+  var sessionCounter = 0;
+
+  btn.addEventListener('click', function() {
+    btn.disabled = true;
+    fetch('/api/faces/cleanup-queue?limit=200')
+      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function(data) {
+        btn.disabled = false;
+        var queue = data.cards || [];
+        if (!queue.length) { alert('No low-confidence matches to review right now.'); return; }
+        runCleanupReview(queue);
+      })
+      .catch(function(err) {
+        btn.disabled = false;
+        alert('Failed to load cleanup queue: ' + err.message);
+      });
+  });
+
+  function peekFace(ref) {
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:2000;' +
+      'display:flex;align-items:center;justify-content:center;cursor:pointer;';
+    var img = document.createElement('img');
+    img.src = '/face-crop/' + encodeURIComponent(ref);
+    img.style.cssText = 'max-width:90vw;max-height:90vh;border-radius:8px;';
+    overlay.appendChild(img);
+    overlay.addEventListener('click', function() { overlay.remove(); });
+    document.body.appendChild(overlay);
+  }
+
+  function runCleanupReview(queue) {
+    var sessionId = ++sessionCounter;
+    var index = 0;
+
+    function markCorrect(f) {
+      fetch('/api/faces/' + encodeURIComponent(f.ref) + '/mark-reviewed', { method: 'POST' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { index++; showCard(); })
+        .catch(function(err) { alert('Failed: ' + err.message); });
+    }
+
+    function markIncorrect(f) {
+      openEntitySearchModal({
+        type: 'identity',
+        title: 'Who is this really?',
+        extraSuggestion: function(resolve, extraBox) {
+          var removeBtn = document.createElement('button');
+          removeBtn.type = 'button';
+          removeBtn.className = 'btn-similar';
+          removeBtn.style.marginTop = '8px';
+          removeBtn.textContent = "🗑 This isn't a face — remove it";
+          removeBtn.addEventListener('click', function() { resolve({ __remove: true }); });
+          extraBox.appendChild(removeBtn);
+        },
+        onResolved: function(entity) {
+          var req = (entity && entity.__remove)
+            ? fetch('/api/faces/' + encodeURIComponent(f.ref) + '/reject', { method: 'POST' })
+            : fetch('/api/faces/' + encodeURIComponent(f.ref) + '/identity', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: entity.name }),
+              });
+          req.then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+            .then(function() { index++; showCard(); })
+            .catch(function(err) { alert('Failed: ' + err.message); showCard(); });
+        },
+      });
+    }
+
+    function showCard() {
+      openModal('Cleanup low confidence matches', function(box) {
+        if (index >= queue.length) {
+          box.innerHTML = '<p>All done — no more low-confidence matches to review.</p>';
+          return;
+        }
+        var f = queue[index];
+        box.dataset.cleanupSession = String(sessionId);
+        box.innerHTML =
+          '<div style="text-align:center;">' +
+            '<img src="/face-crop/' + encodeURIComponent(f.ref) + '" alt="face" ' +
+              'style="width:160px;height:160px;object-fit:cover;border-radius:6px;">' +
+            '<div class="sub" style="margin:6px 0;">"' + escapeHtml(f.identity) + '" — match score ' +
+              f.score.toFixed(3) + ' (' + (index + 1) + ' of ' + queue.length + ')</div>' +
+            '<div style="display:flex;flex-direction:column;align-items:center;gap:6px;margin-top:10px;">' +
+              '<button type="button" class="btn-similar cleanup-up-btn">⬆ Correct — don\'t ask again</button>' +
+              '<div style="display:flex;gap:6px;">' +
+                '<button type="button" class="btn-similar cleanup-left-btn">⬅ Compare</button>' +
+                '<button type="button" class="btn-similar cleanup-right-btn">➡ This face</button>' +
+              '</div>' +
+              '<button type="button" class="btn-similar cleanup-down-btn">⬇ Incorrect</button>' +
+            '</div>' +
+          '</div>';
+        box.querySelector('.cleanup-up-btn').addEventListener('click', function() { markCorrect(f); });
+        box.querySelector('.cleanup-left-btn').addEventListener('click', function() { peekFace(f.compare_ref); });
+        box.querySelector('.cleanup-right-btn').addEventListener('click', function() { peekFace(f.ref); });
+        box.querySelector('.cleanup-down-btn').addEventListener('click', function() { markIncorrect(f); });
+      });
+    }
+
+    // One keydown listener per review session, scoped to only act while
+    // THIS session's card is the one actually showing (checked via the
+    // dataset marker each keypress) — a no-op once the modal's closed, once
+    // the down-flow's search sub-modal has replaced the box, or once a
+    // newer cleanup session has taken over. Avoids interfering with
+    // openEntitySearchModal's own arrow-key list navigation during "down".
+    document.addEventListener('keydown', function(e) {
+      var marker = document.querySelector('[data-cleanup-session]');
+      if (!marker || marker.dataset.cleanupSession !== String(sessionId)) return;
+      if (index >= queue.length) return;
+      var f = queue[index];
+      if (e.key === 'ArrowUp') { e.preventDefault(); markCorrect(f); }
+      else if (e.key === 'ArrowDown') { e.preventDefault(); markIncorrect(f); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); peekFace(f.compare_ref); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); peekFace(f.ref); }
+    });
+
+    showCard();
+  }
+})();
 
 document.querySelectorAll('.identity-rename-btn').forEach(function(btn) {
   btn.addEventListener('click', function() {

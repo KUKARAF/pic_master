@@ -7,6 +7,7 @@ import contextlib
 import io
 import json
 import os
+import random
 import threading
 import time
 from urllib.parse import quote
@@ -2490,6 +2491,91 @@ def create_app(data_root: str) -> FastAPI:
             'favorite_only': favorite,
             'favorite_faces': favorite_faces,
         })
+
+    @app.get('/api/faces/confirmed')
+    def api_confirmed_faces(offset: int = 0, limit: int = 20):
+        """Paginated feed of every identity-assigned, non-rejected face, newest
+        first — backs the main thumbnail grid on the redesigned /faces page
+        (mirrors /api/person/{name}/photos's offset/limit/total contract)."""
+        rows, total = manual.list_confirmed_faces(offset=offset, limit=limit)
+        cards = []
+        for row in rows:
+            file_row = db.get_file_by_checksum(row['checksum'])
+            if file_row is None:
+                continue
+            cards.append({
+                'ref': f"manual:{row['id']}",
+                'file_id': file_row['id'],
+                'path': file_row['path'],
+                'filename': os.path.basename(file_row['path']),
+                'identity': row['identity'],
+            })
+        return {'cards': cards, 'total': total, 'offset': offset, 'limit': limit}
+
+    @app.get('/api/faces/cleanup-queue')
+    def api_faces_cleanup_queue(limit: int = 200):
+        """Review queue for the "cleanup low confidence matches" feature: every
+        confirmed face not yet marked reviewed_ok, ranked worst-first by its
+        own max cosine similarity to the OTHER confirmed faces of the same
+        identity (an outlier vs. its own identity's cohort = a likely
+        mis-tag). Identities with fewer than 2 confirmed faces have nothing to
+        compare against and contribute nothing. `compare_ref` is one randomly
+        chosen sibling face per card, fixed for this queue build — the "peek
+        at what we're comparing against" reference."""
+        rows = manual.get_confirmed_faces_for_cleanup()
+        by_identity = {}
+        for face_id_, checksum, identity, emb_bytes, reviewed_ok in rows:
+            by_identity.setdefault(identity, []).append((face_id_, checksum, emb_bytes, reviewed_ok))
+
+        import numpy as np
+        scored = []  # (score, face_id_, checksum, identity, compare_face_id)
+        for identity, faces_for_identity in by_identity.items():
+            if len(faces_for_identity) < 2:
+                continue
+            matrix = np.stack([
+                np.frombuffer(emb_bytes, dtype=np.float32) for _, _, emb_bytes, _ in faces_for_identity
+            ])
+            for i, (face_id_, checksum, emb_bytes, reviewed_ok) in enumerate(faces_for_identity):
+                if reviewed_ok:
+                    continue
+                vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                sims = matrix.dot(vec)
+                sims[i] = -1.0  # exclude comparing a face against itself
+                score = float(sims.max())
+                # A random sibling to show as "what we're comparing against" —
+                # per spec ("a random face example"), not necessarily the
+                # closest match, just excluding itself.
+                other_indices = [j for j in range(len(faces_for_identity)) if j != i]
+                compare_face_id = faces_for_identity[random.choice(other_indices)][0]
+                scored.append((score, face_id_, checksum, identity, compare_face_id))
+
+        scored.sort(key=lambda t: t[0])
+        cards = []
+        for score, face_id_, checksum, identity, compare_face_id in scored[:limit]:
+            file_row = db.get_file_by_checksum(checksum)
+            if file_row is None:
+                continue
+            cards.append({
+                'ref': f"manual:{face_id_}",
+                'file_id': file_row['id'],
+                'path': file_row['path'],
+                'filename': os.path.basename(file_row['path']),
+                'identity': identity,
+                'score': round(score, 3),
+                'compare_ref': f"manual:{compare_face_id}",
+            })
+        return {'cards': cards, 'total': len(scored)}
+
+    @app.post('/api/faces/{face_id}/mark-reviewed')
+    def api_mark_face_reviewed(face_id: str):
+        """"Correct, leave as is, don't ask again" from the cleanup review."""
+        kind, raw_id = _parse_face_ref(face_id)
+        if kind != 'manual':
+            raise HTTPException(status_code=400, detail='Only confirmed (manual) faces can be marked reviewed')
+        if manual.get_face(raw_id) is None:
+            raise HTTPException(status_code=404, detail='Face not found')
+        manual.mark_face_reviewed_ok(raw_id)
+        return {'ok': True}
 
     @app.get('/face-crop/{face_id}')
     def serve_face_crop(face_id: str):

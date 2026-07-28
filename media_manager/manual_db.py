@@ -284,7 +284,8 @@ class ManualDB(ThreadLocalDB):
                 rejected INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 frame_index INTEGER,
-                favorite INTEGER NOT NULL DEFAULT 0
+                favorite INTEGER NOT NULL DEFAULT 0,
+                reviewed_ok INTEGER NOT NULL DEFAULT 0
             )
         ''')
         existing_face_cols2 = {row[1] for row in cur.execute('PRAGMA table_info(faces)')}
@@ -292,6 +293,12 @@ class ManualDB(ThreadLocalDB):
             cur.execute('ALTER TABLE faces ADD COLUMN frame_index INTEGER')
         if 'favorite' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0')
+        # Backs the "cleanup low confidence matches" feature's "correct, don't
+        # ask again" action — a face marked this way is excluded from all
+        # future cleanup-queue builds regardless of how low its computed
+        # self-consistency score comes out.
+        if 'reviewed_ok' not in existing_face_cols2:
+            cur.execute('ALTER TABLE faces ADD COLUMN reviewed_ok INTEGER NOT NULL DEFAULT 0')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS migration_state (
                 key TEXT PRIMARY KEY,
@@ -1187,6 +1194,14 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE faces SET identity = ?, rejected = 0 WHERE id = ?', (name.strip(), manual_face_id))
         self.conn.commit()
 
+    def mark_face_reviewed_ok(self, manual_face_id):
+        """"Correct, don't ask again" from the cleanup-low-confidence-matches
+        review — excludes this face from all future cleanup-queue builds
+        regardless of its computed self-consistency score."""
+        cur = self.conn.cursor()
+        cur.execute('UPDATE faces SET reviewed_ok = 1 WHERE id = ?', (manual_face_id,))
+        self.conn.commit()
+
     def unassign_identity_for_checksum(self, checksum, name):
         """Clear the identity (back to unidentified, not rejected) for every
         manual.db face row on this one photo currently named `name` — used by
@@ -1339,6 +1354,34 @@ class ManualDB(ThreadLocalDB):
         manual.db face."""
         cur = self.conn.cursor()
         cur.execute('SELECT id, checksum, identity, embedding FROM faces WHERE rejected = 0')
+        return cur.fetchall()
+
+    def list_confirmed_faces(self, offset=0, limit=20):
+        """(id, checksum, identity) for every identity-assigned, non-rejected face,
+        newest first, plus the total count — backs /api/faces/confirmed's
+        paginated grid on the redesigned /faces main view."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        total = cur.fetchone()[0]
+        cur.execute('''
+            SELECT id, checksum, identity FROM faces
+            WHERE identity IS NOT NULL AND rejected = 0
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+        ''', (limit, offset))
+        return cur.fetchall(), total
+
+    def get_confirmed_faces_for_cleanup(self):
+        """Return [(id, checksum, identity, embedding_bytes, reviewed_ok), ...] for
+        every confirmed (identity-assigned, non-rejected) face, regardless of
+        reviewed_ok — the cleanup-low-confidence-matches feature needs ALL of an
+        identity's faces (including already-reviewed ones) to build that
+        identity's comparison pool, then filters to reviewed_ok = 0 for which
+        faces actually become review candidates."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT id, checksum, identity, embedding, reviewed_ok FROM faces
+            WHERE identity IS NOT NULL AND rejected = 0
+        ''')
         return cur.fetchall()
 
     def get_named_face_embeddings(self):
