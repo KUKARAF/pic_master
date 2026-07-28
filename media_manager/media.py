@@ -187,6 +187,19 @@ def main():
     set_files.add_argument('--studio', default=None, help='Studio name (optional)')
     set_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
 
+    # media dir2set <path> - the common "this whole folder is one set" workflow
+    # (a studio shoot, an event, a trip) in one command: scans/imports the
+    # folder like `media add`, creates a set named after the folder's own
+    # name (override with --name), then adds every currently-tracked photo
+    # under that folder to it — same matching db.find_files_under_folder
+    # already does for the web UI's "add folder to set".
+    dir2set = sub.add_parser('dir2set', help="Import a folder and add every photo under it to a set named after it")
+    dir2set.add_argument('path', help="Directory to import (set name defaults to this folder's own name)")
+    dir2set.add_argument('--name', default=None, help="Set name (default: the folder's own name)")
+    dir2set.add_argument('--studio', default=None, help='Studio name (optional)')
+    dir2set.add_argument('--reindex', action='store_true',
+                          help='Force reprocessing (clear detections/faces/embedding) for already-tracked files found in this scan')
+
     # media category <create|ls|assign|clear|files|match> - single-value,
     # ML-assisted classification (e.g. Outside/Convention/Anime)
     category_cmd = sub.add_parser('category', help='Manage image categories (multi-value, ML-assisted classification)')
@@ -455,6 +468,50 @@ def main():
                 file_row = m.db.get_file_by_checksum(checksum)
                 if file_row is not None:
                     print(file_row['path'])
+        m.close()
+        return 0
+
+    elif args.cmd == 'dir2set':
+        m = MediaManager()
+        abs_path = os.path.join(m.data_root, args.path)
+        if not os.path.isdir(abs_path):
+            print(f"ERROR: '{args.path}' is not a directory", file=sys.stderr)
+            m.close()
+            sys.exit(1)
+        # Paths are stored relative to data_root with '/' separators (see
+        # fast_scan.py) — find_files_under_folder needs that same form, not
+        # whatever form the path was typed in (absolute, './'-relative, etc).
+        rel_path = os.path.relpath(abs_path, m.data_root).replace(os.sep, '/').strip('/')
+        set_name = args.name or os.path.basename(rel_path)
+        if not set_name:
+            print("ERROR: could not derive a set name from this path — pass --name explicitly", file=sys.stderr)
+            m.close()
+            sys.exit(1)
+
+        count, dup_count, already_indexed = m.start_scan(args.path, recursive=True, reindex=args.reindex)
+        print(f"Scan done, {count} files")
+        if already_indexed:
+            if args.reindex:
+                print(f"{already_indexed} already-tracked file(s) marked for reindexing.")
+            else:
+                print(f"{already_indexed} file(s) already indexed. If you want to force reindex run with --reindex")
+        if dup_count:
+            print(f"WARNING: {dup_count} duplicate file(s) found and NOT tracked — see duplicates.txt", file=sys.stderr)
+
+        set_id = m.manual.create_set(set_name, args.studio)
+        matches = m.db.find_files_under_folder(rel_path)
+        existing = set(m.manual.get_files_by_set(set_id, limit=1000000))
+        added = 0
+        for row in matches:
+            checksum = row['checksum']
+            if checksum in existing:
+                continue
+            m.manual.assign_file_to_set(checksum, set_id)
+            existing.add(checksum)
+            added += 1
+        studio_suffix = f" ({args.studio})" if args.studio else ""
+        print(f"Set '{set_name}'{studio_suffix} — id {set_id}: added {added} of {len(matches)} matched "
+              f"photo(s) to the set ({len(matches) - added} already there).")
         m.close()
         return 0
 

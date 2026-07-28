@@ -613,17 +613,24 @@ class ManualDB(ThreadLocalDB):
     # ------------------------------------------------------------------
 
     def create_set(self, name, studio=None):
+        """Idempotent: returns the existing set's id if (name, studio) already
+        exists. Checks via find_set first rather than relying on `sets`'
+        UNIQUE(name, studio) + INSERT OR IGNORE — SQLite treats every NULL
+        studio as distinct for UNIQUE purposes, so that combination silently
+        inserted a fresh duplicate row every time for the common
+        studio-less case instead of ever actually being ignored."""
+        name = name.strip()
+        studio = studio.strip() if studio else None
+        existing = self.find_set(name, studio)
+        if existing is not None:
+            return existing['id']
         cur = self.conn.cursor()
         cur.execute(
-            'INSERT OR IGNORE INTO sets (name, studio, created_at) VALUES (?, ?, ?)',
-            (name.strip(), studio.strip() if studio else None, int(time.time()))
+            'INSERT INTO sets (name, studio, created_at) VALUES (?, ?, ?)',
+            (name, studio, int(time.time()))
         )
         self.conn.commit()
-        cur.execute(
-            'SELECT id FROM sets WHERE name = ? AND studio IS ?',
-            (name.strip(), studio.strip() if studio else None)
-        )
-        return cur.fetchone()[0]
+        return cur.lastrowid
 
     def find_set(self, name, studio=None):
         cur = self.conn.cursor()
