@@ -94,6 +94,12 @@
   <input type="checkbox" id="set-exclude-non-matching-faces-toggle">
   Exclude photos showing a recognized face not already confirmed in this set
 </label>
+<label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+  Keep searching until
+  <input type="range" id="set-buffer-size-slider" min="10" max="200" step="10" value="10">
+  <span id="set-buffer-size-value">10</span>
+  are found
+</label>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="set-swipe-page" style="flex:1;min-width:300px;">
     <div class="swipe-stack-wrap" id="set-swipe-stack"></div>
@@ -470,6 +476,15 @@
   // the live one, not whichever existed when the page first loaded.
   let stackHandle = null;
 
+  // Wired once (not inside launchStack, which can re-run after "expand similar
+  // search" relaunches the stack against a fresh initSwipeStack() call) — this
+  // proxy's setBufferSize always delegates to whichever stackHandle is current,
+  // so the slider element (static page markup, not part of the stack's own
+  // regenerated DOM) never accumulates a duplicate listener per relaunch.
+  wireBufferSizeSlider({
+    setBufferSize: function(n) { if (stackHandle) stackHandle.setBufferSize(n); },
+  }, 'set-buffer-size-slider', 'set-buffer-size-value');
+
   function fetchMoreUrl(known, need) {
     const avoidToggle = document.getElementById('set-avoid-existing-toggle');
     const honorNegativesToggle = document.getElementById('set-honor-negatives-toggle');
@@ -482,9 +497,11 @@
   }
 
   function launchStack(initialCards) {
+    const bufferSizeSlider = document.getElementById('set-buffer-size-slider');
     stackHandle = initSwipeStack({
       stackElId: 'set-swipe-stack',
       initialCards: initialCards,
+      bufferSize: bufferSizeSlider ? parseInt(bufferSizeSlider.value, 10) : 10,
       fetchMoreUrl: function(known, biasKey, biasAction, need) {
         return fetchMoreUrl(known, need);
       },
@@ -527,11 +544,7 @@
         const slider = stackEl.querySelector('#set-swipe-threshold-slider');
         const sliderValue = stackEl.querySelector('#set-swipe-threshold-value');
         const expandBtn = stackEl.querySelector('#set-swipe-expand-btn');
-        if (slider && sliderValue) {
-          slider.addEventListener('input', function() {
-            sliderValue.textContent = parseFloat(slider.value).toFixed(2);
-          });
-        }
+        wireLiveLabelSlider(slider, sliderValue);
         if (expandBtn) {
           expandBtn.addEventListener('click', function() {
             currentThreshold = slider ? parseFloat(slider.value) : Math.max(0.4, currentThreshold - 0.1);

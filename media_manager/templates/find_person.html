@@ -51,78 +51,40 @@
   if (!personName || !window.initSwipeStack || !document.getElementById('find-person-swipe-stack')) return;
 
   function wireExpandSimilarSearch() {
-    const slider = document.getElementById('similar-threshold-slider');
-    const sliderValue = document.getElementById('similar-threshold-value');
-    const expandBtn = document.getElementById('expand-similar-btn');
-    const expandStatus = document.getElementById('expand-similar-status');
-    const similarGrid = document.getElementById('similar-unknown-grid');
-    if (!expandBtn) return;
-
-    if (slider && sliderValue) {
-      slider.addEventListener('input', function() {
-        sliderValue.textContent = parseFloat(slider.value).toFixed(2);
-      });
-    }
-
-    expandBtn.addEventListener('click', function() {
-      const threshold = slider ? slider.value : 0.3;
-      const url = '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
-      expandStatus.style.display = 'block';
-      expandStatus.textContent = 'Searching…';
-      fetch(url)
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function(data) {
-          const results = data.results || [];
-          if (!results.length) {
-            expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
-            return;
-          }
-          expandStatus.style.display = 'none';
-          similarGrid.innerHTML = '';
-          results.forEach(function(f) {
-            const card = document.createElement('div');
-            card.className = 'card';
-            card.id = 'unknown-card-' + f.ref;
-            card.dataset.faceRef = f.ref;
-            card.innerHTML =
-              '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
-                '<img src="/face-crop/' + f.ref + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
-              '</a>' +
-              '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
-              '<div class="card-body">' +
-                '<div class="card-name" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.identity || f.filename) + '</div>' +
-                '<button type="button" class="btn-similar use-name-btn" data-face-ref="' + f.ref + '" ' +
-                  'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + escapeHtml(personName) + '"</button>' +
-              '</div>';
-            similarGrid.appendChild(card);
-            card.querySelector('.use-name-btn').addEventListener('click', function(e) {
-              const btn = e.currentTarget;
-              btn.disabled = true;
-              fetch('/api/faces/' + encodeURIComponent(btn.dataset.faceRef) + '/identity', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({name: personName}),
-              })
-                .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-                .then(function() { card.remove(); })
-                .catch(function(err) {
-                  btn.disabled = false;
-                  alert('Failed to assign name: ' + err.message);
-                });
-            });
-          });
-        })
-        .catch(function(err) {
-          expandStatus.textContent = 'Search error: ' + err.message;
-        });
+    wireExpandSearchGrid({
+      sliderId: 'similar-threshold-slider',
+      sliderValueId: 'similar-threshold-value',
+      expandBtnId: 'expand-similar-btn',
+      statusId: 'expand-similar-status',
+      gridId: 'similar-unknown-grid',
+      fetchUrl: function(threshold) {
+        return '/api/identities/' + encodeURIComponent(personName) + '/similar-faces?threshold=' + threshold;
+      },
+      cardHtml: function(f) {
+        return (
+          '<div class="card" id="unknown-card-' + f.ref + '">' +
+            '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
+              '<img src="/face-crop/' + f.ref + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
+            '</a>' +
+            '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
+            '<div class="card-body">' +
+              '<div class="card-name" title="' + escapeHtml(f.path) + '">' + escapeHtml(f.identity || f.filename) + '</div>' +
+              '<button type="button" class="btn-similar expand-grid-use-btn" ' +
+                'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + escapeHtml(personName) + '"</button>' +
+            '</div>' +
+          '</div>'
+        );
+      },
+      confirmRequest: function(f) {
+        return { url: '/api/faces/' + encodeURIComponent(f.ref) + '/identity', method: 'POST', body: { name: personName } };
+      },
+      noResultsText: function(threshold) {
+        return 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
+      },
     });
   }
 
   const bufferSizeSlider = document.getElementById('find-person-buffer-size-slider');
-  const bufferSizeValue = document.getElementById('find-person-buffer-size-value');
 
   const stack = window.initSwipeStack({
     stackElId: 'find-person-swipe-stack',
@@ -174,17 +136,7 @@
     },
   });
 
-  if (bufferSizeSlider && bufferSizeValue) {
-    // Live-update the number while dragging; only actually resize the buffer
-    // (and kick off a refill fetch) once the slider settles, so dragging
-    // through the range doesn't fire a fetch per tick.
-    bufferSizeSlider.addEventListener('input', function() {
-      bufferSizeValue.textContent = bufferSizeSlider.value;
-    });
-    bufferSizeSlider.addEventListener('change', function() {
-      stack.setBufferSize(parseInt(bufferSizeSlider.value, 10));
-    });
-  }
+  wireBufferSizeSlider(stack, 'find-person-buffer-size-slider', 'find-person-buffer-size-value');
 
   /* Auto-calibrate threshold: exponential-search-then-bisect for the lowest
      match threshold that doesn't turn up a false positive, using the user's

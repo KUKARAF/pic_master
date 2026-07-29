@@ -133,6 +133,114 @@
     return parts.join(' · ');
   };
 
+  // Shared "keep searching until X are found" buffer-size slider wiring —
+  // live-updates the displayed number while dragging, only actually resizes
+  // the swipe-core.js stack's buffer (and kicks off a refill fetch) once the
+  // slider settles on `change`, so dragging through the range doesn't fire a
+  // fetch per tick. Same behavior find_person.html and set_detail.html both
+  // want; extracted here instead of each page reimplementing it. `stack` is
+  // whatever initSwipeStack(...) returned (has a setBufferSize method).
+  window.wireBufferSizeSlider = function (stack, sliderId, valueId) {
+    const slider = document.getElementById(sliderId);
+    const value = document.getElementById(valueId);
+    if (!slider || !value) return;
+    slider.addEventListener('input', function () {
+      value.textContent = slider.value;
+    });
+    slider.addEventListener('change', function () {
+      stack.setBufferSize(parseInt(slider.value, 10));
+    });
+  };
+
+  // A plain <input type="range"> mirroring its live value into a label span
+  // on every drag tick — the one piece genuinely identical across every
+  // threshold slider in the app (find_person.html's expand-search slider,
+  // set_detail.html's expand-search slider), even though what happens on
+  // the *button* click next to each of those sliders differs per page (one
+  // fetches a one-shot results grid, the other just re-launches the swipe
+  // stream at the new threshold) — so only this shared sliver is extracted,
+  // not the whole panel around it. `formatFn` defaults to 2-decimal fixed,
+  // matching every current caller's own formatting.
+  window.wireLiveLabelSlider = function (sliderEl, labelEl, formatFn) {
+    if (!sliderEl || !labelEl) return;
+    const format = formatFn || function (v) { return parseFloat(v).toFixed(2); };
+    sliderEl.addEventListener('input', function () {
+      labelEl.textContent = format(sliderEl.value);
+    });
+  };
+
+  // The "expand similar search" one-shot results grid pattern find_person.html
+  // uses: fetch candidates at a slider-chosen threshold once, render a grid of
+  // cards each with a single confirm action, remove a card from the grid once
+  // its action succeeds. Parameterized so any future "search looser, then
+  // pick individual matches to confirm" feature can reuse it instead of
+  // hand-rolling the fetch/render/remove wiring again — set_detail.html's own
+  // expand-search doesn't use this (it re-launches its swipe stream instead
+  // of showing a one-shot grid), so it isn't force-fit here.
+  //
+  // opts = {
+  //   sliderId, sliderValueId, expandBtnId, statusId, gridId,
+  //   fetchUrl(threshold) -> url,               // GET, expects {results: [...]}
+  //   cardHtml(item) -> string,                  // full card markup, must include
+  //                                               // a `.expand-grid-use-btn` with
+  //                                               // data-item-ref set to item.ref
+  //   confirmRequest(item) -> {url, method, body} // fired when that button is clicked
+  //   noResultsText(threshold) -> string,
+  // }
+  window.wireExpandSearchGrid = function (opts) {
+    const slider = document.getElementById(opts.sliderId);
+    const sliderValue = document.getElementById(opts.sliderValueId);
+    const expandBtn = document.getElementById(opts.expandBtnId);
+    const status = document.getElementById(opts.statusId);
+    const grid = document.getElementById(opts.gridId);
+    if (!expandBtn || !grid) return;
+
+    wireLiveLabelSlider(slider, sliderValue);
+
+    expandBtn.addEventListener('click', function () {
+      const threshold = slider ? slider.value : 0.3;
+      status.style.display = 'block';
+      status.textContent = 'Searching…';
+      fetch(opts.fetchUrl(threshold))
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) {
+          const results = data.results || [];
+          if (!results.length) {
+            status.textContent = opts.noResultsText(threshold);
+            return;
+          }
+          status.style.display = 'none';
+          grid.innerHTML = '';
+          results.forEach(function (item) {
+            const wrap = document.createElement('div');
+            wrap.innerHTML = opts.cardHtml(item);
+            const card = wrap.firstElementChild;
+            grid.appendChild(card);
+            const btn = card.querySelector('.expand-grid-use-btn');
+            if (!btn) return;
+            btn.addEventListener('click', function () {
+              btn.disabled = true;
+              const req = opts.confirmRequest(item);
+              fetch(req.url, {
+                method: req.method || 'POST',
+                headers: req.body ? { 'Content-Type': 'application/json' } : undefined,
+                body: req.body ? JSON.stringify(req.body) : undefined,
+              })
+                .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+                .then(function () { card.remove(); })
+                .catch(function (err) {
+                  btn.disabled = false;
+                  alert('Failed: ' + err.message);
+                });
+            });
+          });
+        })
+        .catch(function (err) {
+          status.textContent = 'Search error: ' + err.message;
+        });
+    });
+  };
+
   /* Shared favorite-heart toggle — POSTs {favorite: bool} to `endpoint` and flips the
      button's glyph/class on success. Used by every heart button across the app so
      the toggle behaves identically everywhere. */
