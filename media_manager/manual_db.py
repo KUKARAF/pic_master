@@ -1358,29 +1358,52 @@ class ManualDB(ThreadLocalDB):
 
     def list_confirmed_faces(self, offset=0, limit=20):
         """(id, checksum, identity) for every identity-assigned, non-rejected face,
-        newest first, plus the total count — backs /api/faces/confirmed's
-        paginated grid on the redesigned /faces main view."""
+        deduplicated to one row per (checksum, identity) pair, newest first,
+        plus the total count of unique pairs — backs /api/faces/confirmed's
+        paginated grid on the redesigned /faces main view.
+
+        The same person can end up confirmed more than once for the exact
+        same photo (e.g. re-running `media faces` creates a fresh
+        auto-detection row for the same physical face — a new id, unrelated
+        to any earlier promoted row — which the swipe stream then offers up
+        and gets independently confirmed again), and the grid should show one
+        card per person-in-this-photo, not one per underlying database row.
+        GROUP BY collapses those; MAX(id) picks the most-recently-confirmed
+        row as the representative — SQLite guarantees the other selected
+        columns (checksum, identity here) come from that same max-id row when
+        paired with MAX() like this."""
         cur = self.conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        cur.execute('''
+            SELECT COUNT(*) FROM (
+                SELECT 1 FROM faces WHERE identity IS NOT NULL AND rejected = 0
+                GROUP BY checksum, identity
+            )
+        ''')
         total = cur.fetchone()[0]
         cur.execute('''
-            SELECT id, checksum, identity FROM faces
+            SELECT MAX(id) AS id, checksum, identity FROM faces
             WHERE identity IS NOT NULL AND rejected = 0
-            ORDER BY created_at DESC LIMIT ? OFFSET ?
+            GROUP BY checksum, identity
+            ORDER BY id DESC LIMIT ? OFFSET ?
         ''', (limit, offset))
         return cur.fetchall(), total
 
     def get_confirmed_faces_for_cleanup(self):
-        """Return [(id, checksum, identity, embedding_bytes, reviewed_ok), ...] for
-        every confirmed (identity-assigned, non-rejected) face, regardless of
-        reviewed_ok — the cleanup-low-confidence-matches feature needs ALL of an
-        identity's faces (including already-reviewed ones) to build that
+        """Return [(id, checksum, identity, embedding_bytes, reviewed_ok), ...],
+        deduplicated to one row per (checksum, identity) pair (see
+        list_confirmed_faces for why duplicates happen) — the
+        cleanup-low-confidence-matches feature needs ALL of an identity's
+        (unique) faces, including already-reviewed ones, to build that
         identity's comparison pool, then filters to reviewed_ok = 0 for which
-        faces actually become review candidates."""
+        faces actually become review candidates. Without deduping here, a
+        duplicate confirmation of the exact same face would inflate its
+        identity's comparison pool and, being near-identical to itself, would
+        never look like the outlier it might actually be hiding."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT id, checksum, identity, embedding, reviewed_ok FROM faces
+            SELECT MAX(id) AS id, checksum, identity, embedding, reviewed_ok FROM faces
             WHERE identity IS NOT NULL AND rejected = 0
+            GROUP BY checksum, identity
         ''')
         return cur.fetchall()
 
