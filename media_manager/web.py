@@ -8,14 +8,18 @@ import io
 import json
 import os
 import random
+import signal
+import subprocess
+import sys
 import threading
 import time
+import traceback
 from urllib.parse import quote
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -34,6 +38,14 @@ from media_manager.category_resolver import (
 
 THUMB_SIZE = (400, 400)
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+
+# Applied to /thumb, /image, /face-crop, /body-crop's successful responses only
+# (never the gray-placeholder fallbacks) — each of those is served from a path
+# that's content-addressed by file_id/face_id/body_id and never mutated in
+# place once written (a re-processed/edited photo gets a new checksum and thus
+# a new file_id, never reuses the old id's cached thumbnail/crop), so it's safe
+# to tell the browser to never re-request it.
+IMMUTABLE_CACHE_HEADERS = {'Cache-Control': 'public, max-age=31536000, immutable'}
 
 _HERE = Path(__file__).parent
 
@@ -68,6 +80,7 @@ class ManualFaceBody(BaseModel):
 class SpatialTagBody(BaseModel):
     label: str
     bbox: List[float]
+    polarity: str = 'positive'
 
 class FavoriteBody(BaseModel):
     favorite: bool
@@ -78,6 +91,9 @@ class TagLabelBody(BaseModel):
 class RenameIdentityBody(BaseModel):
     name: str
     confirm_merge: bool = False
+
+class StudioRenameBody(BaseModel):
+    name: str
 
 class IdentityAliasBody(BaseModel):
     alias: str
@@ -302,6 +318,24 @@ def create_app(data_root: str) -> FastAPI:
 
     app = FastAPI(title='media gallery')
 
+    # Every route on this app is hit by fetch()-based JS that always does
+    # `await res.json()` on the response, success or failure (see static/app.js).
+    # Without this handler, an unhandled exception (e.g. a face-detection model
+    # failing to load, a corrupt onnxruntime cache, ...) falls through to
+    # Starlette's default plain-text "Internal Server Error" body, which isn't
+    # JSON — the frontend's .json() call then throws its own unrelated
+    # "JSON.parse: unexpected character..." error, masking the real failure.
+    # This does not swallow anything: the exception is still logged (with full
+    # traceback) and the response is still a 500 — just JSON instead of text/plain,
+    # so callers see the actual error message.
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(request: Request, exc: Exception):
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={'detail': f'{exc.__class__.__name__}: {exc}' if str(exc) else exc.__class__.__name__},
+        )
+
     # Static files and templates
     static_dir = _HERE / 'static'
     templates_dir = _HERE / 'templates'
@@ -390,7 +424,7 @@ def create_app(data_root: str) -> FastAPI:
         title_map = manual.get_titles_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
         _attach_set_people(sets_map.values())
-        identities_map = manual.get_identities_for_checksums(checksums)
+        identities_map = _people_with_ages(manual.get_identities_for_checksums(checksums))
         category_map = resolve_categories_for_checksums(manual, db, [(row[0], row[3]) for row in rows])
         result = []
         for row in rows:
@@ -398,6 +432,7 @@ def create_app(data_root: str) -> FastAPI:
             path = row[1]
             has_embedding = row[2] if len(row) > 2 else 0
             checksum = row[3]
+            card_sets = sets_map.get(checksum, [])
             card = {
                 'id': file_id,
                 'path': path,
@@ -407,8 +442,8 @@ def create_app(data_root: str) -> FastAPI:
                 'tags': tag_map.get(checksum, []),
                 'favorite': checksum in favorite_checksums,
                 'title': title_map.get(checksum),
-                'sets': sets_map.get(checksum, []),
-                'people': identities_map.get(checksum, []),
+                'sets': card_sets,
+                'people': _people_not_in_sets(identities_map.get(checksum, []), card_sets),
                 'categories': category_map.get(checksum, []),
             }
             if scores is not None and file_id in scores:
@@ -416,25 +451,82 @@ def create_app(data_root: str) -> FastAPI:
             result.append(card)
         return result
 
+    def _people_not_in_sets(people, card_sets):
+        """Drop anyone from a card's own 'recognized in this photo' people list
+        who's already shown via one of the card's set chips (chip-set already
+        renders every one of a set's people with an '@' prefix — see
+        set_meta_line/_attach_set_people's get_all_people_for_sets). Without
+        this, someone linked to (or detected in) a set this photo belongs to
+        shows up twice on the same card: once as '@Name' inside the chip-set,
+        once again as a bare 'Name' chip-person — same person, and often a
+        different age since the two used to come from different queries."""
+        if not card_sets:
+            return people
+        set_people_names = {p['name'] for s in card_sets for p in s.get('people', [])}
+        return [p for p in people if p['name'] not in set_people_names]
+
+    def _people_with_ages(identities_map):
+        """Reshape a {checksum: [name, ...]} map (manual.get_identities_for_checksums'
+        return shape) into {checksum: [{'name','age','gender'}, ...]} — one batched
+        get_ages_for_identities_by_checksum call across every checksum involved.
+        Age/gender here are THIS SPECIFIC PHOTO's own estimate for that person
+        (same semantics as photo_page's own get_age_estimates_for_checksum), not a
+        global "most recently estimated anywhere" value — so a card's people chip
+        always agrees with what you'd see if you clicked into that exact photo.
+        None when that identity has no estimate on this specific photo yet."""
+        per_checksum_ages = manual.get_ages_for_identities_by_checksum(list(identities_map.keys()))
+        return {
+            checksum: [
+                {
+                    'name': name,
+                    'age': per_checksum_ages.get(checksum, {}).get(name, {}).get('age'),
+                    'gender': per_checksum_ages.get(checksum, {}).get(name, {}).get('gender'),
+                }
+                for name in names
+            ]
+            for checksum, names in identities_map.items()
+        }
+
     def _attach_set_people(sets_lists):
         """Given an iterable of set-dict lists (e.g. a sets_map's values()), attaches
         a 'people' key to each set dict in place — one {'name', 'age', 'gender'}
-        entry per identity linked to that set via link_identity_to_set ('age'/
-        'gender' are None when that identity has no estimate yet, see
-        get_ages_for_identities). Batches both the set->identity lookup and the
-        identity->age/gender lookup across every set involved instead of querying
-        per set (mirrors the batching _enrich_rows already does for tags/sets/
-        people)."""
+        entry per identity actually present in that set: linked via
+        link_identity_to_set, OR recognized via a real face or whole-photo
+        assignment on one of the set's own photos (see get_all_people_for_sets) —
+        a set's roster always shows everyone in it, not just whoever happened to
+        be explicitly linked, matching the same "everyone" list the set's own
+        People-present strip already used. Age/gender are that identity's average
+        across only THIS set's own member photos (see
+        get_average_ages_for_identities_in_sets) — not a global "most recently
+        estimated anywhere" value — so a set's roster always reflects the people
+        actually in that set, not some unrelated photo of the same person
+        elsewhere in the library. None when that identity has no estimate within
+        this set yet. Batches the set->identity lookup and the per-set age
+        lookup across every set involved instead of querying per set (mirrors
+        the batching _enrich_rows already does for tags/sets/people)."""
         all_sets = [s for lst in sets_lists for s in lst]
         set_ids = {s['id'] for s in all_sets}
-        people_map = manual.get_identities_for_sets(set_ids)
-        all_identities = {name for names in people_map.values() for name in names}
-        ages_map = manual.get_ages_for_identities(all_identities)
+        people_map = manual.get_all_people_for_sets(set_ids)
+        ages_map = manual.get_average_ages_for_identities_in_sets(set_ids)
         for s in all_sets:
             s['people'] = [
-                {'name': name, 'age': ages_map.get(name, {}).get('age'), 'gender': ages_map.get(name, {}).get('gender')}
+                {'name': name, 'age': ages_map.get((s['id'], name), {}).get('age'), 'gender': ages_map.get((s['id'], name), {}).get('gender')}
                 for name in people_map.get(s['id'], [])
             ]
+
+    def _attach_set_people_names_only(sets_lists):
+        """Cheaper sibling of _attach_set_people: same roster (get_all_people_for_sets),
+        but skips get_average_ages_for_identities_in_sets entirely — every
+        person gets age/gender None. For callers that only need to know WHO's
+        in a set (e.g. the set-search picker's personAware "type a name to
+        narrow the list" filter), not their age, this avoids the per-set
+        face/estimate join that's real query cost with nothing to show for it
+        in a text-only picker."""
+        all_sets = [s for lst in sets_lists for s in lst]
+        set_ids = {s['id'] for s in all_sets}
+        people_map = manual.get_all_people_for_sets(set_ids)
+        for s in all_sets:
+            s['people'] = [{'name': name, 'age': None, 'gender': None} for name in people_map.get(s['id'], [])]
 
     def _attach_set_aliases(sets_lists):
         """Given an iterable of set-dict lists, attaches an 'aliases' key to each
@@ -446,6 +538,108 @@ def create_app(data_root: str) -> FastAPI:
         for s in all_sets:
             s['aliases'] = aliases_map.get(s['id'], [])
 
+    def _favorites_highlight(limit=6):
+        """Random mix of up to `limit` items drawn from favorited photos, favorited
+        faces (people), and favorited sets — reshuffled on every call. Homepage
+        'Favorites' teaser section. Each favorite kind is sampled with its own
+        bounded/cheap query rather than the gallery's 'fetch everything then
+        filter' pattern (which doesn't scale with library size)."""
+        items = []
+
+        photo_checksums = manual.get_random_favorite_checksums(limit=limit)
+        if photo_checksums:
+            rows = db.get_files_by_checksums(photo_checksums)
+            if rows:
+                cards = _enrich_rows([(r['id'], r['path'], 0, r['checksum']) for r in rows])
+                items += [{'kind': 'photo', 'card': c} for c in cards]
+
+        favorite_faces = manual.get_favorite_faces()
+        if favorite_faces:
+            sampled = random.sample(favorite_faces, min(limit, len(favorite_faces)))
+            for row in sampled:
+                file_row = db.get_file_by_checksum(row['checksum'])
+                if file_row is None:
+                    continue
+                items.append({'kind': 'face', 'face': {
+                    'ref': f"manual:{row['id']}",
+                    'file_id': file_row['id'],
+                    'identity': row['identity'],
+                }})
+
+        favorite_sets = manual.list_sets(favorite_only=True)
+        if favorite_sets:
+            sampled = random.sample(favorite_sets, min(limit, len(favorite_sets)))
+            set_dicts = []
+            for r in sampled:
+                thumb_id = None
+                first_checksums = manual.get_files_by_set(r['id'], limit=1)
+                if first_checksums:
+                    thumb_rows = db.get_files_by_checksums(first_checksums)
+                    if thumb_rows:
+                        thumb_id = thumb_rows[0]['id']
+                set_dicts.append({
+                    'id': r['id'], 'name': r['name'], 'studio': r['studio'],
+                    'image_count': r['image_count'], 'favorite': True, 'thumb_id': thumb_id,
+                })
+            _attach_set_people([set_dicts])
+            items += [{'kind': 'set', 'set': s} for s in set_dicts]
+
+        random.shuffle(items)
+        return items[:limit]
+
+    def _needs_love_highlight(limit=6, candidate_cap=200, batch_size=50):
+        """Up to `limit` photos with no manual tags, no category (manual or
+        auto-matched), no set membership, AND at least one still-unidentified
+        face on that specific photo — checked via cheap per-candidate queries
+        against a random sample, not a full-library scan (mirrors the per-file
+        'unidentified face' check _unpromoted_auto_faces does library-wide).
+        Stops once `limit` qualify or `candidate_cap` candidates have been
+        examined, whichever comes first — can legitimately return fewer than
+        `limit` items, including zero, on a well-curated or barely-started
+        library."""
+        set_member_checksums = manual.get_all_set_member_checksums()
+        promoted_ids = manual.get_promoted_source_ids()
+
+        found = []
+        examined = 0
+        seen_ids = set()
+        while examined < candidate_cap and len(found) < limit:
+            batch = db.get_random_files(limit=batch_size)
+            if not batch:
+                break
+            new_in_batch = 0
+            for row in batch:
+                file_id, path, checksum = row[0], row[1], row[2]
+                if file_id in seen_ids:
+                    continue
+                seen_ids.add(file_id)
+                new_in_batch += 1
+                examined += 1
+                if examined > candidate_cap:
+                    break
+                if checksum in set_member_checksums:
+                    continue
+                if manual.list_tags_for_checksums([checksum]).get(checksum):
+                    continue
+                if resolve_categories_for_checksums(manual, db, [(file_id, checksum)]).get(checksum):
+                    continue
+                unidentified = [f for f in db.get_faces_for_file(file_id) if f[0] not in promoted_ids]
+                if not unidentified:
+                    continue
+                found.append((file_id, path, checksum))
+                if len(found) >= limit:
+                    break
+            if new_in_batch == 0:
+                # RANDOM() sampling has cycled back over an already-fully-seen
+                # pool (the library has fewer distinct files than candidate_cap)
+                # — stop instead of spinning forever re-fetching the same rows.
+                break
+
+        if not found:
+            return []
+        rows = [(fid, path, 0, checksum) for fid, path, checksum in found]
+        return _enrich_rows(rows)
+
     def _category_checksums_by_name():
         """{category_name: set(checksums)} for every category, resolved once —
         manual assignments plus unsuppressed auto-matches, mirroring
@@ -455,12 +649,17 @@ def create_app(data_root: str) -> FastAPI:
         own fresh db.get_all_file_category_matches() scan every call — fine for a
         single lookup, but the search palette calls this once per category
         *candidate* while ranking suggestions, so re-scanning per category turned
-        one keystroke into O(categories) full-library scans."""
+        one keystroke into O(categories) full-library scans. The manual-assignment
+        and exclusion lookups below are similarly batched (get_all_category_checksums/
+        get_all_category_exclusions, one query each for the whole library) instead
+        of one query per category — that residual N+1 survived the first fix above."""
+        checksums_by_category_id = manual.get_all_category_checksums()
+        exclusions_by_category_id = manual.get_all_category_exclusions()
         by_name = {}
         excluded_by_category = {}
         for row in manual.list_categories():
-            by_name[row['name']] = set(manual.get_example_checksums_for_category(row['id'], limit=1000))
-            excluded_by_category[row['name']] = manual.get_excluded_checksums_for_category(row['id'])
+            by_name[row['name']] = set(checksums_by_category_id.get(row['id'], set()))
+            excluded_by_category[row['name']] = exclusions_by_category_id.get(row['id'], set())
         for _file_id, checksum, name, _score in db.get_all_file_category_matches():
             if checksum in by_name.get(name, ()):
                 continue
@@ -477,7 +676,7 @@ def create_app(data_root: str) -> FastAPI:
         for a library with hundreds of tags that's hundreds of round trips just
         to render a dropdown."""
         cur = manual.conn.cursor()
-        cur.execute("SELECT checksum, label FROM tags WHERE polarity = 'positive'")
+        cur.execute("SELECT checksum, label FROM file_tags_with_label WHERE polarity = 'positive'")
         by_label = {}
         for checksum, label in cur.fetchall():
             by_label.setdefault(label, set()).add(checksum)
@@ -576,7 +775,7 @@ def create_app(data_root: str) -> FastAPI:
         tag_map = manual.list_tags_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
         _attach_set_people(sets_map.values())
-        identities_map = manual.get_identities_for_checksums(checksums)
+        identities_map = _people_with_ages(manual.get_identities_for_checksums(checksums))
         category_map = resolve_categories_for_checksums(
             manual, db, [(r['id'], r['checksum']) for r in file_rows.values()]
         )
@@ -585,10 +784,11 @@ def create_app(data_root: str) -> FastAPI:
             if row is None:
                 continue
             checksum = row['checksum']
+            card_sets = sets_map.get(checksum, [])
             card['filename'] = os.path.basename(row['path'])
             card['tags'] = tag_map.get(checksum, [])
-            card['sets'] = sets_map.get(checksum, [])
-            card['people'] = identities_map.get(checksum, [])
+            card['sets'] = card_sets
+            card['people'] = _people_not_in_sets(identities_map.get(checksum, []), card_sets)
             card['categories'] = category_map.get(checksum, [])
         return cards
 
@@ -674,7 +874,7 @@ def create_app(data_root: str) -> FastAPI:
             if not success:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
 
-        return FileResponse(thumb_path, media_type='image/jpeg')
+        return FileResponse(thumb_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.get('/image/{file_id}')
     def serve_image(file_id: int):
@@ -682,7 +882,7 @@ def create_app(data_root: str) -> FastAPI:
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
             raise HTTPException(status_code=404, detail='Image file not found on disk')
-        return FileResponse(abs_path)
+        return FileResponse(abs_path, headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.get('/api/files/{file_id}/neighbors')
     def api_file_neighbors(file_id: int):
@@ -727,6 +927,9 @@ def create_app(data_root: str) -> FastAPI:
             'favorite_only': favorite,
             'sort': sort,
             'order': order,
+            'favorites_highlight': _favorites_highlight(),
+            'needs_love_highlight': _needs_love_highlight(),
+            'homepage_stats': _homepage_stats(),
         })
 
     @app.get('/photo/{file_id}', response_class=HTMLResponse)
@@ -738,10 +941,14 @@ def create_app(data_root: str) -> FastAPI:
             {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': bool(t['favorite'])}
             for t in tag_rows if t['x1'] is None
         ]
-        spatial_tags = [{'id': t['id'], 'label': t['label']} for t in tag_rows if t['x1'] is not None]
+        spatial_tags = [
+            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity']}
+            for t in tag_rows if t['x1'] is not None
+        ]
         all_tags = manual.list_all_tags()
         negated = manual.get_negated_labels(checksum)
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
+        detection_bboxes = db.get_detection_bboxes(file_id)
         faces = _combined_faces_for_file(file_id, checksum)
         whole_photo_identities = manual.get_identities_assigned_to_photo(checksum)
         file_info = dict(row)
@@ -778,6 +985,7 @@ def create_app(data_root: str) -> FastAPI:
         return templates.TemplateResponse(request, 'photo.html', {
             'file': file_info,
             'detected_classes': detected_classes,
+            'detection_bboxes': detection_bboxes,
             'faces': faces,
             'whole_photo_identities': whole_photo_identities,
             'spatial_tags': spatial_tags,
@@ -786,23 +994,77 @@ def create_app(data_root: str) -> FastAPI:
             'current_sets': current_sets,
         })
 
-    def _identity_checksums(name):
-        """All checksums this identity is associated with: own detected faces
-        (substring name match), whole-photo manual assignments, plus every
-        current member of any set linked to this identity (membership is
-        resolved live, not stored per-photo — see get_sets_linked_to_identity).
+    def _identity_instances(name):
+        """Every individual APPEARANCE of this identity, not just every unique
+        photo: one entry per real detected face (faces table, identity=name,
+        rejected=0), so a photo where this person has two separate faces in it
+        (e.g. a before/after collage) yields TWO entries, each carrying its own
+        face_ref and therefore its own independently correct age estimate (see
+        get_ages_for_face_refs / _apply_instance_ages) — rather than being
+        silently collapsed into one card with an averaged or arbitrary age.
+        Plus one entry per whole-photo manual assignment (no bbox, so no
+        "instance" concept — always at most one per checksum) that isn't
+        already covered by a face instance for this identity on that same
+        checksum, to avoid double-counting the same photo from both sources.
+
+        Deliberately does NOT expand into every member of a set linked to this
+        identity — being linked to a set (see get_sets_linked_to_identity/
+        link_identity_to_set) is a fact about the SET, not a claim that this
+        person is recognizable in every one of that set's photos, so it must
+        not fan out into fake per-photo matches on /person/{name}'s photo grid
+        or count. Sets linked this way are still shown on the page as their
+        own single roster entry (see person_page's linked_sets/sets_by_id) —
+        just not exploded into individual "photos of this person" cards.
+
         Shared by /person/{name} and its /api/person/{name}/photos pagination
-        endpoint, and mirrors the union _checksums_for_chip's 'face' chip type
-        already does for the search palette."""
-        checksums = set(manual.get_files_by_face_identity(name, limit=1000))
-        checksums |= set(manual.get_photos_assigned_to_identity(name, limit=1000))
+        endpoint (so it runs on every page load and every scroll-triggered
+        page fetch)."""
+        instances = []
+        seen_face_checksums = set()
+        for face_id, checksum, _embedding in manual.get_faces_for_identity(name):
+            instances.append({'checksum': checksum, 'face_ref': f'manual:{face_id}'})
+            seen_face_checksums.add(checksum)
+        for checksum in manual.get_photos_assigned_to_identity(name, limit=1000):
+            if checksum not in seen_face_checksums:
+                instances.append({'checksum': checksum, 'face_ref': None})
         linked_sets = manual.get_sets_linked_to_identity(name)
-        for s in linked_sets:
-            checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
-        return checksums, linked_sets
+        return instances, linked_sets
+
+    def _apply_instance_ages(cards, instances, name, ages_by_ref):
+        """Overrides each card's own entry for `name` in its people list with
+        THIS SPECIFIC face instance's own age/gender (see _identity_instances
+        and get_ages_for_face_refs) — _enrich_rows' generic per-checksum people
+        list can't distinguish between two of this identity's own faces on the
+        same photo, so without this override a photo with e.g. a before/after
+        pair of this person would show the same (averaged, or arbitrarily
+        picked) age on both cards instead of each face's own real estimate.
+
+        Also re-adds `name`'s entry if it's missing entirely: _enrich_rows'
+        _people_not_in_sets step strips a person from a card's own people chip
+        when they're already shown via one of the card's set chips (avoiding a
+        duplicate on generic gallery/set pages) — but /person/{name}'s whole
+        point is showing THIS identity's own per-photo appearance, so it must
+        always be present here even when a set chip elsewhere on the card also
+        happens to mention them.
+
+        `cards` and `instances` must be the same length and order (the cards
+        were built from rows constructed directly from these instances)."""
+        for card, inst in zip(cards, instances):
+            card['face_ref'] = inst['face_ref']
+            est = ages_by_ref.get(inst['face_ref']) if inst['face_ref'] else None
+            age = est['age'] if est else None
+            gender = est['gender'] if est else None
+            matched = False
+            for p in card['people']:
+                if p['name'].lower() == name.lower():
+                    p['age'] = age
+                    p['gender'] = gender
+                    matched = True
+            if not matched:
+                card['people'].append({'name': name, 'age': age, 'gender': gender})
 
     @app.get('/search', response_class=HTMLResponse)
-    def search_page(request: Request, q: str = '', tag: str = '',
+    def search_page(request: Request, q: str = '', tag: str = '', start: str = '',
                      face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc',
                      f: List[str] = Query([])):
         files = []
@@ -843,6 +1105,7 @@ def create_app(data_root: str) -> FastAPI:
                 'files': files,
                 'q': q,
                 'tag': tag,
+                'start': start,
                 'face_ref': face_ref,
                 'category': category,
                 'query_face_file_id': _get_face_file_id(face_ref),
@@ -851,6 +1114,7 @@ def create_app(data_root: str) -> FastAPI:
                 'all_tags': all_tags,
                 'all_categories': all_categories,
                 'similar_unknown_faces': similar_unknown_faces,
+                **(_classifier_ui_state(tag) if tag else {}),
             })
 
         if f:
@@ -915,6 +1179,7 @@ def create_app(data_root: str) -> FastAPI:
             'files': files,
             'q': q,
             'tag': tag,
+            'start': start,
             'face_ref': '',
             'category': category,
             'query_face_file_id': None,
@@ -925,6 +1190,7 @@ def create_app(data_root: str) -> FastAPI:
             'sort': sort,
             'order': order,
             'queue_label': queue_label,
+            **(_classifier_ui_state(tag) if tag else {}),
         })
 
     @app.get('/person/{name}', response_class=HTMLResponse)
@@ -938,7 +1204,8 @@ def create_app(data_root: str) -> FastAPI:
         canonical = manual.resolve_identity_name(name)
         if canonical != name:
             return RedirectResponse(url=f'/person/{quote(canonical)}')
-        checksums, linked_sets = _identity_checksums(name)
+        instances, linked_sets = _identity_instances(name)
+        checksums = {inst['checksum'] for inst in instances}
         message = ''
         tags = []
         sets = []
@@ -969,7 +1236,7 @@ def create_app(data_root: str) -> FastAPI:
             'tags': tags,
             'sets': sets,
             'aliases': manual.get_aliases_for_identity(name),
-            'total': len(checksums),
+            'total': len(instances),
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
@@ -977,21 +1244,58 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/person/{name}/photos')
     def api_person_photos(name: str, offset: int = 0, limit: int = 20, sort: str = 'added', order: str = 'desc'):
         """Paginated card feed backing person.html's infinite-scroll photo list.
-        Mirrors gallery_page's approach: 'age' needs every card enriched first
-        (ages live in manual.db, not the SQL-sortable columns) so it enriches
-        everything then slices; other sorts slice the raw rows first and only
-        enrich the one page actually being returned."""
-        checksums, _ = _identity_checksums(name)
-        if not checksums:
+        Built from per-face-instance appearances (see _identity_instances), not
+        unique photos — a photo where this person has two separate detected
+        faces (e.g. a before/after collage) yields two cards, one per face,
+        each showing that face's own independently correct age estimate (see
+        _apply_instance_ages) rather than a card averaging (or, worse, mixing
+        in unrelated people sharing the same photo — the bug behind ages that
+        looked like random noise when sorting, since the old implementation
+        sorted by manual.get_average_ages_for_checksums, a photo-wide average
+        across EVERY face on that checksum regardless of identity).
+        'age' needs every instance's age resolved before sorting/slicing since
+        the ordering spans the whole list, not just one page; other sorts only
+        need the page actually being returned enriched."""
+        instances, _ = _identity_instances(name)
+        if not instances:
             return {'cards': [], 'total': 0, 'offset': offset, 'limit': limit}
-        file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
-        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+
+        checksums = list({inst['checksum'] for inst in instances})
+        file_rows = {r['checksum']: r for r in db.get_files_by_checksums(checksums)}
+        instances = [inst for inst in instances if inst['checksum'] in file_rows]
+
+        face_refs = {inst['face_ref'] for inst in instances if inst['face_ref']}
+        ages_by_ref = manual.get_ages_for_face_refs(face_refs)
+
         if sort == 'age':
-            all_cards = _sort_cards_by_age(_enrich_rows(rows), order)
-            page_cards = all_cards[offset:offset + limit]
+            def age_key(inst):
+                est = ages_by_ref.get(inst['face_ref']) if inst['face_ref'] else None
+                return est['age'] if est else None
+            with_age = [i for i in instances if age_key(i) is not None]
+            without_age = [i for i in instances if age_key(i) is None]
+            with_age.sort(key=age_key, reverse=(order != 'asc'))
+            instances = with_age + without_age
         else:
-            page_cards = _enrich_rows(rows[offset:offset + limit])
-        return {'cards': page_cards, 'total': len(rows), 'offset': offset, 'limit': limit}
+            def timestamp_key(inst):
+                r = file_rows[inst['checksum']]
+                return (r['modified_time'] or 0) if sort == 'modified' else r['first_seen']
+            instances.sort(key=timestamp_key, reverse=(order != 'asc'))
+
+        page_instances = instances[offset:offset + limit]
+        rows = [
+            (file_rows[inst['checksum']]['id'], file_rows[inst['checksum']]['path'], False, inst['checksum'])
+            for inst in page_instances
+        ]
+        page_cards = _enrich_rows(rows)
+        _apply_instance_ages(page_cards, page_instances, name, ages_by_ref)
+
+        # Lets person.html's "estimate all" button skip photos already estimated on a
+        # prior (possibly interrupted) run instead of redoing them — see
+        # get_estimated_checksums.
+        estimated = manual.get_estimated_checksums([c['checksum'] for c in page_cards])
+        for c in page_cards:
+            c['has_age_estimate'] = c['checksum'] in estimated
+        return {'cards': page_cards, 'total': len(instances), 'offset': offset, 'limit': limit}
 
     @app.get('/find-person/{name}', response_class=HTMLResponse)
     def find_person_page(request: Request, name: str):
@@ -1011,6 +1315,69 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
+
+    @app.get('/person/{name}/split', response_class=HTMLResponse)
+    def split_person_page(request: Request, name: str, with_: str = Query('', alias='with')):
+        """'Split' review: walks every real face currently assigned to `name`
+        and lets the user confirm it's really them (↑, no-op) or move it to
+        `with_` instead (↓, single reassign call) — see _next_split_candidates.
+        Fixes the case where a batch of one person's photos got incorrectly
+        assigned to another. Reachable via the ✂️ icon on /person/{name}."""
+        canonical = manual.resolve_identity_name(name)
+        if canonical != name:
+            return RedirectResponse(url=f'/person/{quote(canonical)}/split?with={quote(with_)}')
+        other = manual.resolve_identity_name(with_)
+        known_identities = {n for n, _count in manual.get_all_identities()}
+        error = None
+        if not other:
+            error = 'Pick a person to split against.'
+        elif other.lower() == name.lower():
+            error = f'Pick someone other than "{name}" to split against.'
+        elif other not in known_identities:
+            error = f'"{other}" isn\'t a known person yet.'
+        return templates.TemplateResponse(request, 'split_person.html', {
+            'name': name,
+            'other': other,
+            'error': error,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    def _next_split_candidates(name, other, exclude_refs, count):
+        """Ranks `name`'s currently-assigned real faces by resemblance to
+        `other`'s confirmed embeddings, best match first — the faces most
+        likely to actually be `other` surface first, directly serving the
+        "a batch of Joe's photos got tagged as Steve" case. Falls back to
+        input order if `other` has no confirmed faces yet (nothing to rank
+        against). Mirrors _next_face_suggestions' identity_filter branch."""
+        other_embeddings = manual.get_embeddings_for_identity(other)
+        faces = manual.get_faces_for_identity(name)
+        import numpy as np
+        matrix = (np.stack([np.frombuffer(e, dtype=np.float32) for e in other_embeddings])
+                  if other_embeddings else None)
+        candidates = []  # (score, ref, file_id)
+        for face_id, checksum, emb_bytes in faces:
+            ref = f'manual:{face_id}'
+            if ref in exclude_refs:
+                continue
+            file_row = db.get_file_by_checksum(checksum)
+            if file_row is None:
+                continue
+            if matrix is not None and emb_bytes:
+                score = float(matrix.dot(np.frombuffer(emb_bytes, dtype=np.float32)).max())
+            else:
+                score = 0.0
+            candidates.append((score, ref, file_row['id']))
+        candidates.sort(key=lambda c: -c[0])
+        return _attach_file_meta([
+            {'ref': ref, 'file_id': file_id, 'score': round(score, 3)}
+            for score, ref, file_id in candidates[:count]
+        ])
+
+    @app.post('/api/person/{name}/split-candidates')
+    def api_split_candidates(name: str, body: SwipeExcludeBody, with_: str = Query(..., alias='with'), count: int = 10):
+        exclude_refs = set(body.exclude)
+        return {'cards': _next_split_candidates(name, with_, exclude_refs, count)}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int):
@@ -1209,7 +1576,7 @@ def create_app(data_root: str) -> FastAPI:
             src_path = _live_abs_path(b_file_id, file_row['path'])
             if src_path is None or not _make_body_crop(src_path, bbox_json, crop_path):
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
-        return FileResponse(crop_path, media_type='image/jpeg')
+        return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.post('/api/body-index/start')
     def api_body_index_start():
@@ -1339,6 +1706,7 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = body.bbox
         if x2 <= x1 or y2 <= y1:
             raise HTTPException(status_code=400, detail='Invalid bbox')
+        polarity = 'negative' if body.polarity == 'negative' else 'positive'
 
         abs_path = os.path.join(data_root, row['path'])
         if not os.path.isfile(abs_path):
@@ -1348,8 +1716,8 @@ def create_app(data_root: str) -> FastAPI:
         with PILImage.open(abs_path) as img:
             width, height = img.size
 
-        tag_id = manual.add_spatial_tag(row['checksum'], label, x1, y1, x2, y2, width, height)
-        return {'id': tag_id, 'label': label, 'bbox': [x1, y1, x2, y2]}
+        tag_id = manual.add_spatial_tag(row['checksum'], label, x1, y1, x2, y2, width, height, polarity=polarity)
+        return {'id': tag_id, 'label': label, 'bbox': [x1, y1, x2, y2], 'polarity': polarity}
 
     @app.post('/api/files/{file_id}/reindex')
     def api_reindex_tags(file_id: int):
@@ -1374,7 +1742,7 @@ def create_app(data_root: str) -> FastAPI:
 
         db.insert_detections(file_id, detections, YOLOWorldDetector.model_id())
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
-        return {'detected_classes': detected_classes}
+        return {'detected_classes': detected_classes, 'detection_bboxes': db.get_detection_bboxes(file_id)}
 
     @app.get('/api/tags')
     def api_list_tags():
@@ -1384,7 +1752,10 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/tags', response_class=HTMLResponse)
     def tags_page(request: Request):
         all_tags = manual.list_all_tags()
-        tags = [{'label': r[0], 'count': r[1]} for r in all_tags]
+        tags = [
+            {'label': r[0], 'count': r[1], **_classifier_ui_state(r[0])}
+            for r in all_tags
+        ]
         return templates.TemplateResponse(request, 'tags.html', {
             'tags': tags,
             'all_tags': all_tags,
@@ -1409,6 +1780,12 @@ def create_app(data_root: str) -> FastAPI:
     # justified SET_SUGGEST_THRESHOLD=0.75, so this borrows SUGGEST_THRESHOLD's
     # value rather than inventing a new one without data.
     TAG_SUGGEST_THRESHOLD = 0.45
+
+    # Real per-image YOLO inference (unlike CLIP's cheap embedding dot-product)
+    # — how many undecided candidates one "find more via YOLO" fetch scans per
+    # call. Bounded so a real library doesn't turn one fetch into hundreds of
+    # sequential/batched model calls (see _next_tag_suggestions_by_model).
+    YOLO_CANDIDATE_SAMPLE_SIZE = 60
 
     def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None):
         """Rank not-yet-decided files against the centroid of files already
@@ -1467,6 +1844,334 @@ def create_app(data_root: str) -> FastAPI:
         exclude_ids = {int(x) for x in body.exclude if x.isdigit()}
         bias_id = int(bias_file_id) if bias_file_id.strip().isdigit() else None
         cards = _next_tag_suggestions(label, count, exclude_ids, bias_id, bias or None)
+        return {'cards': cards}
+
+    # ------------------------------------------------------------------
+    # Per-tag classifier training (experimental) — a CLIP linear classifier
+    # and a fine-tuned YOLO-World checkpoint, each trained from this tag's
+    # own confirmed/rejected examples (see clip_tag_classifier.py /
+    # yolo_tag_classifier.py). Both always run as a real subprocess, never
+    # in-process — training can take anywhere from seconds (CLIP) to minutes
+    # (YOLO), and this app already hit real GIL-contention problems earlier
+    # from heavy in-process computation (see the /sets/{id} "opening 2 tabs
+    # makes everything else unresponsive" incident that led to --workers).
+    # metadata.json (see clip_tag_classifier.write_status) is the single
+    # source of truth for status — no separate DB table to keep in sync.
+    # ------------------------------------------------------------------
+
+    def _read_classifier_status(label, kind):
+        """kind is 'clip_model' or 'yolo_model'. Returns None if training was
+        never started for this tag/kind. A 'running' status whose pid is no
+        longer alive (crash, OOM-kill, `kill -9`) is reported back as 'failed'
+        here — WITHOUT rewriting the file — so the UI doesn't show
+        "training…" forever after something goes wrong outside the normal
+        try/except in the training script itself."""
+        from media_manager.clip_tag_classifier import classifier_dir
+
+        path = os.path.join(classifier_dir(data_root, label, kind), 'metadata.json')
+        if not os.path.isfile(path):
+            return None
+        try:
+            with open(path) as f:
+                status = json.load(f)
+        except (OSError, ValueError):
+            return None
+        if status.get('status') == 'running':
+            pid = status.get('pid')
+            # pid is None only in the brief window between the launching
+            # request writing this placeholder and the child process getting
+            # far enough into Python startup to overwrite it with its real
+            # pid (see _launch_training_subprocess) — not itself a sign of
+            # failure. A pid that's SET but no longer alive is the real
+            # "died unexpectedly" signal.
+            if pid and not os.path.exists(f'/proc/{pid}'):
+                return {**status, 'status': 'failed', 'error': 'Training process died unexpectedly.'}
+        return status
+
+    def _classifier_button_state(kind, label, status, enough, hint):
+        """Everything a template needs to render one train button, fully
+        precomputed server-side — no client-side logic decides what the
+        button says or whether it's clickable, only a trivial click-to-fetch
+        handler is left to JS (see tags.html/search.html), so a broken/blocked
+        script can never leave the button silently missing or wrong the way
+        the previous JS-rendered version did.
+        `href` set means "render as a link to the Find-more page"; `href` None
+        means "render as a button", disabled per `disabled`. `title` is the
+        tooltip — either the failure error or the "why disabled" hint.
+        `cancel_url` is only set while genuinely running (the one state a
+        stuck/long job can actually be stopped from) — killing the subprocess
+        is currently the only way to stop it, see api_cancel_training.
+        `log_url` is set whenever a train.log could plausibly exist (anything
+        past "never started"), so progress/failure detail beyond the coarse
+        status is always one click away."""
+        noun = 'CLIP' if kind == 'clip' else 'YOLO'
+        log_url = f'/api/tags/{quote(label)}/train-log?kind={kind}' if status else None
+        if status and status.get('status') == 'done':
+            metric = status.get('cv_accuracy') if kind == 'clip' else status.get('held_out_map')
+            metric_text = f'{round(metric * 100)}%' if isinstance(metric, (int, float)) else 'done'
+            return {
+                'kind': kind, 'label': label, 'disabled': False,
+                'text': f'{noun}: {metric_text} — Find more',
+                'href': f'/search?tag={quote(label)}&start={kind}', 'title': '',
+                'cancel_url': None, 'log_url': log_url,
+            }
+        if status and status.get('status') == 'running':
+            elapsed_min = max(0, round((time.time() - status.get('started_at', time.time())) / 60))
+            progress = ''
+            if status.get('current_epoch') and status.get('total_epochs'):
+                progress = f' — epoch {status["current_epoch"]}/{status["total_epochs"]}'
+            return {
+                'kind': kind, 'label': label, 'disabled': True, 'href': None,
+                'text': f'{noun}: training…{progress} ({elapsed_min}m)',
+                'title': 'Cancel to stop, or check the log for detail.',
+                'cancel_url': f'/api/tags/{quote(label)}/train-cancel?kind={kind}', 'log_url': log_url,
+            }
+        if status and status.get('status') == 'failed':
+            return {
+                'kind': kind, 'label': label, 'disabled': False, 'href': None,
+                'text': f'{noun}: failed — retry', 'title': status.get('error', ''),
+                'cancel_url': None, 'log_url': log_url,
+            }
+        return {
+            'kind': kind, 'label': label, 'disabled': not enough, 'href': None,
+            'text': f'Train {noun}', 'title': '' if enough else hint,
+            'cancel_url': None, 'log_url': None,
+        }
+
+    def _classifier_ui_state(label):
+        """Everything tags.html/search.html need to render this tag's train
+        buttons — one precomputed dict per model kind (see
+        _classifier_button_state)."""
+        from media_manager.clip_tag_classifier import MIN_EXAMPLES_PER_CLASS
+        from media_manager.yolo_tag_classifier import MIN_BOXES
+
+        polarities = manual.get_whole_image_tag_polarities(label)
+        n_positive = sum(1 for p in polarities.values() if p == 'positive')
+        n_negative = sum(1 for p in polarities.values() if p == 'negative')
+        # Region crops (see get_all_spatial_tags_for_label/clip_tag_classifier.py's
+        # _add_region_examples) count toward CLIP's threshold too — a hard-negative
+        # region (e.g. a dog boxed "not monstera plant") is just as valid a
+        # training example as a whole-image rejection.
+        for region_row in manual.get_all_spatial_tags_for_label(label):
+            if region_row[-1] == 'positive':
+                n_positive += 1
+            else:
+                n_negative += 1
+        n_boxes = len(manual.get_spatial_tags_for_label(label))
+        clip_status = _read_classifier_status(label, 'clip_model')
+        yolo_status = _read_classifier_status(label, 'yolo_model')
+        return {
+            'clip_btn': _classifier_button_state(
+                'clip', label, clip_status, n_positive >= MIN_EXAMPLES_PER_CLASS and n_negative >= MIN_EXAMPLES_PER_CLASS,
+                f'Need {MIN_EXAMPLES_PER_CLASS}+ confirmed and {MIN_EXAMPLES_PER_CLASS}+ rejected examples, '
+                f'whole-image or region (have {n_positive} confirmed, {n_negative} rejected).'
+            ),
+            'yolo_btn': _classifier_button_state(
+                'yolo', label, yolo_status, n_boxes >= MIN_BOXES,
+                f'Need {MIN_BOXES}+ labeled bounding boxes (have {n_boxes}).'
+            ),
+            'clip_status': clip_status,
+            'yolo_status': yolo_status,
+        }
+
+    def _launch_training_subprocess(module_name, label, kind):
+        """Writes the initial 'running' status itself, synchronously, before
+        returning — the child process's own train_for_tag also writes this
+        (with its real pid, overwriting this placeholder within moments), but
+        relying on that alone leaves a real race: two rapid clicks on "Train"
+        could both pass the "already running?" check in api_train_*_classifier
+        before either child has actually gotten far enough into Python
+        startup/imports to write anything."""
+        from media_manager.clip_tag_classifier import classifier_dir, write_status
+
+        out_dir = classifier_dir(data_root, label, kind)
+        os.makedirs(out_dir, exist_ok=True)
+        write_status(out_dir, status='running', pid=None, started_at=int(time.time()))
+        subprocess.Popen(
+            [sys.executable, '-m', module_name, '--data-root', data_root, '--tag', label],
+            start_new_session=True,
+        )
+
+    @app.post('/api/tags/{label}/train-clip')
+    def api_train_clip_classifier(label: str):
+        from media_manager.clip_tag_classifier import MIN_EXAMPLES_PER_CLASS
+
+        existing = _read_classifier_status(label, 'clip_model')
+        if existing and existing.get('status') == 'running':
+            raise HTTPException(status_code=409, detail='CLIP training is already running for this tag.')
+
+        polarities = manual.get_whole_image_tag_polarities(label)
+        n_positive = sum(1 for p in polarities.values() if p == 'positive')
+        n_negative = sum(1 for p in polarities.values() if p == 'negative')
+        if n_positive < MIN_EXAMPLES_PER_CLASS or n_negative < MIN_EXAMPLES_PER_CLASS:
+            raise HTTPException(
+                status_code=400,
+                detail=f'Need at least {MIN_EXAMPLES_PER_CLASS} confirmed and {MIN_EXAMPLES_PER_CLASS} '
+                       f'rejected examples; have {n_positive} confirmed, {n_negative} rejected.'
+            )
+        _launch_training_subprocess('media_manager.clip_tag_classifier', label, 'clip_model')
+        return {'status': 'running'}
+
+    @app.post('/api/tags/{label}/train-yolo')
+    def api_train_yolo_classifier(label: str):
+        from media_manager.yolo_tag_classifier import MIN_BOXES
+
+        existing = _read_classifier_status(label, 'yolo_model')
+        if existing and existing.get('status') == 'running':
+            raise HTTPException(status_code=409, detail='YOLO training is already running for this tag.')
+
+        n_boxes = len(manual.get_spatial_tags_for_label(label))
+        if n_boxes < MIN_BOXES:
+            raise HTTPException(
+                status_code=400,
+                detail=f'Need at least {MIN_BOXES} labeled bounding boxes; have {n_boxes}.'
+            )
+        _launch_training_subprocess('media_manager.yolo_tag_classifier', label, 'yolo_model')
+        return {'status': 'running'}
+
+    @app.get('/api/tags/{label}/train-status')
+    def api_train_status(label: str, kind: str = 'clip'):
+        status = _read_classifier_status(label, 'clip_model' if kind == 'clip' else 'yolo_model')
+        return status or {'status': 'not_trained'}
+
+    @app.post('/api/tags/{label}/train-cancel')
+    def api_cancel_training(label: str, kind: str = 'clip'):
+        """Stops a running training subprocess — the only way to do this today
+        is to actually kill the OS process (there's no cooperative "please
+        stop soon" flag either script checks). SIGTERM first (lets torch/
+        ultralytics unwind and release any file handles cleanly); the status
+        is marked 'failed' here directly rather than waiting for the next
+        status read's dead-pid check, so the UI reflects the cancellation
+        immediately instead of still saying "running" until someone happens
+        to reload."""
+        from media_manager.clip_tag_classifier import classifier_dir
+
+        model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
+        status = _read_classifier_status(label, model_kind)
+        if not status or status.get('status') != 'running':
+            raise HTTPException(status_code=400, detail='No training is currently running for this tag.')
+        pid = status.get('pid')
+        if pid:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass  # already gone — fine, we're marking it failed either way
+        out_dir = classifier_dir(data_root, label, model_kind)
+        from media_manager.clip_tag_classifier import write_status
+        write_status(out_dir, status='failed', error='Cancelled by user.', failed_at=int(time.time()))
+        return {'status': 'failed'}
+
+    @app.get('/api/tags/{label}/train-log')
+    def api_train_log(label: str, kind: str = 'clip'):
+        """Raw train.log content (the training subprocess's own stdout/stderr,
+        see clip_tag_classifier.py's/yolo_tag_classifier.py's main()) — the
+        only place per-run detail lives beyond the coarse running/done/failed
+        status, e.g. ultralytics' own per-epoch loss table for a YOLO run."""
+        from media_manager.clip_tag_classifier import classifier_dir
+
+        model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
+        log_path = os.path.join(classifier_dir(data_root, label, model_kind), 'train.log')
+        if not os.path.isfile(log_path):
+            return PlainTextResponse('No log yet.')
+        with open(log_path, errors='replace') as f:
+            return PlainTextResponse(f.read())
+
+    def _next_tag_suggestions_by_model(label, model_kind, count, exclude_ids):
+        """Candidate ranking for the "find more" swipe view — same shape as
+        _next_tag_suggestions (same decided/exclude filtering, same
+        _attach_file_meta response), but scored by a trained classifier
+        instead of centroid-cosine similarity."""
+        decided = manual.get_decided_checksums_for_tag(label)
+
+        if model_kind == 'yolo':
+            from media_manager.clip_tag_classifier import classifier_dir
+
+            checkpoint = os.path.join(classifier_dir(data_root, label, 'yolo_model'), 'best.pt')
+            if not os.path.isfile(checkpoint):
+                return []
+
+            candidates = [
+                row for row in db.get_all_embeddings()
+                if row[3] not in decided and row[0] not in exclude_ids
+            ]
+            if not candidates:
+                return []
+
+            # Real model inference per image (not a cheap embedding dot-product
+            # like the CLIP path) — scanning the WHOLE undecided-photo pool
+            # synchronously on every single fetch was the actual cause of the
+            # swipe stream getting stuck on "searching" forever on a real
+            # library: hundreds of sequential predict() calls before the
+            # request could ever return, no error, no timeout, just a very
+            # long wait. Bounded random sample keeps each fetch fast; repeated
+            # fetches (the swipe stack's own refill, each excluding what it's
+            # already seen) progressively cover more of the library over a
+            # session instead of exhaustively scanning it on every call.
+            sample = random.sample(candidates, min(len(candidates), YOLO_CANDIDATE_SAMPLE_SIZE))
+
+            path_by_file_id = {}
+            for file_id, path, _emb, _checksum in sample:
+                abs_path = os.path.join(data_root, path)
+                if os.path.isfile(abs_path):
+                    path_by_file_id[file_id] = abs_path
+            if not path_by_file_id:
+                return []
+
+            try:
+                from ultralytics import YOLOWorld
+                model = YOLOWorld(checkpoint)
+                # Batched in one call (not one predict() per image) — batching
+                # amortizes real per-call model overhead, meaningfully faster
+                # than the same total number of images predicted one at a time.
+                results_list = model.predict(list(path_by_file_id.values()), verbose=False)
+            except Exception:
+                # Loud, not silent — a bad/incompatible checkpoint or a
+                # transient inference failure should show up in the server
+                # console immediately, not just look like an empty result or
+                # (worse) hang the request.
+                print(f'[tag classifier] YOLO inference failed for tag "{label}" using {checkpoint}:')
+                traceback.print_exc()
+                return []
+
+            scored = []
+            for file_id, results in zip(path_by_file_id.keys(), results_list):
+                confs = results.boxes.conf if results.boxes is not None else []
+                if len(confs):
+                    best_idx = int(confs.argmax())
+                    # Normalized (0..1) xyxy — resolution-independent, so the
+                    # frontend can position a highlight box as plain CSS
+                    # percentages over whatever size the photo actually
+                    # renders at, no pixel math needed on either side.
+                    bbox = [round(float(v), 4) for v in results.boxes.xyxyn[best_idx]]
+                    scored.append((file_id, float(confs[best_idx]), bbox))
+            scored.sort(key=lambda x: -x[1])
+            return _attach_file_meta([
+                {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3), 'bbox': bbox}
+                for fid, score, bbox in scored[:count]
+            ])
+
+        from media_manager.clip_tag_classifier import score_all
+
+        all_embeddings = [
+            row for row in db.get_all_embeddings()
+            if row[3] not in decided and row[0] not in exclude_ids
+        ]
+        candidates = [(row[3], row[2]) for row in all_embeddings]
+        checksum_to_file_id = {row[3]: row[0] for row in all_embeddings}
+        scores = score_all(data_root, label, candidates)
+        ranked = sorted(
+            ((checksum_to_file_id[c], s) for c, s in scores.items() if c in checksum_to_file_id),
+            key=lambda x: -x[1],
+        )
+        return _attach_file_meta([
+            {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+            for fid, score in ranked[:count]
+        ])
+
+    @app.post('/api/tags/{label}/suggestions/next-by-model')
+    def api_next_tag_suggestions_by_model(label: str, body: SwipeExcludeBody, model: str = 'clip', count: int = 10):
+        exclude_ids = {int(x) for x in body.exclude if x.isdigit()}
+        cards = _next_tag_suggestions_by_model(label, model, count, exclude_ids)
         return {'cards': cards}
 
     @app.get('/api/vocab')
@@ -1580,7 +2285,18 @@ def create_app(data_root: str) -> FastAPI:
             chip_type, _, chip_value = part.partition(':')
             if chip_type and chip_value:
                 chips.append({'type': chip_type, 'value': chip_value})
-        matching_checksums = _intersect_chips(chips)
+
+        # Computed once regardless of chips — reused below both to resolve a
+        # 'face'/'set' chip filter (avoiding _checksums_for_chip's unindexed
+        # LOWER(identity) LIKE '%...%' scan for 'face') and to pick each set's
+        # thumbnail without a get_files_by_set + get_files_by_checksums round
+        # trip per set (this page is unpaginated — that used to be 2 queries
+        # times every set in the library, on every view).
+        set_checksums_map = _set_checksums_by_id()
+        identity_map = None
+        if any(c['type'] == 'face' for c in chips):
+            identity_map = _identity_checksums_by_name(set_checksums_map)
+        matching_checksums = _intersect_chips(chips, set_map=set_checksums_map, identity_map=identity_map)
         matching_set_ids = None
         if matching_checksums is not None:
             matching_set_ids = set()
@@ -1588,20 +2304,28 @@ def create_app(data_root: str) -> FastAPI:
                 for sets_here in manual.get_sets_for_checksums(list(matching_checksums)).values():
                     matching_set_ids.update(s['id'] for s in sets_here)
 
+        filtered_rows = [
+            r for r in manual.list_sets(favorite_only=favorite, studio=studio_filter)
+            if matching_set_ids is None or r['id'] in matching_set_ids
+        ]
+        representative_checksum_by_set = {}
+        for r in filtered_rows:
+            checksums_here = set_checksums_map.get(r['id'])
+            if checksums_here:
+                representative_checksum_by_set[r['id']] = next(iter(checksums_here))
+        thumb_rows_by_checksum = {}
+        all_repr_checksums = list(representative_checksum_by_set.values())
+        if all_repr_checksums:
+            thumb_rows_by_checksum = {row['checksum']: row for row in db.get_files_by_checksums(all_repr_checksums)}
+
         sets = []
-        for r in manual.list_sets(favorite_only=favorite, studio=studio_filter):
-            if matching_set_ids is not None and r['id'] not in matching_set_ids:
-                continue
-            thumb_id = None
-            first_checksums = manual.get_files_by_set(r['id'], limit=1)
-            if first_checksums:
-                thumb_rows = db.get_files_by_checksums(first_checksums)
-                if thumb_rows:
-                    thumb_id = thumb_rows[0]['id']
+        for r in filtered_rows:
+            checksum = representative_checksum_by_set.get(r['id'])
+            thumb_row = thumb_rows_by_checksum.get(checksum) if checksum else None
             sets.append({
                 'id': r['id'], 'name': r['name'], 'studio': r['studio'],
                 'image_count': r['image_count'], 'favorite': bool(r['favorite']),
-                'thumb_id': thumb_id,
+                'thumb_id': thumb_row['id'] if thumb_row else None,
             })
         _attach_set_people([sets])
         return templates.TemplateResponse(request, 'sets.html', {
@@ -1632,6 +2356,18 @@ def create_app(data_root: str) -> FastAPI:
             {'name': r['studio'], 'set_count': r['set_count'], 'image_count': r['image_count']}
             for r in manual.list_studios()
         ]
+
+    @app.put('/api/studios/{studio}')
+    def api_rename_studio(studio: str, body: StudioRenameBody):
+        """Renames a studio everywhere it's used. Since studios are just a free-text
+        column on `sets` (no separate table/id), renaming one studio to another
+        that already exists IS the merge — every set lands on the same string,
+        exactly like fixing a typo would."""
+        new_name = body.name.strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail='Studio name must not be empty')
+        manual.rename_studio(studio, new_name)
+        return {'name': new_name}
 
     # Cosine similarity above this, an image outside the set is suggested as a
     # possible member. CLIP image-image similarity runs hotter than face similarity
@@ -1729,12 +2465,20 @@ def create_app(data_root: str) -> FastAPI:
             card['ref'] = str(card['id'])
         return cards
 
-    def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3):
+    def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
         set it's not already in by how close the photo's embedding is to that set's
         centroid — "which set does this probably belong to". Sets are cheap and
         unpaginated everywhere else in the app (personal-library scale), so unlike
-        the set-detail version this runs synchronously over all of them per call."""
+        the set-detail version this runs synchronously over all of them per call.
+
+        set_ids, when given, restricts the candidate pool to just those ids (still
+        excluding sets the file already belongs to) and returns a score for every
+        one of them, regardless of `threshold`/`limit` — used by the set-detail
+        page's quick-access modal, which wants a rank ordering of a small,
+        caller-chosen set of sets, not "does this clear the bar to suggest it at
+        all". Cheaper than the default path too: only the requested sets' centroids
+        get computed, not every set in the library."""
         emb_bytes = db.get_embedding(file_id)
         if emb_bytes is None:
             return []
@@ -1742,7 +2486,10 @@ def create_app(data_root: str) -> FastAPI:
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
 
         member_of = {s['id'] for s in manual.get_sets_for_checksums([checksum]).get(checksum, [])}
-        candidates = [s for s in manual.list_sets() if s['id'] not in member_of]
+        if set_ids is not None:
+            candidates = [s for s in manual.list_sets() if s['id'] in set_ids and s['id'] not in member_of]
+        else:
+            candidates = [s for s in manual.list_sets() if s['id'] not in member_of]
         if not candidates:
             return []
 
@@ -1760,21 +2507,25 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             centroid = centroid / norm
             score = float(centroid.dot(query_emb))
-            if score >= threshold:
+            if set_ids is not None or score >= threshold:
                 scored.append((set_row, score))
 
         scored.sort(key=lambda item: item[1], reverse=True)
+        page = scored if set_ids is not None else scored[:limit]
         results = [
             {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'score': round(score, 3)}
-            for s, score in scored[:limit]
+            for s, score in page
         ]
         _attach_set_people([results])
         return results
 
     @app.get('/api/files/{file_id}/suggested-sets')
-    def api_suggested_sets_for_file(file_id: int):
+    def api_suggested_sets_for_file(file_id: int, ids: str = ''):
         row = _file_or_404(file_id)
-        return {'results': _find_best_sets_for_file(file_id, row['checksum'])}
+        set_ids = None
+        if ids:
+            set_ids = {int(s) for s in ids.split(',') if s.strip().isdigit()}
+        return {'results': _find_best_sets_for_file(file_id, row['checksum'], set_ids=set_ids)}
 
     def _people_present_in_set(set_id, member_checksums):
         """Everyone confirmed to appear in this set, for the "People present"
@@ -1840,6 +2591,13 @@ def create_app(data_root: str) -> FastAPI:
         file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
         rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
         files = _enrich_rows(rows)
+        # Every card here already belongs to this set — showing this set's own
+        # roster again on each card (chip-set + set_meta_line) is pure redundant
+        # context and, since a set's people and a photo's own recognized people
+        # commonly overlap, reads as the same person listed twice on one card.
+        # Cards still show any OTHER set they also belong to.
+        for f in files:
+            f['sets'] = [s for s in f['sets'] if s['id'] != set_id]
         if sort == 'age':
             files = _sort_cards_by_age(files, order)
         people_present = _people_present_in_set(set_id, checksums)
@@ -1923,13 +2681,25 @@ def create_app(data_root: str) -> FastAPI:
         return {'results': results, 'cards': results}
 
     @app.get('/api/sets')
-    def api_list_sets(favorite: bool = False):
+    def api_list_sets(favorite: bool = False, light: bool = False):
+        """`light=True` uses _attach_set_people_names_only instead of
+        _attach_set_people — the set-search picker (openEntitySearchModal's
+        'set' type) needs to know WHO's linked to each set (its personAware
+        "type a name to narrow the list" filter depends on it) but never
+        displays their age, so skip the per-set face/estimate join
+        (get_average_ages_for_identities_in_sets) that computes it — real
+        query cost with nothing to show for it in a text-only picker. The
+        full (non-light) list — /sets/'s own page, favorites, etc. — still
+        gets ages attached as before."""
         sets = [
             {'id': r['id'], 'name': r['name'], 'studio': r['studio'],
              'image_count': r['image_count'], 'favorite': bool(r['favorite'])}
             for r in manual.list_sets(favorite_only=favorite)
         ]
-        _attach_set_people([sets])
+        if light:
+            _attach_set_people_names_only([sets])
+        else:
+            _attach_set_people([sets])
         _attach_set_aliases([sets])
         return sets
 
@@ -2057,21 +2827,56 @@ def create_app(data_root: str) -> FastAPI:
             key=lambda c: c['name']
         )
 
+    def _homepage_stats():
+        """The 8 homepage stat tiles. 'known_people'/'unknown_faces' distinguish
+        distinct-identity count from raw unidentified-face-instance count (see
+        faces_page's own 'known people' == distinct-identity precedent).
+        'total_videos' is a reserved placeholder — video tracking isn't
+        implemented yet, so it's always None (rendered as '—').
+
+        'photos_without_set' is total files minus the *count* of set-member
+        checksums, not a resolved file-row count — get_all_set_member_checksums()
+        exists specifically so callers never need to feed its (potentially huge)
+        result into an IN (...) query (see its own docstring: that's the exact
+        pattern that already caused a 'too many SQL variables' crash once
+        before). Treating checksum count as a stand-in for file-row count is
+        the same approximation already accepted for 'total_photos' above."""
+        set_member_checksums = manual.get_all_set_member_checksums()
+        total_files = db.count_files()
+        return {
+            'known_people': len(manual.get_identity_summary()),
+            'unknown_faces': len(_unpromoted_auto_faces(limit=None)),
+            'num_sets': manual.count_sets(),
+            'photos_without_set': max(0, total_files - len(set_member_checksums)),
+            'total_photos': total_files,
+            'total_videos': None,
+            'total_manual_tags': len(manual.list_all_tags()),
+            'total_auto_tags': db.count_detected_classes(),
+        }
+
     @app.get('/categories', response_class=HTMLResponse)
     def categories_page(request: Request):
         all_tags = manual.list_all_tags()
         all_categories = _all_categories_for_nav()
+        # One query for the whole library instead of a get_example_checksums_for_
+        # category + get_files_by_checksums round trip per category (this page is
+        # unpaginated — that used to be 2 queries times every category, per view).
+        category_checksums_map = manual.get_all_category_checksums()
+        representative_checksum_by_category = {
+            cat_id: next(iter(checksums)) for cat_id, checksums in category_checksums_map.items() if checksums
+        }
+        all_repr_checksums = list(representative_checksum_by_category.values())
+        thumb_rows_by_checksum = {}
+        if all_repr_checksums:
+            thumb_rows_by_checksum = {row['checksum']: row for row in db.get_files_by_checksums(all_repr_checksums)}
+
         categories = []
         for r in manual.list_categories():
-            thumb_id = None
-            example_checksums = manual.get_example_checksums_for_category(r['id'], limit=1)
-            if example_checksums:
-                thumb_rows = db.get_files_by_checksums(example_checksums)
-                if thumb_rows:
-                    thumb_id = thumb_rows[0]['id']
+            checksum = representative_checksum_by_category.get(r['id'])
+            thumb_row = thumb_rows_by_checksum.get(checksum) if checksum else None
             categories.append({
                 'id': r['id'], 'name': r['name'], 'temperature': r['temperature'],
-                'image_count': r['image_count'], 'thumb_id': thumb_id,
+                'image_count': r['image_count'], 'thumb_id': thumb_row['id'] if thumb_row else None,
             })
         return templates.TemplateResponse(request, 'categories.html', {
             'categories': categories,
@@ -2470,8 +3275,8 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/faces', response_class=HTMLResponse)
     def faces_page(request: Request, favorite: bool = False):
         all_tags = manual.list_all_tags()
-        identities = manual.get_all_identities()
         favorite_faces = []
+        people = []
         if favorite:
             for row in manual.get_favorite_faces():
                 file_row = db.get_file_by_checksum(row['checksum'])
@@ -2482,35 +3287,26 @@ def create_app(data_root: str) -> FastAPI:
                     'file_id': file_row['id'],
                     'identity': row['identity'],
                 })
-        faces = []
+        else:
+            for entry in manual.get_identity_summary():
+                file_row = db.get_file_by_checksum(entry['checksum']) if entry['checksum'] else None
+                if file_row is None:
+                    continue
+                people.append({
+                    'ref': entry['ref'],
+                    'file_id': file_row['id'],
+                    'identity': entry['identity'],
+                    'count': entry['count'],
+                    'last_modified': entry['last_modified'],
+                })
         return templates.TemplateResponse(request, 'faces.html', {
-            'faces': faces,
-            'identities': identities,
+            'people': people,
+            'people_count': len(people),
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
             'favorite_only': favorite,
             'favorite_faces': favorite_faces,
         })
-
-    @app.get('/api/faces/confirmed')
-    def api_confirmed_faces(offset: int = 0, limit: int = 20):
-        """Paginated feed of every identity-assigned, non-rejected face, newest
-        first — backs the main thumbnail grid on the redesigned /faces page
-        (mirrors /api/person/{name}/photos's offset/limit/total contract)."""
-        rows, total = manual.list_confirmed_faces(offset=offset, limit=limit)
-        cards = []
-        for row in rows:
-            file_row = db.get_file_by_checksum(row['checksum'])
-            if file_row is None:
-                continue
-            cards.append({
-                'ref': f"manual:{row['id']}",
-                'file_id': file_row['id'],
-                'path': file_row['path'],
-                'filename': os.path.basename(file_row['path']),
-                'identity': row['identity'],
-            })
-        return {'cards': cards, 'total': total, 'offset': offset, 'limit': limit}
 
     @app.get('/api/faces/cleanup-queue')
     def api_faces_cleanup_queue(limit: int = 200):
@@ -2603,7 +3399,7 @@ def create_app(data_root: str) -> FastAPI:
         if not os.path.isfile(crop_path):
             if not _make_face_crop(src_path, bbox_json, crop_path):
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
-        return FileResponse(crop_path, media_type='image/jpeg')
+        return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.get('/api/faces')
     def api_list_faces():
@@ -2708,6 +3504,18 @@ def create_app(data_root: str) -> FastAPI:
     def api_unlink_identity_from_set(name: str, set_id: int):
         manual.unlink_identity_from_set(set_id, name)
         return {'linked': False}
+
+    @app.delete('/api/identities/{name}/exclude-set/{set_id}')
+    def api_exclude_identity_from_set(name: str, set_id: int):
+        """Remove a person from a set's People-present list regardless of which
+        of the three sources (explicit link, whole-photo assignment, or a
+        detected face on one of the set's own photos) put them there — see
+        exclude_identity_from_set/get_people_present_in_set. Unlike the
+        assign-set DELETE above (which only undoes an explicit link and leaves a
+        detected-face-only person still showing), this is what the set page's
+        single "×" on each People-present entry calls."""
+        manual.exclude_identity_from_set(set_id, name)
+        return {'excluded': True}
 
     @app.post('/api/files/{file_id}/identity-assignments')
     def api_assign_identity_to_file(file_id: int, body: IdentityBody):
@@ -3270,3 +4078,12 @@ def create_app(data_root: str) -> FastAPI:
         manual.close()
 
     return app
+
+
+def create_app_from_env() -> FastAPI:
+    """Factory for uvicorn's multi-worker mode (`media web --workers N`,
+    N > 1) — uvicorn calls this with no arguments in each freshly-spawned
+    worker process, so data_root has to travel via an env var rather than a
+    normal function argument. Set by media.py's 'web' command before calling
+    uvicorn.run(..., factory=True) with this function's import string."""
+    return create_app(os.environ['MEDIA_WEB_DATA_ROOT'])

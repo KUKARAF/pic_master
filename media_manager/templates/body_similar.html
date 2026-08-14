@@ -19,7 +19,9 @@
           style="display:inline-block;width:auto;margin-left:10px;">Build body index</button>
 </div>
 
-<p id="body-similar-loading" class="sub" style="text-align:center;margin:24px 0;">
+<button type="button" id="body-similar-start-btn" class="btn-similar swipe-start-btn">🔍 Find similar people</button>
+
+<p id="body-similar-loading" class="sub" style="text-align:center;margin:24px 0;display:none;">
   <span class="spinner" aria-hidden="true"></span> Looking for similar people… this can take a while the first time.
 </p>
 
@@ -48,6 +50,7 @@
 (function() {
   var sourceId = {{ source_id | tojson }};
   var bodyId = {{ body_id | tojson }};
+  var startBtn = document.getElementById('body-similar-start-btn');
   var loadingEl = document.getElementById('body-similar-loading');
   var messageEl = document.getElementById('body-similar-message');
   var pickerWrap = document.getElementById('body-crop-picker-wrap');
@@ -93,7 +96,10 @@
         tagsHtml += '<span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.sets.length - 3) + '</span>';
       }
       (f.people || []).slice(0, 3).forEach(function (p) {
-        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p) + '" title="Recognized person">' + escapeHtml(p) + '</a>';
+        var age = p.age != null
+          ? '<span class="set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '') + '">' + Math.round(p.age) + '</span>'
+          : '';
+        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p.name) + '" title="Recognized person">' + escapeHtml(p.name) + age + '</a>';
       });
       if (f.people && f.people.length > 3) {
         tagsHtml += '<span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.people.length - 3) + '</span>';
@@ -118,51 +124,62 @@
     );
   }
 
-  var url = '/api/files/' + sourceId + '/body-similar' + (bodyId != null ? '?body_id=' + bodyId : '');
-  fetch(url)
-    .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-    .then(function (data) {
-      if (data.message) {
-        messageEl.textContent = data.message;
-        messageEl.style.display = 'block';
-      }
+  // Deferred behind an explicit click — this is a YOLO-World + CLIP pass
+  // over the WHOLE library's body embeddings (see _ensure_own_bodies/
+  // _body_search in web.py), real CPU cost that shouldn't fire just from
+  // landing on this page (mirrors swipe-core.js's same "Start reviewing"
+  // gate on every other ML-suggestion stream in this app).
+  function runSearch() {
+    startBtn.style.display = 'none';
+    loadingEl.style.display = 'block';
+    var url = '/api/files/' + sourceId + '/body-similar' + (bodyId != null ? '?body_id=' + bodyId : '');
+    fetch(url)
+      .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function (data) {
+        if (data.message) {
+          messageEl.textContent = data.message;
+          messageEl.style.display = 'block';
+        }
 
-      var crops = data.crops || [];
-      if (crops.length > 1) {
-        crops.forEach(function (c, i) {
-          var a = document.createElement('a');
-          a.href = '/body-similar/' + sourceId + '?body_id=' + c.id;
-          a.className = 'body-crop-choice' + (c.id === data.selected_id ? ' selected' : '');
-          var img = document.createElement('img');
-          img.src = '/body-crop/' + c.id;
-          img.alt = 'person ' + (i + 1);
-          a.appendChild(img);
-          picker.appendChild(a);
+        var crops = data.crops || [];
+        if (crops.length > 1) {
+          crops.forEach(function (c, i) {
+            var a = document.createElement('a');
+            a.href = '/body-similar/' + sourceId + '?body_id=' + c.id;
+            a.className = 'body-crop-choice' + (c.id === data.selected_id ? ' selected' : '');
+            var img = document.createElement('img');
+            img.src = '/body-crop/' + c.id;
+            img.alt = 'person ' + (i + 1);
+            a.appendChild(img);
+            picker.appendChild(a);
+          });
+          pickerWrap.style.display = 'block';
+        }
+
+        var results = data.results || [];
+        results.forEach(function (f) {
+          var wrap = document.createElement('div');
+          wrap.innerHTML = cardHtml(f);
+          var cardEl = wrap.firstElementChild;
+          grid.appendChild(cardEl);
+          var heartBtn = cardEl.querySelector('.file-heart-btn');
+          if (heartBtn && window.wireHeartButton) wireHeartButton(heartBtn, '/api/files/' + heartBtn.dataset.fileId + '/favorite');
         });
-        pickerWrap.style.display = 'block';
-      }
 
-      var results = data.results || [];
-      results.forEach(function (f) {
-        var wrap = document.createElement('div');
-        wrap.innerHTML = cardHtml(f);
-        var cardEl = wrap.firstElementChild;
-        grid.appendChild(cardEl);
-        var heartBtn = cardEl.querySelector('.file-heart-btn');
-        if (heartBtn && window.wireHeartButton) wireHeartButton(heartBtn, '/api/files/' + heartBtn.dataset.fileId + '/favorite');
+        if (!results.length && data.selected_id && !data.message) {
+          emptyEl.style.display = 'block';
+        }
+      })
+      .catch(function (err) {
+        messageEl.textContent = 'Failed to load similar people: ' + err.message;
+        messageEl.style.display = 'block';
+      })
+      .finally(function () {
+        loadingEl.style.display = 'none';
       });
+  }
 
-      if (!results.length && data.selected_id && !data.message) {
-        emptyEl.style.display = 'block';
-      }
-    })
-    .catch(function (err) {
-      messageEl.textContent = 'Failed to load similar people: ' + err.message;
-      messageEl.style.display = 'block';
-    })
-    .finally(function () {
-      loadingEl.style.display = 'none';
-    });
+  startBtn.addEventListener('click', runSearch);
 })();
 </script>
 {% endblock %}

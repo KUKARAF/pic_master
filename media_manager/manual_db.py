@@ -9,7 +9,11 @@ change and has no meaning at all if media.db is ever rebuilt from scratch. Check
 the one thing that's actually stable: the same photo bytes always hash the same way,
 so a tag/face/set-membership recorded against a checksum stays correctly attached to
 that photo forever, independent of anything that ever happens to media.db."""
+import os
+import shutil
+import sqlite3
 import time
+from collections import Counter
 
 from media_manager.database import ThreadLocalDB
 
@@ -18,6 +22,98 @@ from media_manager.database import ThreadLocalDB
 # let a human confirm" threshold used elsewhere, since auto-assignment has no human
 # in the loop to catch a wrong guess.
 AUTO_MATCH_THRESHOLD = 0.6
+
+
+def run_migrations(db_path, apply=False):
+    """Checks/applies every pending schema migration in media_manager/migrations/
+    against a raw manual.db connection — never through ManualDB, whose
+    _create_tables() fail-loud-guards against any pending migration (a ManualDB
+    can't be constructed until migrations are applied). Backs `media migrate`
+    (media.py), not run automatically at app startup.
+
+    Tracked in the `migration_state` table (one row per migration id), so this
+    is safe to run repeatedly — a migration already recorded there is skipped
+    without even calling its describe_pending/apply. A migration whose
+    describe_pending() says there's nothing to do (a fresh install, or a
+    manual.db already in the target shape from before this migration existed)
+    is recorded as applied immediately, with no write beyond that bookkeeping
+    row, so it's not re-checked on every future startup either.
+
+    apply=False (default): reports what's pending, writes nothing else.
+    apply=True: backs up db_path once, before the first pending migration
+    (shutil.copyfile with a timestamp suffix, same pattern as
+    migrate_file_identity.py) — not once per migration, since one backup
+    covers the whole run. Each migration then runs inside its own transaction
+    — SQLite's DDL is fully transactional, so a failure rolls back that one
+    migration cleanly (leaving its target tables completely untouched) and
+    this stops immediately without attempting any later migrations.
+
+    Returns a list of report strings, one per migration that was pending (or
+    a single "nothing pending" message if none were). Raises on failure
+    (never swallows an exception) — the caller (media.py's `migrate` command)
+    is expected to let it propagate."""
+    if not os.path.isfile(db_path):
+        return [f"{db_path} does not exist yet — nothing to migrate."]
+
+    from media_manager.migrations import MIGRATIONS
+
+    conn = sqlite3.connect(db_path, isolation_level=None)  # explicit BEGIN/COMMIT below, not pysqlite's implicit one
+    reports = []
+    backup_path = None
+    try:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS migration_state (
+                key TEXT PRIMARY KEY,
+                done_at INTEGER NOT NULL
+            )
+        ''')
+        for migration in MIGRATIONS:
+            already_applied = conn.execute(
+                'SELECT 1 FROM migration_state WHERE key = ?', (migration.ID,)
+            ).fetchone() is not None
+            if already_applied:
+                continue
+
+            pending_desc = migration.describe_pending(conn)
+            if pending_desc is None:
+                conn.execute(
+                    'INSERT OR IGNORE INTO migration_state (key, done_at) VALUES (?, ?)',
+                    (migration.ID, int(time.time()))
+                )
+                continue
+
+            reports.append(f'{migration.ID}: {pending_desc}')
+            if not apply:
+                continue
+
+            if backup_path is None:
+                backup_path = f'{db_path}.bak-{time.strftime("%Y%m%d%H%M%S")}'
+                shutil.copyfile(db_path, backup_path)
+
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                result = migration.apply(conn)
+                conn.execute(
+                    'INSERT OR IGNORE INTO migration_state (key, done_at) VALUES (?, ?)',
+                    (migration.ID, int(time.time()))
+                )
+                conn.execute('COMMIT')
+                reports[-1] = f'{migration.ID}: {result}. Backup: {backup_path}'
+            except Exception as exc:
+                conn.execute('ROLLBACK')
+                raise RuntimeError(
+                    f"Migration '{migration.ID}' failed and was rolled back — manual.db "
+                    f"is unchanged (a backup was also taken at {backup_path} before "
+                    f"starting, just in case): {exc}"
+                ) from exc
+
+        if not reports:
+            return ['Nothing pending — manual.db is already up to date.']
+        if not apply:
+            reports.append('Re-run with --apply to perform these migration(s).')
+        return reports
+    finally:
+        conn.close()
 
 
 class ManualDB(ThreadLocalDB):
@@ -42,27 +138,65 @@ class ManualDB(ThreadLocalDB):
                 "resolve file_id -> checksum from it before rebuilding either db. "
                 "Otherwise, this manual.db needs to be recreated from scratch."
             )
+        # Fail loudly if any registered migration (media_manager/migrations/) is
+        # still pending, rather than letting 'CREATE TABLE IF NOT EXISTS' silently
+        # no-op against an old shape and crash confusingly on the first query that
+        # expects the new one. Unlike the additive migrations elsewhere in this
+        # method (simple ADD COLUMN + backfill, safe to run silently), a pending
+        # migration here is a genuine data-rewriting change — deliberately NOT run
+        # automatically. See `media migrate --apply`.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS migration_state (
+                key TEXT PRIMARY KEY,
+                done_at INTEGER NOT NULL
+            )
+        ''')
+        from media_manager.migrations import MIGRATIONS
+        pending_ids = []
+        for migration in MIGRATIONS:
+            applied = cur.execute('SELECT 1 FROM migration_state WHERE key = ?', (migration.ID,)).fetchone()
+            if applied:
+                continue
+            if migration.describe_pending(cur) is not None:
+                pending_ids.append(migration.ID)
+        if pending_ids:
+            raise RuntimeError(
+                "manual.db has pending schema migration(s): " + ', '.join(pending_ids) + ". Run:\n"
+                "    media migrate --dry-run   # see what would change, writes nothing\n"
+                "    media migrate --apply     # backs up manual.db, then migrates\n"
+                "first. Nothing has been written by this run."
+            )
 
         cur.execute('''
             CREATE TABLE IF NOT EXISTS tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 checksum TEXT NOT NULL,
-                label TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
                 polarity TEXT NOT NULL DEFAULT 'positive',
                 x1 REAL, y1 REAL, x2 REAL, y2 REAL,
                 image_width INTEGER, image_height INTEGER,
-                created_at INTEGER NOT NULL,
                 frame_index INTEGER,
-                favorite INTEGER NOT NULL DEFAULT 0
+                favorite INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
             )
         ''')
-        # Migrate manual.db files that predate frame_index (nullable ADD COLUMN is
-        # safe in-place — every existing row correctly becomes "whole file", NULL).
-        existing_tag_cols2 = {row[1] for row in cur.execute('PRAGMA table_info(tags)')}
-        if 'frame_index' not in existing_tag_cols2:
-            cur.execute('ALTER TABLE tags ADD COLUMN frame_index INTEGER')
-        if 'favorite' not in existing_tag_cols2:
-            cur.execute('ALTER TABLE tags ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0')
+        # Read-only convenience view exposing every file_tags column plus the joined
+        # tag label (mirrors sets_with_studio) — every read site that used to select
+        # straight from the old flat `tags` table and read row['label'] directly can
+        # just select FROM this instead of rewriting its own join.
+        cur.execute('''
+            CREATE VIEW IF NOT EXISTS file_tags_with_label AS
+            SELECT ft.*, t.label AS label
+            FROM file_tags ft
+            JOIN tags t ON t.id = ft.tag_id
+        ''')
 
         cur.execute('''
             CREATE TABLE IF NOT EXISTS file_favorites (
@@ -97,6 +231,16 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_age_estimates_checksum ON face_age_estimates (checksum)')
+        # A studio is one-per-set (not multi-valued like tags/categories), so this is
+        # a plain id'd lookup table (same shape as `categories`) referenced by a
+        # single FK column on `sets` — no join table needed.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS studios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            )
+        ''')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS sets (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +254,51 @@ class ManualDB(ThreadLocalDB):
         existing_set_cols = {row[1] for row in cur.execute('PRAGMA table_info(sets)')}
         if 'favorite' not in existing_set_cols:
             cur.execute('ALTER TABLE sets ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0')
+        # studio used to be a free-text column directly on sets (no id — the
+        # UNIQUE(name, studio) above was already dead weight even then, since
+        # SQLite treats every NULL studio as distinct for UNIQUE purposes, see
+        # find_sets_by_name's docstring), so renaming a studio meant a blind
+        # UPDATE ... WHERE studio = ? string rewrite across every set instead of
+        # renaming one row. Migrated once into the real `studios` table above,
+        # dedup'd by exact name, via a plain ALTER TABLE ADD COLUMN + backfill
+        # rather than the file_sets-style rename+recreate+copy+drop: sets.id is
+        # referenced by file_sets/file_set_exclusions/identity_set_assignments/
+        # set_aliases, so rebuilding this table would mean carefully preserving
+        # every existing id and the sqlite_sequence counter — real risk for no
+        # benefit when only a column (not the primary key) is changing.
+        #
+        # The old `studio` column itself is deliberately NOT dropped afterward
+        # (app code never reads/writes it again once studio_id exists — see
+        # sets_with_studio below) — SQLite's ALTER TABLE DROP COLUMN refuses to
+        # drop a column that's part of a table-level constraint, and it's still
+        # named in UNIQUE(name, studio) above; dropping that constraint needs
+        # the same disruptive full rebuild this approach exists to avoid, so
+        # the column is left behind as harmless dead weight instead.
+        if 'studio' in existing_set_cols and 'studio_id' not in existing_set_cols:
+            cur.execute('ALTER TABLE sets ADD COLUMN studio_id INTEGER REFERENCES studios(id)')
+            cur.execute('''
+                INSERT OR IGNORE INTO studios (name, created_at)
+                SELECT DISTINCT studio, ? FROM sets WHERE studio IS NOT NULL AND studio != ''
+            ''', (int(time.time()),))
+            cur.execute('''
+                UPDATE sets SET studio_id = (SELECT id FROM studios WHERE studios.name = sets.studio)
+                WHERE sets.studio IS NOT NULL AND sets.studio != ''
+            ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_sets_studio_id ON sets (studio_id)')
+        # Read-only convenience view exposing every current `sets` column (the old
+        # `studio` text column deliberately excluded, per above — replaced by the
+        # freshly joined name under the same key) plus the joined studio *name*
+        # (mirrors database.py's files_with_path view over files+file_paths) —
+        # every read site that used to do `SELECT * FROM sets`/`s.*` and read
+        # row['studio'] directly can just select FROM this instead of rewriting
+        # its own join. Writes still go through the real `sets`/`studios` tables
+        # — views aren't written to.
+        cur.execute('''
+            CREATE VIEW IF NOT EXISTS sets_with_studio AS
+            SELECT s.id, s.name, s.created_at, s.favorite, s.studio_id, st.name AS studio
+            FROM sets s
+            LEFT JOIN studios st ON st.id = s.studio_id
+        ''')
 
         cur.execute('''
             CREATE TABLE IF NOT EXISTS file_sets (
@@ -139,6 +328,12 @@ class ManualDB(ThreadLocalDB):
                 SELECT checksum, set_id, created_at FROM file_sets_old
             ''')
             cur.execute('DROP TABLE file_sets_old')
+        # checksum (leftmost of the PK above) is already indexed via the PK itself,
+        # but set_id alone is not — every "which files are in set X" lookup
+        # (get_files_by_set, used once per set on /sets, /studios, and the
+        # set-similarity ranking helpers) filters by set_id alone and was doing a
+        # full table scan without this.
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_sets_set_id ON file_sets (set_id)')
         # A human-confirmed "this file does NOT belong in this set" — the
         # negative counterpart to file_sets, same (checksum, set_id) shape,
         # scoped per-set (unlike faces' single global `rejected` flag, since
@@ -155,6 +350,7 @@ class ManualDB(ThreadLocalDB):
                 PRIMARY KEY (checksum, set_id)
             )
         ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_set_exclusions_set_id ON file_set_exclusions (set_id)')
         # A human-confirmed "this person appears somewhere in this photo,"
         # independent of any specific detected face — no bbox, no embedding.
         # Exists for photos where face detection missed the person entirely
@@ -172,6 +368,7 @@ class ManualDB(ThreadLocalDB):
                 PRIMARY KEY (checksum, identity)
             )
         ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_photo_assignments_identity ON identity_photo_assignments (identity)')
         # A human-confirmed "this person appears in this set" — a single link, not
         # one row per member photo. Deliberately dynamic: which photos that implies
         # is resolved at read time from the set's current membership (see
@@ -187,6 +384,24 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_set_assignments_identity ON identity_set_assignments (identity)')
+        # "This person does NOT belong on this set's roster" — same reasoning as
+        # file_set_exclusions above, just for a person instead of a photo. Needed
+        # because a person can end up on a set's "People present" list without
+        # ever being explicitly linked (identity_set_assignments): a detected
+        # face, or a whole-photo assignment, on one of the set's own photos is
+        # enough (see get_people_present_in_set/get_all_people_for_sets). Without
+        # this table there'd be no way to remove such a person from the set's
+        # people list — unlink_identity_from_set only has a row to delete for the
+        # explicit-link source, so removal has to also suppress the other two.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS identity_set_exclusions (
+                set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+                identity TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (set_id, identity)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_identity_set_exclusions_identity ON identity_set_exclusions (identity)')
         # Alternate names for a set ("bts22" for "Behind The Scenes 2022") — same
         # shape/reasoning as identity_aliases below: a lookup convenience only,
         # never written onto the set's own name/studio columns, resolved back to
@@ -262,6 +477,7 @@ class ManualDB(ThreadLocalDB):
                 PRIMARY KEY (checksum, category_id)
             )
         ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_category_exclusions_category ON file_category_exclusions (category_id)')
         if old_overrides_exists:
             cur.execute('''
                 INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
@@ -299,14 +515,8 @@ class ManualDB(ThreadLocalDB):
         # self-consistency score comes out.
         if 'reviewed_ok' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN reviewed_ok INTEGER NOT NULL DEFAULT 0')
-        cur.execute('''
-            CREATE TABLE IF NOT EXISTS migration_state (
-                key TEXT PRIMARY KEY,
-                done_at INTEGER NOT NULL
-            )
-        ''')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_tags_checksum ON tags (checksum)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_tags_label ON tags (label)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_checksum ON file_tags (checksum)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags (tag_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_checksum ON faces (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_identity ON faces (identity)')
         cur.execute(
@@ -319,72 +529,114 @@ class ManualDB(ThreadLocalDB):
     # Tags
     # ------------------------------------------------------------------
 
+    def _find_or_create_tag(self, label):
+        """Exact-match find-or-create for a tag definition row by label (mirrors
+        _find_or_create_studio) — the write paths below always resolve/create a tag
+        this way rather than storing the label text directly on the instance row."""
+        cur = self.conn.cursor()
+        row = cur.execute('SELECT id FROM tags WHERE label = ?', (label,)).fetchone()
+        if row is not None:
+            return row[0]
+        cur.execute('INSERT INTO tags (label, created_at) VALUES (?, ?)', (label, int(time.time())))
+        return cur.lastrowid
+
     def add_tag(self, checksum, label, polarity='positive', frame_index=None):
         """Whole-image tag (no bbox). polarity='negative' records a human correction —
         e.g. YOLO detected "car" but there is no car — so it can be excluded from search
         and used to suppress that false-positive detection chip in the UI. frame_index
         set means this tag applies to that one frame of an animated file, not the file
         as a whole."""
+        tag_id = self._find_or_create_tag(label.strip())
         cur = self.conn.cursor()
         cur.execute(
-            'INSERT INTO tags (checksum, label, polarity, x1,y1,x2,y2, image_width,image_height, created_at, frame_index) '
+            'INSERT INTO file_tags (checksum, tag_id, polarity, x1,y1,x2,y2, image_width,image_height, created_at, frame_index) '
             'VALUES (?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,?,?)',
-            (checksum, label.strip(), polarity, int(time.time()), frame_index)
+            (checksum, tag_id, polarity, int(time.time()), frame_index)
         )
         self.conn.commit()
         return cur.lastrowid
 
-    def add_spatial_tag(self, checksum, label, x1, y1, x2, y2, image_width, image_height, frame_index=None):
+    def add_spatial_tag(self, checksum, label, x1, y1, x2, y2, image_width, image_height, frame_index=None, polarity='positive'):
         """A tag scoped to a region — a YOLO-style (image, bbox, label) training
         example. frame_index set means this region is on that specific frame of an
-        animated file."""
+        animated file. polarity='negative' marks this specific region as a
+        confirmed NON-example — e.g. a dog, boxed and labeled "monstera plant"
+        with polarity='negative', a hard negative for the CLIP tag classifier
+        (see clip_tag_classifier.py) — distinct from a whole-image negative
+        (add_tag's polarity='negative'), which says "this photo has no X"
+        rather than "this specific region here is definitely not X"."""
+        tag_id = self._find_or_create_tag(label.strip())
         cur = self.conn.cursor()
         cur.execute(
-            'INSERT INTO tags (checksum, label, polarity, x1,y1,x2,y2, image_width,image_height, created_at, frame_index) '
-            "VALUES (?,?,'positive',?,?,?,?,?,?,?,?)",
-            (checksum, label.strip(), x1, y1, x2, y2, image_width, image_height, int(time.time()), frame_index)
+            'INSERT INTO file_tags (checksum, tag_id, polarity, x1,y1,x2,y2, image_width,image_height, created_at, frame_index) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (checksum, tag_id, polarity, x1, y1, x2, y2, image_width, image_height, int(time.time()), frame_index)
         )
         self.conn.commit()
         return cur.lastrowid
 
     def remove_tag(self, tag_id):
+        """Deletes one tag *instance* row by its own id (the id param here is a
+        file_tags.id, i.e. one photo's tag, not the shared tags.id definition)."""
         cur = self.conn.cursor()
-        cur.execute('DELETE FROM tags WHERE id = ?', (tag_id,))
+        cur.execute('DELETE FROM file_tags WHERE id = ?', (tag_id,))
         self.conn.commit()
 
     def remove_tag_by_label(self, checksum, label, polarity):
         """Delete a single whole-file tag row by (checksum, label, polarity) rather
         than by numeric id — lets a caller (the tag-suggestion swipe stream's undo)
         reverse its own add_tag call without having to thread the row id it never
-        asked for back through a fetch response."""
+        asked for back through a fetch response. A label with no matching tag
+        definition at all has nothing to delete — no-op, not a create."""
         cur = self.conn.cursor()
+        row = cur.execute('SELECT id FROM tags WHERE label = ?', (label,)).fetchone()
+        if row is None:
+            return
         cur.execute(
-            'DELETE FROM tags WHERE checksum = ? AND label = ? AND polarity = ? AND x1 IS NULL',
-            (checksum, label, polarity)
+            'DELETE FROM file_tags WHERE checksum = ? AND tag_id = ? AND polarity = ? AND x1 IS NULL',
+            (checksum, row[0], polarity)
         )
         self.conn.commit()
 
     def update_tag_label(self, tag_id, new_label):
-        """Fix a typo in a tag's label in place, without a delete-and-re-add round trip."""
+        """Fix a typo on THIS ONE photo's tag instance (tag_id here is a file_tags.id) —
+        deliberately a per-instance move, not a global rename: resolves/creates the tag
+        definition for new_label and repoints just this one instance row to it, so
+        every other photo still carrying the old label is unaffected. See
+        rename_tag_label for the "rename everywhere" equivalent."""
+        new_tag_id = self._find_or_create_tag(new_label.strip())
         cur = self.conn.cursor()
-        cur.execute('UPDATE tags SET label = ? WHERE id = ?', (new_label.strip(), tag_id))
+        cur.execute('UPDATE file_tags SET tag_id = ? WHERE id = ?', (new_tag_id, tag_id))
         self.conn.commit()
 
     def set_tag_favorite(self, tag_id, favorite):
         cur = self.conn.cursor()
-        cur.execute('UPDATE tags SET favorite = ? WHERE id = ?', (1 if favorite else 0, tag_id))
+        cur.execute('UPDATE file_tags SET favorite = ? WHERE id = ?', (1 if favorite else 0, tag_id))
         self.conn.commit()
 
     def rename_tag_label(self, old_label, new_label):
-        """Renames a label everywhere it's used (every tag row with this label, any
-        photo, any polarity) — the label-level equivalent of rename_identity, so
-        fixing a typo doesn't require editing each photo's tag individually."""
+        """Renames a label everywhere it's used. If new_label already belongs to a
+        *different* tag, this is a real merge — every instance row pointing at the old
+        tag is repointed to the existing one and the now-empty old tag row is deleted
+        (tags.label is UNIQUE, so two rows can never share a label); otherwise it's a
+        plain single-row rename. Mirrors rename_studio exactly."""
+        new_label = new_label.strip()
         cur = self.conn.cursor()
-        cur.execute('UPDATE tags SET label = ? WHERE label = ?', (new_label.strip(), old_label))
+        old_row = cur.execute('SELECT id FROM tags WHERE label = ?', (old_label,)).fetchone()
+        if old_row is None:
+            return
+        old_id = old_row[0]
+        existing = cur.execute('SELECT id FROM tags WHERE label = ? AND id != ?', (new_label, old_id)).fetchone()
+        if existing is not None:
+            cur.execute('UPDATE file_tags SET tag_id = ? WHERE tag_id = ?', (existing[0], old_id))
+            cur.execute('DELETE FROM tags WHERE id = ?', (old_id,))
+        else:
+            cur.execute('UPDATE tags SET label = ? WHERE id = ?', (new_label, old_id))
         self.conn.commit()
 
     def delete_tag_label(self, label):
-        """Removes every tag row with this label, across every photo."""
+        """Removes the tag everywhere — every instance row cascades away via
+        file_tags.tag_id's ON DELETE CASCADE once the definition row is deleted."""
         cur = self.conn.cursor()
         cur.execute('DELETE FROM tags WHERE label = ?', (label,))
         self.conn.commit()
@@ -392,7 +644,7 @@ class ManualDB(ThreadLocalDB):
     def get_tags(self, checksum):
         """Return full tag rows (id, label, polarity, x1..y2, image_width, image_height) for a file."""
         cur = self.conn.cursor()
-        cur.execute('SELECT * FROM tags WHERE checksum = ? ORDER BY id', (checksum,))
+        cur.execute('SELECT * FROM file_tags_with_label WHERE checksum = ? ORDER BY id', (checksum,))
         return cur.fetchall()
 
     def get_whole_image_tag_labels(self, checksum):
@@ -401,7 +653,7 @@ class ManualDB(ThreadLocalDB):
         not "this file has X". Frame-scoped tags don't show up in this default list."""
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT label FROM tags WHERE checksum = ? AND x1 IS NULL AND frame_index IS NULL "
+            "SELECT label FROM file_tags_with_label WHERE checksum = ? AND x1 IS NULL AND frame_index IS NULL "
             "AND polarity = 'positive' ORDER BY label",
             (checksum,)
         )
@@ -412,7 +664,7 @@ class ManualDB(ThreadLocalDB):
         matching auto-detected class from showing up as a "Detected objects" chip."""
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT DISTINCT label FROM tags WHERE checksum = ? AND polarity = 'negative'",
+            "SELECT DISTINCT label FROM file_tags_with_label WHERE checksum = ? AND polarity = 'negative'",
             (checksum,)
         )
         return {row[0] for row in cur.fetchall()}
@@ -422,7 +674,7 @@ class ManualDB(ThreadLocalDB):
         Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT DISTINCT checksum FROM tags WHERE label = ? AND polarity = 'positive' ORDER BY checksum LIMIT ?",
+            "SELECT DISTINCT checksum FROM file_tags_with_label WHERE label = ? AND polarity = 'positive' ORDER BY checksum LIMIT ?",
             (label, limit)
         )
         return [row[0] for row in cur.fetchall()]
@@ -431,32 +683,83 @@ class ManualDB(ThreadLocalDB):
         """Checksums with ANY tag row for this label — positive (already tagged) or
         negative (explicitly rejected) — must never be re-suggested for this label."""
         cur = self.conn.cursor()
-        cur.execute('SELECT DISTINCT checksum FROM tags WHERE label = ?', (label,))
+        cur.execute('SELECT DISTINCT checksum FROM file_tags_with_label WHERE label = ?', (label,))
         return {row[0] for row in cur.fetchall()}
+
+    def get_whole_image_tag_polarities(self, label):
+        """{checksum: polarity} for every whole-image (x1 IS NULL AND frame_index
+        IS NULL) row of this label — the CLIP tag-classifier's training source:
+        'positive' rows are this tag's confirmed examples, 'negative' rows are
+        confirmed non-examples (a human explicitly rejected a detection), giving
+        the classifier real negatives to learn from rather than just guessing
+        from unlabeled photos."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT checksum, polarity FROM file_tags_with_label "
+            "WHERE label = ? AND x1 IS NULL AND frame_index IS NULL",
+            (label,)
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_spatial_tags_for_label(self, label):
+        """[(checksum, x1, y1, x2, y2, image_width, image_height), ...] for this
+        label's positive-polarity bbox rows (see add_spatial_tag) — the YOLO
+        tag-classifier's training source, already in the same (image, box, label)
+        shape a YOLO dataset needs. YOLO has no explicit "negative box" concept
+        (an unboxed region in a training image is already an implicit negative),
+        so negative-polarity regions are deliberately excluded here — see
+        get_all_spatial_tags_for_label for the CLIP classifier's version, which
+        needs both polarities as explicit hard-negative crops."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT checksum, x1, y1, x2, y2, image_width, image_height FROM file_tags_with_label "
+            "WHERE label = ? AND x1 IS NOT NULL AND polarity = 'positive'",
+            (label,)
+        )
+        return cur.fetchall()
+
+    def get_all_spatial_tags_for_label(self, label):
+        """[(checksum, x1, y1, x2, y2, image_width, image_height, polarity), ...]
+        for this label's bbox rows of EITHER polarity — the CLIP tag
+        classifier's region-level training source (see
+        clip_tag_classifier.py): a positive region crop is "this specific area
+        is X", a negative region crop is a hard negative — e.g. a dog boxed
+        and labeled "monstera plant" with polarity='negative' — a much more
+        precise training signal than a whole-image polarity when the same
+        photo has both the target and a look-alike in it."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT checksum, x1, y1, x2, y2, image_width, image_height, polarity FROM file_tags_with_label "
+            "WHERE label = ? AND x1 IS NOT NULL",
+            (label,)
+        )
+        return cur.fetchall()
 
     def list_all_tags(self):
         """Return [(label, count), ...] for positive tags only, ordered by count descending."""
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT label, COUNT(*) as cnt FROM tags WHERE polarity = 'positive' GROUP BY label ORDER BY cnt DESC"
+            "SELECT label, COUNT(*) as cnt FROM file_tags_with_label WHERE polarity = 'positive' GROUP BY label ORDER BY cnt DESC"
         )
         return cur.fetchall()
 
     def list_tags_for_checksums(self, checksums):
         """Batched positive whole-file (non-frame-scoped) tag lookup:
-        {checksum: [label, ...]}. Avoids N+1 queries on list pages."""
+        {checksum: [label, ...]}. Avoids N+1 queries on list pages. Chunked (see
+        _chunked) since callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f"SELECT checksum, label FROM tags WHERE x1 IS NULL AND frame_index IS NULL AND polarity = 'positive' "
-            f'AND checksum IN ({placeholders}) ORDER BY label',
-            tuple(checksums)
-        )
         result = {}
-        for checksum, label in cur.fetchall():
-            result.setdefault(checksum, []).append(label)
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f"SELECT checksum, label FROM file_tags_with_label WHERE x1 IS NULL AND frame_index IS NULL AND polarity = 'positive' "
+                f'AND checksum IN ({placeholders}) ORDER BY label',
+                tuple(chunk)
+            )
+            for checksum, label in cur.fetchall():
+                result.setdefault(checksum, []).append(label)
         return result
 
     def get_all_positive_labels(self):
@@ -464,7 +767,7 @@ class ManualDB(ThreadLocalDB):
         vocabulary with every object a human has confirmed, so it starts looking for
         things it wasn't originally told about."""
         cur = self.conn.cursor()
-        cur.execute("SELECT DISTINCT label FROM tags WHERE polarity = 'positive' ORDER BY label")
+        cur.execute("SELECT DISTINCT label FROM file_tags_with_label WHERE polarity = 'positive' ORDER BY label")
         return [row[0] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
@@ -483,21 +786,32 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
 
     def get_favorite_checksums(self, checksums):
-        """Batched lookup: subset of `checksums` that are favorited."""
+        """Batched lookup: subset of `checksums` that are favorited. Chunked (see
+        _chunked) since callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return set()
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'SELECT checksum FROM file_favorites WHERE checksum IN ({placeholders})',
-            tuple(checksums)
-        )
-        return {row[0] for row in cur.fetchall()}
+        result = set()
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'SELECT checksum FROM file_favorites WHERE checksum IN ({placeholders})',
+                tuple(chunk)
+            )
+            result.update(row[0] for row in cur.fetchall())
+        return result
 
     def is_file_favorite(self, checksum):
         cur = self.conn.cursor()
         cur.execute('SELECT 1 FROM file_favorites WHERE checksum = ?', (checksum,))
         return cur.fetchone() is not None
+
+    def get_random_favorite_checksums(self, limit=6):
+        """Random sample of favorited whole-photo checksums, bounded by `limit`
+        regardless of how many photos are favorited — homepage Favorites teaser."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_favorites ORDER BY RANDOM() LIMIT ?', (limit,))
+        return [row[0] for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # File titles
@@ -525,16 +839,20 @@ class ManualDB(ThreadLocalDB):
 
     def get_titles_for_checksums(self, checksums):
         """Batched lookup: {checksum: title} for whichever of `checksums` have one —
-        avoids N+1 queries on list pages (mirrors list_tags_for_checksums)."""
+        avoids N+1 queries on list pages (mirrors list_tags_for_checksums). Chunked
+        (see _chunked) since callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'SELECT checksum, title FROM file_titles WHERE checksum IN ({placeholders})',
-            tuple(checksums)
-        )
-        return {row[0]: row[1] for row in cur.fetchall()}
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'SELECT checksum, title FROM file_titles WHERE checksum IN ({placeholders})',
+                tuple(chunk)
+            )
+            result.update(cur.fetchall())
+        return result
 
     # ------------------------------------------------------------------
     # Age/gender estimates (experimental — see age_estimator.py)
@@ -573,6 +891,32 @@ class ManualDB(ThreadLocalDB):
         )
         return cur.fetchone()
 
+    def get_ages_for_face_refs(self, face_refs):
+        """Batched {face_ref: {'age': float, 'gender': str}} for a specific set of
+        face refs — each ref's own most-recently-run estimate (mirrors
+        get_age_estimate_for_face_ref's single-ref shape, batched). Unlike
+        get_ages_for_identities_by_checksum (one value per (checksum, identity),
+        averaged across however many of that identity's faces are on that photo),
+        this resolves each INDIVIDUAL face instance's own age independently — needed
+        when the same identity has more than one face on one photo (e.g. a
+        before/after collage) and each occurrence must keep its own real estimate
+        rather than being blended with the other's."""
+        if not face_refs:
+            return {}
+        result = {}
+        cur = self.conn.cursor()
+        for chunk in self._chunked(list(face_refs)):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'''
+                SELECT face_ref, age, gender FROM face_age_estimates
+                WHERE face_ref IN ({placeholders})
+                ORDER BY created_at DESC
+            ''', tuple(chunk))
+            for face_ref, age, gender in cur.fetchall():
+                if face_ref not in result:
+                    result[face_ref] = {'age': age, 'gender': gender}
+        return result
+
     def get_ages_for_identities(self, identities):
         """Best-effort {identity: {'age': float, 'gender': str}} for every identity in
         `identities` that has an age/gender estimate on at least one of their faces
@@ -599,25 +943,145 @@ class ManualDB(ThreadLocalDB):
                 result[identity] = {'age': age, 'gender': gender}
         return result
 
+    def get_average_ages_for_identities_in_sets(self, set_ids):
+        """{(set_id, identity): {'age': float, 'gender': str}} averaged across only
+        each set's own member photos (file_sets), not the identity's whole
+        library — this is what a set's own roster (set_meta_line) should show,
+        since "18" from some unrelated photo of the same person is meaningless
+        context for this set. Gender is the most common non-null value across
+        those faces (age estimates can drift photo to photo, but gender
+        shouldn't); ties keep whichever SQLite happens to return first. Unlike
+        get_ages_for_identities, this deliberately does NOT fall back to a
+        global estimate when an identity has none within a given set — a
+        missing key means "no estimate for this person within this set yet",
+        not "no estimate anywhere". Batched across every set_id in one query
+        (mirrors _attach_set_people's existing batching over multiple sets).
+
+        Gender's "most common value" is resolved in Python from one flat
+        query, not a correlated subquery re-scanning faces/face_age_estimates
+        once per (set, identity) row — that pattern is O(rows × faces-per-set)
+        and got slow as either grew; this is a single O(rows) pass."""
+        if not set_ids:
+            return {}
+        placeholders = ','.join('?' for _ in set_ids)
+        cur = self.conn.cursor()
+        cur.execute(f'''
+            SELECT fs.set_id, f.identity, fae.age, fae.gender
+            FROM faces f
+            JOIN face_age_estimates fae ON fae.face_ref = 'manual:' || f.id
+            JOIN file_sets fs ON fs.checksum = f.checksum
+            WHERE fs.set_id IN ({placeholders}) AND f.identity IS NOT NULL
+                  AND f.rejected = 0 AND fae.age IS NOT NULL
+        ''', tuple(set_ids))
+        ages = {}      # (set_id, identity) -> [age, ...]
+        genders = {}   # (set_id, identity) -> Counter(gender -> count)
+        for set_id, identity, age, gender in cur.fetchall():
+            key = (set_id, identity)
+            ages.setdefault(key, []).append(age)
+            if gender is not None:
+                genders.setdefault(key, Counter())[gender] += 1
+        return {
+            key: {
+                'age': sum(age_list) / len(age_list),
+                'gender': genders[key].most_common(1)[0][0] if key in genders else None,
+            }
+            for key, age_list in ages.items()
+        }
+
+    def get_ages_for_identities_by_checksum(self, checksums):
+        """{checksum: {identity: {'age': float, 'gender': str}}} — this specific
+        photo's own estimate for each identity recognized in it, averaged across
+        only that identity's face(s) on that one checksum (usually just one, but
+        a person occasionally appears twice in a group photo). This is the
+        per-photo counterpart to get_average_ages_for_identities_in_set: a photo
+        card's "who's in this photo" chip should show what get_age_estimates_for_checksum
+        would show if you clicked into that exact photo, not some other estimate
+        of the same person from a different photo. Chunked (see _chunked) since
+        callers can hand this an unbounded, library-wide list."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'''
+                SELECT f.checksum, f.identity, AVG(fae.age),
+                       (SELECT gender FROM face_age_estimates fae2
+                        JOIN faces f2 ON fae2.face_ref = 'manual:' || f2.id
+                        WHERE f2.checksum = f.checksum AND f2.identity = f.identity
+                              AND fae2.gender IS NOT NULL
+                        GROUP BY fae2.gender ORDER BY COUNT(*) DESC LIMIT 1)
+                FROM faces f
+                JOIN face_age_estimates fae ON fae.face_ref = 'manual:' || f.id
+                WHERE f.checksum IN ({placeholders}) AND f.identity IS NOT NULL
+                      AND f.rejected = 0 AND fae.age IS NOT NULL
+                GROUP BY f.checksum, f.identity
+            ''', tuple(chunk))
+            for checksum, identity, age, gender in cur.fetchall():
+                result.setdefault(checksum, {})[identity] = {'age': age, 'gender': gender}
+        return result
+
+    def get_estimated_checksums(self, checksums):
+        """Batched lookup: subset of `checksums` that already have at least one
+        face_age_estimates row (regardless of whether age/gender actually resolved —
+        a face_ref with a row here has already been run through the model). Mirrors
+        get_favorite_checksums's exact shape. Lets "estimate all" on a person page
+        skip photos already done on a previous run instead of redoing them —
+        deliberately not get_average_ages_for_checksums, which filters out NULL ages
+        and would wrongly re-queue a photo whose face(s) failed to yield an age.
+        Chunked (see _chunked) since callers can hand this an unbounded, library-wide
+        list."""
+        if not checksums:
+            return set()
+        cur = self.conn.cursor()
+        result = set()
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'SELECT DISTINCT checksum FROM face_age_estimates WHERE checksum IN ({placeholders})',
+                tuple(chunk)
+            )
+            result.update(row[0] for row in cur.fetchall())
+        return result
+
     def get_average_ages_for_checksums(self, checksums):
         """Batched lookup: {checksum: average age} across every face with an estimate
         on that photo — feeds "sort by age" on gallery-style views. A photo with no
-        estimate at all is simply absent from the result (not 0)."""
+        estimate at all is simply absent from the result (not 0). Chunked (see
+        _chunked) since callers can hand this an unbounded, library-wide list —
+        this is exactly the gallery's `sort=age` path, which enriches the whole
+        library before slicing to a page."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'''SELECT checksum, AVG(age) FROM face_age_estimates
-                WHERE checksum IN ({placeholders}) AND age IS NOT NULL
-                GROUP BY checksum''',
-            tuple(checksums)
-        )
-        return {row[0]: row[1] for row in cur.fetchall()}
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'''SELECT checksum, AVG(age) FROM face_age_estimates
+                    WHERE checksum IN ({placeholders}) AND age IS NOT NULL
+                    GROUP BY checksum''',
+                tuple(chunk)
+            )
+            result.update(cur.fetchall())
+        return result
 
     # ------------------------------------------------------------------
     # Sets
     # ------------------------------------------------------------------
+
+    def _find_or_create_studio(self, name):
+        """Exact-match find-or-create for a studio row by name. Deliberately not
+        case-insensitive — the "did you mean the existing studio 'Acme'?" prompt
+        for a near-miss spelling lives entirely in find_studio_variant, called by
+        web.py *before* create_set/rename_set ever get a confirmed name; this just
+        resolves or creates whatever exact string it's given."""
+        cur = self.conn.cursor()
+        row = cur.execute('SELECT id FROM studios WHERE name = ?', (name,)).fetchone()
+        if row is not None:
+            return row[0]
+        cur.execute('INSERT INTO studios (name, created_at) VALUES (?, ?)', (name, int(time.time())))
+        return cur.lastrowid
 
     def create_set(self, name, studio=None):
         """Idempotent: returns the existing set's id if (name, studio) already
@@ -631,10 +1095,11 @@ class ManualDB(ThreadLocalDB):
         existing = self.find_set(name, studio)
         if existing is not None:
             return existing['id']
+        studio_id = self._find_or_create_studio(studio) if studio else None
         cur = self.conn.cursor()
         cur.execute(
-            'INSERT INTO sets (name, studio, created_at) VALUES (?, ?, ?)',
-            (name, studio, int(time.time()))
+            'INSERT INTO sets (name, studio_id, created_at) VALUES (?, ?, ?)',
+            (name, studio_id, int(time.time()))
         )
         self.conn.commit()
         return cur.lastrowid
@@ -642,14 +1107,14 @@ class ManualDB(ThreadLocalDB):
     def find_set(self, name, studio=None):
         cur = self.conn.cursor()
         cur.execute(
-            'SELECT * FROM sets WHERE name = ? AND studio IS ?',
+            'SELECT * FROM sets_with_studio WHERE name = ? AND studio IS ?',
             (name, studio)
         )
         return cur.fetchone()
 
     def get_set(self, set_id):
         cur = self.conn.cursor()
-        cur.execute('SELECT * FROM sets WHERE id = ?', (set_id,))
+        cur.execute('SELECT * FROM sets_with_studio WHERE id = ?', (set_id,))
         return cur.fetchone()
 
     def list_sets(self, favorite_only=False, studio=None):
@@ -664,7 +1129,7 @@ class ManualDB(ThreadLocalDB):
         where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
         cur.execute(f'''
             SELECT s.id, s.name, s.studio, s.created_at, s.favorite, COUNT(fs.checksum) as image_count
-            FROM sets s
+            FROM sets_with_studio s
             LEFT JOIN file_sets fs ON fs.set_id = s.id
             {where}
             GROUP BY s.id
@@ -672,25 +1137,55 @@ class ManualDB(ThreadLocalDB):
         ''', tuple(params))
         return cur.fetchall()
 
+    def count_sets(self):
+        """Cheap set count, avoiding list_sets()'s LEFT JOIN/image_count aggregation
+        — used by the homepage stats section, which runs on every page load."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM sets')
+        return cur.fetchone()[0]
+
     def list_studios(self):
-        """Distinct studios across all sets, with set count and total image count —
-        feeds the Studios wall page."""
+        """Every studio with at least one set, with set count and total image count
+        — feeds the Studios wall page. Real join against the studios table now,
+        not a GROUP BY over a free-text sets.studio column."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT s.studio as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
-            FROM sets s
+            SELECT st.name as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
+            FROM studios st
+            JOIN sets s ON s.studio_id = st.id
             LEFT JOIN file_sets fs ON fs.set_id = s.id
-            WHERE s.studio IS NOT NULL AND s.studio != ''
-            GROUP BY s.studio
-            ORDER BY s.studio
+            GROUP BY st.id
+            ORDER BY st.name
         ''')
         return cur.fetchall()
 
+    def rename_studio(self, old_name, new_name):
+        """Renames a studio everywhere it's used. If new_name already belongs to a
+        *different* studio, this is a real merge — every set pointing at the old
+        studio is repointed to the existing one and the now-empty old studio row
+        is deleted (studios.name is UNIQUE, so two rows can never share a name);
+        otherwise it's a plain single-row rename."""
+        new_name = new_name.strip()
+        cur = self.conn.cursor()
+        old_row = cur.execute('SELECT id FROM studios WHERE name = ?', (old_name,)).fetchone()
+        if old_row is None:
+            return
+        old_id = old_row[0]
+        existing = cur.execute('SELECT id FROM studios WHERE name = ? AND id != ?', (new_name, old_id)).fetchone()
+        if existing is not None:
+            cur.execute('UPDATE sets SET studio_id = ? WHERE studio_id = ?', (existing[0], old_id))
+            cur.execute('DELETE FROM studios WHERE id = ?', (old_id,))
+        else:
+            cur.execute('UPDATE studios SET name = ? WHERE id = ?', (new_name, old_id))
+        self.conn.commit()
+
     def rename_set(self, set_id, name, studio=None):
+        studio = studio.strip() if studio else None
+        studio_id = self._find_or_create_studio(studio) if studio else None
         cur = self.conn.cursor()
         cur.execute(
-            'UPDATE sets SET name = ?, studio = ? WHERE id = ?',
-            (name.strip(), studio.strip() if studio else None, set_id)
+            'UPDATE sets SET name = ?, studio_id = ? WHERE id = ?',
+            (name.strip(), studio_id, set_id)
         )
         self.conn.commit()
 
@@ -701,7 +1196,7 @@ class ManualDB(ThreadLocalDB):
         purposes, and studio is NULL on most sets), so this is what backs the
         rename-time "a set with this name already exists, merge them?" prompt."""
         cur = self.conn.cursor()
-        query = 'SELECT * FROM sets WHERE LOWER(name) = LOWER(?)'
+        query = 'SELECT * FROM sets_with_studio WHERE LOWER(name) = LOWER(?)'
         params = [name]
         if exclude_id is not None:
             query += ' AND id != ?'
@@ -713,24 +1208,24 @@ class ManualDB(ThreadLocalDB):
         """If a studio already exists elsewhere under a different exact
         spelling (case-insensitive match, different exact string — e.g. typed
         "acme" when sets already use "Acme"), return its existing spelling +
-        how many sets/images use it. Studios have no separate table/id (just
-        a free-text column on `sets`), so there's nothing to "merge" in the
-        database sense — this only backs a prompt offering to reuse the
+        how many sets/images use it — backs a prompt offering to reuse the
         existing spelling instead of fragmenting the same studio across two
-        differently-cased entries on /studios."""
+        differently-cased studios rows."""
         if not studio:
             return None
         cur = self.conn.cursor()
         query = '''
-            SELECT s.studio as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
-            FROM sets s LEFT JOIN file_sets fs ON fs.set_id = s.id
-            WHERE LOWER(s.studio) = LOWER(?) AND s.studio != ?
+            SELECT st.name as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
+            FROM studios st
+            JOIN sets s ON s.studio_id = st.id
+            LEFT JOIN file_sets fs ON fs.set_id = s.id
+            WHERE LOWER(st.name) = LOWER(?) AND st.name != ?
         '''
         params = [studio, studio]
         if exclude_set_id is not None:
             query += ' AND s.id != ?'
             params.append(exclude_set_id)
-        query += ' GROUP BY s.studio'
+        query += ' GROUP BY st.id'
         cur.execute(query, params)
         return cur.fetchone()
 
@@ -889,7 +1384,7 @@ class ManualDB(ThreadLocalDB):
         """Every set this file belongs to (a file can be in more than one)."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT s.* FROM sets s JOIN file_sets fs ON fs.set_id = s.id
+            SELECT s.* FROM sets_with_studio s JOIN file_sets fs ON fs.set_id = s.id
             WHERE fs.checksum = ? ORDER BY s.name
         ''', (checksum,))
         return cur.fetchall()
@@ -911,20 +1406,22 @@ class ManualDB(ThreadLocalDB):
 
     def get_sets_for_checksums(self, checksums):
         """Batched lookup: {checksum: [{'id', 'name', 'studio'}, ...]} — avoids N+1
-        queries on list pages (mirrors list_tags_for_checksums)."""
+        queries on list pages (mirrors list_tags_for_checksums). Chunked (see
+        _chunked) since callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'''SELECT fs.checksum, s.id, s.name, s.studio
-                FROM file_sets fs JOIN sets s ON s.id = fs.set_id
-                WHERE fs.checksum IN ({placeholders}) ORDER BY s.name''',
-            tuple(checksums)
-        )
         result = {}
-        for checksum, set_id, name, studio in cur.fetchall():
-            result.setdefault(checksum, []).append({'id': set_id, 'name': name, 'studio': studio})
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'''SELECT fs.checksum, s.id, s.name, s.studio
+                    FROM file_sets fs JOIN sets_with_studio s ON s.id = fs.set_id
+                    WHERE fs.checksum IN ({placeholders}) ORDER BY s.name''',
+                tuple(chunk)
+            )
+            for checksum, set_id, name, studio in cur.fetchall():
+                result.setdefault(checksum, []).append({'id': set_id, 'name': name, 'studio': studio})
         return result
 
     # ------------------------------------------------------------------
@@ -1024,19 +1521,21 @@ class ManualDB(ThreadLocalDB):
 
     def get_categories_for_checksums(self, checksums):
         """Batched lookup: {checksum: [{'id','name'}, ...]} — avoids N+1 queries on
-        list pages (mirrors get_sets_for_checksums)."""
+        list pages (mirrors get_sets_for_checksums). Chunked (see _chunked) since
+        callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(f'''
-            SELECT fc.checksum, c.id, c.name
-            FROM file_categories fc JOIN categories c ON c.id = fc.category_id
-            WHERE fc.checksum IN ({placeholders}) ORDER BY c.name
-        ''', tuple(checksums))
         result = {}
-        for checksum, cat_id, name in cur.fetchall():
-            result.setdefault(checksum, []).append({'id': cat_id, 'name': name})
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'''
+                SELECT fc.checksum, c.id, c.name
+                FROM file_categories fc JOIN categories c ON c.id = fc.category_id
+                WHERE fc.checksum IN ({placeholders}) ORDER BY c.name
+            ''', tuple(chunk))
+            for checksum, cat_id, name in cur.fetchall():
+                result.setdefault(checksum, []).append({'id': cat_id, 'name': name})
         return result
 
     def exclude_file_from_category(self, checksum, category_id):
@@ -1069,18 +1568,20 @@ class ManualDB(ThreadLocalDB):
         """Batched lookup: {checksum: {category_id, ...}} — which categories each
         of `checksums` has been rejected for, used by the resolver to suppress
         just those specific auto-matches (mirrors get_categories_for_checksums'
-        batching shape)."""
+        batching shape). Chunked (see _chunked) since callers can hand this an
+        unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'SELECT checksum, category_id FROM file_category_exclusions WHERE checksum IN ({placeholders})',
-            tuple(checksums)
-        )
         result = {}
-        for checksum, category_id in cur.fetchall():
-            result.setdefault(checksum, set()).add(category_id)
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'SELECT checksum, category_id FROM file_category_exclusions WHERE checksum IN ({placeholders})',
+                tuple(chunk)
+            )
+            for checksum, category_id in cur.fetchall():
+                result.setdefault(checksum, set()).add(category_id)
         return result
 
     def get_example_checksums_for_category(self, category_id, limit=1000):
@@ -1092,6 +1593,28 @@ class ManualDB(ThreadLocalDB):
             (category_id, limit)
         )
         return [row[0] for row in cur.fetchall()]
+
+    def get_all_category_checksums(self):
+        """{category_id: set(checksum), ...} for every manual category assignment,
+        one query total — avoids the one-query-per-category loop get_category_counts
+        and the search palette's _category_checksums_by_name used to do (mirrors
+        _set_checksums_by_id/_tag_checksums_by_label's batching idiom in web.py)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT category_id, checksum FROM file_categories')
+        result = {}
+        for category_id, checksum in cur.fetchall():
+            result.setdefault(category_id, set()).add(checksum)
+        return result
+
+    def get_all_category_exclusions(self):
+        """{category_id: set(checksum), ...} for every category exclusion, one
+        query total — same batching reasoning as get_all_category_checksums."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT category_id, checksum FROM file_category_exclusions')
+        result = {}
+        for category_id, checksum in cur.fetchall():
+            result.setdefault(category_id, set()).add(checksum)
+        return result
 
     # ------------------------------------------------------------------
     # Faces
@@ -1289,20 +1812,22 @@ class ManualDB(ThreadLocalDB):
     def get_identities_for_checksums(self, checksums):
         """Batched lookup: {checksum: [name, ...]} of *named* faces only (unknown/
         unidentified faces are deliberately excluded) — feeds card-level "who's in
-        this photo" chips without an N+1 query per file."""
+        this photo" chips without an N+1 query per file. Chunked (see _chunked)
+        since callers can hand this an unbounded, library-wide list."""
         if not checksums:
             return {}
-        placeholders = ','.join('?' for _ in checksums)
         cur = self.conn.cursor()
-        cur.execute(
-            f'''SELECT DISTINCT checksum, identity FROM faces
-                WHERE checksum IN ({placeholders}) AND identity IS NOT NULL AND rejected = 0
-                ORDER BY identity''',
-            tuple(checksums)
-        )
         result = {}
-        for checksum, identity in cur.fetchall():
-            result.setdefault(checksum, []).append(identity)
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'''SELECT DISTINCT checksum, identity FROM faces
+                    WHERE checksum IN ({placeholders}) AND identity IS NOT NULL AND rejected = 0
+                    ORDER BY identity''',
+                tuple(chunk)
+            )
+            for checksum, identity in cur.fetchall():
+                result.setdefault(checksum, []).append(identity)
         return result
 
     def get_all_checksums_with_named_face(self):
@@ -1356,38 +1881,6 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT id, checksum, identity, embedding FROM faces WHERE rejected = 0')
         return cur.fetchall()
 
-    def list_confirmed_faces(self, offset=0, limit=20):
-        """(id, checksum, identity) for every identity-assigned, non-rejected face,
-        deduplicated to one row per (checksum, identity) pair, newest first,
-        plus the total count of unique pairs — backs /api/faces/confirmed's
-        paginated grid on the redesigned /faces main view.
-
-        The same person can end up confirmed more than once for the exact
-        same photo (e.g. re-running `media faces` creates a fresh
-        auto-detection row for the same physical face — a new id, unrelated
-        to any earlier promoted row — which the swipe stream then offers up
-        and gets independently confirmed again), and the grid should show one
-        card per person-in-this-photo, not one per underlying database row.
-        GROUP BY collapses those; MAX(id) picks the most-recently-confirmed
-        row as the representative — SQLite guarantees the other selected
-        columns (checksum, identity here) come from that same max-id row when
-        paired with MAX() like this."""
-        cur = self.conn.cursor()
-        cur.execute('''
-            SELECT COUNT(*) FROM (
-                SELECT 1 FROM faces WHERE identity IS NOT NULL AND rejected = 0
-                GROUP BY checksum, identity
-            )
-        ''')
-        total = cur.fetchone()[0]
-        cur.execute('''
-            SELECT MAX(id) AS id, checksum, identity FROM faces
-            WHERE identity IS NOT NULL AND rejected = 0
-            GROUP BY checksum, identity
-            ORDER BY id DESC LIMIT ? OFFSET ?
-        ''', (limit, offset))
-        return cur.fetchall(), total
-
     def get_confirmed_faces_for_cleanup(self):
         """Return [(id, checksum, identity, embedding_bytes, reviewed_ok), ...],
         deduplicated to one row per (checksum, identity) pair (see
@@ -1439,6 +1932,16 @@ class ManualDB(ThreadLocalDB):
         cur.execute("SELECT embedding FROM faces WHERE identity = ? AND rejected = 0", (name,))
         return [row[0] for row in cur.fetchall()]
 
+    def get_faces_for_identity(self, name):
+        """[(face_id, checksum, embedding_bytes), ...] for every real face row
+        currently assigned to this identity — the candidate pool for the
+        "Split" review (see get_embeddings_for_identity, same WHERE clause,
+        plus id/checksum since split needs to reassign each specific face, not
+        just compare embeddings)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, checksum, embedding FROM faces WHERE identity = ? AND rejected = 0", (name,))
+        return cur.fetchall()
+
     def get_all_identities(self):
         """Return [(identity, count), ...] ordered by count descending."""
         cur = self.conn.cursor()
@@ -1449,6 +1952,40 @@ class ManualDB(ThreadLocalDB):
             ORDER BY cnt DESC
         ''')
         return cur.fetchall()
+
+    def get_identity_summary(self):
+        """One row per unique identity — (identity, count, last_modified, ref,
+        checksum) — for the single unique-faces grid on /faces. count and
+        last_modified (a unix timestamp) are computed over every non-rejected
+        confirmed face for that identity; last_modified is the created_at of
+        the most recently confirmed one, used as a "last modified" proxy since
+        faces has no updated_at column. The representative thumbnail is that
+        same most-recent row (MAX(id)), so the grid shows the newest-confirmed
+        face rather than an arbitrary one."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT identity, COUNT(*) as cnt, MAX(created_at) as last_modified, MAX(id) as rep_id
+            FROM faces
+            WHERE identity IS NOT NULL AND rejected = 0
+            GROUP BY identity
+        ''')
+        rows = cur.fetchall()
+        if not rows:
+            return []
+        rep_ids = [row['rep_id'] for row in rows]
+        placeholders = ','.join('?' for _ in rep_ids)
+        cur.execute(f'SELECT id, checksum FROM faces WHERE id IN ({placeholders})', rep_ids)
+        checksum_by_id = {r['id']: r['checksum'] for r in cur.fetchall()}
+        return [
+            {
+                'identity': row['identity'],
+                'count': row['cnt'],
+                'last_modified': row['last_modified'],
+                'ref': f"manual:{row['rep_id']}",
+                'checksum': checksum_by_id.get(row['rep_id']),
+            }
+            for row in rows
+        ]
 
     def get_representative_face_ids(self):
         """{identity: earliest non-rejected manual.db face id} for every named
@@ -1469,6 +2006,20 @@ class ManualDB(ThreadLocalDB):
         cur.execute(
             "SELECT DISTINCT checksum FROM faces WHERE LOWER(identity) LIKE LOWER(?) AND rejected = 0 LIMIT ?",
             (f'%{name}%', limit)
+        )
+        return [row[0] for row in cur.fetchall()]
+
+    def get_files_by_face_identity_exact(self, name, limit=1000):
+        """Exact-match sibling of get_files_by_face_identity — identity names on
+        faces are always assigned verbatim (never free-typed), so callers that
+        already have a canonical name in hand (e.g. /person/{name}) don't need
+        substring matching, and exact match lets this use idx_manual_faces_identity
+        instead of forcing a full table scan the way LOWER(identity) LIKE '%...%'
+        does (see _identity_checksums_by_name in web.py for prior art on this)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT checksum FROM faces WHERE identity = ? AND rejected = 0 LIMIT ?",
+            (name, limit)
         )
         return [row[0] for row in cur.fetchall()]
 
@@ -1522,12 +2073,19 @@ class ManualDB(ThreadLocalDB):
         """'This person appears in this set' — one row, not one per member photo.
         Which photos that implies is resolved dynamically by callers (join against
         the set's current membership at read time), so a photo added to this set
-        later is automatically "theirs" too, with nothing further to write here."""
+        later is automatically "theirs" too, with nothing further to write here.
+        Also clears any prior exclusion for this (set, identity) pair — explicitly
+        re-adding someone should undo a previous removal, not silently no-op
+        against it (see exclude_identity_from_set)."""
         cur = self.conn.cursor()
         cur.execute('''
             INSERT OR IGNORE INTO identity_set_assignments (set_id, identity, created_at)
             VALUES (?, ?, ?)
         ''', (set_id, identity, int(time.time())))
+        cur.execute(
+            'DELETE FROM identity_set_exclusions WHERE set_id = ? AND identity = ?',
+            (set_id, identity)
+        )
         self.conn.commit()
 
     def unlink_identity_from_set(self, set_id, identity):
@@ -1538,6 +2096,23 @@ class ManualDB(ThreadLocalDB):
         )
         self.conn.commit()
 
+    def exclude_identity_from_set(self, set_id, identity):
+        """'This person does NOT belong on this set's roster' — see
+        identity_set_exclusions' schema comment. Also removes any explicit link
+        row, so this is the one call the "×" on a set's People-present entry
+        needs regardless of which of the three sources (link, whole-photo
+        assignment, or detected face) put that person there."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'DELETE FROM identity_set_assignments WHERE set_id = ? AND identity = ?',
+            (set_id, identity)
+        )
+        cur.execute('''
+            INSERT OR IGNORE INTO identity_set_exclusions (set_id, identity, created_at)
+            VALUES (?, ?, ?)
+        ''', (set_id, identity, int(time.time())))
+        self.conn.commit()
+
     def get_sets_linked_to_identity(self, identity):
         """Every set this identity has been linked to (see link_identity_to_set),
         as full set rows — callers resolve "files for this person" by expanding
@@ -1545,7 +2120,7 @@ class ManualDB(ThreadLocalDB):
         set picker UI."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT s.* FROM sets s
+            SELECT s.* FROM sets_with_studio s
             JOIN identity_set_assignments isa ON isa.set_id = s.id
             WHERE isa.identity = ?
             ORDER BY s.name
@@ -1570,6 +2145,50 @@ class ManualDB(ThreadLocalDB):
             result.setdefault(set_id, []).append(identity)
         for identities in result.values():
             identities.sort(key=str.lower)
+        return result
+
+    def get_all_people_for_sets(self, set_ids):
+        """Batched {set_id: [identity, ...]} (sorted, case-insensitively) for a
+        set's FULL roster — every identity linked via identity_set_assignments,
+        PLUS anyone with a real named face or a whole-photo assignment on one of
+        that set's own member photos (file_sets), minus anything excluded via
+        identity_set_exclusions. This is the "sets always have @ with all the
+        names, even when not manually set" list: set_meta_line/chip-set should
+        show everyone actually present in the set, not just the subset someone
+        happened to explicitly link. Mirrors get_people_present_in_set's three
+        sources, batched across many sets at once instead of one set + its
+        already-resolved member checksums (avoids the N+1 of calling that per
+        set on pages rendering many sets, e.g. /sets or a card grid)."""
+        if not set_ids:
+            return {}
+        placeholders = ','.join('?' for _ in set_ids)
+        cur = self.conn.cursor()
+        cur.execute(f'''
+            SELECT fs.set_id, f.identity FROM faces f
+            JOIN file_sets fs ON fs.checksum = f.checksum
+            WHERE fs.set_id IN ({placeholders}) AND f.identity IS NOT NULL AND f.rejected = 0
+            UNION
+            SELECT fs.set_id, ipa.identity FROM identity_photo_assignments ipa
+            JOIN file_sets fs ON fs.checksum = ipa.checksum
+            WHERE fs.set_id IN ({placeholders})
+            UNION
+            SELECT isa.set_id, isa.identity FROM identity_set_assignments isa
+            WHERE isa.set_id IN ({placeholders})
+        ''', tuple(set_ids) * 3)
+        result = {}
+        for set_id, identity in cur.fetchall():
+            result.setdefault(set_id, []).append(identity)
+
+        cur.execute(f'''
+            SELECT set_id, identity FROM identity_set_exclusions WHERE set_id IN ({placeholders})
+        ''', tuple(set_ids))
+        excluded = {}
+        for set_id, identity in cur.fetchall():
+            excluded.setdefault(set_id, set()).add(identity)
+
+        for set_id, identities in result.items():
+            names = [name for name in identities if name not in excluded.get(set_id, ())]
+            result[set_id] = sorted(set(names), key=str.lower)
         return result
 
     def generate_placeholder_identity_name(self):
@@ -1602,14 +2221,17 @@ class ManualDB(ThreadLocalDB):
 
         Each value is actually a (face_id, set_linked) pair — set_linked is True
         only for the identity_set_assignments source (an explicit "person X is in
-        this set" link made via link_identity_to_set/the assign-set endpoint),
-        the one and only source unlink_identity_from_set can undo. A name present
-        via a whole-photo assignment or a detected face but with no set-link row
-        is set_linked=False — callers should only offer a "remove" action when
-        this is True, since there'd be nothing for the unlink call to actually
-        delete for the other two sources, and removing it wouldn't necessarily
-        make the person disappear from this list anyway."""
+        this set" link made via link_identity_to_set/the assign-set endpoint).
+        Callers offering a single "remove" action for any entry regardless of
+        source should call exclude_identity_from_set, not unlink_identity_from_set
+        directly — the latter only has a row to delete for the linked source, so
+        an excluded identity (identity_set_exclusions) is always filtered out
+        below regardless of which of the three sources would otherwise surface
+        it, and stays excluded until explicitly re-added via link_identity_to_set
+        (which clears the exclusion)."""
         cur = self.conn.cursor()
+        cur.execute('SELECT identity FROM identity_set_exclusions WHERE set_id = ?', (set_id,))
+        excluded_names = {row[0] for row in cur.fetchall()}
         face_people = {}
         if member_checksums:
             placeholders = ','.join('?' for _ in member_checksums)
@@ -1619,7 +2241,8 @@ class ManualDB(ThreadLocalDB):
                 GROUP BY identity
             ''', tuple(member_checksums))
             for identity, face_id in cur.fetchall():
-                face_people[identity] = face_id
+                if identity not in excluded_names:
+                    face_people[identity] = face_id
 
         photo_assigned_names = set()
         if member_checksums:
@@ -1628,10 +2251,10 @@ class ManualDB(ThreadLocalDB):
                 SELECT DISTINCT identity FROM identity_photo_assignments
                 WHERE checksum IN ({placeholders})
             ''', tuple(member_checksums))
-            photo_assigned_names.update(row[0] for row in cur.fetchall())
+            photo_assigned_names.update(row[0] for row in cur.fetchall() if row[0] not in excluded_names)
 
         cur.execute('SELECT identity FROM identity_set_assignments WHERE set_id = ?', (set_id,))
-        set_linked_names = {row[0] for row in cur.fetchall()}
+        set_linked_names = {row[0] for row in cur.fetchall() if row[0] not in excluded_names}
 
         assigned_names = photo_assigned_names | set_linked_names
 

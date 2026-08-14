@@ -9,6 +9,65 @@
   <span class="sub">{{ total }} files tracked</span>
 </div>
 
+<div class="section-title" style="margin-bottom:10px;">Library stats</div>
+<div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:24px;">
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_photos }}</span><span class="sub">Photos</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_videos or '—' }}</span><span class="sub">Videos</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.known_people }}</span><span class="sub">Known people</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.unknown_faces }}</span><span class="sub">Unknown faces</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.num_sets }}</span><span class="sub">Sets</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.photos_without_set }}</span><span class="sub">Photos without a set</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_manual_tags }}</span><span class="sub">Manual tags</span></div>
+  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_auto_tags }}</span><span class="sub">Auto-detected tags</span></div>
+</div>
+
+{% if favorites_highlight %}
+<div class="section-title" style="margin-bottom:10px;">Favorites</div>
+<div class="grid" style="margin-bottom:24px;">
+  {% for item in favorites_highlight %}
+  {% if item.kind == 'photo' %}
+  {{ macros.card(item.card) }}
+  {% elif item.kind == 'face' %}
+  <div class="card">
+    <a class="card-img-link" href="/person/{{ item.face.identity | urlencode }}">
+      <img src="/face-crop/{{ item.face.ref }}" alt="{{ item.face.identity }}" loading="lazy">
+    </a>
+    <div class="card-body">
+      <div class="card-name">
+        {% if item.face.identity %}
+        <a href="/person/{{ item.face.identity | urlencode }}">{{ item.face.identity }}</a>
+        {% else %}<span class="sub">Unnamed</span>{% endif %}
+      </div>
+    </div>
+  </div>
+  {% elif item.kind == 'set' %}
+  <div class="card">
+    <a class="card-img-link" href="/sets/{{ item.set.id }}">
+      {% if item.set.thumb_id %}
+      <img src="/thumb/{{ item.set.thumb_id }}" alt="{{ item.set.name }}" loading="lazy">
+      {% else %}
+      <div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2rem;">🗂️</div>
+      {% endif %}
+    </a>
+    <div class="card-body">
+      <div class="card-name" title="{{ item.set.name }}"><a href="/sets/{{ item.set.id }}">{{ item.set.name }}</a></div>
+      {{ macros.set_meta_line(item.set) }}
+    </div>
+  </div>
+  {% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if needs_love_highlight %}
+<div class="section-title" style="margin-bottom:10px;">In need of some love</div>
+<div class="grid" style="margin-bottom:24px;" data-queue-source="Needs love">
+  {% for f in needs_love_highlight %}
+  {{ macros.card(f) }}
+  {% endfor %}
+</div>
+{% endif %}
+
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
   {% if favorite_only %}
   <a href="/?sort={{ sort }}&order={{ order }}" class="sub">← All photos</a>

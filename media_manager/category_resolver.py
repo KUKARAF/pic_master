@@ -88,22 +88,29 @@ def get_resolved_checksums_for_category(manual, db, category_id, category_name, 
 
 def get_category_counts(manual, db):
     """{category_name: resolved_count} across the whole library — manual
-    assignments plus unsuppressed auto-matches. Used for the navbar dropdown.
+    assignments plus unsuppressed auto-matches. Used for the navbar dropdown,
+    which renders on nearly every page, so this is 3 queries total regardless
+    of category count (get_all_category_checksums/get_all_category_exclusions
+    are each one query for the whole library) plus the one unavoidable full
+    scan of auto-matches — not one-query-per-category like it used to be.
     A file with both a manual assignment and an auto-match for the *same*
     category only counts once."""
     counts = {}
     manual_by_category = {}
-    for row in manual.list_categories():
+    categories = manual.list_categories()
+    checksums_by_category_id = manual.get_all_category_checksums()
+    for row in categories:
         counts[row['name']] = row['image_count']
-        manual_by_category[row['name']] = set(manual.get_example_checksums_for_category(row['id'], limit=100000))
+        manual_by_category[row['name']] = checksums_by_category_id.get(row['id'], set())
 
     auto_matches = db.get_all_file_category_matches()
     if not auto_matches:
         return counts
 
+    exclusions_by_category_id = manual.get_all_category_exclusions()
     excluded_by_category = {
-        row['name']: manual.get_excluded_checksums_for_category(row['id'])
-        for row in manual.list_categories()
+        row['name']: exclusions_by_category_id.get(row['id'], set())
+        for row in categories
     }
 
     for _file_id, checksum, name, _score in auto_matches:

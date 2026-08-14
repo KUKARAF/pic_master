@@ -91,8 +91,21 @@
   // added to X, proceed?" confirmation lives on the banner's own Cancel
   // button instead (see the renderer IIFE further down), for in-app
   // dismissal rather than actually leaving.
+  //
+  // NOT shown for Left/Right (or the queue grid overlay's) browsing between
+  // photos that are themselves part of the pending action's own queue — that
+  // IS the review flow this action exists for (see set_detail.html's "Add
+  // folder" comment), not abandoning it, and since every photo view here is a
+  // real page navigation (not a SPA route change), skipping this check would
+  // otherwise mean a "leave site?" prompt on every single step through the
+  // very queue you're supposed to browse. The queue-nav code sets
+  // photoQueueNavigating right before calling location.href for exactly this
+  // reason; it's cleared again the moment the next page's script runs (below)
+  // so it only ever suppresses the one navigation it was set for.
+  if (sessionStorage.getItem('photoQueueNavigating')) sessionStorage.removeItem('photoQueueNavigating');
   window.addEventListener('beforeunload', function (e) {
     if (!sessionStorage.getItem('photoCustomAction')) return;
+    if (sessionStorage.getItem('photoQueueNavigating')) return;
     e.preventDefault();
     e.returnValue = '';
   });
@@ -120,7 +133,9 @@
   window.swipeCardMeta = function (card) {
     const parts = [];
     if (card.filename) parts.push(escapeHtml(card.filename));
-    if (card.people && card.people.length) parts.push('with ' + card.people.map(escapeHtml).join(', '));
+    if (card.people && card.people.length) parts.push('with ' + card.people.map(function (p) {
+      return escapeHtml(p.name) + (p.age != null ? ' (' + Math.round(p.age) + ')' : '');
+    }).join(', '));
     if (card.categories && card.categories.length) parts.push('categories: ' + card.categories.map(function (c) { return escapeHtml(c.name); }).join(', '));
     if (card.sets && card.sets.length) parts.push('in ' + card.sets.map(function (s) {
       const studioText = s.studio ? ' — ' + escapeHtml(s.studio) : '';
@@ -363,7 +378,9 @@
 
   /* A plain <input> backed by a native <datalist> — the shared shape both the
      studio and person fields in openNewSetDetailsModal use. Populates from
-     `listUrl`, calling `labelFn` per item for the datalist option text. */
+     `listUrl`, calling `labelFn` per item for the datalist option text.
+     `opts.value`, if given, pre-fills the input (e.g. the rename-set modal
+     editing an existing studio, vs. the new-set modal always starting blank). */
   function wireDatalistField(box, opts) {
     const input = document.createElement('input');
     input.type = 'text';
@@ -374,6 +391,7 @@
     input.style.fontSize = '1.2rem';
     input.style.padding = '10px 12px';
     input.style.marginBottom = '8px';
+    if (opts.value) input.value = opts.value;
     box.appendChild(input);
 
     const datalist = document.createElement('datalist');
@@ -405,6 +423,10 @@
 
     return input;
   }
+  // Exposed so per-page inline <script> blocks (e.g. set_detail.html's
+  // rename-set modal) can reuse the same studio/person suggestion field
+  // instead of falling back to a plain, suggestion-less <input>.
+  window.wireDatalistField = wireDatalistField;
 
   function openNewSetDetailsModal(setName, onResolved) {
     openModal('Details for "' + setName + '"', function (box) {
@@ -585,6 +607,92 @@
     return firstIndex + (lastIndex - firstIndex) * 0.1;
   }
 
+  // Shared, invalidated cache for the handful of "fetch the whole list" GET
+  // endpoints hit repeatedly from client-side pickers (openEntitySearchModal
+  // below) and the search-palette preload further down — keyed by URL rather
+  // than by a notion of "entity type", since two different features can
+  // legitimately want two different endpoints for what's conceptually the
+  // same entity (e.g. the tag picker wants /api/vocab's full YOLO-World +
+  // confirmed vocabulary, the palette wants /api/tags' confirmed-with-counts
+  // list) — this only has to guarantee each cached URL reflects its own most
+  // recent successful GET, not unify two different responses into one.
+  //
+  // Invalidation: rather than hand-patching every one of the many places that
+  // create/rename/delete a set/category/tag/identity (already gone wrong once
+  // — the palette preload below used to just never invalidate at all), any
+  // successful non-GET request to /api/... clears every cached GET
+  // unconditionally. Slightly coarser than per-endpoint precision, but
+  // correctness-by-construction beats an enumerated list that's one miss away
+  // from reintroducing the exact staleness bug this replaces. Refetching
+  // these lists is cheap; staying stale isn't.
+  var GET_CACHE_TTL_MS = 5 * 60 * 1000;
+  var getCache = {}; // url -> {promise, expiresAt}
+
+  // The in-memory cache above only helps within a single page's lifetime —
+  // this app navigates via full page loads, so every fresh /sets, /photo/*,
+  // etc. load starts with an empty getCache and pays the full round-trip
+  // again the first time something opens the set picker. localStorage
+  // persists across that reload: LOCAL_CACHE_PREFIX + url holds the last
+  // successful response body, returned INSTANTLY (no network wait) while a
+  // real fetch still runs in the background to refresh it for next time
+  // (stale-while-revalidate) — so the very slow part (network latency /
+  // server-side query cost) only ever blocks the very first use ever, not
+  // every page load after.
+  var LOCAL_CACHE_PREFIX = 'mm_get_cache:';
+
+  function cachedGetJson(url) {
+    var entry = getCache[url];
+    if (entry && entry.expiresAt > Date.now()) return entry.promise;
+
+    var freshPromise = fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    }).then(function (data) {
+      try { localStorage.setItem(LOCAL_CACHE_PREFIX + url, JSON.stringify(data)); } catch (e) {}
+      return data;
+    });
+
+    var promise = freshPromise;
+    try {
+      var cachedRaw = localStorage.getItem(LOCAL_CACHE_PREFIX + url);
+      if (cachedRaw) {
+        promise = Promise.resolve(JSON.parse(cachedRaw));
+        freshPromise.catch(function () {}); // background refresh — its failure must never surface via this call
+      }
+    } catch (e) {
+      // Corrupt localStorage entry, or JSON.parse failed — fall back to the real fetch.
+    }
+
+    getCache[url] = { promise: promise, expiresAt: Date.now() + GET_CACHE_TTL_MS };
+    promise.catch(function () { delete getCache[url]; }); // never cache a failed fetch
+    return promise;
+  }
+
+  (function () {
+    var origFetch = window.fetch.bind(window);
+    window.fetch = function (input, init) {
+      var method = ((init && init.method) || 'GET').toUpperCase();
+      var url = typeof input === 'string' ? input : (input && input.url) || '';
+      return origFetch(input, init).then(function (response) {
+        if (response.ok && method !== 'GET' && url.indexOf('/api/') === 0) {
+          getCache = {};
+          // Same coarse "clear everything" invalidation as the in-memory
+          // cache above, applied to its localStorage-backed counterpart —
+          // otherwise a set/category/tag/identity created or renamed just
+          // now would keep showing the pre-mutation snapshot on next page
+          // load until its background refresh happened to complete first.
+          try {
+            for (var i = localStorage.length - 1; i >= 0; i--) {
+              var key = localStorage.key(i);
+              if (key && key.indexOf(LOCAL_CACHE_PREFIX) === 0) localStorage.removeItem(key);
+            }
+          } catch (e) {}
+        }
+        return response;
+      });
+    };
+  })();
+
   // Per-type behavior for openEntitySearchModal — the one place that knows how
   // to list/label/create each kind of entity. `image` is only set for
   // 'identity' (a face-crop thumbnail); every other type renders text-only.
@@ -598,7 +706,10 @@
       // filtering set names/studios as usual, now narrowed to sets linked to
       // that person too. See openEntitySearchModal's personAware handling.
       personAware: true,
-      fetchAll: function () { return fetch('/api/sets').then(function (r) { return r.json(); }); },
+      // light=true: text-only fields (id/name/studio/aliases) — skips the
+      // per-set age/people attach (_attach_set_people), which is real query
+      // work this picker never displays. See api_list_sets.
+      fetchAll: function () { return cachedGetJson('/api/sets?light=true'); },
       label: function (s) { return s.name; },
       // Matching includes aliases (an alias is never shown as the primary
       // label — only name is — but typing one still has to surface the set).
@@ -606,9 +717,9 @@
         return [s.name, s.studio || '', (s.aliases || []).join(' ')].filter(Boolean).join(' ');
       },
       secondary: function (s) {
-        const peopleText = s.people && s.people.length ? s.people.map(function (p) {
-          return '@' + p.name + (p.age != null ? ' (' + Math.round(p.age) + (p.gender === 'male' ? 'm' : p.gender === 'female' ? 'f' : '') + ')' : '');
-        }).join(' ') : '';
+        // No age/gender here (light picker fetch omits it, see api_list_sets) —
+        // just names, which is all personAware's filter needs anyway.
+        const peopleText = s.people && s.people.length ? s.people.map(function (p) { return '@' + p.name; }).join(' ') : '';
         const aliasText = s.aliases && s.aliases.length ? 'aka ' + s.aliases.join(', ') : '';
         return [s.studio || '', peopleText, aliasText].filter(Boolean).join(' — ');
       },
@@ -622,7 +733,7 @@
     category: {
       title: 'Set category',
       placeholder: 'Search or create a category…',
-      fetchAll: function () { return fetch('/api/categories').then(function (r) { return r.json(); }); },
+      fetchAll: function () { return cachedGetJson('/api/categories'); },
       label: function (c) { return c.name; },
       secondary: function (c) { return (c.image_count || 0) + ' photo(s)'; },
       image: null,
@@ -644,7 +755,7 @@
       // search terms + manual.db's confirmed tags) — exactly the right
       // candidate pool for this picker, hint-only entries included.
       fetchAll: function () {
-        return fetch('/api/vocab').then(function (r) { return r.json(); })
+        return cachedGetJson('/api/vocab')
           .then(function (data) { return (data.vocab || []).map(function (name) { return { name: name }; }); });
       },
       label: function (t) { return t.name; },
@@ -655,7 +766,7 @@
     identity: {
       title: 'Choose a person',
       placeholder: 'Search or type a name…',
-      fetchAll: function () { return fetch('/api/identities').then(function (r) { return r.json(); }); },
+      fetchAll: function () { return cachedGetJson('/api/identities'); },
       label: function (i) { return i.name; },
       secondary: function (i) { return i.count + ' photo(s)'; },
       image: function (i) { return i.face_id != null ? '/face-crop/manual:' + i.face_id : null; },
@@ -927,7 +1038,7 @@
 
       Promise.all([
         config.fetchAll(),
-        config.personAware ? fetch('/api/identities').then(function (r) { return r.json(); }) : Promise.resolve([]),
+        config.personAware ? cachedGetJson('/api/identities') : Promise.resolve([]),
       ])
         .then(function (results) {
           let items = results[0];
@@ -1113,7 +1224,7 @@
       }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
     ];
     return Promise.all(sources.map(function (src) {
-      return fetch(src.url).then(function (r) { return r.json(); }).then(function (data) {
+      return cachedGetJson(src.url).then(function (data) {
         return data.map(function (item) {
           return { type: src.type, value: src.value(item), label: src.label(item), count: src.count(item) };
         });
@@ -1552,6 +1663,9 @@
     }
 
     function goTo(id) {
+      // Tells the beforeunload guard above this is in-queue browsing, not
+      // abandoning a pending custom action — see its comment for why.
+      sessionStorage.setItem('photoQueueNavigating', '1');
       window.location.href = '/photo/' + id;
     }
 
@@ -1594,6 +1708,9 @@
     let selectedIndex = 0;
 
     function goTo(id) {
+      // Tells the beforeunload guard above this is in-queue browsing, not
+      // abandoning a pending custom action — see its comment for why.
+      sessionStorage.setItem('photoQueueNavigating', '1');
       window.location.href = '/photo/' + id;
     }
 
@@ -2113,6 +2230,46 @@
 
   const boxDrawStates = [];
 
+  /* Hover a "Detected objects" chip (or a labeled-region chip) to see WHERE
+     on the photo it was found — same idea as the swipe-review fullview's
+     Right-arrow highlight (swipe-core.js), just triggered by hover instead
+     of a keypress, and reusing the existing drag-to-draw box's own
+     naturalWidth/clientWidth scaling (photoImg) so it lines up correctly in
+     whatever fit mode is active, same as .face-draw-box already does for
+     drawing. window.DETECTED_BBOXES ({class_name: [x1,y1,x2,y2]} in ORIGINAL
+     image pixels, see database.get_detection_bboxes) is only set on
+     photo.html; harmless no-op anywhere it's undefined/empty. */
+  if (photoWrap && photoImg) {
+    let hoverBox = null;
+
+    function hideHoverBbox() {
+      if (hoverBox) { hoverBox.remove(); hoverBox = null; }
+    }
+
+    function showHoverBbox(bbox) {
+      hideHoverBbox();
+      if (!photoImg.naturalWidth || !photoImg.clientWidth) return; // image not loaded yet
+      const scaleX = photoImg.clientWidth / photoImg.naturalWidth;
+      const scaleY = photoImg.clientHeight / photoImg.naturalHeight;
+      const [x1, y1, x2, y2] = bbox;
+      hoverBox = document.createElement('div');
+      hoverBox.className = 'face-draw-box';
+      hoverBox.style.left = (x1 * scaleX) + 'px';
+      hoverBox.style.top = (y1 * scaleY) + 'px';
+      hoverBox.style.width = ((x2 - x1) * scaleX) + 'px';
+      hoverBox.style.height = ((y2 - y1) * scaleY) + 'px';
+      photoWrap.appendChild(hoverBox);
+    }
+
+    document.querySelectorAll('.tag-detected[data-detected-label]').forEach(function (chip) {
+      const bboxes = window.DETECTED_BBOXES || {};
+      const bbox = bboxes[chip.dataset.detectedLabel];
+      if (!bbox) return; // detected before bboxes were stored, or a stale/renamed label — nothing to show
+      chip.addEventListener('mouseenter', function () { showHoverBbox(bbox); });
+      chip.addEventListener('mouseleave', hideHoverBbox);
+    });
+  }
+
   /* Add face */
   const addFaceBtn = document.getElementById('add-face-btn');
   const addFaceStatus = document.getElementById('add-face-status');
@@ -2139,35 +2296,44 @@
   });
   if (addFaceState) boxDrawStates.push(addFaceState);
 
-  /* Label region (spatial tag) */
-  const labelRegionBtn = document.getElementById('label-region-btn');
+  /* Label region (spatial tag) — positive ("this area IS X") and negative
+     ("this area is confirmed NOT X", a hard negative for CLIP training, see
+     manual_db.add_spatial_tag/clip_tag_classifier.py) share the same
+     draw-a-box-then-pick-a-tag flow, differing only in the polarity posted. */
   const labelRegionStatus = document.getElementById('label-region-status');
 
-  const labelRegionState = wireBoxDraw(labelRegionBtn, 'Click and drag on the photo…', '＋ Label region', function (bbox) {
-    openEntitySearchModal({
-      type: 'tag',
-      title: 'Label this region',
-      onResolved: function (entity) {
-        if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Saving…'; }
-        fetch('/api/files/' + fileId + '/tags/region', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ label: entity.name, bbox: bbox }),
-        })
-          .then(function (r) {
-            if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
-            return r.json();
+  function wireLabelRegion(btnId, polarity, modalTitle) {
+    const btn = document.getElementById(btnId);
+    const idleLabel = btn ? btn.textContent : '';
+    const state = wireBoxDraw(btn, 'Click and drag on the photo…', idleLabel, function (bbox) {
+      openEntitySearchModal({
+        type: 'tag',
+        title: modalTitle,
+        onResolved: function (entity) {
+          if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Saving…'; }
+          fetch('/api/files/' + fileId + '/tags/region', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ label: entity.name, bbox: bbox, polarity: polarity }),
           })
-          .then(function () {
-            location.reload();
-          })
-          .catch(function (err) {
-            if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Failed: ' + err.message; }
-          });
-      },
+            .then(function (r) {
+              if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
+              return r.json();
+            })
+            .then(function () {
+              location.reload();
+            })
+            .catch(function (err) {
+              if (labelRegionStatus) { labelRegionStatus.style.display = 'block'; labelRegionStatus.textContent = 'Failed: ' + err.message; }
+            });
+        },
+      });
     });
-  });
-  if (labelRegionState) boxDrawStates.push(labelRegionState);
+    if (state) boxDrawStates.push(state);
+  }
+
+  wireLabelRegion('label-region-btn', 'positive', 'Label this region');
+  wireLabelRegion('label-region-negative-btn', 'negative', 'Label this region as NOT…');
 
   /* Face naming modal — click any face chip (named or "Unknown") to name/rename
      it. Goes through the shared entity picker: fuzzy-search known people, pick
@@ -2652,14 +2818,7 @@
   }
 
   function assignSetById(setId) {
-    return fetch('/api/files/' + fileId + '/sets', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ set_id: setId }),
-    }).then(function (r) {
-      if (!r.ok) throw new Error('Request failed: ' + r.status);
-      return r.json();
-    });
+    return window.assignFileToSet(fileId, setId);
   }
 
   function appendSetChip(set) {
@@ -2747,60 +2906,65 @@
      itself isn't blocked on scanning every set. Renders nothing when there's
      nothing worth suggesting (no embedding yet, no sets, already in every
      set, or nothing clears the match threshold) — this mirrors auto-detected
-     tags/faces elsewhere in the app, which stay silent rather than nagging. */
-  const setSuggestions = document.getElementById('set-suggestions');
-  if (setSuggestions && fileId) {
-    fetch('/api/files/' + fileId + '/suggested-sets')
-      .then(function (r) { return r.ok ? r.json() : { results: [] }; })
-      .then(function (data) {
-        (data.results || []).forEach(function (set) {
-          const chip = document.createElement('a');
-          chip.className = 'chip-set';
-          chip.href = '#';
-          chip.style.marginRight = '6px';
-          chip.style.marginBottom = '4px';
-          chip.title = 'Suggested match — click to add';
-          chip.dataset.setId = set.id;
+     tags/faces elsewhere in the app, which stay silent rather than nagging.
 
-          const row = document.createElement('span');
-          row.style.display = 'flex';
-          row.style.alignItems = 'center';
-          row.style.gap = '4px';
-          const nameSpan = document.createElement('span');
-          nameSpan.textContent = set.name;
-          row.appendChild(nameSpan);
-          const scoreSpan = document.createElement('span');
-          scoreSpan.className = 'score-badge';
-          scoreSpan.style.position = 'static';
-          scoreSpan.textContent = set.score.toFixed(2);
-          row.appendChild(scoreSpan);
-          chip.appendChild(row);
-
-          const metaLine = buildSetMetaLine(set);
-          if (metaLine) chip.appendChild(metaLine);
-
-          chip.addEventListener('click', function (e) {
-            e.preventDefault();
-            chip.style.pointerEvents = 'none';
-            assignSetById(set.id)
-              .then(function (data) {
-                appendSetChip(data);
-                chip.remove();
-              })
-              .catch(function (err) {
-                chip.style.pointerEvents = '';
-                alert('Failed to add set: ' + err.message);
-              });
-          });
-
-          setSuggestions.appendChild(chip);
-        });
-      })
-      .catch(function () {
-        // Non-critical: leave the block empty rather than surfacing an error
-        // for what is, at worst, a missed convenience suggestion.
-      });
-  }
+     DISABLED (2026-07-29): scanning every set's embedding on every /photo/
+     load was too heavy — page load speed matters more than this convenience.
+     Uncomment to re-enable; "+ Add to set" is unaffected (openSetPickerModal/
+     openSetSearchModal use the separate cached entity-list fetch, not this). */
+  // const setSuggestions = document.getElementById('set-suggestions');
+  // if (setSuggestions && fileId) {
+  //   fetch('/api/files/' + fileId + '/suggested-sets')
+  //     .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+  //     .then(function (data) {
+  //       (data.results || []).forEach(function (set) {
+  //         const chip = document.createElement('a');
+  //         chip.className = 'chip-set';
+  //         chip.href = '#';
+  //         chip.style.marginRight = '6px';
+  //         chip.style.marginBottom = '4px';
+  //         chip.title = 'Suggested match — click to add';
+  //         chip.dataset.setId = set.id;
+  //
+  //         const row = document.createElement('span');
+  //         row.style.display = 'flex';
+  //         row.style.alignItems = 'center';
+  //         row.style.gap = '4px';
+  //         const nameSpan = document.createElement('span');
+  //         nameSpan.textContent = set.name;
+  //         row.appendChild(nameSpan);
+  //         const scoreSpan = document.createElement('span');
+  //         scoreSpan.className = 'score-badge';
+  //         scoreSpan.style.position = 'static';
+  //         scoreSpan.textContent = set.score.toFixed(2);
+  //         row.appendChild(scoreSpan);
+  //         chip.appendChild(row);
+  //
+  //         const metaLine = buildSetMetaLine(set);
+  //         if (metaLine) chip.appendChild(metaLine);
+  //
+  //         chip.addEventListener('click', function (e) {
+  //           e.preventDefault();
+  //           chip.style.pointerEvents = 'none';
+  //           assignSetById(set.id)
+  //             .then(function (data) {
+  //               appendSetChip(data);
+  //               chip.remove();
+  //             })
+  //             .catch(function (err) {
+  //               chip.style.pointerEvents = '';
+  //               alert('Failed to add set: ' + err.message);
+  //             });
+  //         });
+  //
+  //         setSuggestions.appendChild(chip);
+  //       });
+  //     })
+  //     .catch(function () {
+  //       // Non-critical: leave the block empty rather than surfacing an error
+  //       // for what is, at worst, a missed convenience suggestion.
+  //     });
+  // }
 
   /* Photo (file) favorite heart */
   const fileHeartBtn = document.getElementById('file-heart-btn');
@@ -2979,7 +3143,7 @@
     // Drag-to-draw (add face / label region) maps clicks through the img element
     // box, which only equals the visible image outside FILL mode — so entering a
     // draw tool snaps back to FIT.
-    ['add-face-btn', 'label-region-btn'].forEach(function (id) {
+    ['add-face-btn', 'label-region-btn', 'label-region-negative-btn'].forEach(function (id) {
       const btn = document.getElementById(id);
       if (btn) btn.addEventListener('click', function () {
         if (photoStage.classList.contains('fit-cover')) setFit('fit');

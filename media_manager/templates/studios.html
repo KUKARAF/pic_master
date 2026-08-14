@@ -16,7 +16,11 @@
       <div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2.5rem;">🏢</div>
     </a>
     <div class="card-body">
-      <div class="card-name" title="{{ s.name }}"><a href="/sets?studio={{ s.name | urlencode }}">{{ s.name }}</a></div>
+      <div class="card-name" title="{{ s.name }}">
+        <a href="/sets?studio={{ s.name | urlencode }}">{{ s.name }}</a>
+        <button type="button" class="studio-rename-btn heart-btn-inline" data-studio="{{ s.name }}"
+                title="Rename this studio everywhere (renaming to an existing studio merges them)" style="font-size:0.8em;">✏️</button>
+      </div>
       <div class="sub" style="font-size:0.78rem;">{{ s.set_count }} set(s) &nbsp;·&nbsp; {{ s.image_count }} image(s)</div>
     </div>
   </div>
@@ -28,4 +32,26 @@
   <p>No studios yet. Assign a studio when creating or renaming a set.</p>
 </div>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* Rename (or merge, by renaming to an existing studio name) a studio — same
+   prompt-based pattern as /faces' identity-rename-btn. */
+document.querySelectorAll('.studio-rename-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const oldName = btn.dataset.studio;
+    const newName = prompt('Rename studio "' + oldName + '" to (renaming to an existing studio merges them):', oldName);
+    if (!newName || newName.trim() === '' || newName.trim() === oldName) return;
+    fetch('/api/studios/' + encodeURIComponent(oldName), {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: newName.trim()}),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+      .then(function() { location.reload(); })
+      .catch(function(err) { alert('Failed to rename: ' + err.message); });
+  });
+});
+</script>
 {% endblock %}

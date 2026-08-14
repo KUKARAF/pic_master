@@ -245,6 +245,16 @@ def main():
     age_setup.add_argument('--force', action='store_true',
                            help='Delete and recreate the venv if it already exists')
 
+    # media migrate - deliberate, backed-up, verified schema migrations (currently:
+    # promoting tags to a real id'd table) — never run silently/automatically the
+    # way simple additive schema changes elsewhere in this app are.
+    migrate_cmd = sub.add_parser(
+        'migrate',
+        help='Check for and apply pending database schema migrations (dry-run by default)')
+    migrate_cmd.add_argument('--apply', action='store_true',
+                             help='Actually perform the migration (backs up manual.db first). '
+                                  'Without this flag, only reports what would change.')
+
     # media web - launch the FastAPI gallery server
     web_cmd = sub.add_parser('web', help='Start the web gallery UI at localhost:8000')
     web_cmd.add_argument('host_pos', nargs='?', metavar='host', default=None,
@@ -257,6 +267,12 @@ def main():
     web_cmd.add_argument('--https', action='store_true',
                          help='Serve over HTTPS using a self-signed cert '
                               '(auto-generated via the openssl binary, cached in .media/)')
+    web_cmd.add_argument('--workers', type=int, default=2,
+                         help='Number of worker processes (default: 2). Independent processes '
+                              'avoid one heavy request (a CLIP/embedding scan) blocking every '
+                              'other request behind the single-process GIL. Each worker '
+                              'independently loads ML models (CLIP/YOLO-World), so higher counts '
+                              'cost more RAM; pass 1 to keep today\'s single-process behavior.')
 
     args = parser.parse_args()
 
@@ -293,6 +309,23 @@ def main():
 
     # every other command first checks that repo exists when --strict is on
     _ensure_repo()
+
+    if args.cmd == 'migrate':
+        # Deliberately does NOT go through ManualDB/MediaManager — ManualDB's
+        # _create_tables() fail-loud-guards against any pending migration, so a
+        # ManualDB can't even be constructed until one's been applied. Operates on
+        # the raw manual.db path directly; see media_manager/migrations/ for the
+        # list of migrations this checks/runs, in order.
+        from media_manager.manual_db import run_migrations
+        manual_db_path = os.path.join('.media', 'manual.db')
+        try:
+            reports = run_migrations(manual_db_path, apply=args.apply)
+        except RuntimeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        for line in reports:
+            print(line)
+        return 0
 
     if args.cmd == 'add':
         m = MediaManager()
@@ -649,7 +682,20 @@ def main():
             ssl_kwargs = {'ssl_certfile': certfile, 'ssl_keyfile': keyfile}
             scheme = 'https'
         print(f"Starting media gallery at {scheme}://{host}:{args.port}/")
-        uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
+        if args.workers > 1:
+            # uvicorn's multi-worker mode spawns separate processes that each
+            # need to independently construct the app, so it needs an import
+            # string/factory rather than the already-built `app` object above
+            # (kept and used above only to surface a clean pending-migration
+            # error before committing to spawning workers — see create_app's
+            # RuntimeError check). data_root travels to each worker via env
+            # var since create_app_from_env is called with no arguments.
+            os.environ['MEDIA_WEB_DATA_ROOT'] = data_root
+            print(f"Running with {args.workers} worker processes.")
+            uvicorn.run('media_manager.web:create_app_from_env', factory=True,
+                        host=host, port=args.port, workers=args.workers, **ssl_kwargs)
+        else:
+            uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
         return 0
 
     else:

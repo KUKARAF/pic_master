@@ -40,6 +40,19 @@ class ThreadLocalDB:
             conn.close()
             self._local.conn = None
 
+    @staticmethod
+    def _chunked(items, size=500):
+        """SQLite has a hard cap on bound parameters per query (varies by build,
+        often as low as 999) — any `WHERE x IN (...)` lookup built from an
+        *unbounded* candidate pool (e.g. every checksum in the whole library, not
+        just a fixed-size page) needs to be split into chunks like this rather
+        than bound in one query, or it raises 'too many SQL variables' once the
+        library is large enough. Inherited by both Database and ManualDB so every
+        checksum/id-batched lookup method gets this for free."""
+        items = list(items)
+        for i in range(0, len(items), size):
+            yield items[i:i + size]
+
 
 class Database(ThreadLocalDB):
     def __init__(self, db_path="media.db"):
@@ -286,6 +299,14 @@ class Database(ThreadLocalDB):
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_file ON file_paths (file_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_taken_at ON files (taken_at)')
+        # Backs the gallery's default sort ('added' = first_seen DESC, the homepage's
+        # default view) — without this, ordering by first_seen forces a full sort of
+        # every tracked file before LIMIT/OFFSET can apply, on every single default
+        # homepage load (confirmed via EXPLAIN QUERY PLAN: the top-level "USE TEMP
+        # B-TREE FOR ORDER BY" step disappears with this index in place, for both
+        # ASC and DESC). Doesn't help the 'modified' sort option — that value comes
+        # from files_with_path's per-row correlated subquery, not a plain column.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_files_first_seen_id ON files (first_seen DESC, id DESC)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags (tag)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_class ON detections (class_name)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_file ON detections (file_id)')
@@ -584,13 +605,18 @@ class Database(ThreadLocalDB):
 
     def get_files_by_checksums(self, checksums):
         """Batched path lookup for a list of checksums — resolves manual.db query
-        results (which are checksum-keyed) to current file_id/path rows."""
+        results (which are checksum-keyed) to current file_id/path rows. Chunked
+        (see _chunked) since callers can hand this an unbounded, library-wide
+        checksum list, not just a fixed-size page."""
         if not checksums:
             return []
-        placeholders = ','.join('?' for _ in checksums)
         cursor = self.conn.cursor()
-        cursor.execute(f'SELECT * FROM files_with_path WHERE checksum IN ({placeholders})', tuple(checksums))
-        return cursor.fetchall()
+        rows = []
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cursor.execute(f'SELECT * FROM files_with_path WHERE checksum IN ({placeholders})', tuple(chunk))
+            rows.extend(cursor.fetchall())
+        return rows
 
     # Columns 'age' can sort by are handled entirely in Python (web.py) since ages
     # live in the separate manual.db — this SQL-level sort only ever sees 'added'/
@@ -620,6 +646,14 @@ class Database(ThreadLocalDB):
         cursor.execute('SELECT embedding FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
         row = cursor.fetchone()
         return row[0] if row else None
+
+    def get_random_files(self, limit=50):
+        """Random sample of (id, path, checksum) rows — bounded by `limit` regardless
+        of library size, unlike a full-table pull. Seeds homepage 'in need of some
+        love' candidate scanning (see _needs_love_highlight in web.py)."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, path, checksum FROM files_with_path ORDER BY RANDOM() LIMIT ?', (limit,))
+        return cursor.fetchall()
 
     # ------------------------------------------------------------------
     # Detection methods (YOLO-World)
@@ -662,6 +696,40 @@ class Database(ThreadLocalDB):
             (file_id,)
         )
         return [row[0] for row in cursor.fetchall()]
+
+    def get_detection_bboxes(self, file_id):
+        """{class_name: [x1, y1, x2, y2]} for a file's primary-frame detections —
+        each class's own highest-confidence box (mirrors get_detected_classes'
+        one-representative-entry-per-class shape). Coordinates are absolute
+        pixels in the ORIGINAL image (see detector.py's box.xyxy, what
+        insert_detections was given) — deliberately not normalized, since the
+        one current caller (photo.html's hover-to-highlight) already has the
+        loaded <img>'s own naturalWidth/naturalHeight to scale against, the
+        same technique the existing drag-to-draw box feature uses."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT class_name, x1, y1, x2, y2 FROM detections "
+            "WHERE file_id = ? AND frame_index IS NULL AND class_name != '__indexed__' "
+            "AND x1 IS NOT NULL ORDER BY confidence ASC",
+            (file_id,)
+        )
+        # ASC order + dict overwrite = last-write-wins = highest confidence
+        # ends up kept, without a second GROUP BY query.
+        result = {}
+        for class_name, x1, y1, x2, y2 in cursor.fetchall():
+            result[class_name] = [x1, y1, x2, y2]
+        return result
+
+    def count_detected_classes(self):
+        """Distinct auto-detected class names across the whole library (primary-frame
+        detections only, sentinel excluded) — mirrors get_detected_classes' per-file
+        filter, for the homepage stats section's 'automatic tags' number."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(DISTINCT class_name) FROM detections "
+            "WHERE frame_index IS NULL AND class_name != '__indexed__'"
+        )
+        return cursor.fetchone()[0]
 
     def remove_detection(self, file_id, class_name):
         """Delete a specific auto-detected class for a file — used when a human marks it
@@ -1151,18 +1219,21 @@ class Database(ThreadLocalDB):
 
     def get_file_category_matches_for_files(self, file_ids):
         """Batched lookup: {file_id: [(category_name, score, model), ...]} — mirrors
-        get_embeddings_for_files, but list-valued now (see get_file_category_matches)."""
+        get_embeddings_for_files, but list-valued now (see get_file_category_matches).
+        Chunked (see _chunked) since callers can hand this an unbounded, library-wide
+        file_id list, not just a fixed-size page."""
         if not file_ids:
             return {}
-        placeholders = ','.join('?' for _ in file_ids)
         cursor = self.conn.cursor()
-        cursor.execute(
-            f'SELECT file_id, category_name, score, model FROM file_category_matches WHERE file_id IN ({placeholders})',
-            tuple(file_ids)
-        )
         result = {}
-        for file_id, category_name, score, model in cursor.fetchall():
-            result.setdefault(file_id, []).append((category_name, score, model))
+        for chunk in self._chunked(file_ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cursor.execute(
+                f'SELECT file_id, category_name, score, model FROM file_category_matches WHERE file_id IN ({placeholders})',
+                tuple(chunk)
+            )
+            for file_id, category_name, score, model in cursor.fetchall():
+                result.setdefault(file_id, []).append((category_name, score, model))
         return result
 
     def get_all_file_category_matches(self):

@@ -5,7 +5,7 @@
 {% block content %}
 <div class="page-heading">
   <h1>Faces</h1>
-  <span class="sub">{{ identities | length }} known people</span>
+  <span class="sub">{{ people_count }} known people</span>
 </div>
 
 <div style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
@@ -18,153 +18,127 @@
   {% endif %}
 </div>
 
-<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
-
-  <!-- Main content -->
-  <div style="flex:1;min-width:300px;">
-    {% if favorite_only %}
-    <div class="section-title" style="margin-bottom:12px;">Favorited faces</div>
-    {% if favorite_faces %}
-    <div style="display:flex;flex-wrap:wrap;gap:16px;">
-      {% for face in favorite_faces %}
-      <div class="face-label-card">
-        <a href="/photo/{{ face.file_id }}">
-          <img src="/face-crop/{{ face.ref }}" alt="face" width="80" height="80" style="border-radius:4px;display:block;">
-        </a>
-        <div style="font-size:0.8em;margin-top:4px;">
-          {% if face.identity %}{{ face.identity }}{% else %}<span class="sub">Unnamed</span>{% endif %}
-        </div>
-      </div>
-      {% endfor %}
+{% if favorite_only %}
+<div class="section-title" style="margin-bottom:12px;">Favorited faces</div>
+{% if favorite_faces %}
+<div style="display:flex;flex-wrap:wrap;gap:16px;">
+  {% for face in favorite_faces %}
+  <div class="face-label-card">
+    <a href="/photo/{{ face.file_id }}">
+      <img src="/face-crop/{{ face.ref }}" alt="face" width="80" height="80" style="border-radius:4px;display:block;">
+    </a>
+    <div style="font-size:0.8em;margin-top:4px;">
+      {% if face.identity %}{{ face.identity }}{% else %}<span class="sub">Unnamed</span>{% endif %}
     </div>
-    {% else %}
-    <div class="alert">No favorited faces yet.</div>
-    {% endif %}
-    {% else %}
-
-    <!-- Confirmed-faces grid — the main view -->
-    <div class="section-title" style="margin-bottom:12px;">Confirmed faces</div>
-    <div class="grid" id="confirmed-faces-grid"></div>
-    <div id="confirmed-faces-sentinel" style="height:1px;"></div>
-    <p id="confirmed-faces-loading" class="sub" style="text-align:center;margin-top:16px;display:none;">Loading…</p>
-    <p id="confirmed-faces-empty" class="empty-state" style="display:none;">
-      <span class="icon">🖼️</span>
-      <br>No confirmed faces yet.
-    </p>
-
-    <!-- "Find new faces" swipe stream — hidden until requested, unchanged behavior -->
-    <div id="find-new-faces-section" style="display:none;margin-top:28px;">
-      <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
-      <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
-        <input type="checkbox" id="faces-avoid-existing-toggle" checked>
-        Deprioritize photos that already have an identified face
-      </label>
-      <div class="swipe-page">
-        <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
-        <div class="swipe-controls">
-          <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not same face (↓)">✕</button>
-          <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Same face (↑)">✓</button>
-        </div>
-        <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
-      </div>
-    </div>
-    {% endif %}
   </div>
-
-  <!-- Known people sidebar -->
-  {% if identities %}
-  <div style="min-width:160px;max-width:220px;">
-    <div class="section-title" style="margin-bottom:8px;">Known people</div>
-    <ul style="list-style:none;padding:0;margin:0;">
-      {% for name, count in identities %}
-      <li style="margin-bottom:6px;" data-identity="{{ name }}">
-        <a href="/person/{{ name | urlencode }}" style="font-weight:500;">{{ name }}</a>
-        <span style="color:#728C72;font-size:0.85em;"> ({{ count }})</span>
-        <button type="button" class="identity-rename-btn heart-btn-inline" data-identity="{{ name }}"
-                title="Rename this person everywhere" style="font-size:0.8em;">✏️</button>
-      </li>
-      {% endfor %}
-    </ul>
-  </div>
-  {% endif %}
-
+  {% endfor %}
 </div>
+{% else %}
+<div class="alert">No favorited faces yet.</div>
+{% endif %}
+{% else %}
+
+<div style="margin-bottom:16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+  <input type="search" id="people-search-input" placeholder="Filter by name…" style="min-width:180px;max-width:240px;">
+  <label class="sub" style="display:flex;align-items:center;gap:6px;">
+    Sort by
+    <select id="people-sort-select">
+      <option value="last_modified">Last modified</option>
+      <option value="count">Number of faces</option>
+      <option value="name">Name</option>
+    </select>
+  </label>
+</div>
+
+<!-- One grid of unique people (identities), not one card per confirmed face -->
+<div class="grid" id="people-grid"></div>
+<p id="people-empty" class="empty-state" style="display:none;">
+  <span class="icon">🖼️</span>
+  <br>No confirmed faces yet.
+</p>
+<p id="people-no-match" class="sub" style="text-align:center;margin-top:16px;display:none;">No people match "<span id="people-no-match-query"></span>".</p>
+
+<!-- "Find new faces" swipe stream — hidden until requested, unchanged behavior -->
+<div id="find-new-faces-section" style="display:none;margin-top:28px;">
+  <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
+  <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+    <input type="checkbox" id="faces-avoid-existing-toggle" checked>
+    Deprioritize photos that already have an identified face
+  </label>
+  <div class="swipe-page">
+    <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
+    <div class="swipe-controls">
+      <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not same face (↓)">✕</button>
+      <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Same face (↑)">✓</button>
+    </div>
+    <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
+  </div>
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
 <script src="/static/swipe-core.js"></script>
 <script>
-/* Confirmed-faces grid — same lazily-paginated pattern as person.html's
-   photo grid, pointed at /api/faces/confirmed instead. */
+/* Unique-people grid — one card per identity (not per confirmed face), all
+   loaded up front with the page (the identity count is small — nothing like
+   the total confirmed-face count, so no pagination needed). Filtering and
+   sorting both happen client-side over this one in-memory list; no
+   additional endpoints. */
 (function() {
-  var grid = document.getElementById('confirmed-faces-grid');
+  var grid = document.getElementById('people-grid');
   if (!grid) return;
-  var loadingEl = document.getElementById('confirmed-faces-loading');
-  var emptyEl = document.getElementById('confirmed-faces-empty');
-  var sentinel = document.getElementById('confirmed-faces-sentinel');
-  var limit = 20;
-  var offset = 0;
-  var total = Infinity;
-  var loading = false;
-  var done = false;
+  var emptyEl = document.getElementById('people-empty');
+  var noMatchEl = document.getElementById('people-no-match');
+  var noMatchQueryEl = document.getElementById('people-no-match-query');
+  var searchInput = document.getElementById('people-search-input');
+  var sortSelect = document.getElementById('people-sort-select');
+  var people = {{ people | tojson }};
 
-  function cardHtml(f) {
+  if (!people.length) {
+    emptyEl.style.display = 'block';
+    return;
+  }
+
+  function cardHtml(p) {
     return (
-      '<div class="card" data-file-id="' + f.file_id + '">' +
-        '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
-          '<img src="/face-crop/' + encodeURIComponent(f.ref) + '" alt="' + escapeHtml(f.identity || 'face') + '" loading="lazy">' +
+      '<div class="card" data-file-id="' + p.file_id + '" data-identity="' + escapeHtml(p.identity) + '">' +
+        '<a class="card-img-link" href="/photo/' + p.file_id + '">' +
+          '<img src="/face-crop/' + encodeURIComponent(p.ref) + '" alt="' + escapeHtml(p.identity) + '" loading="lazy">' +
         '</a>' +
         '<div class="card-body">' +
-          '<a class="card-name" href="/person/' + encodeURIComponent(f.identity) + '">' + escapeHtml(f.identity) + '</a>' +
+          '<a class="card-name" href="/person/' + encodeURIComponent(p.identity) + '">' + escapeHtml(p.identity) + '</a>' +
+          '<div class="sub" style="font-size:0.85em;">' + p.count + (p.count === 1 ? ' face' : ' faces') + '</div>' +
+          '<button type="button" class="identity-rename-btn heart-btn-inline" data-identity="' + escapeHtml(p.identity) + '" ' +
+                  'title="Rename this person everywhere" style="font-size:0.8em;">✏️</button>' +
         '</div>' +
       '</div>'
     );
   }
 
-  function loadMore() {
-    if (loading || done) return;
-    loading = true;
-    loadingEl.style.display = 'block';
-    fetch('/api/faces/confirmed?offset=' + offset + '&limit=' + limit)
-      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-      .then(function(data) {
-        total = data.total;
-        var cards = data.cards || [];
-        cards.forEach(function(f) {
-          var wrap = document.createElement('div');
-          wrap.innerHTML = cardHtml(f);
-          grid.appendChild(wrap.firstElementChild);
-        });
-        offset += cards.length;
-        if (offset === 0 && total === 0) emptyEl.style.display = 'block';
-        if (cards.length < limit || offset >= total) done = true;
-      })
-      .catch(function(err) {
-        loadingEl.textContent = 'Failed to load more faces: ' + err.message;
-      })
-      .finally(function() {
-        loading = false;
-        loadingEl.style.display = 'none';
-        if (!done && sentinel) {
-          var rect = sentinel.getBoundingClientRect();
-          if (rect.top < window.innerHeight + 400) loadMore();
-        }
-      });
-  }
+  function render() {
+    var query = (searchInput.value || '').trim().toLowerCase();
+    var sortBy = sortSelect.value;
 
-  if (window.IntersectionObserver && sentinel) {
-    var observer = new IntersectionObserver(function(entries) {
-      entries.forEach(function(entry) { if (entry.isIntersecting) loadMore(); });
-    }, { rootMargin: '400px' });
-    observer.observe(sentinel);
-  } else {
-    window.addEventListener('scroll', function() {
-      if (done || loading) return;
-      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) loadMore();
+    var filtered = people.filter(function(p) {
+      return !query || p.identity.toLowerCase().indexOf(query) !== -1;
     });
+
+    filtered.sort(function(a, b) {
+      if (sortBy === 'count') return b.count - a.count;
+      if (sortBy === 'name') return a.identity.localeCompare(b.identity);
+      return b.last_modified - a.last_modified;
+    });
+
+    grid.innerHTML = filtered.map(cardHtml).join('');
+    noMatchEl.style.display = (query && filtered.length === 0) ? 'block' : 'none';
+    if (query && filtered.length === 0) noMatchQueryEl.textContent = searchInput.value.trim();
+    bindRenameButtons();
   }
 
-  loadMore();
+  searchInput.addEventListener('input', render);
+  sortSelect.addEventListener('change', render);
+  render();
 })();
 
 /* "Find new faces" — reveals the existing unidentified-faces swipe stream
@@ -350,20 +324,26 @@
   }
 })();
 
-document.querySelectorAll('.identity-rename-btn').forEach(function(btn) {
-  btn.addEventListener('click', function() {
-    const oldName = btn.dataset.identity;
-    const newName = prompt('Rename "' + oldName + '" to:', oldName);
-    if (!newName || newName.trim() === '' || newName.trim() === oldName) return;
-    fetch('/api/identities/' + encodeURIComponent(oldName), {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({name: newName.trim()}),
-    })
-      .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-      .then(function() { location.reload(); })
-      .catch(function(err) { alert('Failed to rename: ' + err.message); });
+/* Hoisted function declaration — called from the people-grid IIFE above
+   (defined earlier in this same script) after every re-render, since the
+   grid's rename buttons are recreated each time innerHTML is replaced. */
+function bindRenameButtons() {
+  document.querySelectorAll('.identity-rename-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      const oldName = btn.dataset.identity;
+      const newName = prompt('Rename "' + oldName + '" to:', oldName);
+      if (!newName || newName.trim() === '' || newName.trim() === oldName) return;
+      fetch('/api/identities/' + encodeURIComponent(oldName), {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: newName.trim()}),
+      })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { location.reload(); })
+        .catch(function(err) { alert('Failed to rename: ' + err.message); });
+    });
   });
-});
+}
+bindRenameButtons();
 </script>
 {% endblock %}

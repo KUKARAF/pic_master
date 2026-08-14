@@ -25,17 +25,43 @@ function _getFullviewOverlay() {
   if (_fullviewOverlay) return _fullviewOverlay;
   const overlay = document.createElement('div');
   overlay.className = 'swipe-fullview-overlay';
+  // .swipe-fullview-frame is display:inline-block, so it shrinks to exactly
+  // the <img>'s own rendered box (the img has no explicit width/height, just
+  // max-width/max-height — so there's no object-fit letterboxing gap to
+  // account for) — the highlight box can then just be plain CSS percentages
+  // of that frame, no pixel math needed, and it stays correctly positioned
+  // through any resize for free.
+  const frame = document.createElement('div');
+  frame.className = 'swipe-fullview-frame';
   const img = document.createElement('img');
-  overlay.appendChild(img);
+  const highlight = document.createElement('div');
+  highlight.className = 'swipe-fullview-highlight';
+  frame.appendChild(img);
+  frame.appendChild(highlight);
+  overlay.appendChild(frame);
   overlay.addEventListener('click', _hideFullview);
   document.body.appendChild(overlay);
   _fullviewOverlay = overlay;
   return overlay;
 }
 
-function _showFullview(src) {
+function _showFullview(src, bbox) {
   const overlay = _getFullviewOverlay();
   overlay.querySelector('img').src = src;
+  const highlight = overlay.querySelector('.swipe-fullview-highlight');
+  // bbox is [x1,y1,x2,y2] normalized 0..1 (see _next_tag_suggestions_by_model's
+  // YOLO path, the only current source of a per-card bbox) — absent for
+  // every other suggestion stream, which just shows the plain photo as before.
+  if (Array.isArray(bbox) && bbox.length === 4) {
+    const [x1, y1, x2, y2] = bbox;
+    highlight.style.left = (x1 * 100) + '%';
+    highlight.style.top = (y1 * 100) + '%';
+    highlight.style.width = ((x2 - x1) * 100) + '%';
+    highlight.style.height = ((y2 - y1) * 100) + '%';
+    highlight.style.display = 'block';
+  } else {
+    highlight.style.display = 'none';
+  }
   overlay.classList.add('open');
   _fullviewOpen = true;
 }
@@ -85,6 +111,20 @@ window.initSwipeStack = function (config) {
   let queue = (config.initialCards || []).slice(0, BUFFER_SIZE);
   const known = new Set(queue.map(c => c.ref)); // queued or already-decided refs
   let fetching = false;
+  // Every one of these streams is a CLIP-embedding-vs-whole-library (or
+  // similar) scan server-side — real CPU cost, not a cheap lookup. Firing it
+  // the instant the page loads meant just opening a couple of tabs could
+  // stack up several of these concurrently and starve everything else on the
+  // single-process GIL. `started` gates that first fetch behind an explicit
+  // click (see renderEmptyState's "not started yet" branch below) — true
+  // immediately only if the page pre-seeded real cards via initialCards
+  // (matches today's behavior for any page that does that), or if the page
+  // itself already gated construction behind its own explicit user action
+  // (config.autoStart: true — e.g. search.html's own "Start review"/"Review
+  // with YOLO"/"Review with CLIP" buttons, which only call initSwipeStack at
+  // all once one of them is clicked, so there's no need to also show this
+  // engine's OWN internal Start button afterward).
+  let started = queue.length > 0 || !!config.autoStart;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
   const history = []; // [{card, action}, ...] — most recent decision last
 
@@ -121,6 +161,20 @@ window.initSwipeStack = function (config) {
   }
 
   function renderEmptyState() {
+    // Checked before `fetching`/config.emptyStateHtml — a page's own "genuinely
+    // nothing found" UI (e.g. find_person.html's threshold-expand panel) must
+    // only ever appear after a real search has run, never before one's even
+    // been started.
+    if (!started) {
+      stackEl.innerHTML = '<button type="button" class="btn-similar swipe-start-btn">▶ Start reviewing</button>';
+      const startBtn = stackEl.querySelector('.swipe-start-btn');
+      startBtn.addEventListener('click', function () {
+        started = true;
+        maybeFetchMore();
+        render();
+      });
+      return;
+    }
     // `fetching` (not "is this the very first load") is what actually
     // distinguishes "still waiting on results" from "genuinely nothing left" —
     // it's true for the initial buffer-fill exactly the same as any later
@@ -143,6 +197,7 @@ window.initSwipeStack = function (config) {
     stackEl.innerHTML = '';
     if (queue.length === 0) {
       renderEmptyState();
+      if (typeof config.onTopCardChange === 'function') config.onTopCardChange(null);
       return;
     }
     const visible = queue.slice(0, visibleCount());
@@ -151,6 +206,12 @@ window.initSwipeStack = function (config) {
       stackEl.appendChild(cardEl(visible[i], i));
     }
     maybeFetchMore();
+    // Fires on every render, not just genuine top-card changes (e.g. a
+    // refill that doesn't move the current card to a new one still calls
+    // this again) — cheap and idempotent for consumers (find_person.html's
+    // auto-approve timer just cancels+rearms), so no need to track "did the
+    // ref actually change" here.
+    if (typeof config.onTopCardChange === 'function') config.onTopCardChange(topCard());
   }
 
   function topCard() {
@@ -170,7 +231,11 @@ window.initSwipeStack = function (config) {
   // stuck-buffer symptom well before the URL length limit ever came into
   // play. Sending it as a POST body removes both problems at once.
   async function maybeFetchMore(biasKey, biasAction) {
-    if (fetching || queue.length >= BUFFER_SIZE) return;
+    // Gated centrally here (not just in the Start button's click handler) so
+    // nothing — setBufferSize's slider, the returned handle's refill(), a
+    // future caller — can accidentally kick off the heavy scan before the
+    // user has actually clicked Start.
+    if (!started || fetching || queue.length >= BUFFER_SIZE) return;
     fetching = true;
     let fetchedCards = [];
     try {
@@ -356,19 +421,19 @@ window.initSwipeStack = function (config) {
     } else if (e.key === 'ArrowRight') {
       e.preventDefault();
       const fileId = card.file_id != null ? card.file_id : card.id;
-      _showFullview('/image/' + fileId);
+      _showFullview('/image/' + fileId, card.bbox);
     }
   });
 
-  // render()'s empty-queue branch only shows a state, it doesn't fetch (the
-  // non-empty branch's trailing maybeFetchMore() call is what normally keeps
-  // the buffer topped up) — so a stack that intentionally starts empty needs
-  // its own kick to ever load anything. Called *before* the first render()
-  // (not after) so its synchronous fetching=true is already set by the time
-  // renderEmptyState() runs — otherwise the very first paint would
-  // momentarily show "genuinely done" instead of "searching" for the split
-  // second before the initial fetch is even in flight.
-  if (queue.length === 0) maybeFetchMore();
+  // A stack that starts empty (every page today passes initialCards: []) no
+  // longer auto-fetches here on its own — renderEmptyState's `!started`
+  // branch shows a "Start reviewing" button instead, and the click handles
+  // kicking off maybeFetchMore() itself. See the `started` flag's comment
+  // above for why. The one exception is config.autoStart (already `started`
+  // by the time we get here) — that means the PAGE already gated getting
+  // this far behind its own button, so the fetch needs kicking off right
+  // now instead of waiting for a click on a button this engine never shows.
+  if (config.autoStart) maybeFetchMore();
   render();
 
   // getTopCard/decide let a page-specific script drive the stack externally

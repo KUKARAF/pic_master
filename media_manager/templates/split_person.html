@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block title %}Split {{ name }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Split {{ name }} / {{ other }}</h1>
+  <a href="/person/{{ name | urlencode }}" class="sub">← Back to {{ name }}</a>
+</div>
+
+{% if error %}
+<div class="alert" style="margin-bottom:20px;">{{ error }}</div>
+{% else %}
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="split-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="split-swipe-reject-btn" title="Move to {{ other }} (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="split-swipe-confirm-btn" title="Keep as {{ name }} (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">↑ Keep as <strong>{{ name }}</strong> &nbsp; ↓ Move to <strong>{{ other }}</strong> (or use ↑ / ↓)</div>
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/swipe-core.js"></script>
+<script>
+/* Reviews every real face currently assigned to `name`, ranked by resemblance
+   to `other` (see _next_split_candidates) — the most likely mis-tagged ones
+   surface first. Up = keep as `name` (no mutation, see swipe-core's onConfirm
+   returning null being treated as a no-op). Down = single reassign call to
+   `other` (see api_assign_identity, the same endpoint every other reassign
+   flow in this app already uses). */
+(function() {
+  const name = {{ name | tojson }};
+  const other = {{ other | tojson }};
+  if (!name || !other || !window.initSwipeStack || !document.getElementById('split-swipe-stack')) return;
+
+  window.initSwipeStack({
+    stackElId: 'split-swipe-stack',
+    confirmBtnId: 'split-swipe-confirm-btn',
+    rejectBtnId: 'split-swipe-reject-btn',
+    initialCards: [],
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      return '/api/person/' + encodeURIComponent(name) + '/split-candidates?with=' +
+        encodeURIComponent(other) + '&count=' + (need || 10);
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+        questionHtml: '↑ <strong>' + escapeHtml(name) + '</strong> &nbsp; ↓ <strong>' + escapeHtml(other) + '</strong>',
+        scoreText: card.score ? ('resemblance to ' + other + ': ' + card.score.toFixed(2)) : '',
+        metaHtml: swipeCardMeta(card),
+        originalUrl: '/photo/' + card.file_id,
+      };
+    },
+    onConfirm: function(card) {
+      return null;
+    },
+    onReject: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: other } };
+    },
+    onUndo: function(card, action) {
+      if (action !== 'reject') return null;
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: name } };
+    },
+  });
+})();
+</script>
+{% endblock %}

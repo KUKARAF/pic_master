@@ -58,6 +58,10 @@
   {% elif tag %}
   <h1>Tag: {{ tag }}</h1>
   <span class="sub">{{ files | length }} file(s)</span>
+  <div style="display:flex;gap:8px;margin-top:6px;">
+    {{ macros.classifier_button(clip_btn) }}
+    {{ macros.classifier_button(yolo_btn) }}
+  </div>
   {% else %}
   <h1>Search</h1>
   {% endif %}
@@ -111,7 +115,14 @@
 </div>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" style="padding:0;flex:1;min-width:300px;">
-    <div class="swipe-stack-wrap" id="tag-swipe-stack"></div>
+    <div id="tag-review-chooser" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+      <button type="button" class="btn-similar" id="tag-review-default-btn">▶ Start review</button>
+      <button type="button" class="btn-similar" id="tag-review-yolo-btn"
+              {% if not (yolo_status and yolo_status.status == 'done') %}disabled title="Train a YOLO model for this tag first"{% endif %}>▶ Review with YOLO</button>
+      <button type="button" class="btn-similar" id="tag-review-clip-btn"
+              {% if not (clip_status and clip_status.status == 'done') %}disabled title="Train a CLIP model for this tag first"{% endif %}>▶ Review with CLIP</button>
+    </div>
+    <div class="swipe-stack-wrap" id="tag-swipe-stack" style="display:none;"></div>
   </div>
 
   {% if all_tags %}
@@ -138,6 +149,43 @@
 <script>
 document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+
+document.querySelectorAll('.tag-train-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const kind = btn.dataset.kind;
+    const label = btn.dataset.label;
+    btn.disabled = true;
+    fetch('/api/tags/' + encodeURIComponent(label) + '/train-' + kind, {method: 'POST'})
+      .then(function(r) {
+        if (!r.ok) return r.json().then(function(data) { throw new Error(data.detail || 'Request failed'); });
+        return r.json();
+      })
+      .then(function() { location.reload(); })
+      .catch(function(err) {
+        btn.disabled = false;
+        alert('Failed to start training: ' + err.message);
+      });
+  });
+});
+
+document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const kind = btn.dataset.kind;
+    const label = btn.dataset.label;
+    if (!confirm('Stop the ' + kind.toUpperCase() + ' training run for "' + label + '"?')) return;
+    btn.disabled = true;
+    fetch('/api/tags/' + encodeURIComponent(label) + '/train-cancel?kind=' + kind, {method: 'POST'})
+      .then(function(r) {
+        if (!r.ok) return r.json().then(function(data) { throw new Error(data.detail || 'Request failed'); });
+        return r.json();
+      })
+      .then(function() { location.reload(); })
+      .catch(function(err) {
+        btn.disabled = false;
+        alert('Failed to cancel: ' + err.message);
+      });
+  });
 });
 
 /* Bulk selection — shared by every bulk action on this grid (currently just
@@ -393,50 +441,88 @@ document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   wireExpandSimilarSearch(queryFaceRef || null);
 })();
 
+/* Three explicit review modes instead of one auto-started stream — "Start
+   review" (default centroid ranking), "Review with YOLO"/"Review with CLIP"
+   (a trained per-tag model's own ranking, see _next_tag_suggestions_by_model
+   in web.py). All three write plain tag confirmations through the exact same
+   endpoints regardless of which one surfaced the candidate — a trained model
+   is purely a candidate-ranking signal, never a separate storage path.
+   initSwipeStack is only ever constructed once one of the three buttons is
+   clicked (config.autoStart tells it to skip its own internal "Start
+   reviewing" gate, since these buttons already served as that action). */
 (function() {
   const tagLabel = {{ tag | tojson }};
   if (!tagLabel || !window.initSwipeStack) return;
-  window.initSwipeStack({
-    stackElId: 'tag-swipe-stack',
-    initialCards: [],
-    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
-      const params = new URLSearchParams({
-        count: String(need || 10),
-      });
-      if (biasKey) {
-        params.set('bias_file_id', biasKey);
-        params.set('bias', biasAction);
-      }
-      return '/api/tags/' + encodeURIComponent(tagLabel) + '/suggestions/next?' + params.toString();
-    },
-    renderCard: function(card) {
-      return {
-        imageUrl: '/thumb/' + card.file_id,
-        questionHtml: 'Does this have <strong>' + escapeHtml(tagLabel) + '</strong>?',
-        scoreText: 'match score ' + card.score.toFixed(2),
-        metaHtml: swipeCardMeta(card),
-        originalUrl: '/photo/' + card.file_id,
-      };
-    },
-    onConfirm: function(card) {
-      return {
-        url: '/api/files/' + card.file_id + '/tags', method: 'POST',
-        body: { tag: tagLabel, polarity: 'positive' },
-      };
-    },
-    onReject: function(card) {
-      return {
-        url: '/api/files/' + card.file_id + '/tags', method: 'POST',
-        body: { tag: tagLabel, polarity: 'negative' },
-      };
-    },
-    onUndo: function(card, action) {
-      const polarity = action === 'confirm' ? 'positive' : 'negative';
-      const params = new URLSearchParams({ label: tagLabel, polarity: polarity });
-      return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
-    },
-    emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',
-  });
+
+  const chooser = document.getElementById('tag-review-chooser');
+  const stackWrap = document.getElementById('tag-swipe-stack');
+
+  function buildConfig(mode) {
+    return {
+      stackElId: 'tag-swipe-stack',
+      initialCards: [],
+      autoStart: true,
+      fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+        if (mode !== 'default') {
+          return '/api/tags/' + encodeURIComponent(tagLabel) + '/suggestions/next-by-model?model=' +
+            mode + '&count=' + (need || 10);
+        }
+        const params = new URLSearchParams({ count: String(need || 10) });
+        if (biasKey) {
+          params.set('bias_file_id', biasKey);
+          params.set('bias', biasAction);
+        }
+        return '/api/tags/' + encodeURIComponent(tagLabel) + '/suggestions/next?' + params.toString();
+      },
+      renderCard: function(card) {
+        return {
+          imageUrl: '/thumb/' + card.file_id,
+          questionHtml: 'Does this have <strong>' + escapeHtml(tagLabel) + '</strong>?',
+          scoreText: 'match score ' + card.score.toFixed(2),
+          metaHtml: swipeCardMeta(card),
+          originalUrl: '/photo/' + card.file_id,
+        };
+      },
+      onConfirm: function(card) {
+        return {
+          url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+          body: { tag: tagLabel, polarity: 'positive' },
+        };
+      },
+      onReject: function(card) {
+        return {
+          url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+          body: { tag: tagLabel, polarity: 'negative' },
+        };
+      },
+      onUndo: function(card, action) {
+        const polarity = action === 'confirm' ? 'positive' : 'negative';
+        const params = new URLSearchParams({ label: tagLabel, polarity: polarity });
+        return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
+      },
+      emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',
+    };
+  }
+
+  function startReview(mode) {
+    if (chooser) chooser.style.display = 'none';
+    if (stackWrap) stackWrap.style.display = '';
+    window.initSwipeStack(buildConfig(mode));
+  }
+
+  const defaultBtn = document.getElementById('tag-review-default-btn');
+  const yoloBtn = document.getElementById('tag-review-yolo-btn');
+  const clipBtn = document.getElementById('tag-review-clip-btn');
+  if (defaultBtn) defaultBtn.addEventListener('click', function() { startReview('default'); });
+  if (yoloBtn) yoloBtn.addEventListener('click', function() { startReview('yolo'); });
+  if (clipBtn) clipBtn.addEventListener('click', function() { startReview('clip'); });
+
+  // Auto-picks a mode when arriving via a "Find more" link from /tags
+  // (?start=yolo|clip) — still one explicit user click away (the earlier
+  // link click), not a page-load auto-fire.
+  const autoStartMode = {{ start | tojson }};
+  if (autoStartMode === 'yolo' && yoloBtn && !yoloBtn.disabled) startReview('yolo');
+  else if (autoStartMode === 'clip' && clipBtn && !clipBtn.disabled) startReview('clip');
 })();
 
 </script>

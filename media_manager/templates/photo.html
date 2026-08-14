@@ -9,6 +9,7 @@
 <script>
   window.MEDIA_FILE_ID = {{ file.id }};
   window.DETECTED_CLASSES = {{ detected_classes | tojson }};
+  window.DETECTED_BBOXES = {{ detection_bboxes | tojson }};
 </script>
 {% endblock %}
 
@@ -123,13 +124,18 @@
       <div class="section-title" style="margin-top:14px;">Labeled regions</div>
       <div id="spatial-tag-list">
         {% for t in spatial_tags %}
+        {% if t.polarity == 'negative' %}
+        <span class="tag-detected" style="color:var(--danger, #c0392b);" title="Marked as NOT {{ t.label }} — a hard negative for CLIP training">🚫 not {{ t.label }}</span>
+        {% else %}
         <span class="tag-detected">▦ {{ t.label }}</span>
+        {% endif %}
         {% endfor %}
       </div>
       {% endif %}
 
       {% if file.is_image %}
       <button type="button" id="label-region-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">＋ Label region</button>
+      <button type="button" id="label-region-negative-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🚫 Label region as NOT</button>
       <div id="label-region-status" class="sub" style="display:none;"></div>
       {% endif %}
     </div>

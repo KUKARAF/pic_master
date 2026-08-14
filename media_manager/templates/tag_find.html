@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+
+{% block title %}Find "{{ label }}" ({{ model }} model) — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Find more "{{ label }}" — {{ 'CLIP' if model == 'clip' else 'YOLO' }} model</h1>
+  <a href="/search?tag={{ label | urlencode }}" class="sub">← Back to tag "{{ label }}"</a>
+</div>
+
+{% if not ready %}
+<div class="alert" style="margin-bottom:20px;">
+  No trained {{ 'CLIP' if model == 'clip' else 'YOLO' }} model for "{{ label }}" yet — train it from the
+  <a href="/search?tag={{ label | urlencode }}">tag page</a> first.
+</div>
+{% else %}
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="tag-find-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="tag-find-swipe-reject-btn" title="Not this (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="tag-find-swipe-confirm-btn" title="Yes, this too (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Swipe up to confirm, down to reject (or use ↑ / ↓)</div>
+</div>
+
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+{% if ready %}
+<script src="/static/swipe-core.js"></script>
+<script>
+/* Candidates ranked by the trained {{ model }} classifier for this tag (see
+   _next_tag_suggestions_by_model in web.py) instead of the default
+   centroid-similarity stream — confirm/reject go through the exact same
+   whole-image tag endpoints every other tag flow already uses, so a trained
+   model is purely a candidate-ranking signal, never a new storage path. */
+(function() {
+  const label = {{ label | tojson }};
+  const model = {{ model | tojson }};
+  if (!document.getElementById('tag-find-swipe-stack')) return;
+
+  window.initSwipeStack({
+    stackElId: 'tag-find-swipe-stack',
+    confirmBtnId: 'tag-find-swipe-confirm-btn',
+    rejectBtnId: 'tag-find-swipe-reject-btn',
+    initialCards: [],
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      return '/api/tags/' + encodeURIComponent(label) + '/suggestions/next-by-model?model=' +
+        encodeURIComponent(model) + '&count=' + (need || 10);
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/thumb/' + card.file_id,
+        questionHtml: 'Is this <strong>' + escapeHtml(label) + '</strong>?',
+        scoreText: 'match score ' + card.score.toFixed(2),
+        metaHtml: swipeCardMeta(card),
+        originalUrl: '/photo/' + card.file_id,
+      };
+    },
+    onConfirm: function(card) {
+      return { url: '/api/files/' + card.file_id + '/tags', method: 'POST', body: { tag: label, polarity: 'positive' } };
+    },
+    onReject: function(card) {
+      return { url: '/api/files/' + card.file_id + '/tags', method: 'POST', body: { tag: label, polarity: 'negative' } };
+    },
+    onUndo: function(card, action) {
+      const polarity = action === 'reject' ? 'negative' : 'positive';
+      return {
+        url: '/api/files/' + card.file_id + '/tags-by-label?label=' + encodeURIComponent(label) + '&polarity=' + polarity,
+        method: 'DELETE',
+      };
+    },
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

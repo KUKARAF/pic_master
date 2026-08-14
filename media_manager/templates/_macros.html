@@ -8,6 +8,13 @@
    for that identity. Empty when a set has neither studio nor people. #}
 {% macro set_meta_line(s) %}{% if s.studio or s.people %}<span class="set-meta-line">{% if s.studio %}<span class="set-studio">{{ s.studio }}</span>{% endif %}{% for p in s.people %}<span class="set-people-tag">@{{ p.name }}{% if p.age is not none %}<span class="set-person-age {{ 'gender-male' if p.gender == 'male' else ('gender-female' if p.gender == 'female' else '') }}">{{ p.age | round(0) | int }}</span>{% endif %}</span>{% endfor %}</span>{% endif %}{% endmacro %}
 
+{# One CLIP/YOLO tag-classifier train button — `btn` is one of _classifier_ui_state's
+   clip_btn/yolo_btn dicts (web.py), fully precomputed server-side (text/href/
+   disabled/title) so the button's existence and label never depend on any
+   client-side JS running — only the click's fetch-to-train call does (see
+   tags.html/search.html's own tiny .tag-train-btn wiring). #}
+{% macro classifier_button(btn) %}<span style="display:inline-flex;align-items:center;gap:4px;">{% if btn.href %}<a href="{{ btn.href }}" class="btn-similar" style="font-size:0.8em;padding:4px 10px;" title="{{ btn.title }}">{{ btn.text }}</a>{% else %}<button type="button" class="tag-train-btn btn-similar" data-kind="{{ btn.kind }}" data-label="{{ btn.label }}" {% if btn.disabled %}disabled{% endif %} title="{{ btn.title }}" style="font-size:0.8em;padding:4px 10px;">{{ btn.text }}</button>{% endif %}{% if btn.cancel_url %}<button type="button" class="tag-cancel-btn btn-similar" data-kind="{{ btn.kind }}" data-label="{{ btn.label }}" title="Stop this training run" style="font-size:0.8em;padding:4px 8px;">✕</button>{% endif %}{% if btn.log_url %}<a href="{{ btn.log_url }}" target="_blank" class="sub" style="font-size:0.75em;">log</a>{% endif %}</span>{% endmacro %}
+
 {% macro card_chips(f) %}
 {% if f.tags or f.categories or f.sets or f.people %}
 <div class="card-tags">
@@ -32,8 +39,8 @@
   {% if f.sets | length > 3 %}
   <span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.sets | length - 3 }}</span>
   {% endif %}
-  {% for name in f.people[:3] %}
-  <a class="chip-person" href="/person/{{ name | urlencode }}" title="Recognized person">{{ name }}</a>
+  {% for p in f.people[:3] %}
+  <a class="chip-person" href="/person/{{ p.name | urlencode }}" title="Recognized person">{{ p.name }}{% if p.age is not none %}<span class="set-person-age {{ 'gender-male' if p.gender == 'male' else ('gender-female' if p.gender == 'female' else '') }}">{{ p.age | round(0) | int }}</span>{% endif %}</a>
   {% endfor %}
   {% if f.people | length > 3 %}
   <span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+{{ f.people | length - 3 }}</span>

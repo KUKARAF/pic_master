@@ -1298,6 +1298,26 @@ input[type="range"] { accent-color: var(--accent); }
 }
 
 /* ------------------------------------------------------------------ */
+/* Homepage stat tiles                                                  */
+/* ------------------------------------------------------------------ */
+.stat-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  min-width: 100px;
+}
+.stat-value {
+  font-family: var(--font-term);
+  font-size: 1.3rem;
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------------ */
 /* Empty state                                                          */
 /* ------------------------------------------------------------------ */
 .empty-state {
@@ -1489,7 +1509,21 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .swipe-fullview-overlay.open { display: flex; }
 .swipe-fullview-overlay img { max-width: 96vw; max-height: 96vh; object-fit: contain; }
+/* display:inline-block so this shrinks to exactly the <img>'s own rendered
+   box (no explicit width/height on the img means no object-fit letterboxing
+   gap) — the highlight box (a YOLO detection's bbox, see
+   _next_tag_suggestions_by_model/swipe-core.js's _showFullview) is then just
+   plain CSS percentages of this frame, correct at any size for free. */
+.swipe-fullview-frame { position: relative; display: inline-block; line-height: 0; }
+.swipe-fullview-highlight {
+  display: none;
+  position: absolute;
+  border: 3px solid var(--accent);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .6);
+  pointer-events: none;
+}
 .swipe-empty { text-align: center; color: var(--text-muted); padding: 40px 0; }
+.swipe-start-btn { display: block; margin: 40px auto; }
 
 /* Space-to-open queue thumbnail grid (photo.html) — built entirely from ids
    already in sessionStorage/memory, no fetches, so it opens instantly even
@@ -1537,6 +1571,24 @@ input[type="range"] { accent-color: var(--accent); }
   color: var(--accent);
   font-size: 10px;
   text-shadow: 0 0 3px rgba(0, 0, 0, .8);
+}
+
+/* Name label for the quick-set grid (set_detail.html) — .queue-grid-cell has
+   no text slot by default (photo.html's queue grid is thumbnail-only), so
+   this is additive, not a replacement. */
+.quick-set-grid-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 3px 5px;
+  font-size: 0.72em;
+  line-height: 1.2;
+  color: #fff;
+  background: rgba(5, 7, 5, .78);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .swipe-searching {
   font-family: var(--font-pixel);

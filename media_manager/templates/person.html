@@ -10,6 +10,7 @@
     <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }}">🔍</a>
     <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
     <button type="button" id="estimate-all-age-btn" class="heart-btn-inline" title="Estimate age &amp; gender for every photo of {{ name }}">🎂</button>
+    <button type="button" id="person-split-btn" class="heart-btn-inline" title="Split off photos that are actually someone else">✂️</button>
   </h1>
   {% if aliases %}
   <span class="sub">also known as {{ aliases | join(', ') }}</span>
@@ -142,7 +143,10 @@
         tagsHtml += '<span class="chip-set" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.sets.length - 3) + '</span>';
       }
       (f.people || []).slice(0, 3).forEach(function (p) {
-        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p) + '" title="Recognized person">' + escapeHtml(p) + '</a>';
+        var age = p.age != null
+          ? '<span class="set-person-age' + (p.gender === 'male' ? ' gender-male' : p.gender === 'female' ? ' gender-female' : '') + '">' + Math.round(p.age) + '</span>'
+          : '';
+        tagsHtml += '<a class="chip-person" href="/person/' + encodeURIComponent(p.name) + '" title="Recognized person">' + escapeHtml(p.name) + age + '</a>';
       });
       if (f.people && f.people.length > 3) {
         tagsHtml += '<span class="chip-person" style="background:#111811;border-color:#243024;color:#728C72;">+' + (f.people.length - 3) + '</span>';
@@ -250,7 +254,32 @@
         (total === Infinity ? 10000 : total);
       return fetch(url)
         .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-        .then(function (data) { return (data.cards || []).map(function (f) { return f.id; }); });
+        // Cards are now per FACE INSTANCE, not per unique photo (see
+        // _identity_instances — a before/after-style photo with two of this
+        // person's faces yields two cards sharing one file id); de-dupe here
+        // since this feeds a per-PHOTO bulk action, where re-processing the
+        // same photo twice would just be wasted work, not new information.
+        .then(function (data) { return Array.from(new Set((data.cards || []).map(function (f) { return f.id; }))); });
+    },
+    // Same fetch as fetchAllFileIds, but split by each card's has_age_estimate flag
+    // (set server-side from face_age_estimates, see get_estimated_checksums) so the
+    // "estimate all" button can skip photos a previous — possibly interrupted, e.g.
+    // by a server reload — run already finished, and only estimate what's left.
+    fetchFileIdsNeedingEstimate: function () {
+      var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=0&limit=' +
+        (total === Infinity ? 10000 : total);
+      return fetch(url)
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) {
+          var cards = data.cards || [];
+          // De-dupe to unique photos — see fetchAllFileIds' note on why
+          // per-face-instance cards shouldn't turn into per-photo duplicate work.
+          var remaining = Array.from(new Set(
+            cards.filter(function (f) { return !f.has_age_estimate; }).map(function (f) { return f.id; })
+          ));
+          var doneCount = new Set(cards.map(function (f) { return f.id; })).size - remaining.length;
+          return { total: cards.length, alreadyDone: doneCount, remaining: remaining };
+        });
     },
   };
 })();
@@ -385,7 +414,11 @@
 /* 🎂 Estimate all — runs the existing single-photo age/gender estimate
    endpoint (POST /api/files/{id}/estimate-age) for every photo of this
    person, one at a time (same sequential reasoning as the bulk add-to-set
-   handler above). */
+   handler above). Each POST commits its result to manual.db immediately (see
+   api_estimate_age), and photos already estimated (has_age_estimate, from
+   get_estimated_checksums) are skipped up front — so if the page/server is
+   reloaded mid-run, clicking this again resumes from where it left off
+   instead of redoing already-estimated photos. */
 (function() {
   var btn = document.getElementById('estimate-all-age-btn');
   var status = document.getElementById('estimate-all-age-status');
@@ -394,27 +427,31 @@
   btn.addEventListener('click', function() {
     btn.disabled = true;
     status.textContent = 'Loading photo list…';
-    window.__personPhotoGrid.fetchAllFileIds().then(function(ids) {
+    window.__personPhotoGrid.fetchFileIdsNeedingEstimate().then(function(info) {
+      var ids = info.remaining;
       if (!ids.length) {
-        status.textContent = 'No photos to estimate.';
+        status.textContent = info.alreadyDone
+          ? 'All ' + info.alreadyDone + ' photo(s) already estimated.'
+          : 'No photos to estimate.';
         btn.disabled = false;
-        return;
+        return null; // nothing to run — skip the "Done" message below
       }
       var done = 0;
-      status.textContent = 'Estimated 0/' + ids.length + '…';
+      var prefix = info.alreadyDone ? 'Already had ' + info.alreadyDone + ', estimating ' : 'Estimating ';
+      status.textContent = prefix + '0/' + ids.length + '…';
       return ids.reduce(function(chain, fileId) {
         return chain.then(function() {
           return fetch('/api/files/' + fileId + '/estimate-age', { method: 'POST' })
             .catch(function() { /* keep going even if one photo fails/times out */ })
             .then(function() {
               done++;
-              status.textContent = 'Estimated ' + done + '/' + ids.length + '…';
+              status.textContent = prefix + done + '/' + ids.length + '…';
             });
         });
-      }, Promise.resolve());
+      }, Promise.resolve()).then(function() { return true; });
     })
-      .then(function() {
-        status.textContent = 'Done estimating age/gender for ' + name + '.';
+      .then(function(ran) {
+        if (ran) status.textContent = 'Done estimating age/gender for ' + name + '.';
         btn.disabled = false;
       })
       .catch(function(err) {
@@ -550,6 +587,32 @@
           });
       });
       box.appendChild(addAliasBtn);
+    });
+  });
+})();
+
+/* Scissors icon — "Split" review: pick the other person a batch of this
+   person's photos actually belongs to, then hand off to /person/{name}/split
+   for the swipe review (see split_person.html). Reuses the same generic
+   identity picker set_detail.html's "+ Add person" and faces.html's
+   reassign-to-different-identity flow already use. */
+(function() {
+  var splitBtn = document.getElementById('person-split-btn');
+  if (!splitBtn) return;
+  var name = {{ name | tojson }};
+
+  splitBtn.addEventListener('click', function() {
+    window.openEntitySearchModal({
+      type: 'identity',
+      title: 'Split ' + name + ' — which person is mixed in?',
+      onResolved: function(entity) {
+        var other = entity.name;
+        if (!other || other.toLowerCase() === name.toLowerCase()) {
+          alert('Pick someone other than ' + name + '.');
+          return;
+        }
+        location.href = '/person/' + encodeURIComponent(name) + '/split?with=' + encodeURIComponent(other);
+      },
     });
   });
 })();

@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% import "_macros.html" as macros %}
 
 {% block title %}Tags — media{% endblock %}
 
@@ -9,15 +10,17 @@
 </div>
 
 {% if tags %}
-<ul style="list-style:none;padding:0;margin:0;max-width:480px;">
+<ul style="list-style:none;padding:0;margin:0;max-width:720px;">
   {% for t in tags %}
-  <li style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);" data-label="{{ t.label }}">
-    <a href="/search?tag={{ t.label | urlencode }}" style="font-weight:500;flex:1;">{{ t.label }}</a>
+  <li style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);" data-label="{{ t.label }}">
+    <a href="/search?tag={{ t.label | urlencode }}" style="font-weight:500;flex:1 0 auto;">{{ t.label }}</a>
     <span class="sub" style="font-size:0.85em;">{{ t.count }} photo{{ '' if t.count == 1 else 's' }}</span>
     <button type="button" class="tag-rename-btn heart-btn-inline" data-label="{{ t.label }}"
             title="Rename this tag everywhere" style="font-size:0.9em;">✏️</button>
     <button type="button" class="tag-delete-btn heart-btn-inline" data-label="{{ t.label }}"
             title="Delete this tag everywhere" style="font-size:0.9em;">🗑️</button>
+    {{ macros.classifier_button(t.clip_btn) }}
+    {{ macros.classifier_button(t.yolo_btn) }}
   </li>
   {% endfor %}
 </ul>
@@ -58,6 +61,43 @@ document.querySelectorAll('.tag-delete-btn').forEach(function(btn) {
         if (li) li.remove();
       })
       .catch(function(err) { alert('Failed to delete: ' + err.message); });
+  });
+});
+
+document.querySelectorAll('.tag-train-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const kind = btn.dataset.kind;
+    const label = btn.dataset.label;
+    btn.disabled = true;
+    fetch('/api/tags/' + encodeURIComponent(label) + '/train-' + kind, {method: 'POST'})
+      .then(function(r) {
+        if (!r.ok) return r.json().then(function(data) { throw new Error(data.detail || 'Request failed'); });
+        return r.json();
+      })
+      .then(function() { location.reload(); })
+      .catch(function(err) {
+        btn.disabled = false;
+        alert('Failed to start training: ' + err.message);
+      });
+  });
+});
+
+document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
+  btn.addEventListener('click', function() {
+    const kind = btn.dataset.kind;
+    const label = btn.dataset.label;
+    if (!confirm('Stop the ' + kind.toUpperCase() + ' training run for "' + label + '"?')) return;
+    btn.disabled = true;
+    fetch('/api/tags/' + encodeURIComponent(label) + '/train-cancel?kind=' + kind, {method: 'POST'})
+      .then(function(r) {
+        if (!r.ok) return r.json().then(function(data) { throw new Error(data.detail || 'Request failed'); });
+        return r.json();
+      })
+      .then(function() { location.reload(); })
+      .catch(function(err) {
+        btn.disabled = false;
+        alert('Failed to cancel: ' + err.message);
+      });
   });
 });
 </script>
