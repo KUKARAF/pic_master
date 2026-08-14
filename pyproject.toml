@@ -18,8 +18,10 @@ media = "media_manager.media:main"
 [project.urls]
 Homepage = "https://github.com/KUKARAF/pic_master"
 
-[tool.setuptools]
-packages = ["media_manager"]
+[tool.setuptools.packages.find]
+# Auto-discover media_manager and all its subpackages (e.g. media_manager.migrations)
+# so new subpackages ship in the wheel without editing an explicit list here.
+include = ["media_manager*"]
 
 [tool.setuptools.package-data]
 # web.py serves these from the installed package (Path(__file__).parent), so they
