@@ -994,10 +994,15 @@ input[type="range"] { accent-color: var(--accent); }
   width: auto;
   height: auto;
 }
-.photo-stage.fit-cover .photo-image-wrap,
 .photo-stage.fit-stretch .photo-image-wrap { width: 100%; height: 100%; }
-.photo-stage.fit-cover #photo-image { width: 100%; height: 100%; object-fit: cover; }
 .photo-stage.fit-stretch #photo-image { width: 100%; height: 100%; object-fit: fill; }
+/* Fill: scale to the stage width at the image's natural aspect ratio. When the
+   image is taller than the stage it overflows and the stage scrolls (block +
+   overflow:auto, top-anchored — flex centering clips the top of overflowing
+   content and makes it unreachable, same reason the 1:1 mode below is block). */
+.photo-stage.fit-cover { overflow: auto; display: block; }
+.photo-stage.fit-cover .photo-image-wrap { display: inline-block; width: 100%; }
+.photo-stage.fit-cover #photo-image { width: 100%; height: auto; }
 .photo-stage.fit-pixel { overflow: auto; display: block; }
 .photo-stage.fit-pixel .photo-image-wrap { display: inline-block; }
 .photo-stage.fit-pixel #photo-image { image-rendering: pixelated; }

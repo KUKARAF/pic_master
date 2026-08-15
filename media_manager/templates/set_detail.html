@@ -59,13 +59,13 @@
 
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
   <p class="sub">{{ files | length }} image(s)</p>
-  {{ macros.sort_controls(sort, order) }}
+  {{ macros.sort_controls(sort, order, show_filename=True, show_manual=True) }}
 </div>
 
 {% if files %}
-<div class="grid" data-queue-source="Set: {{ set.name }}">
+<div class="grid" id="set-grid" data-set-id="{{ set.id }}" data-manual="{{ '1' if sort == 'manual' else '' }}" data-queue-source="Set: {{ set.name }}">
   {% for f in files %}
-  {{ macros.card(f, add_to_set=True) }}
+  {{ macros.card(f, add_to_set=True, reorder=(sort == 'manual')) }}
   {% endfor %}
 </div>
 {% else %}

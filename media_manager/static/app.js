@@ -3172,4 +3172,74 @@
     });
   }
 
+  /* Manual set ordering (set_detail.html, sort=manual): per-card ▲/▼ buttons and
+     a position number input reorder the grid in place, then persist the full new
+     order (each card's data-file-id, in DOM order) to /api/sets/{id}/reorder. The
+     server writes dense positions, so the whole order — not a two-row swap — is
+     sent on every change; that keeps up/down and the number input on one path. */
+  (function wireManualReorder() {
+    var grid = document.getElementById('set-grid');
+    if (!grid || !grid.dataset.manual) return;
+    var setId = grid.dataset.setId;
+
+    function cards() {
+      return Array.prototype.slice.call(grid.querySelectorAll('.card'));
+    }
+
+    function renumber() {
+      cards().forEach(function (card, i) {
+        var input = card.querySelector('.pos-input');
+        if (input) input.value = i + 1;
+      });
+    }
+
+    var saveTimer = null;
+    function persist() {
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () {
+        var ids = cards().map(function (card) {
+          return parseInt(card.dataset.fileId, 10);
+        }).filter(function (n) { return !isNaN(n); });
+        fetch('/api/sets/' + setId + '/reorder', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ file_ids: ids }),
+        }).catch(function () { /* best-effort; order is re-derivable from the DOM */ });
+      }, 300);
+    }
+
+    function moveTo(card, index) {
+      var list = cards();
+      var clamped = Math.max(0, Math.min(index, list.length - 1));
+      var ref = list[clamped];
+      if (ref === card) return;
+      // Insert before ref when moving up, after ref when moving down.
+      if (list.indexOf(card) < clamped) {
+        grid.insertBefore(card, ref.nextSibling);
+      } else {
+        grid.insertBefore(card, ref);
+      }
+      renumber();
+      persist();
+    }
+
+    grid.addEventListener('click', function (e) {
+      var btn = e.target.closest && e.target.closest('.reorder-up, .reorder-down');
+      if (!btn) return;
+      var card = btn.closest('.card');
+      var idx = cards().indexOf(card);
+      moveTo(card, btn.classList.contains('reorder-up') ? idx - 1 : idx + 1);
+    });
+
+    grid.addEventListener('change', function (e) {
+      if (!e.target.classList.contains('pos-input')) return;
+      var card = e.target.closest('.card');
+      var pos = parseInt(e.target.value, 10);
+      if (isNaN(pos)) { renumber(); return; }
+      moveTo(card, pos - 1); // 1-based input -> 0-based index
+    });
+
+    renumber();
+  })();
+
 })();

@@ -59,7 +59,7 @@
    behavior everywhere else. add_to_set renders the same "＋ Add" button the
    set-detail suggestions grid uses (no set id needed on the button — the
    page's own wireAddButton/setId closure wires any .add-to-set-btn it finds). #}
-{% macro card(f, selectable=False, img_src=None, star_href=None, star_title=None, star_icon='⭐', add_to_set=False) %}
+{% macro card(f, selectable=False, img_src=None, star_href=None, star_title=None, star_icon='⭐', add_to_set=False, reorder=False) %}
 <div class="card" data-file-id="{{ f.id }}">
   {% if selectable %}
   <input type="checkbox" class="card-select-checkbox" data-file-id="{{ f.id }}">
@@ -86,6 +86,16 @@
     <button type="button" class="btn-similar add-to-set-btn" data-file-id="{{ f.id }}"
             style="font-size:0.8em;padding:4px 10px;margin-top:6px;">＋ Add</button>
     {% endif %}
+    {% if reorder %}
+    <div class="reorder-controls" style="display:flex;align-items:center;gap:6px;margin-top:6px;">
+      <button type="button" class="btn-similar reorder-up" title="Move up"
+              style="font-size:0.8em;padding:2px 8px;">▲</button>
+      <button type="button" class="btn-similar reorder-down" title="Move down"
+              style="font-size:0.8em;padding:2px 8px;">▼</button>
+      <input type="number" class="pos-input" min="1" title="Position"
+             style="width:56px;font-size:0.8em;padding:2px 4px;">
+    </div>
+    {% endif %}
   </div>
 </div>
 {% endmacro %}
@@ -93,7 +103,7 @@
 {# Sort control shared by gallery/search/set-detail — a plain GET form so it works
    without JS, preserving whatever other query params the page already has via
    hidden inputs passed in `extra_params` (a dict). #}
-{% macro sort_controls(sort, order, extra_params={}) %}
+{% macro sort_controls(sort, order, extra_params={}, show_filename=False, show_manual=False) %}
 <form class="sort-controls" method="get" style="display:inline-flex;align-items:center;gap:6px;">
   {% for key, value in extra_params.items() %}
   {% if value %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}
@@ -103,10 +113,20 @@
     <option value="added" {{ 'selected' if sort == 'added' }}>Date added</option>
     <option value="modified" {{ 'selected' if sort == 'modified' }}>Date modified</option>
     <option value="age" {{ 'selected' if sort == 'age' }}>Estimated age</option>
+    {% if show_filename %}<option value="filename" {{ 'selected' if sort == 'filename' }}>Filename</option>{% endif %}
+    {% if show_manual %}<option value="manual" {{ 'selected' if sort == 'manual' }}>Manual order</option>{% endif %}
   </select>
+  {# Manual order is absolute — no asc/desc, so the direction select is hidden for it. #}
+  {% if sort != 'manual' %}
   <select name="order" onchange="this.form.submit()">
+    {% if sort == 'filename' %}
+    <option value="asc" {{ 'selected' if order == 'asc' }}>A → Z</option>
+    <option value="desc" {{ 'selected' if order == 'desc' }}>Z → A</option>
+    {% else %}
     <option value="desc" {{ 'selected' if order == 'desc' }}>{{ 'Oldest first' if sort == 'age' else 'Newest first' }}</option>
     <option value="asc" {{ 'selected' if order == 'asc' }}>{{ 'Youngest first' if sort == 'age' else 'Oldest first' }}</option>
+    {% endif %}
   </select>
+  {% endif %}
 </form>
 {% endmacro %}

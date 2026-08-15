@@ -334,6 +334,14 @@ class ManualDB(ThreadLocalDB):
         # set-similarity ranking helpers) filters by set_id alone and was doing a
         # full table scan without this.
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_sets_set_id ON file_sets (set_id)')
+        # Manual per-set ordering: a nullable rank so a user can arrange a set's
+        # files in an arbitrary order on the web set page. NULL means "never
+        # manually positioned" and sorts last, falling back to created_at (see
+        # get_files_by_set's manual_order path). A plain ADD COLUMN is safe here
+        # (unlike the PK rebuild above) since only a column, not the key, changes.
+        file_sets_cols = {row[1] for row in cur.execute('PRAGMA table_info(file_sets)')}
+        if 'position' not in file_sets_cols:
+            cur.execute('ALTER TABLE file_sets ADD COLUMN position INTEGER')
         # A human-confirmed "this file does NOT belong in this set" — the
         # negative counterpart to file_sets, same (checksum, set_id) shape,
         # scoped per-set (unlike faces' single global `rejected` flag, since
@@ -1374,11 +1382,34 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT checksum FROM file_set_exclusions WHERE set_id = ?', (set_id,))
         return {row[0] for row in cur.fetchall()}
 
-    def get_files_by_set(self, set_id, limit=200):
-        """Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""
+    def get_files_by_set(self, set_id, limit=200, manual_order=False):
+        """Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums.
+
+        With manual_order=True, orders by the user-assigned `position` (see
+        set_file_positions), placing never-positioned members (NULL) last, tie-broken
+        by created_at then checksum for a stable order. Without it, order is left to
+        SQLite (rowid/insertion order) as before."""
         cur = self.conn.cursor()
-        cur.execute('SELECT checksum FROM file_sets WHERE set_id = ? LIMIT ?', (set_id, limit))
+        if manual_order:
+            cur.execute('''
+                SELECT checksum FROM file_sets WHERE set_id = ?
+                ORDER BY (position IS NULL), position, created_at, checksum
+                LIMIT ?
+            ''', (set_id, limit))
+        else:
+            cur.execute('SELECT checksum FROM file_sets WHERE set_id = ? LIMIT ?', (set_id, limit))
         return [row[0] for row in cur.fetchall()]
+
+    def set_file_positions(self, set_id, ordered_checksums):
+        """Persist a full manual ordering for a set: writes position = index for each
+        checksum in the given order. Writing the entire order (rather than swapping
+        two rows) keeps positions dense and lets the up/down and number-input UI
+        actions share one code path. Checksums not in this set are simply no-ops."""
+        cur = self.conn.cursor()
+        for idx, checksum in enumerate(ordered_checksums):
+            cur.execute('UPDATE file_sets SET position = ? WHERE set_id = ? AND checksum = ?',
+                        (idx, set_id, checksum))
+        self.conn.commit()
 
     def get_sets_for_file(self, checksum):
         """Every set this file belongs to (a file can be in more than one)."""

@@ -68,6 +68,9 @@ class SetBody(BaseModel):
 class AddFolderBody(BaseModel):
     path: str
 
+class ReorderBody(BaseModel):
+    file_ids: List[int]
+
 class IdentityBody(BaseModel):
     name: Optional[str] = None
 
@@ -843,6 +846,8 @@ def create_app(data_root: str) -> FastAPI:
         (search by tag/person, set detail) which don't paginate via SQL. 'age' isn't
         handled here since it needs manual.db and enriched cards; see _sort_cards_by_age."""
         reverse = (order != 'asc')
+        if sort == 'filename':
+            return sorted(file_rows, key=lambda r: os.path.basename(r['path']).lower(), reverse=reverse)
         if sort == 'modified':
             return sorted(file_rows, key=lambda r: r['modified_time'] or 0, reverse=reverse)
         return sorted(file_rows, key=lambda r: r['first_seen'], reverse=reverse)
@@ -2587,8 +2592,15 @@ def create_app(data_root: str) -> FastAPI:
         if set_row is None:
             raise HTTPException(status_code=404, detail='Set not found')
         all_tags = manual.list_all_tags()
-        checksums = manual.get_files_by_set(set_id, limit=500)
-        file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
+        manual_mode = (sort == 'manual')
+        checksums = manual.get_files_by_set(set_id, limit=500, manual_order=manual_mode)
+        file_rows = db.get_files_by_checksums(checksums)
+        if manual_mode:
+            # get_files_by_checksums returns rows unordered; keep the manual order.
+            by_ck = {r['checksum']: r for r in file_rows}
+            file_rows = [by_ck[c] for c in checksums if c in by_ck]
+        else:
+            file_rows = _sort_file_rows(file_rows, sort, order)
         rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
         files = _enrich_rows(rows)
         # Every card here already belongs to this set — showing this set's own
@@ -3072,6 +3084,21 @@ def create_app(data_root: str) -> FastAPI:
     def api_remove_set(file_id: int, set_id: int):
         row = _file_or_404(file_id)
         manual.remove_file_from_set(row['checksum'], set_id)
+        return {'ok': True}
+
+    @app.post('/api/sets/{set_id}/reorder')
+    def api_reorder_set(set_id: int, body: ReorderBody):
+        """Persist the manual order of a set from the full ordered list of file ids
+        the set-detail page sends (its cards' data-file-id, in DOM order). Resolves
+        each id to its checksum and writes dense positions via set_file_positions."""
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        checksums = []
+        for fid in body.file_ids:
+            row = db.get_file_by_id(fid)
+            if row is not None:
+                checksums.append(row['checksum'])
+        manual.set_file_positions(set_id, checksums)
         return {'ok': True}
 
     @app.post('/api/files/{file_id}/sets/{set_id}/exclude')
