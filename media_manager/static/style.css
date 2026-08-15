@@ -582,7 +582,25 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
-.card a.card-img-link { display: block; }
+.card a.card-img-link { display: block; position: relative; }
+
+/* ▶ badge marking a video thumbnail in any photo grid */
+.card .video-badge {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font-size: 13px;
+  padding-left: 2px; /* optically center the ▶ glyph */
+  pointer-events: none;
+}
 
 .card img {
   width: 100%;
@@ -976,6 +994,10 @@ input[type="range"] { accent-color: var(--accent); }
 /* the wrap shrink-wraps the rendered image so app.js's drag-to-draw
    coordinate mapping (naturalWidth / clientWidth) stays exact */
 .photo-image-wrap { position: relative; line-height: 0; }
+/* Video player: fit within the stage (which flex-centers its child), like FIT
+   mode for images. The image fit-mode/draw JS is bound to #photo-image and never
+   touches #photo-video. */
+#photo-video { max-width: 100%; max-height: calc(100vh - 56px); display: block; }
 .photo-image-wrap.add-face-active,
 .photo-image-wrap.add-face-active img { cursor: crosshair; }
 .photo-image-wrap img {

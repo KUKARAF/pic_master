@@ -22,6 +22,8 @@ import os
 
 from PIL import Image
 
+from .formats import IMAGE_EXTENSIONS
+
 # Fraction of the face box's area that must fall inside a person box to call that
 # person box the face's body — containment, not IoU, since a small face box inside
 # a much larger body box has a tiny IoU but is obviously "in" that body.
@@ -119,6 +121,13 @@ def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=
     total = len(files)
     processed = 0
     for file_id, rel_path in files:
+        # Body detection is image-only (PIL/YOLO); videos are tracked but have no
+        # body crops — skip them (get_unbody_indexed_files doesn't filter by kind).
+        if os.path.splitext(rel_path)[1].lower() not in IMAGE_EXTENSIONS:
+            processed += 1
+            if on_progress:
+                on_progress(processed, total)
+            continue
         try:
             abs_path = os.path.join(data_root, rel_path)
             if not os.path.isfile(abs_path):

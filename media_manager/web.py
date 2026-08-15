@@ -25,6 +25,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from media_manager import frames
+from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from media_manager.category_resolver import (
     get_category_counts,
     get_resolved_checksums_for_category,
@@ -37,7 +38,6 @@ from media_manager.category_resolver import (
 # ---------------------------------------------------------------------------
 
 THUMB_SIZE = (400, 400)
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 
 # Applied to /thumb, /image, /face-crop, /body-crop's successful responses only
 # (never the gray-placeholder fallbacks) — each of those is served from a path
@@ -189,6 +189,43 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
                 _save_jpeg_atomic(img, dst_path, quality=80)
         message = '; '.join(str(w.message) for w in caught) if caught else None
         return True, message
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
+    """Poster-frame thumbnail for a video: grab a frame with OpenCV (the same
+    decoder broken_finder.verify_video uses), then reuse the image thumbnail's
+    resize-to-400px + atomic-JPEG-save tail. Seeks ~1s in so the poster isn't a
+    black/leading frame, falling back to frame 0. Returns (success, message) with
+    the same shape as _make_thumbnail so serve_thumb treats them identically."""
+    import cv2
+    from PIL import Image as PILImage
+    try:
+        cap = cv2.VideoCapture(src_path)
+        if not cap.isOpened():
+            return False, 'could not open video'
+        try:
+            cap.set(cv2.CAP_PROP_POS_MSEC, 1000)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                # Seeking past a very short clip's end leaves nothing to read —
+                # rewind and take the first frame instead.
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = cap.read()
+            if not ok or frame is None:
+                return False, 'could not read a video frame'
+        finally:
+            cap.release()
+        img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        w, h = img.size
+        if w == 0:
+            return False, 'video frame has zero width'
+        new_w = 400
+        new_h = max(1, int(h * new_w / w))
+        img = img.resize((new_w, new_h), PILImage.LANCZOS)
+        _save_jpeg_atomic(img, dst_path, quality=80)
+        return True, None
     except Exception as exc:
         return False, str(exc)
 
@@ -441,6 +478,7 @@ def create_app(data_root: str) -> FastAPI:
                 'path': path,
                 'checksum': checksum,
                 'filename': os.path.basename(path),
+                'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
                 'has_embedding': bool(has_embedding),
                 'tags': tag_map.get(checksum, []),
                 'favorite': checksum in favorite_checksums,
@@ -864,16 +902,20 @@ def create_app(data_root: str) -> FastAPI:
 
         rel_path = row['path']
         ext = os.path.splitext(rel_path)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
+        is_video = ext in VIDEO_EXTENSIONS
+        if ext not in IMAGE_EXTENSIONS and not is_video:
             return Response(content=_gray_placeholder(), media_type='image/jpeg')
 
+        # Videos get a poster frame cached to the same {file_id}.jpg path as image
+        # thumbnails (still served as image/jpeg), so the gallery's <img> works unchanged.
         thumb_path = os.path.join(thumbs_dir, f'{file_id}.jpg')
 
         if not os.path.isfile(thumb_path):
             abs_path = _live_abs_path(file_id, rel_path)
             if abs_path is None:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
-            success, message = _make_thumbnail(abs_path, thumb_path)
+            make_thumb = _make_video_thumbnail if is_video else _make_thumbnail
+            success, message = make_thumb(abs_path, thumb_path)
             if message:
                 errors.log(rel_path, message)
             if not success:
@@ -961,6 +1003,7 @@ def create_app(data_root: str) -> FastAPI:
         file_info['tags'] = whole_tags
         ext = os.path.splitext(file_info['path'])[1].lower()
         file_info['is_image'] = ext in IMAGE_EXTENSIONS
+        file_info['is_video'] = ext in VIDEO_EXTENSIONS
         frame_count = 1
         if file_info['is_image']:
             abs_path = _live_abs_path(file_id, file_info['path'])

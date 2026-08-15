@@ -90,8 +90,13 @@ def find_broken(root_path, db_conn, data_root, max_workers=8, error_log=None):
 
             if not healthy:
                 now = int(time.time())
-                # mark broken (timestamp) or leave NULL if healthy
-                cur.execute('UPDATE files SET broken=? WHERE path=?', (now, rel_path))
+                # mark broken (timestamp) or leave NULL if healthy. `broken` lives on
+                # the content row (files), keyed by checksum; paths live in file_paths,
+                # so resolve this path to its file_id rather than filtering files by a
+                # `path` column it doesn't have.
+                cur.execute(
+                    'UPDATE files SET broken=? WHERE id=(SELECT file_id FROM file_paths WHERE path=?)',
+                    (now, rel_path))
                 if cur.rowcount:      # row actually existed
                     broken_count += 1
 

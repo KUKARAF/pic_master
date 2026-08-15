@@ -8,7 +8,7 @@ import shutil
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .ignore import IgnoreRules
-from .formats import IMAGE_EXTENSIONS
+from .formats import MEDIA_EXTENSIONS
 from .hasher import FileHasher
 
 def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False, manual=None):
@@ -74,7 +74,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
             continue
 
         ext = os.path.splitext(full_path)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
+        if ext not in MEDIA_EXTENSIONS:
             continue
 
         rel_path = os.path.relpath(full_path, data_root).replace(os.sep, '/')

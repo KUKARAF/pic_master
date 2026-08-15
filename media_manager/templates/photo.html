@@ -20,8 +20,12 @@
   <div class="photo-image-wrap" id="photo-image-wrap">
     <img src="/image/{{ file.id }}" alt="{{ file.filename }}" id="photo-image" draggable="false">
   </div>
+  {% elif file.is_video %}
+  <div class="photo-image-wrap" id="photo-image-wrap">
+    <video src="/image/{{ file.id }}" id="photo-video" controls playsinline preload="metadata"></video>
+  </div>
   {% else %}
-  <div class="alert">This file is not a supported image type.</div>
+  <div class="alert">This file is not a supported media type.</div>
   {% endif %}
 
   <!-- top-left: back -->
