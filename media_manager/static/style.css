@@ -1692,8 +1692,20 @@ input[type="range"] { accent-color: var(--accent); }
 
 /* Multi-select mode ("Add queue to set"). */
 .queue-grid-overlay.select-mode { flex-direction: column; }
-/* Leave room for the footer so the grid scrolls under it, never behind it. */
-.queue-grid-overlay.select-mode .queue-grid-panel { max-height: calc(100% - 84px); }
+/* In column layout the panel's width is the flex CROSS axis; with the overlay's
+   align-items:center it would be indefinite, so the grid's auto-fill can't
+   resolve a stable column count and the aspect-ratio cells overlap. Stretch it
+   to a definite full width (then re-cap + re-center) so it renders exactly like
+   the row-layout Space grid. Also leave room for the footer below. */
+.queue-grid-overlay.select-mode .queue-grid-panel {
+  max-height: calc(100% - 84px);
+  align-self: stretch;
+  margin-inline: auto;
+}
+.queue-grid-overlay.select-mode .queue-grid-footer {
+  align-self: stretch;
+  margin-inline: auto;
+}
 
 /* A chosen item: accent frame + check badge (top-left, so it never collides
    with the is-current dot at top-right). */
