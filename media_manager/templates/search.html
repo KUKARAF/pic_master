@@ -19,9 +19,9 @@
 </div>
 
 {% if similar_faces %}
-<div class="grid" id="similar-unknown-grid">
+<div class="grid" id="similar-unknown-grid" data-queue-source="Similar faces">
   {% for f in similar_faces %}
-  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}">
+  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}" data-file-id="{{ f.file_id }}">
     <a class="card-img-link" href="/photo/{{ f.file_id }}">
       <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
     </a>
@@ -47,7 +47,7 @@
   </div>
   <div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>
 </div>
-<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>
+<div class="grid" id="similar-unknown-grid" data-queue-source="Similar faces" style="margin-top:16px;"></div>
 {% endif %}
 
 {% else %}
@@ -75,7 +75,7 @@
     <button type="button" id="face-search-btn" class="btn-similar">Find face</button>
     <span id="face-search-status" style="font-size:0.85em;color:#728C72;"></span>
   </div>
-  <div id="face-results" class="grid" style="margin-top:16px;"></div>
+  <div id="face-results" class="grid" data-queue-source="Face search" style="margin-top:16px;"></div>
 </div>
 {% endif %}
 
@@ -325,7 +325,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
         status.textContent = data.results.length + ' result(s)';
         data.results.forEach(function(f) {
           resultsDiv.innerHTML += `
-            <div class="card">
+            <div class="card" data-file-id="${f.file_id}">
               <a class="card-img-link" href="/photo/${f.file_id}">
                 <img src="/thumb/${f.file_id}" alt="${f.filename}" loading="lazy">
               </a>
@@ -414,6 +414,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
               card.className = 'card';
               card.id = 'unknown-card-' + f.ref;
               card.dataset.faceRef = f.ref;
+              card.dataset.fileId = f.file_id;
               const actionHtml = f.identity
                 ? '<button type="button" class="btn-similar use-name-btn" data-name="' + f.identity + '" ' +
                   'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + f.identity + '"</button>'

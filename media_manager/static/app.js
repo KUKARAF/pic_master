@@ -1655,11 +1655,16 @@
 
     window.__photoQueue = queue;
 
-    const hintEl = document.getElementById('stage-hint');
-    if (hintEl) {
-      hintEl.textContent = queue
-        ? queue.label + ' · ' + (queue.cursor + 1) + '/' + queue.ids.length + ' · ← → BROWSE · SPACE GRID · F FIT · ESC PANEL'
-        : 'F FIT · ESC PANEL';
+    // Neon progress line under the navbar: fills to the current position in the
+    // queue (cursor+1 of N). Hidden when this photo isn't part of a queue.
+    const progressEl = document.getElementById('queue-progress');
+    if (progressEl) {
+      if (queue && queue.ids.length > 0) {
+        progressEl.style.width = ((queue.cursor + 1) / queue.ids.length * 100) + '%';
+        progressEl.style.display = 'block';
+      } else {
+        progressEl.style.display = 'none';
+      }
     }
 
     function goTo(id) {
