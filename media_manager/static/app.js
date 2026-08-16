@@ -1743,10 +1743,25 @@
 
     document.addEventListener('keydown', function (e) {
       if (photoGridOpen) return;
-      if (!queue) return;
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
       if (isTypingTarget(document.activeElement)) return;
       if (e.altKey || e.ctrlKey || e.metaKey) return;
+
+      // Up/Down scroll the displayed image inside #photo-stage (the element
+      // made scrollable via overflow:auto in FILL/1:1 modes). Works regardless
+      // of queue state; a visual no-op in FIT mode where nothing overflows.
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        const stage = document.getElementById('photo-stage');
+        if (!stage) return;
+        e.preventDefault(); // stop the browser page from also scrolling
+        // Fixed ~120px step: predictable, wheel-like nudges that let you
+        // fine-tune framing without overshooting on tall images.
+        const step = 120;
+        stage.scrollBy({ top: e.key === 'ArrowDown' ? step : -step, behavior: 'smooth' });
+        return;
+      }
+
+      if (!queue) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
 
       if (e.key === 'ArrowLeft') {
         if (queue.cursor <= 0) return;
