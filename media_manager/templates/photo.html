@@ -14,7 +14,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="photo-stage fit-contain sidebar-open" id="photo-stage">
+<div class="photo-stage fit-contain" id="photo-stage">
 
   {% if file.is_image %}
   <div class="photo-image-wrap" id="photo-image-wrap">
@@ -28,39 +28,38 @@
   <div class="alert">This file is not a supported media type.</div>
   {% endif %}
 
-  <!-- top-left: back -->
-  <div class="stage-chrome stage-top-left">
-    <a href="/" class="stage-btn">&lt; BACK</a>
-  </div>
-
-  <!-- top-right: fit mode + sidebar toggle -->
+  <!-- top-right: fit mode (own corner) -->
   <div class="stage-chrome stage-top-right">
     {% if file.is_image %}
     <button type="button" id="fit-mode-btn" class="stage-btn stage-btn-accent" title="cycle image fit (F)">▣ MODE · <span id="fit-mode-label">FIT</span></button>
     {% endif %}
-    <button type="button" id="sidebar-open-btn" class="stage-btn" style="display:none;">INFO ▸</button>
   </div>
 
-  <!-- ===== overlay sidebar ===== -->
-  <aside class="photo-sidebar" id="photo-sidebar">
+  <!-- transient cross-page action banner (floats top-center) -->
+  <div id="sidebar-custom-action" class="stage-custom-action"></div>
 
-    <div id="sidebar-custom-action"></div>
+  <!-- bottom-right: favorite (standalone, no menu) -->
+  <div class="stage-pod stage-bottom-right">
+    <button type="button" id="file-heart-btn" class="stage-pod-btn heart-fav-btn {{ 'is-favorite' if file.favorite else '' }}"
+            data-fav-count="{{ file.favorite or 0 }}"
+            title="Favorite (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
+  </div>
 
-    <div class="sidebar-header">
-      <div class="sidebar-title-wrap">
-        <div>
-          <span id="photo-title-display">{{ file.title or file.filename }}</span>
-          <button type="button" id="photo-title-edit-btn" class="heart-btn-inline" title="Edit title" style="font-size:0.8em;">✏️</button>
-          <button type="button" id="file-heart-btn" class="heart-btn-inline heart-btn-file {{ 'is-favorite' if file.favorite else '' }}"
-                  data-fav-count="{{ file.favorite or 0 }}"
-                  title="Favorite this photo (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
+  <!-- TOP-CENTER: file info + title -->
+  <div class="stage-pod stage-top-center" data-pod>
+    <button type="button" class="stage-pod-btn">ⓘ INFO</button>
+    <div class="stage-pod-menu">
+      <div class="sidebar-header">
+        <div class="sidebar-title-wrap">
+          <div>
+            <span id="photo-title-display">{{ file.title or file.filename }}</span>
+            <button type="button" id="photo-title-edit-btn" class="heart-btn-inline" title="Edit title" style="font-size:0.8em;">✏️</button>
+          </div>
+          {% if file.title %}
+          <div class="sidebar-filename" id="photo-filename-sub" title="Original filename">{{ file.filename }}</div>
+          {% endif %}
         </div>
-        {% if file.title %}
-        <div class="sidebar-filename" id="photo-filename-sub" title="Original filename">{{ file.filename }}</div>
-        {% endif %}
       </div>
-      <button type="button" id="sidebar-close-btn" class="sidebar-close-btn" title="Hide panel (Esc)">✕</button>
-    </div>
 
     <!-- Metadata -->
     <div class="sidebar-panel">
@@ -90,8 +89,17 @@
           <td>{{ file.checksum or '—' }}</td>
         </tr>
       </table>
+      </div>
+      <button type="button" id="fileinfo-add-set-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
     </div>
+  </div>
 
+  <!-- RIGHT RAIL: Tags / Categories / Sets metadata pods -->
+  <div class="stage-pod-rail stage-right">
+
+  <div class="stage-pod" data-pod>
+    <button type="button" class="stage-pod-btn">🏷 Tags</button>
+    <div class="stage-pod-menu">
     <!-- Tags (manually set + auto-detected are shown together — blue = manual,
          gray = detected, red = manually rejected and excluded from search) -->
     <div class="sidebar-panel">
@@ -150,7 +158,12 @@
       <div id="label-region-status" class="sub" style="display:none;"></div>
       {% endif %}
     </div>
+    </div>
+  </div>
 
+  <div class="stage-pod" data-pod>
+    <button type="button" class="stage-pod-btn">▦ Categories</button>
+    <div class="stage-pod-menu">
     <!-- Categories — a photo can belong to any number of categories, same as
          tags/sets. Each chip is either a manual assignment or an unsuppressed
          ML auto-match (see category_resolver.py). -->
@@ -171,7 +184,12 @@
       </div>
       <button type="button" id="category-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add category</button>
     </div>
+    </div>
+  </div>
 
+  <div class="stage-pod" data-pod>
+    <button type="button" class="stage-pod-btn">▤ Sets</button>
+    <div class="stage-pod-menu">
     <!-- Sets — a photo can belong to any number of sets -->
     <div class="sidebar-panel">
       <div class="section-title">Sets</div>
@@ -197,7 +215,15 @@
       <button type="button" id="set-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
       <button type="button" id="set-picker-queue-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;display:none;">＋ Add queue to set</button>
     </div>
+    </div>
+  </div>
 
+  </div><!-- /right rail -->
+
+  <!-- TOP-LEFT: Faces -->
+  <div class="stage-pod stage-top-left" data-pod>
+    <button type="button" class="stage-pod-btn">☺ Faces</button>
+    <div class="stage-pod-menu">
     <!-- Faces -->
     <div class="sidebar-panel">
       <div class="section-title">Faces</div>
@@ -297,14 +323,18 @@
       </p>
       {% endif %}
     </div>
-
-    <!-- The three search actions -->
-    <div style="display:flex;flex-direction:column;gap:8px;margin-top:2px;">
-      <a class="btn-similar btn-primary btn-block" href="/similar/{{ file.id }}">◈ Find similar images</a>
-      <span class="btn-similar btn-disabled btn-block" title="Coming soon">☺ Faces — coming soon</span>
-      <a class="btn-similar btn-block" href="/body-similar/{{ file.id }}">⛶ Find by body</a>
     </div>
+  </div>
 
-  </aside>
+  <!-- BOTTOM-LEFT: find -->
+  <div class="stage-pod stage-bottom-left" data-pod>
+    <button type="button" class="stage-pod-btn">🔎 Find</button>
+    <div class="stage-pod-menu">
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <a class="btn-similar btn-primary btn-block" href="/similar/{{ file.id }}">◈ Find similar images</a>
+        <a class="btn-similar btn-block" href="/body-similar/{{ file.id }}">⛶ Find by body</a>
+      </div>
+    </div>
+  </div>
 </div>
 {% endblock %}

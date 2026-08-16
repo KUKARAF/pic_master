@@ -3618,25 +3618,48 @@
       });
     });
 
-    const sidebarOpenBtn = document.getElementById('sidebar-open-btn');
-    const sidebarCloseBtn = document.getElementById('sidebar-close-btn');
-    function setSidebar(open) {
-      photoStage.classList.toggle('sidebar-open', open);
-      if (sidebarOpenBtn) sidebarOpenBtn.style.display = open ? 'none' : '';
-      try { localStorage.setItem('mm_sidebar', open ? '1' : '0'); } catch (e) {}
+    // ---- Corner pods: hover opens (with a small close delay to cross the
+    // trigger→menu gap), click pins; outside-click / Esc closes. One pin max. ----
+    const pods = Array.prototype.slice.call(photoStage.querySelectorAll('[data-pod]'));
+    function closeAllPods(exceptEl) {
+      pods.forEach(function (p) {
+        if (p !== exceptEl) { p.classList.remove('is-open'); p.__pinned = false; }
+      });
     }
-    let sidebarPref = '1';
-    try { sidebarPref = localStorage.getItem('mm_sidebar') || '1'; } catch (e) {}
-    setSidebar(sidebarPref === '1');
-    if (sidebarOpenBtn) sidebarOpenBtn.addEventListener('click', function () { setSidebar(true); });
-    if (sidebarCloseBtn) sidebarCloseBtn.addEventListener('click', function () { setSidebar(false); });
+    pods.forEach(function (pod) {
+      const trigger = pod.querySelector('.stage-pod-btn');
+      let hideTimer = null;
+      function openPod() { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } pod.classList.add('is-open'); }
+      function scheduleClose() {
+        if (pod.__pinned) return;
+        if (hideTimer) clearTimeout(hideTimer);
+        hideTimer = setTimeout(function () { pod.classList.remove('is-open'); }, 160);
+      }
+      pod.addEventListener('mouseenter', openPod);
+      pod.addEventListener('mouseleave', scheduleClose);
+      if (trigger) {
+        trigger.addEventListener('click', function (e) {
+          e.stopPropagation();
+          pod.__pinned = !pod.__pinned;
+          if (pod.__pinned) { closeAllPods(pod); openPod(); }
+          else pod.classList.remove('is-open');
+        });
+      }
+    });
+    document.addEventListener('click', function (e) {
+      if (!e.target.closest('[data-pod]')) closeAllPods(null);
+    });
+
+    // Quick "＋ Add to set" in the top File-info pod reuses the set picker.
+    const fileinfoAddSet = document.getElementById('fileinfo-add-set-btn');
+    if (fileinfoAddSet) fileinfoAddSet.addEventListener('click', openSetPickerModal);
 
     window.addEventListener('keydown', function (e) {
       if (photoGridOpen) return;
       const tag = (e.target && e.target.tagName) || '';
       if (tag === 'INPUT' || tag === 'TEXTAREA') return;
       if (e.key === 'f' || e.key === 'F') cycleFit();
-      if (e.key === 'Escape') setSidebar(!photoStage.classList.contains('sidebar-open'));
+      if (e.key === 'Escape') closeAllPods(null);
     });
   }
 
