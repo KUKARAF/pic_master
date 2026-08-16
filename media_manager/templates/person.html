@@ -503,7 +503,7 @@
           })
           .catch(function(err) {
             renameBtn.disabled = false;
-            alert('Failed to rename: ' + err.message);
+            showToast('Failed to rename: ' + err.message);
           });
       });
       box.appendChild(renameBtn);
@@ -547,7 +547,7 @@
               .then(function(data) { renderAliases(data.aliases || []); })
               .catch(function(err) {
                 rm.disabled = false;
-                alert('Failed to remove alias: ' + err.message);
+                showToast('Failed to remove alias: ' + err.message);
               });
           });
           chip.appendChild(rm);
@@ -583,7 +583,7 @@
           })
           .catch(function(err) {
             addAliasBtn.disabled = false;
-            alert('Failed to add alias: ' + err.message);
+            showToast('Failed to add alias: ' + err.message);
           });
       });
       box.appendChild(addAliasBtn);
@@ -608,7 +608,7 @@
       onResolved: function(entity) {
         var other = entity.name;
         if (!other || other.toLowerCase() === name.toLowerCase()) {
-          alert('Pick someone other than ' + name + '.');
+          showToast('Pick someone other than ' + name + '.');
           return;
         }
         location.href = '/person/' + encodeURIComponent(name) + '/split?with=' + encodeURIComponent(other);

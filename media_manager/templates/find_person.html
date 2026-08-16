@@ -290,7 +290,7 @@
             .catch(function(err) {
               confirmBtn.disabled = false;
               rejectBtn.disabled = false;
-              alert('Failed to decide: ' + err.message);
+              showToast('Failed to decide: ' + err.message);
             });
         }
 
@@ -371,7 +371,7 @@
                 })
                 .catch(function(err) {
                   bulkBtn.disabled = false;
-                  alert('Failed to bulk-confirm: ' + err.message);
+                  showToast('Failed to bulk-confirm: ' + err.message);
                 });
             });
           }

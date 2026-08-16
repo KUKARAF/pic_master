@@ -46,7 +46,7 @@ document.querySelectorAll('.tag-rename-btn').forEach(function(btn) {
     })
       .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
       .then(function() { location.reload(); })
-      .catch(function(err) { alert('Failed to rename: ' + err.message); });
+      .catch(function(err) { showToast('Failed to rename: ' + err.message); });
   });
 });
 
@@ -60,7 +60,7 @@ document.querySelectorAll('.tag-delete-btn').forEach(function(btn) {
         const li = document.querySelector('li[data-label="' + CSS.escape(label) + '"]');
         if (li) li.remove();
       })
-      .catch(function(err) { alert('Failed to delete: ' + err.message); });
+      .catch(function(err) { showToast('Failed to delete: ' + err.message); });
   });
 });
 
@@ -77,7 +77,7 @@ document.querySelectorAll('.tag-train-btn').forEach(function(btn) {
       .then(function() { location.reload(); })
       .catch(function(err) {
         btn.disabled = false;
-        alert('Failed to start training: ' + err.message);
+        showToast('Failed to start training: ' + err.message);
       });
   });
 });
@@ -96,7 +96,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
       .then(function() { location.reload(); })
       .catch(function(err) {
         btn.disabled = false;
-        alert('Failed to cancel: ' + err.message);
+        showToast('Failed to cancel: ' + err.message);
       });
   });
 });

@@ -106,10 +106,10 @@ document.querySelectorAll('.set-delete-btn').forEach(function(btn) {
         const card = document.getElementById('set-card-' + btn.dataset.setId);
         if (card) card.remove();
       } else {
-        alert('Failed to delete set.');
+        showToast('Failed to delete set.');
       }
     } catch (err) {
-      alert('Network error.');
+      showToast('Network error.');
     }
   });
 });
@@ -140,7 +140,7 @@ document.querySelectorAll('.set-edit-btn').forEach(function(btn) {
         if (!name) return;
         renameSetWithMergePrompt(btn.dataset.setId, name, studioInput.value.trim() || null)
           .then(function() { closeModal(); location.reload(); })
-          .catch(function(err) { alert('Failed to rename set: ' + err.message); });
+          .catch(function(err) { showToast('Failed to rename set: ' + err.message); });
       });
       box.appendChild(saveBtn);
     });

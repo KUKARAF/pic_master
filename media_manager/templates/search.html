@@ -164,7 +164,7 @@ document.querySelectorAll('.tag-train-btn').forEach(function(btn) {
       .then(function() { location.reload(); })
       .catch(function(err) {
         btn.disabled = false;
-        alert('Failed to start training: ' + err.message);
+        showToast('Failed to start training: ' + err.message);
       });
   });
 });
@@ -183,7 +183,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
       .then(function() { location.reload(); })
       .catch(function(err) {
         btn.disabled = false;
-        alert('Failed to cancel: ' + err.message);
+        showToast('Failed to cancel: ' + err.message);
       });
   });
 });
@@ -366,7 +366,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
         .catch(function(err) {
           ubtn.disabled = false;
           ubtn.textContent = 'Use "' + name + '"';
-          alert('Failed to assign name: ' + err.message);
+          showToast('Failed to assign name: ' + err.message);
         });
     });
   }

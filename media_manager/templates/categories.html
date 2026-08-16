@@ -100,10 +100,10 @@ document.querySelectorAll('.category-delete-btn').forEach(function(btn) {
         const card = document.getElementById('category-card-' + btn.dataset.categoryId);
         if (card) card.remove();
       } else {
-        alert('Failed to delete category.');
+        showToast('Failed to delete category.');
       }
     } catch (err) {
-      alert('Network error.');
+      showToast('Network error.');
     }
   });
 });
@@ -131,7 +131,7 @@ document.querySelectorAll('.category-edit-btn').forEach(function(btn) {
         })
           .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
           .then(function() { closeModal(); location.reload(); })
-          .catch(function(err) { alert('Failed to rename category: ' + err.message); });
+          .catch(function(err) { showToast('Failed to rename category: ' + err.message); });
       });
       box.appendChild(saveBtn);
     });
@@ -152,7 +152,7 @@ document.querySelectorAll('.category-temperature-slider').forEach(function(slide
         valueEl.textContent = data.temperature.toFixed(2);
       }
     } catch (err) {
-      alert('Failed to update temperature.');
+      showToast('Failed to update temperature.');
     }
   });
   slider.addEventListener('input', function() {

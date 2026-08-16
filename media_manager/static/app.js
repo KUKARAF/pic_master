@@ -3,6 +3,57 @@
 (function () {
   'use strict';
 
+  /* ------------------------------------------------------------------ */
+  /* Toasts — app-wide non-blocking notifications, replacing native      */
+  /* showToast() for status/success/error messages. window.showToast is      */
+  /* available to every page's inline scripts (app.js loads before them).*/
+  /* ------------------------------------------------------------------ */
+  window.showToast = function (message, type) {
+    // type: 'info' (default) | 'success' | 'error'. When omitted, guess from
+    // the message so the many "Failed to …" call sites colour themselves.
+    if (!type) type = /\b(fail|error)/i.test(String(message)) ? 'error' : 'info';
+
+    var container = document.getElementById('toast-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.id = 'toast-container';
+      container.className = 'toast-container';
+      document.body.appendChild(container);
+    }
+
+    var toast = document.createElement('div');
+    toast.className = 'toast toast-' + type;
+    toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+
+    var msg = document.createElement('span');
+    msg.className = 'toast-msg';
+    msg.textContent = String(message);
+    toast.appendChild(msg);
+
+    var closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'toast-close';
+    closeBtn.setAttribute('aria-label', 'Dismiss');
+    closeBtn.textContent = '×';
+    toast.appendChild(closeBtn);
+
+    container.appendChild(toast);
+    requestAnimationFrame(function () { toast.classList.add('show'); });
+
+    var timer = null;
+    function dismiss() {
+      if (timer) { clearTimeout(timer); timer = null; }
+      toast.classList.remove('show');
+      var removed = false;
+      function drop() { if (!removed) { removed = true; toast.remove(); } }
+      toast.addEventListener('transitionend', drop, { once: true });
+      setTimeout(drop, 400);   // fallback if the transition never fires
+    }
+    closeBtn.addEventListener('click', dismiss);
+    timer = setTimeout(dismiss, type === 'error' ? 6000 : 3500);
+    return toast;
+  };
+
   /* Generic dropdown toggle, used by both the tags and warning-bell nav buttons */
   function wireDropdown(btnId, menuId) {
     var btn = document.getElementById(btnId);
@@ -245,7 +296,7 @@
                 .then(function () { card.remove(); })
                 .catch(function (err) {
                   btn.disabled = false;
-                  alert('Failed: ' + err.message);
+                  showToast('Failed: ' + err.message);
                 });
             });
           });
@@ -281,7 +332,7 @@
         })
         .catch(function (err) {
           btn.disabled = false;
-          alert('Failed to update favorite: ' + err.message);
+          showToast('Failed to update favorite: ' + err.message);
         });
     });
   };
@@ -549,7 +600,7 @@
               // a failure to link one or more people shouldn't lose that or
               // block the caller, just surface it and move on.
               if (failures.length) {
-                alert('Set created, but failed to link: ' + failures.join(', '));
+                showToast('Set created, but failed to link: ' + failures.join(', '));
               }
               return data;
             });
@@ -561,7 +612,7 @@
             personInput.disabled = false;
             addPersonBtn.disabled = false;
             createBtn.disabled = false;
-            alert('Failed to create set: ' + err.message);
+            showToast('Failed to create set: ' + err.message);
           });
       }
 
@@ -922,7 +973,7 @@
             .catch(function (err) {
               resolved = false;
               input.disabled = false;
-              alert('Failed to create: ' + err.message);
+              showToast('Failed to create: ' + err.message);
             });
         } else if (entry.kind === 'create') {
           resolveWith({ name: entry.text, isNew: true });
@@ -1862,10 +1913,10 @@
         if (firstErr) {
           overlay.commitBtn.disabled = false;
           updateFooter();
-          alert('Added ' + added + ' of ' + ids.length + ' — failed: ' + firstErr.message);
+          showToast('Added ' + added + ' of ' + ids.length + ' — failed: ' + firstErr.message);
         } else {
           closeGrid();
-          alert('Added ' + added + ' item' + (added === 1 ? '' : 's') + ' to "' + targetSet.name + '".');
+          showToast('Added ' + added + ' item' + (added === 1 ? '' : 's') + ' to "' + targetSet.name + '".');
         }
       });
     }
@@ -2129,7 +2180,7 @@
             heartBtn.classList.toggle('is-favorite', goingTo);
             heartBtn.textContent = goingTo ? '♥' : '♡';
           })
-          .catch(function (err) { alert('Failed to update favorite: ' + err.message); });
+          .catch(function (err) { showToast('Failed to update favorite: ' + err.message); });
         return;
       }
 
@@ -2158,7 +2209,7 @@
             return;
           }
           updateTagLabel(chip.dataset.tagId, newLabel).catch(function (err) {
-            alert('Failed to update tag: ' + err.message);
+            showToast('Failed to update tag: ' + err.message);
           });
         }
         input.addEventListener('keydown', function (ev) {
@@ -2200,7 +2251,7 @@
           })
           .catch(function (err) {
             btn.disabled = false;
-            alert('Failed to reject tag: ' + err.message);
+            showToast('Failed to reject tag: ' + err.message);
           });
       }
     });
@@ -2220,7 +2271,7 @@
         renderTags(data.tags);
       })
       .catch(function (err) {
-        alert('Failed to add tag: ' + err.message);
+        showToast('Failed to add tag: ' + err.message);
       });
   }
 
@@ -2236,7 +2287,7 @@
         renderTags(data.tags);
       })
       .catch(function (err) {
-        alert('Failed to remove tag: ' + err.message);
+        showToast('Failed to remove tag: ' + err.message);
       });
   }
 
@@ -2505,7 +2556,7 @@
           return r.json();
         })
         .then(function () { location.reload(); })
-        .catch(function (err) { alert('Failed to save name: ' + err.message); });
+        .catch(function (err) { showToast('Failed to save name: ' + err.message); });
     }
 
     openEntitySearchModal({
@@ -2556,7 +2607,7 @@
         })
         .catch(function (err) {
           btn.disabled = false;
-          alert('Failed to reject face: ' + err.message);
+          showToast('Failed to reject face: ' + err.message);
         });
     });
   });
@@ -2597,7 +2648,7 @@
         })
         .catch(function (err) {
           removeBtn.disabled = false;
-          alert('Failed to remove assignment: ' + err.message);
+          showToast('Failed to remove assignment: ' + err.message);
         });
     });
   }
@@ -2851,7 +2902,7 @@
         if (!categoryCurrent.children.length) renderCategories([]);
       })
       .catch(function (err) {
-        alert('Failed to remove category: ' + err.message);
+        showToast('Failed to remove category: ' + err.message);
       });
   }
 
@@ -2861,7 +2912,7 @@
       onResolved: function (entity) {
         addFileCategory(entity.id)
           .then(function () { appendCategoryChip({ id: entity.id, name: entity.name }); })
-          .catch(function (err) { alert('Failed to add category: ' + err.message); });
+          .catch(function (err) { showToast('Failed to add category: ' + err.message); });
       },
     });
   }
@@ -3034,7 +3085,7 @@
         if (!setCurrent.children.length) renderSets([]);
       })
       .catch(function (err) {
-        alert('Failed to remove set: ' + err.message);
+        showToast('Failed to remove set: ' + err.message);
       });
   }
 
@@ -3042,7 +3093,7 @@
     openSetSearchModal(function (set) {
       assignSetById(set.id)
         .then(function (data) { appendSetChip(data); })
-        .catch(function (err) { alert('Failed to add set: ' + err.message); });
+        .catch(function (err) { showToast('Failed to add set: ' + err.message); });
     });
   }
 
@@ -3118,7 +3169,7 @@
   //             })
   //             .catch(function (err) {
   //               chip.style.pointerEvents = '';
-  //               alert('Failed to add set: ' + err.message);
+  //               showToast('Failed to add set: ' + err.message);
   //             });
   //         });
   //
@@ -3173,7 +3224,7 @@
           })
           .catch(function (err) {
             restoreDisplay();
-            alert('Failed to save title: ' + err.message);
+            showToast('Failed to save title: ' + err.message);
           });
       }
       input.addEventListener('keydown', function (e) {

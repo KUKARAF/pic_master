@@ -124,7 +124,7 @@
       fetch('/api/sets/' + setId, { method: 'DELETE' })
         .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
         .then(function() { window.location.href = '/sets'; })
-        .catch(function(err) { alert('Failed to delete set: ' + err.message); });
+        .catch(function(err) { showToast('Failed to delete set: ' + err.message); });
     });
   }
 
@@ -166,7 +166,7 @@
                 location.reload();
               }
             })
-            .catch(function(err) { alert('Failed to rename set: ' + err.message); });
+            .catch(function(err) { showToast('Failed to rename set: ' + err.message); });
         });
         box.appendChild(saveBtn);
 
@@ -209,7 +209,7 @@
                 .then(function(data) { renderAliases(data.aliases || []); })
                 .catch(function(err) {
                   rm.disabled = false;
-                  alert('Failed to remove alias: ' + err.message);
+                  showToast('Failed to remove alias: ' + err.message);
                 });
             });
             chip.appendChild(rm);
@@ -245,7 +245,7 @@
             })
             .catch(function(err) {
               addAliasBtn.disabled = false;
-              alert('Failed to add alias: ' + err.message);
+              showToast('Failed to add alias: ' + err.message);
             });
         });
         box.appendChild(addAliasBtn);
@@ -286,7 +286,7 @@
       .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
       .then(function(data) {
         closeModal();
-        alert('Added ' + data.added + ' photo(s) to this set' +
+        showToast('Added ' + data.added + ' photo(s) to this set' +
           (data.already_present ? ' (' + data.already_present + ' were already in it).' : '.'));
         location.reload();
       })
@@ -414,7 +414,7 @@
       window.openSetSearchModal(function(otherSet) {
         window.assignFileToSet(btn.dataset.fileId, otherSet.id)
           .then(function() { location.reload(); })
-          .catch(function(err) { alert('Failed to add to set: ' + err.message); });
+          .catch(function(err) { showToast('Failed to add to set: ' + err.message); });
       }, setId);
     });
   });
@@ -443,7 +443,7 @@
           })
             .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
             .then(function() { location.reload(); })
-            .catch(function(err) { alert('Failed to add person: ' + err.message); });
+            .catch(function(err) { showToast('Failed to add person: ' + err.message); });
         },
       });
     });
@@ -461,7 +461,7 @@
         .then(function() { location.reload(); })
         .catch(function(err) {
           btn.disabled = false;
-          alert('Failed to remove person: ' + err.message);
+          showToast('Failed to remove person: ' + err.message);
         });
     });
   });
@@ -482,7 +482,7 @@
         .catch(function(err) {
           btn.disabled = false;
           btn.textContent = 'Estimate age';
-          alert('Failed to estimate age: ' + err.message);
+          showToast('Failed to estimate age: ' + err.message);
         });
     });
   });
@@ -697,7 +697,7 @@
         rememberSimilarSet(otherSet, card.id);
         stackHandle.decide('reject');
       })
-      .catch(function(err) { alert('Failed to add to set: ' + err.message); });
+      .catch(function(err) { showToast('Failed to add to set: ' + err.message); });
   }
 
   /* Enter opens an INSTANT 3x3 grid of stashed quick-access sets — no fetch,
@@ -794,7 +794,7 @@
         quickSetModalState = null;
         closeModal();
       })
-      .catch(function(err) { alert('Failed to add to set: ' + err.message); });
+      .catch(function(err) { showToast('Failed to add to set: ' + err.message); });
   }
 
   function openQuickSetModal(card, cells) {

@@ -61,7 +61,7 @@ document.getElementById('use-folder-btn').addEventListener('click', function () 
     fetch('/api/sets/' + set.id + '/add-folder/preview?path=' + encodeURIComponent(folder))
       .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
       .then(function (d) {
-        if (!d.matched) { alert('No tracked media under this folder.'); return; }
+        if (!d.matched) { showToast('No tracked media under this folder.'); return; }
         if (!confirm('Add ' + d.new_count + ' new item(s) to "' + set.name + '"? ('
                      + d.already_present + ' already in it)')) return;
         return fetch('/api/sets/' + set.id + '/add-folder', {
@@ -71,10 +71,10 @@ document.getElementById('use-folder-btn').addEventListener('click', function () 
         })
           .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
           .then(function (res) {
-            alert('Added ' + res.added + ' to "' + set.name + '" — ' + res.already_present + ' already present.');
+            showToast('Added ' + res.added + ' to "' + set.name + '" — ' + res.already_present + ' already present.');
           });
       })
-      .catch(function (err) { alert('Failed to add folder: ' + err.message); });
+      .catch(function (err) { showToast('Failed to add folder: ' + err.message); });
   });
 });
 </script>

@@ -81,7 +81,7 @@
           })
             .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
             .then(function() { closeModal(); location.reload(); })
-            .catch(function(err) { alert('Failed to rename category: ' + err.message); });
+            .catch(function(err) { showToast('Failed to rename category: ' + err.message); });
         });
         box.appendChild(saveBtn);
       });
@@ -95,7 +95,7 @@
       fetch('/api/categories/' + categoryId, { method: 'DELETE' })
         .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
         .then(function() { window.location.href = '/categories'; })
-        .catch(function(err) { alert('Failed to delete category: ' + err.message); });
+        .catch(function(err) { showToast('Failed to delete category: ' + err.message); });
     });
   }
 
@@ -113,7 +113,7 @@
       })
         .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
         .then(function() { location.reload(); })
-        .catch(function(err) { alert('Failed to update temperature: ' + err.message); });
+        .catch(function(err) { showToast('Failed to update temperature: ' + err.message); });
     });
   }
 

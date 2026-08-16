@@ -213,12 +213,12 @@
       .then(function(data) {
         btn.disabled = false;
         var queue = data.cards || [];
-        if (!queue.length) { alert('No low-confidence matches to review right now.'); return; }
+        if (!queue.length) { showToast('No low-confidence matches to review right now.'); return; }
         runCleanupReview(queue);
       })
       .catch(function(err) {
         btn.disabled = false;
-        alert('Failed to load cleanup queue: ' + err.message);
+        showToast('Failed to load cleanup queue: ' + err.message);
       });
   });
 
@@ -242,7 +242,7 @@
       fetch('/api/faces/' + encodeURIComponent(f.ref) + '/mark-reviewed', { method: 'POST' })
         .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
         .then(function() { index++; showCard(); })
-        .catch(function(err) { alert('Failed: ' + err.message); });
+        .catch(function(err) { showToast('Failed: ' + err.message); });
     }
 
     function markIncorrect(f) {
@@ -268,7 +268,7 @@
               });
           req.then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
             .then(function() { index++; showCard(); })
-            .catch(function(err) { alert('Failed: ' + err.message); showCard(); });
+            .catch(function(err) { showToast('Failed: ' + err.message); showCard(); });
         },
       });
     }
@@ -340,7 +340,7 @@ function bindRenameButtons() {
       })
         .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
         .then(function() { location.reload(); })
-        .catch(function(err) { alert('Failed to rename: ' + err.message); });
+        .catch(function(err) { showToast('Failed to rename: ' + err.message); });
     });
   });
 }
