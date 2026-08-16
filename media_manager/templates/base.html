@@ -10,14 +10,17 @@
 <body>
 
 <nav class="nav">
-  <a class="nav-logo" href="/">MEDIA<span class="logo-dim">//</span>MGR</a>
-  <a class="nav-link" href="/files">Files</a>
-  <a class="nav-link" href="/faces">Faces</a>
-  <a class="nav-link" href="/tags">Tags</a>
-  <a class="nav-link" href="/categories">Categories</a>
-  <a class="nav-link" href="/sets">Sets</a>
-  <a class="nav-link" href="/studios">Studios</a>
-  <a class="nav-link" href="/duplicates">Duplicates</a>
+  <button type="button" class="nav-toggle" id="nav-toggle" aria-label="Menu" aria-expanded="false">☰</button>
+  <div class="nav-links" id="nav-links">
+    <a class="nav-link" href="/">Gallery</a>
+    <a class="nav-link" href="/files">Files</a>
+    <a class="nav-link" href="/faces">Faces</a>
+    <a class="nav-link" href="/tags">Tags</a>
+    <a class="nav-link" href="/categories">Categories</a>
+    <a class="nav-link" href="/sets">Sets</a>
+    <a class="nav-link" href="/studios">Studios</a>
+    <a class="nav-link" href="/duplicates">Duplicates</a>
+  </div>
 
   <form class="nav-search" action="/search" method="get">
     <input type="text" id="nav-search-input" name="q" placeholder="search photos, tags, people… ( / )" value="{{ request.query_params.get('q', '') }}">

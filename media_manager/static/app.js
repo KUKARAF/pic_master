@@ -69,6 +69,23 @@
   }
   wireDropdown('warn-dropdown-btn', 'warn-dropdown-menu');
 
+  /* Mobile hamburger — toggles the collapsed nav links (see .nav-links in CSS). */
+  (function () {
+    var navToggle = document.getElementById('nav-toggle');
+    var navLinks = document.getElementById('nav-links');
+    if (!navToggle || !navLinks) return;
+    navToggle.addEventListener('click', function (e) {
+      e.stopPropagation();
+      var open = navLinks.classList.toggle('open');
+      navToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    document.addEventListener('click', function (e) {
+      if (navLinks.contains(e.target) || e.target === navToggle) return;
+      navLinks.classList.remove('open');
+      navToggle.setAttribute('aria-expanded', 'false');
+    });
+  })();
+
   /* Generic modal — used by the set picker and face-naming modal */
   var modalOverlay = document.getElementById('modal-overlay');
   var modalBox = document.getElementById('modal-box');
