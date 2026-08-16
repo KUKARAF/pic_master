@@ -1647,18 +1647,22 @@ input[type="range"] { accent-color: var(--accent); }
   background: rgba(5, 7, 5, .88);
   align-items: center;
   justify-content: center;
-  padding: 40px;
+  padding: 28px;
 }
 .queue-grid-overlay.open { display: flex; }
 .queue-grid-panel {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  /* Responsive: as many ~170px columns as fit, so thumbnails keep a
+     consistent size and more show per row on wider screens (instead of a
+     fixed 3-across squeezed under a 900px cap). */
+  grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
   gap: 10px;
   width: 100%;
-  max-width: 900px;
+  max-width: 1600px;
   max-height: 100%;
   overflow-y: auto;
   padding: 4px;
+  align-content: start;   /* pack rows at the top; don't stretch them vertically */
 }
 .queue-grid-cell {
   position: relative;
@@ -1676,7 +1680,8 @@ input[type="range"] { accent-color: var(--accent); }
 
 /* Multi-select mode ("Add queue to set"). */
 .queue-grid-overlay.select-mode { flex-direction: column; }
-.queue-grid-overlay.select-mode .queue-grid-panel { max-height: calc(100% - 72px); }
+/* Leave room for the footer so the grid scrolls under it, never behind it. */
+.queue-grid-overlay.select-mode .queue-grid-panel { max-height: calc(100% - 84px); }
 
 /* A chosen item: accent frame + check badge (top-left, so it never collides
    with the is-current dot at top-right). */
@@ -1706,9 +1711,13 @@ input[type="range"] { accent-color: var(--accent); }
 .queue-grid-footer {
   display: none;
   align-items: center;
-  gap: 16px;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px 16px;
   margin-top: 14px;
   flex: 0 0 auto;
+  width: 100%;
+  max-width: 1600px;
 }
 .queue-grid-overlay.select-mode .queue-grid-footer { display: flex; }
 .queue-grid-hint { color: var(--text-muted); font-size: 0.82em; }
