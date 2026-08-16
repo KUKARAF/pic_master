@@ -127,6 +127,8 @@ class SearchChip(BaseModel):
 class SearchPaletteBody(BaseModel):
     q: str = ''
     chips: List[SearchChip] = []
+    sort: str = ''      # '', 'added', 'modified', 'filename', 'age', 'favorites'
+    order: str = 'desc'
 
 class SwipeExcludeBody(BaseModel):
     """Shared body for every swipe stack's buffer-refill endpoint. Sent as a
@@ -890,7 +892,60 @@ def create_app(data_root: str) -> FastAPI:
             return sorted(file_rows, key=lambda r: os.path.basename(r['path']).lower(), reverse=reverse)
         if sort == 'modified':
             return sorted(file_rows, key=lambda r: r['modified_time'] or 0, reverse=reverse)
+        if sort == 'favorites':
+            counts = manual.get_favorite_counts([r['checksum'] for r in file_rows])
+            return sorted(file_rows, key=lambda r: counts.get(r['checksum'], 0), reverse=reverse)
         return sorted(file_rows, key=lambda r: r['first_seen'], reverse=reverse)
+
+    def _ordered_rows(checksums, sort, order):
+        """Resolve a checksum set to files_with_path rows ordered by sort/order.
+        Shared by the search palette (preview + open-as-queue). 'age' ranks by the
+        checksum age map at the row level (no enrichment needed); everything else
+        goes through _sort_file_rows. Rows with no age sort last."""
+        if not checksums:
+            return []
+        rows = db.get_files_by_checksums(list(checksums))
+        if sort == 'age':
+            age_map = manual.get_average_ages_for_checksums([r['checksum'] for r in rows])
+            with_age = [r for r in rows if r['checksum'] in age_map]
+            without_age = [r for r in rows if r['checksum'] not in age_map]
+            with_age.sort(key=lambda r: age_map[r['checksum']], reverse=(order != 'asc'))
+            return with_age + without_age
+        return _sort_file_rows(rows, sort or 'added', order)
+
+    def _palette_media(checksums, sort, order, cap=16):
+        """Top `cap` of `checksums` as enriched cards, ordered by sort/order."""
+        rows = _ordered_rows(checksums, sort, order)[:cap]
+        return _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
+
+    def _search_resolve(q, chips, category_map, tag_map, set_map, identity_map):
+        """Core resolver shared by the palette preview and open-as-queue endpoints.
+        Returns (chip_cs, tag_cs, file_cs): the chip AND-intersection (None if no
+        chips), and — when there's free text — the checksums whose tag names match
+        and whose path matches, each narrowed by the chips when present."""
+        chip_cs = _intersect_chips(chips, category_map=category_map, tag_map=tag_map,
+                                   set_map=set_map, identity_map=identity_map)
+        tag_cs = file_cs = None
+        if q:
+            ql = q.lower()
+            tag_cs = set()
+            for label, cksums in tag_map.items():
+                if ql in label.lower():
+                    tag_cs |= cksums
+            file_cs = {row[2] for row in db.search_by_path_substring(q, limit=100_000)}
+            if chip_cs is not None:
+                tag_cs &= chip_cs
+                file_cs &= chip_cs
+        return chip_cs, tag_cs, file_cs
+
+    def _effective_checksums(chip_cs, tag_cs, file_cs):
+        """The set a committed search resolves to: chip intersection when chips are
+        present, else the union of the free-text tag + file matches."""
+        if chip_cs is not None:
+            return chip_cs
+        if tag_cs is not None or file_cs is not None:
+            return (tag_cs or set()) | (file_cs or set())
+        return set()
 
     # ------------------------------------------------------------------
     # Thumbnail / image serving
@@ -2295,8 +2350,9 @@ def create_app(data_root: str) -> FastAPI:
         the entity picker), so that part is instant and needs no round trip. This
         endpoint only has to do real checksum-set work, which is inherently a
         server-side/DB job — but only once per call now, not once per candidate."""
-        q = body.q.strip().lower()
+        q = body.q.strip()
         chips = [{'type': c.type, 'value': c.value} for c in body.chips]
+        sort, order = body.sort, body.order
         # Computed once per request — see each _*_checksums_by_* helper's
         # docstring for why resolving per-chip from scratch (fine for the rare
         # /search f= page load) doesn't scale to a call made on every keystroke.
@@ -2305,56 +2361,67 @@ def create_app(data_root: str) -> FastAPI:
         set_map = _set_checksums_by_id()
         identity_map = _identity_checksums_by_name(set_map)
 
-        media = []
+        chip_cs, tag_cs, file_cs = _search_resolve(q, chips, category_map, tag_map, set_map, identity_map)
+        effective = _effective_checksums(chip_cs, tag_cs, file_cs)
+
+        # Applied-filter photos (only when chips are active — free text results go
+        # in the tag/file sections instead). Free text yields its own two sections.
+        media = _palette_media(chip_cs, sort, order) if chip_cs else []
+        tag_matches = _palette_media(tag_cs, sort, order) if tag_cs else []
+        file_matches = _palette_media(file_cs, sort, order) if file_cs else []
+
+        # Which sets/people are represented in the effective result set — shown as
+        # their own tiles so a result reads as "these sets / these people / these
+        # photos", not one undifferentiated grid.
         sets_result = []
         people_result = []
-        total_count = 0
-        checksums = _intersect_chips(chips, category_map=category_map, tag_map=tag_map,
-                                      set_map=set_map, identity_map=identity_map)
-        if checksums is not None or q:
-            if checksums is None:
-                # q alone (no chips yet) — filename substring is the only sensible
-                # "just typed text" match; there's no free-text object-detection
-                # search here (that's what the plain /search q= path is for).
-                checksums = {row[2] for row in db.search_by_path_substring(q, limit=200)}
-            total_count = len(checksums)
-            if checksums:
-                rows = db.get_files_by_checksums(list(checksums)[:16])
-                enriched_rows = [(r['id'], r['path'], False, r['checksum']) for r in rows]
-                media = _enrich_rows(enriched_rows)
+        if effective:
+            sets_map = {}
+            identities_map = {}
+            for chunk in _chunked(effective):
+                sets_map.update(manual.get_sets_for_checksums(chunk))
+                identities_map.update(manual.get_identities_for_checksums(chunk))
 
-                # Which sets/people are actually represented in the current result
-                # set — shown as their own tiles alongside individual photos, so a
-                # result reads as "these sets / these people / these photos", not
-                # just an undifferentiated photo grid.
-                sets_map = {}
-                identities_map = {}
-                for chunk in _chunked(checksums):
-                    sets_map.update(manual.get_sets_for_checksums(chunk))
-                    identities_map.update(manual.get_identities_for_checksums(chunk))
+            set_agg = {}
+            for cs, sets_here in sets_map.items():
+                for s in sets_here:
+                    agg = set_agg.setdefault(s['id'], {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'count': 0, 'checksum': cs})
+                    agg['count'] += 1
+            sets_result = sorted(set_agg.values(), key=lambda s: s['count'], reverse=True)[:6]
+            for s in sets_result:
+                thumb_rows = db.get_files_by_checksums([s.pop('checksum')])
+                s['thumb_file_id'] = thumb_rows[0]['id'] if thumb_rows else None
+            _attach_set_people([sets_result])
 
-                set_agg = {}
-                for cs, sets_here in sets_map.items():
-                    for s in sets_here:
-                        agg = set_agg.setdefault(s['id'], {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'count': 0, 'checksum': cs})
-                        agg['count'] += 1
-                sets_result = sorted(set_agg.values(), key=lambda s: s['count'], reverse=True)[:6]
-                for s in sets_result:
-                    thumb_rows = db.get_files_by_checksums([s.pop('checksum')])
-                    s['thumb_file_id'] = thumb_rows[0]['id'] if thumb_rows else None
-                _attach_set_people([sets_result])
+            people_agg = {}
+            for cs, names in identities_map.items():
+                for name in names:
+                    people_agg[name] = people_agg.get(name, 0) + 1
+            face_ids = manual.get_representative_face_ids()
+            people_result = sorted(
+                [{'name': n, 'count': c, 'face_id': face_ids.get(n)} for n, c in people_agg.items()],
+                key=lambda p: p['count'], reverse=True
+            )[:6]
 
-                people_agg = {}
-                for cs, names in identities_map.items():
-                    for name in names:
-                        people_agg[name] = people_agg.get(name, 0) + 1
-                face_ids = manual.get_representative_face_ids()
-                people_result = sorted(
-                    [{'name': n, 'count': c, 'face_id': face_ids.get(n)} for n, c in people_agg.items()],
-                    key=lambda p: p['count'], reverse=True
-                )[:6]
+        return {'media': media, 'tag_matches': tag_matches, 'file_matches': file_matches,
+                'sets': sets_result, 'people': people_result, 'total_count': len(effective)}
 
-        return {'media': media, 'sets': sets_result, 'people': people_result, 'total_count': total_count}
+    @app.post('/api/search-ids')
+    def api_search_ids(body: SearchPaletteBody):
+        """Full ordered list of file ids for the current search (chips + free text),
+        for the 'open results as a queue' action — the frontend writes these into the
+        photo viewer's watch queue and opens the first. Same resolver/sort as the
+        palette preview, just uncapped and ids-only."""
+        q = body.q.strip()
+        chips = [{'type': c.type, 'value': c.value} for c in body.chips]
+        category_map = _category_checksums_by_name()
+        tag_map = _tag_checksums_by_label()
+        set_map = _set_checksums_by_id()
+        identity_map = _identity_checksums_by_name(set_map)
+        chip_cs, tag_cs, file_cs = _search_resolve(q, chips, category_map, tag_map, set_map, identity_map)
+        effective = _effective_checksums(chip_cs, tag_cs, file_cs)
+        rows = _ordered_rows(effective, body.sort, body.order)
+        return {'ids': [r['id'] for r in rows]}
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):

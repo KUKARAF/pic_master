@@ -51,18 +51,20 @@
   <div class="palette-box" id="palette-box">
     <div class="palette-input-row">
       <span class="palette-caret">&gt;</span>
-      <div class="palette-chips" id="palette-chips"></div>
       <input type="text" id="palette-input" class="palette-in" autocomplete="off"
-             placeholder="type anything — a tag, category, person, set, filename…">
+             placeholder="search tags &amp; filenames · sort e.g. age:asc, date:desc · click filters at left">
       <span class="palette-count" id="palette-count"></span>
     </div>
     <div class="palette-body">
-      <div class="palette-suggestions" id="palette-suggestions"></div>
+      <div class="palette-left">
+        <div class="palette-applied" id="palette-applied"></div>
+        <div class="palette-suggestions" id="palette-suggestions"></div>
+      </div>
       <div class="palette-grid" id="palette-grid"></div>
     </div>
     <div class="palette-footer">
-      <a href="#" id="palette-viewall" class="sub" style="display:none;">View all results →</a>
-      <span class="sub palette-hint">↑↓ select · Enter add chip · Backspace remove chip · Esc close</span>
+      <a href="#" id="palette-viewall" class="sub" style="display:none;">Browse results →</a>
+      <span class="sub palette-hint">↑↓ select · Enter apply filter / open results · Esc close</span>
     </div>
   </div>
 </div>

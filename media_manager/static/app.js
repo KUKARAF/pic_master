@@ -1304,18 +1304,38 @@
     var navInput = document.getElementById('nav-search-input');
     if (!overlay || !input) return;
 
-    var chipsEl = document.getElementById('palette-chips');
+    var chipsEl = document.getElementById('palette-applied');
     var countEl = document.getElementById('palette-count');
     var suggestionsEl = document.getElementById('palette-suggestions');
     var gridEl = document.getElementById('palette-grid');
     var viewAllEl = document.getElementById('palette-viewall');
 
-    var chips = [];       // [{type, value}]
-    var suggestions = []; // current in-memory suggestion list
+    var chips = [];       // [{type, value}] — applied facet filters
+    var sortSpec = null;  // {field, dir} parsed from a "field:asc|desc" token, or null
+    var suggestions = []; // current in-memory suggestion list (flat, grouped by type in render)
     var highlighted = 0;
     var requestSeq = 0;   // guards against an in-flight grid request resolving out of order
 
     var FACET_LABELS = { category: 'CAT', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
+    // Section headers for the grouped left-pane suggestions.
+    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', set: 'SETS', file: 'FILES' };
+    var TYPE_ORDER = ['face', 'tag', 'category', 'set', 'file'];
+
+    // Text sort syntax: "field:asc|desc" anywhere in the input is parsed out into a
+    // sort chip. Aliases map onto the backend's sort keys.
+    var SORT_ALIASES = { age: 'age', date: 'added', added: 'added', modified: 'modified',
+                         filename: 'filename', name: 'filename', favorites: 'favorites', fav: 'favorites' };
+    var SORT_TOKEN_RE = /\b(age|date|added|modified|filename|name|favorites|fav)\s*:\s*(asc|desc)\b/i;
+
+    // Pull a sort token out of `text`; returns {clean, sort} where sort is
+    // {field, dir} (backend key) or null and clean is text with the token removed.
+    function parseSortToken(text) {
+      var m = text.match(SORT_TOKEN_RE);
+      if (!m) return { clean: text, sort: null };
+      var field = SORT_ALIASES[m[1].toLowerCase()];
+      var clean = (text.slice(0, m.index) + text.slice(m.index + m[0].length)).replace(/\s{2,}/g, ' ').trim();
+      return { clean: clean, sort: { field: field, dir: m[2].toLowerCase() } };
+    }
 
     /* "cat /outs" — everything up to the last "/" is leftover text the user is
        composing (kept untouched), everything after it is the fragment actively
@@ -1342,10 +1362,13 @@
     function close() {
       overlay.style.display = 'none';
       chips = [];
+      sortSpec = null;
       suggestions = [];
       highlighted = 0;
     }
 
+    // Applied filters (top of the left pane): the facet chips plus, if set, the
+    // sort chip (distinctly colored). Each removable.
     function renderChips() {
       chipsEl.innerHTML = '';
       chips.forEach(function (c, i) {
@@ -1370,18 +1393,48 @@
         });
         chipsEl.appendChild(chip);
       });
+      if (sortSpec) {
+        var schip = document.createElement('span');
+        schip.className = 'palette-chip palette-chip-sort';
+        var stag = document.createElement('span');
+        stag.className = 'palette-chip-tag';
+        stag.textContent = 'SORT';
+        var sval = document.createElement('span');
+        sval.textContent = sortSpec.field + ' ' + (sortSpec.dir === 'asc' ? '▲' : '▼');
+        var sx = document.createElement('span');
+        sx.className = 'palette-chip-x';
+        sx.textContent = '×';
+        schip.appendChild(stag); schip.appendChild(sval); schip.appendChild(sx);
+        schip.title = 'remove sort';
+        schip.addEventListener('click', function () {
+          sortSpec = null;
+          renderChips();
+          updateGrid();
+        });
+        chipsEl.appendChild(schip);
+      }
     }
 
+    // Left-pane "available filters", grouped by type with a header per group;
+    // click (or Enter on the highlighted row) applies it as a filter chip.
     function renderSuggestions() {
       suggestionsEl.innerHTML = '';
       if (!suggestions.length) {
         var empty = document.createElement('div');
         empty.className = 'palette-empty';
-        empty.textContent = '— no matches —';
+        empty.textContent = paletteCandidates === null ? '— loading… —' : '— no matching filters —';
         suggestionsEl.appendChild(empty);
         return;
       }
+      var lastType = null;
       suggestions.forEach(function (s, i) {
+        if (s.type !== lastType) {
+          lastType = s.type;
+          var h = document.createElement('div');
+          h.className = 'palette-suggestion-group';
+          h.textContent = TYPE_HEADINGS[s.type] || s.type.toUpperCase();
+          suggestionsEl.appendChild(h);
+        }
         var row = document.createElement('div');
         row.className = 'palette-suggestion-item' + (i === highlighted ? ' is-highlighted' : '');
         row.style.borderLeftColor = i === highlighted ? 'var(--accent)' : 'transparent';
@@ -1466,18 +1519,35 @@
       return meta;
     }
 
+    // A photo tile that, when clicked, opens the FULL result set as the photo
+    // viewer's watch queue starting at this photo (not just the previewed tiles).
+    function photoTile(m) {
+      var tile = makeTile('/photo/' + m.id, '/thumb/' + m.id, m.filename, m.title || m.filename);
+      tile.dataset.fileId = m.id;
+      var link = tile.querySelector('.card-img-link');
+      if (link) link.addEventListener('click', function (e) { e.preventDefault(); openResultsAsQueue(m.id); });
+      return tile;
+    }
+
+    function photoSection(label, list) {
+      if (!list || !list.length) return;
+      var sec = section(label, list.length);
+      list.forEach(function (m) { sec.tiles.appendChild(photoTile(m)); });
+      gridEl.appendChild(sec.wrap);
+    }
+
     function renderGrid(data) {
       gridEl.innerHTML = '';
-      var summary = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (fragmentText().trim() || 'all');
-      var hasAny = data.media.length || data.sets.length || data.people.length;
+      var hasAny = (data.media || []).length || (data.sets || []).length || (data.people || []).length
+        || (data.tag_matches || []).length || (data.file_matches || []).length;
       if (!hasAny) {
         var empty = document.createElement('div');
         empty.className = 'palette-empty';
-        empty.textContent = chips.length || fragmentText().trim() ? '— no results for this query —' : 'Type to search, or pick a suggestion…';
+        empty.textContent = chips.length || fragmentText().trim() ? '— no results for this query —' : 'Type to search, or pick a filter…';
         gridEl.appendChild(empty);
         return;
       }
-      if (data.sets.length) {
+      if ((data.sets || []).length) {
         var setSec = section('SETS', data.sets.length);
         data.sets.forEach(function (s) {
           setSec.tiles.appendChild(makeTile(
@@ -1486,9 +1556,6 @@
             s.name, s.name, 'palette-tile-set', buildSetTileMeta(s)
           ));
         });
-        // Only meaningful once at least one chip is confirmed (e.g. a "joe"
-        // person chip) — /sets' own f= filtering only understands chips, not
-        // the free-text fragment still being typed.
         if (chips.length) {
           var viewSetsLink = document.createElement('a');
           viewSetsLink.className = 'sub palette-section-viewall';
@@ -1499,7 +1566,7 @@
         }
         gridEl.appendChild(setSec.wrap);
       }
-      if (data.people.length) {
+      if ((data.people || []).length) {
         var peopleSec = section('PEOPLE', data.people.length);
         data.people.forEach(function (p) {
           peopleSec.tiles.appendChild(makeTile(
@@ -1510,26 +1577,43 @@
         });
         gridEl.appendChild(peopleSec.wrap);
       }
-      if (data.media.length) {
-        var photoSec = section('PHOTOS', data.media.length);
-        data.media.forEach(function (m) {
-          var tile = makeTile('/photo/' + m.id, '/thumb/' + m.id, m.filename, m.title || m.filename);
-          tile.dataset.fileId = m.id;
-          photoSec.tiles.appendChild(tile);
-        });
-        photoSec.tiles.dataset.queueSource = 'Search: ' + summary;
-        gridEl.appendChild(photoSec.wrap);
-      }
+      // Free-text matches, each in its own section; applied-filter photos last.
+      photoSection('TAGS', data.tag_matches);
+      photoSection('FILES', data.file_matches);
+      photoSection('PHOTOS', data.media);
     }
 
-    function buildFilterHref() {
-      var parts = chips.map(function (c) { return 'f=' + encodeURIComponent(c.type + ':' + c.value); });
-      return '/search?' + parts.join('&');
+    // Open the full result set (chips + free text, in the current sort order) as
+    // the photo viewer's watch queue, starting at `startId` (or the first result).
+    // Replaces the old "view all on /search" — results are browsed as a queue.
+    function openResultsAsQueue(startId) {
+      var q = fragmentText().trim();
+      fetch('/api/search-ids', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          q: q, chips: chips,
+          sort: sortSpec ? sortSpec.field : '',
+          order: sortSpec ? sortSpec.dir : 'desc',
+        }),
+      })
+        .then(function (r) { if (!r.ok) throw new Error('search-ids ' + r.status); return r.json(); })
+        .then(function (data) {
+          var ids = data.ids || [];
+          if (!ids.length) { showToast('No results to open.'); return; }
+          var cursor = startId != null ? ids.indexOf(startId) : 0;
+          if (cursor < 0) cursor = 0;
+          var label = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (q || 'search');
+          sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor, label: 'Search: ' + label }));
+          sessionStorage.setItem('photoQueueNavigating', '1');
+          window.location.href = '/photo/' + ids[cursor];
+        })
+        .catch(function (err) { showToast('Failed to open results: ' + err.message); });
     }
 
-    // Same chip encoding as buildFilterHref, but targeting /sets' own f=
-    // filtering (added alongside its existing favorite/studio filters) rather
-    // than /search — used by the palette's "View as list" link under SETS.
+    // Chip-encoded href targeting /sets' own f= filtering (alongside its
+    // favorite/studio filters) — used by the palette's "View as list" link under
+    // SETS (the only place a chip combination still resolves to a list page).
     function buildSetsFilterHref() {
       var parts = chips.map(function (c) { return 'f=' + encodeURIComponent(c.type + ':' + c.value); });
       return '/sets?' + parts.join('&');
@@ -1549,17 +1633,28 @@
       var pool = (paletteCandidates || []).filter(function (c) {
         return !activeKeys[c.type + ':' + c.value];
       });
-      if (!fragment) {
-        pool = pool.slice().sort(function (a, b) { return b.count - a.count; });
-        return pool.slice(0, 8);
-      }
-      var scored = [];
+      // Group by type, fuzzy-filter within each (or top-by-count when the
+      // fragment is empty), take the top few per group, and emit in TYPE_ORDER
+      // so renderSuggestions can print a header per contiguous group.
+      var byType = {};
       pool.forEach(function (c) {
-        var score = fuzzyScore(fragment, c.label);
-        if (score !== null) scored.push({ item: c, score: score });
+        var score;
+        if (!fragment) {
+          score = -c.count;   // ascending sort → highest count first
+        } else {
+          score = fuzzyScore(fragment, c.label);
+          if (score === null) return;
+        }
+        (byType[c.type] = byType[c.type] || []).push({ item: c, score: score });
       });
-      scored.sort(function (a, b) { return a.score - b.score; });
-      return scored.slice(0, 8).map(function (s) { return s.item; });
+      var out = [];
+      TYPE_ORDER.forEach(function (t) {
+        var arr = byType[t];
+        if (!arr) return;
+        arr.sort(function (a, b) { return a.score - b.score; });
+        arr.slice(0, 6).forEach(function (s) { out.push(s.item); });
+      });
+      return out;
     }
 
     function updateSuggestions() {
@@ -1575,7 +1670,11 @@
       fetch('/api/search-palette', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ q: q, chips: chips }),
+        body: JSON.stringify({
+          q: q, chips: chips,
+          sort: sortSpec ? sortSpec.field : '',
+          order: sortSpec ? sortSpec.dir : 'desc',
+        }),
       })
         .then(function (r) {
           if (!r.ok) {
@@ -1589,11 +1688,9 @@
           if (seq !== requestSeq) return; // a newer request already landed
           renderGrid(data);
           countEl.textContent = data.total_count + ' RESULTS';
-          var shown = data.media.length + data.sets.length + data.people.length;
-          if (data.total_count > data.media.length && shown) {
+          if (data.total_count > 0) {
             viewAllEl.style.display = '';
-            viewAllEl.href = buildFilterHref();
-            viewAllEl.textContent = 'View all ' + data.total_count + ' results →';
+            viewAllEl.textContent = 'Browse ' + data.total_count + ' result' + (data.total_count === 1 ? '' : 's') + ' →';
           } else {
             viewAllEl.style.display = 'none';
           }
@@ -1623,10 +1720,24 @@
 
     var gridDebounceTimer = null;
     input.addEventListener('input', function () {
-      updateSuggestions(); // instant, no debounce needed — it's pure in-memory work
+      // A "field:asc|desc" token anywhere in the box is pulled out into the sort
+      // chip and disappears from the input.
+      var parsed = parseSortToken(input.value);
+      if (parsed.sort) {
+        input.value = parsed.clean;
+        sortSpec = parsed.sort;
+      }
+      updateSuggestions(); // instant, pure in-memory work; also re-renders chips (incl. sort)
       clearTimeout(gridDebounceTimer);
       gridDebounceTimer = setTimeout(updateGrid, 150);
     });
+
+    if (viewAllEl) {
+      viewAllEl.addEventListener('click', function (e) {
+        e.preventDefault();
+        openResultsAsQueue(null);
+      });
+    }
 
     // paletteCandidates may still be loading the first time the palette opens
     // (a handful of small GETs, normally done well before that) — refresh
@@ -1646,9 +1757,18 @@
         renderSuggestions();
       } else if (e.key === 'Enter') {
         e.preventDefault();
+        // Enter applies the highlighted filter suggestion when there is one;
+        // otherwise it opens the current results as a queue.
         if (suggestions.length) commitHighlighted();
+        else openResultsAsQueue(null);
       } else if (e.key === 'Backspace' && input.value === '') {
-        if (chips.length) {
+        // Peel off the sort chip first, then the most-recent filter chip.
+        if (sortSpec) {
+          e.preventDefault();
+          sortSpec = null;
+          renderChips();
+          updateGrid();
+        } else if (chips.length) {
           e.preventDefault();
           chips.pop();
           updateSuggestions();
