@@ -665,6 +665,39 @@ class Database(ThreadLocalDB):
         row = cursor.fetchone()
         return row[0] if row else None
 
+    def get_random_faceless_files(self, limit=200):
+        """Random sample of files with NO real (non-sentinel) detected face, excluding
+        hidden + noface-marked content. Returns (id, checksum) rows. Sampled on the
+        base `files` table (no files_with_path correlated-subquery), and the face
+        exclusion is an indexed NOT EXISTS (idx_faces_file) — the "needs attention"
+        home section's candidate pool. Caller filters these against the set/tag
+        exclusion sets from manual.db."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT id, checksum FROM files f
+            WHERE f.hidden = 0 AND f.noface = 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM faces fa
+                  WHERE fa.file_id = f.id AND (fa.identity IS NULL OR fa.identity != '__indexed__')
+              )
+            ORDER BY RANDOM() LIMIT ?
+        ''', (limit,))
+        return cur.fetchall()
+
+    def get_random_file_checksums(self, limit=6):
+        """Random (non-hidden) file checksums, sampled on the base files table."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM files WHERE hidden = 0 ORDER BY RANDOM() LIMIT ?', (limit,))
+        return [r[0] for r in cur.fetchall()]
+
+    def count_unidentified_faces(self):
+        """Cheap count of unidentified real faces (identity IS NULL) — a stat-tile
+        approximation of 'unknown faces' that avoids the full row scan + join."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM faces WHERE identity IS NULL')
+        row = cur.fetchone()
+        return row[0] if row else 0
+
     def get_random_files(self, limit=50):
         """Random sample of (id, path, checksum) rows — bounded by `limit` regardless
         of library size, unlike a full-table pull. Seeds homepage 'in need of some

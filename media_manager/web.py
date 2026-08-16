@@ -1000,44 +1000,49 @@ def create_app(data_root: str) -> FastAPI:
     # HTML pages
     # ------------------------------------------------------------------
 
+    def _cards_for_checksums(checksums):
+        """Enrich a small, specific set of checksums into cards — never the whole
+        library. Order follows get_files_by_checksums (arbitrary); callers re-sort."""
+        checksums = list(checksums)
+        if not checksums:
+            return []
+        rows = db.get_files_by_checksums(checksums)
+        return _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
+
     @app.get('/', response_class=HTMLResponse)
-    def gallery_page(request: Request, page: int = 1, favorite: bool = False, sort: str = 'added', order: str = 'desc'):
-        limit = 60
-        all_tags = manual.list_all_tags()
-        if favorite or sort in ('age', 'favorites'):
-            # Favorites are typically a small subset, and "age"/"favorites" need
-            # manual.db data the paginated SQL here can't join against — so filter/
-            # sort in Python rather than adding those paths to the SQL query.
-            sql_sort = sort if sort not in ('age', 'favorites') else 'added'
-            all_rows = db.list_files_with_embedding_flag(limit=1_000_000, offset=0, sort=sql_sort, order=order)
-            all_files = _enrich_rows(all_rows)
-            if favorite:
-                all_files = [f for f in all_files if f['favorite']]
-            if sort == 'age':
-                all_files = _sort_cards_by_age(all_files, order)
-            elif sort == 'favorites':
-                # 'favorite' is the counter now — most-favorited first (desc default).
-                all_files = sorted(all_files, key=lambda f: f['favorite'], reverse=(order != 'asc'))
-            total = len(all_files)
-            offset = (page - 1) * limit
-            files = all_files[offset:offset + limit]
-        else:
-            offset = (page - 1) * limit
-            rows = db.list_files_with_embedding_flag(limit=limit, offset=offset, sort=sort, order=order)
-            files = _enrich_rows(rows)
-            total = db.count_files()
+    def gallery_page(request: Request):
+        """A fast, curated landing page — three small sections, each enriching only a
+        few dozen cards (never the whole library): favorites (most-favorited first),
+        a random 'needs attention' sample (no face / no set / no manual tag), and a
+        random sample. Browsing everything lives on Search / Files now."""
+        # 1. Favorites, most-favorited first.
+        fav = manual.get_top_favorite_checksums(limit=60)
+        fav_rank = {cs: i for i, (cs, _c) in enumerate(fav)}
+        favorites = _cards_for_checksums(fav_rank.keys())
+        favorites.sort(key=lambda c: fav_rank.get(c['checksum'], 1 << 30))
+
+        # 2. Needs attention: no face (SQL) ∩ no set ∩ no manual tag (Python).
+        set_ex = manual.get_all_set_member_checksums()
+        tag_ex = manual.get_checksums_with_manual_tags()
+        needs = []
+        for r in db.get_random_faceless_files(limit=200):
+            cs = r['checksum']
+            if cs in set_ex or cs in tag_ex:
+                continue
+            needs.append(cs)
+            if len(needs) >= 6:
+                break
+        needs_attention = _cards_for_checksums(needs)
+
+        # 3. Random.
+        random_cards = _cards_for_checksums(db.get_random_file_checksums(limit=6))
+
         return templates.TemplateResponse(request, 'gallery.html', {
-            'files': files,
-            'page': page,
-            'total': total,
-            'limit': limit,
-            'all_tags': all_tags,
+            'favorites': favorites,
+            'needs_attention': needs_attention,
+            'random_cards': random_cards,
+            'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
-            'favorite_only': favorite,
-            'sort': sort,
-            'order': order,
-            'favorites_highlight': _favorites_highlight(),
-            'needs_love_highlight': _needs_love_highlight(),
             'homepage_stats': _homepage_stats(),
         })
 
@@ -3049,13 +3054,15 @@ def create_app(data_root: str) -> FastAPI:
         pattern that already caused a 'too many SQL variables' crash once
         before). Treating checksum count as a stand-in for file-row count is
         the same approximation already accepted for 'total_photos' above."""
-        set_member_checksums = manual.get_all_set_member_checksums()
         total_files = db.count_files()
         return {
-            'known_people': len(manual.get_identity_summary()),
-            'unknown_faces': len(_unpromoted_auto_faces(limit=None)),
+            # Cheap counts only — no whole-library row scans/joins (this runs on the
+            # home page): distinct-identity/set-member/unidentified-face COUNTs instead
+            # of materializing + len()-ing full result sets.
+            'known_people': manual.count_identities(),
+            'unknown_faces': db.count_unidentified_faces(),
             'num_sets': manual.count_sets(),
-            'photos_without_set': max(0, total_files - len(set_member_checksums)),
+            'photos_without_set': max(0, total_files - manual.count_set_member_checksums()),
             'total_photos': total_files,
             'total_videos': None,
             'total_manual_tags': len(manual.list_all_tags()),

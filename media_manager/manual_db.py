@@ -1506,6 +1506,37 @@ class ManualDB(ThreadLocalDB):
         ''', (checksum,))
         return cur.fetchall()
 
+    def get_top_favorite_checksums(self, limit=60):
+        """Favorited checksums, most-favorited first — (checksum, count) rows.
+        file_favorites only holds favorited rows so this stays small/cheap."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum, count FROM file_favorites WHERE count > 0 '
+                    'ORDER BY count DESC, checksum LIMIT ?', (limit,))
+        return cur.fetchall()
+
+    def get_checksums_with_manual_tags(self):
+        """Whole-library set() of checksums carrying at least one positive manual tag —
+        one indexed DISTINCT scan (idx_file_tags_checksum). For the home 'needs
+        attention' exclusion."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT checksum FROM file_tags WHERE polarity = 'positive'")
+        return {row[0] for row in cur.fetchall()}
+
+    def count_set_member_checksums(self):
+        """Cheap count of distinct set-member checksums (no set() materialization)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(DISTINCT checksum) FROM file_sets')
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def count_identities(self):
+        """Cheap count of distinct confirmed identities (mirrors get_identity_summary's
+        filter) without the per-identity GROUP BY + thumbnail resolution."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(DISTINCT identity) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        row = cur.fetchone()
+        return row[0] if row else 0
+
     def get_all_set_member_checksums(self):
         """Every checksum that belongs to at least one set, as a plain set() —
         one cheap query independent of any candidate list size, unlike

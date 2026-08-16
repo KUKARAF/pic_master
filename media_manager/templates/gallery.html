@@ -6,7 +6,7 @@
 {% block content %}
 <div class="page-heading">
   <h1>Gallery</h1>
-  <span class="sub">{{ total }} files tracked</span>
+  <span class="sub">{{ homepage_stats.total_photos }} files tracked</span>
 </div>
 
 <div class="section-title" style="margin-bottom:10px;">Library stats</div>
@@ -21,98 +21,44 @@
   <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_auto_tags }}</span><span class="sub">Auto-detected tags</span></div>
 </div>
 
-{% if favorites_highlight %}
+{% if favorites %}
 <div class="section-title" style="margin-bottom:10px;">Favorites</div>
-<div class="grid" style="margin-bottom:24px;">
-  {% for item in favorites_highlight %}
-  {% if item.kind == 'photo' %}
-  {{ macros.card(item.card) }}
-  {% elif item.kind == 'face' %}
-  <div class="card">
-    <a class="card-img-link" href="/person/{{ item.face.identity | urlencode }}">
-      <img src="/face-crop/{{ item.face.ref }}" alt="{{ item.face.identity }}" loading="lazy">
-    </a>
-    <div class="card-body">
-      <div class="card-name">
-        {% if item.face.identity %}
-        <a href="/person/{{ item.face.identity | urlencode }}">{{ item.face.identity }}</a>
-        {% else %}<span class="sub">Unnamed</span>{% endif %}
-      </div>
-    </div>
-  </div>
-  {% elif item.kind == 'set' %}
-  <div class="card">
-    <a class="card-img-link" href="/sets/{{ item.set.id }}">
-      {% if item.set.thumb_id %}
-      <img src="/thumb/{{ item.set.thumb_id }}" alt="{{ item.set.name }}" loading="lazy">
-      {% else %}
-      <div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2rem;">🗂️</div>
-      {% endif %}
-    </a>
-    <div class="card-body">
-      <div class="card-name" title="{{ item.set.name }}"><a href="/sets/{{ item.set.id }}">{{ item.set.name }}</a></div>
-      {{ macros.set_meta_line(item.set) }}
-    </div>
-  </div>
-  {% endif %}
-  {% endfor %}
-</div>
-{% endif %}
-
-{% if needs_love_highlight %}
-<div class="section-title" style="margin-bottom:10px;">In need of some love</div>
-<div class="grid" style="margin-bottom:24px;" data-queue-source="Needs love">
-  {% for f in needs_love_highlight %}
+<div class="grid" style="margin-bottom:28px;" data-queue-source="Favorites">
+  {% for f in favorites %}
   {{ macros.card(f) }}
   {% endfor %}
 </div>
 {% endif %}
 
-<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
-  {% if favorite_only %}
-  <a href="/?sort={{ sort }}&order={{ order }}" class="sub">← All photos</a>
-  {% else %}
-  <a href="/?favorite=1&sort={{ sort }}&order={{ order }}" class="sub">♥ Favorites only</a>
-  {% endif %}
-  {{ macros.sort_controls(sort, order, {'favorite': '1' if favorite_only else ''}, show_favorites=True) }}
-</div>
-
-{% if files %}
-<div class="grid" data-queue-source="Gallery">
-  {% for f in files %}
+{% if needs_attention %}
+<div class="section-title" style="margin-bottom:4px;">Needs attention</div>
+<div class="sub" style="margin-bottom:10px;">Random items with no face, no set, and no manual tags yet.</div>
+<div class="grid" style="margin-bottom:28px;" data-queue-source="Needs attention">
+  {% for f in needs_attention %}
   {{ macros.card(f) }}
   {% endfor %}
 </div>
+{% endif %}
 
-{% if total > limit %}
-<div class="pagination">
-  {% if page > 1 %}
-  <a href="/?page={{ page - 1 }}{{ '&favorite=1' if favorite_only else '' }}&sort={{ sort }}&order={{ order }}">← Prev</a>
-  {% endif %}
-
-  <span class="current">{{ page }}</span>
-
-  {% if page * limit < total %}
-  <a href="/?page={{ page + 1 }}{{ '&favorite=1' if favorite_only else '' }}&sort={{ sort }}&order={{ order }}">Next →</a>
-  {% endif %}
+{% if random_cards %}
+<div class="section-title" style="margin-bottom:10px;">Random</div>
+<div class="grid" style="margin-bottom:24px;" data-queue-source="Random">
+  {% for f in random_cards %}
+  {{ macros.card(f) }}
+  {% endfor %}
 </div>
 {% endif %}
 
-{% else %}
+{% if not favorites and not needs_attention and not random_cards %}
 <div class="empty-state">
   <div class="icon">📂</div>
-  {% if favorite_only %}
-  <p>No favorited photos yet.</p>
-  {% else %}
   <p>No files tracked yet. Run <code>media add .</code> to scan your photos.</p>
-  {% endif %}
 </div>
 {% endif %}
 {% endblock %}
 
 {% block scripts %}
 <script>
-/* tags dropdown (shared logic lives in app.js, initialised automatically) */
 document.querySelectorAll('.file-heart-btn').forEach(function(btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
 });
