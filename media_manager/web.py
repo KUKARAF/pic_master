@@ -25,7 +25,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from media_manager import frames
-from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
+from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
 from media_manager.category_resolver import (
     get_category_counts,
     get_resolved_checksums_for_category,
@@ -929,7 +929,9 @@ def create_app(data_root: str) -> FastAPI:
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
             raise HTTPException(status_code=404, detail='Image file not found on disk')
-        return FileResponse(abs_path, headers=IMMUTABLE_CACHE_HEADERS)
+        ext = os.path.splitext(abs_path)[1].lower()
+        media_type = VIDEO_MIME_TYPES.get(ext)   # None for images → FileResponse guesses
+        return FileResponse(abs_path, media_type=media_type, headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.get('/api/files/{file_id}/neighbors')
     def api_file_neighbors(file_id: int):
