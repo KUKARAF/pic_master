@@ -39,8 +39,8 @@
   <div id="sidebar-custom-action" class="stage-custom-action"></div>
 
   {% if parent_capture %}
-  <!-- This still was captured from a video — link back to it. -->
-  <a class="stage-frame-origin" href="/photo/{{ parent_capture.id }}">◄ frame of {{ parent_capture.filename }} @ {{ (parent_capture.time_ms / 1000) | round(1) }}s</a>
+  <!-- This still was captured from a video/animated image — link back to it. -->
+  <a class="stage-frame-origin" href="/photo/{{ parent_capture.id }}">◄ frame of {{ parent_capture.filename }}{% if parent_capture.time_ms %} @ {{ (parent_capture.time_ms / 1000) | round(1) }}s{% endif %}</a>
   {% endif %}
 
   <!-- bottom-right: favorite (standalone, no menu) -->
@@ -99,8 +99,8 @@
       <button type="button" id="fileinfo-add-set-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
     </div>
   </div>
-  {% if file.is_video %}
-  <!-- Frames pod: grab the current frame as a still, list saved frames. -->
+  {% if file.can_capture %}
+  <!-- Frames pod: grab the current frame (video or animated image) as a still. -->
   <div class="stage-pod" data-pod>
     <button type="button" class="stage-pod-btn">🎞 Frames{% if captured_frames %} · {{ captured_frames | length }}{% endif %}</button>
     <div class="stage-pod-menu">
@@ -111,9 +111,9 @@
         {% if captured_frames %}
         <div class="frame-strip">
           {% for cf in captured_frames %}
-          <a class="frame-strip-item" href="/photo/{{ cf.id }}" title="{{ (cf.time_ms / 1000) | round(1) }}s">
+          <a class="frame-strip-item" href="/photo/{{ cf.id }}" title="{% if cf.time_ms %}{{ (cf.time_ms / 1000) | round(1) }}s{% else %}frame{% endif %}">
             <img src="/thumb/{{ cf.id }}" loading="lazy" alt="frame">
-            <span class="frame-strip-t">{{ (cf.time_ms / 1000) | round(1) }}s</span>
+            {% if cf.time_ms %}<span class="frame-strip-t">{{ (cf.time_ms / 1000) | round(1) }}s</span>{% endif %}
           </a>
           {% endfor %}
         </div>

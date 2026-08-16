@@ -1100,6 +1100,8 @@ def create_app(data_root: str) -> FastAPI:
                 except Exception:
                     frame_count = 1
         file_info['frame_count'] = frame_count
+        # Frame capture applies to videos and multi-frame (animated) images.
+        file_info['can_capture'] = file_info['is_video'] or (file_info['is_image'] and frame_count > 1)
         file_info['favorite'] = manual.get_file_favorite_count(checksum)
         file_info['title'] = manual.get_file_title(checksum)
         current_sets = [
@@ -1120,7 +1122,7 @@ def create_app(data_root: str) -> FastAPI:
         # Manually-captured stills of this video (for the Frames pod), and — when this
         # file is itself a captured still — a link back to its source video.
         captured_frames = []
-        if file_info['is_video']:
+        if file_info['can_capture']:
             for cap in manual.get_frame_captures_for(checksum):
                 rows = db.get_files_by_checksums([cap['child_checksum']])
                 if rows:
@@ -4262,8 +4264,10 @@ def create_app(data_root: str) -> FastAPI:
         file id so the client can open it. Idempotent per identical frame (checksum)."""
         import xxhash
         row = _file_or_404(file_id)
-        if os.path.splitext(row['path'])[1].lower() not in VIDEO_EXTENSIONS:
-            raise HTTPException(status_code=400, detail='Frame capture is only for videos')
+        # Videos and animated images (GIF/WEBP) both capture a frame the same way —
+        # the client draws the currently-shown frame of <video>/<img> to a canvas.
+        if os.path.splitext(row['path'])[1].lower() not in (VIDEO_EXTENSIONS | IMAGE_EXTENSIONS):
+            raise HTTPException(status_code=400, detail='Frame capture needs a video or animated image')
         data = await frame.read()
         if not data:
             raise HTTPException(status_code=400, detail='Empty frame')

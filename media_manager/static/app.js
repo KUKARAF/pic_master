@@ -3671,25 +3671,31 @@
     const fileinfoAddSet = document.getElementById('fileinfo-add-set-btn');
     if (fileinfoAddSet) fileinfoAddSet.addEventListener('click', openSetPickerModal);
 
-    // Capture the current video frame → a hidden still image, then open it.
+    // Capture the current frame → a hidden still image, then open it. Works for a
+    // <video> (currentTime) and for an animated <img> (GIF/WEBP) — drawImage grabs
+    // whichever frame the element is showing right now.
     const captureBtn = document.getElementById('capture-frame-btn');
-    const captureVideo = document.getElementById('photo-video');
-    if (captureBtn && captureVideo) {
+    const captureSrc = document.getElementById('photo-video') || document.getElementById('photo-image');
+    if (captureBtn && captureSrc) {
       captureBtn.addEventListener('click', function () {
         const status = document.getElementById('capture-frame-status');
         function say(t) { if (status) { status.style.display = ''; status.textContent = t; } }
-        if (!captureVideo.videoWidth) { say('Video not ready yet — press play/seek first.'); return; }
+        const isVideo = captureSrc.tagName === 'VIDEO';
+        const w = isVideo ? captureSrc.videoWidth : captureSrc.naturalWidth;
+        const h = isVideo ? captureSrc.videoHeight : captureSrc.naturalHeight;
+        if (!w || !h) { say(isVideo ? 'Video not ready yet — press play/seek first.' : 'Image not ready yet.'); return; }
         const canvas = document.createElement('canvas');
-        canvas.width = captureVideo.videoWidth;
-        canvas.height = captureVideo.videoHeight;
-        canvas.getContext('2d').drawImage(captureVideo, 0, 0, canvas.width, canvas.height);
+        canvas.width = w; canvas.height = h;
+        try {
+          canvas.getContext('2d').drawImage(captureSrc, 0, 0, w, h);
+        } catch (e) { say('Could not read this frame.'); return; }
         captureBtn.disabled = true;
         say('Capturing…');
         canvas.toBlob(function (blob) {
           if (!blob) { captureBtn.disabled = false; say('Capture failed.'); return; }
           const fd = new FormData();
           fd.append('frame', blob, 'frame.jpg');
-          fd.append('time_ms', String(Math.round((captureVideo.currentTime || 0) * 1000)));
+          fd.append('time_ms', String(isVideo ? Math.round((captureSrc.currentTime || 0) * 1000) : 0));
           fetch('/api/files/' + fileId + '/capture-frame', { method: 'POST', body: fd })
             .then(function (r) {
               if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
