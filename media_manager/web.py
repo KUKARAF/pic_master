@@ -1395,8 +1395,89 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    def _person_photos_collapsed(name, instances, file_rows, ages_by_ref, offset, limit, sort, order):
+        """Collapse-to-set view: photos in a set become one set card (positioned by
+        this-person's-slice averages — avg age of the person in the set, avg first_seen
+        of the person's photos in it); set-less photos stay as photo cards. All mixed
+        into one grid, sorted together by the page's active sort, then paged."""
+        checksums = list(file_rows.keys())
+        sets_by_cs = manual.get_sets_for_checksums(checksums)  # {cs: [{id,name,studio}]}
+
+        # Group the person's in-set photos by set; keep set-less ones as photo items.
+        set_group = {}   # set_id -> {'name','studio','checksums': set()}
+        photo_insts = []
+        for inst in instances:
+            here = sets_by_cs.get(inst['checksum'])
+            if here:
+                for s in here:
+                    g = set_group.setdefault(s['id'], {'name': s['name'], 'studio': s['studio'], 'checksums': set()})
+                    g['checksums'].add(inst['checksum'])
+            else:
+                photo_insts.append(inst)
+
+        # Per-(set, this person) average age — for positioning the set card under 'age'.
+        age_in_set = manual.get_average_ages_for_identities_in_sets(list(set_group.keys())) if set_group else {}
+
+        items = []
+        for inst in photo_insts:
+            r = file_rows[inst['checksum']]
+            est = ages_by_ref.get(inst['face_ref']) if inst['face_ref'] else None
+            items.append({'kind': 'photo', 'inst': inst, 'added': r['first_seen'],
+                          'modified': r['modified_time'] or 0, 'age': est['age'] if est else None})
+        for sid, g in set_group.items():
+            members = list(g['checksums'])
+            added_vals = [file_rows[cs]['first_seen'] for cs in members if cs in file_rows]
+            avg_added = sum(added_vals) / len(added_vals) if added_vals else 0
+            est = age_in_set.get((sid, name))
+            items.append({'kind': 'set', 'set_id': sid, 'name': g['name'], 'studio': g['studio'],
+                          'members': members, 'added': avg_added, 'modified': avg_added,
+                          'age': est.get('age') if est else None})
+
+        if sort == 'age':
+            with_age = [it for it in items if it['age'] is not None]
+            without_age = [it for it in items if it['age'] is None]
+            with_age.sort(key=lambda it: it['age'], reverse=(order != 'asc'))
+            items = with_age + without_age
+        else:
+            key = 'modified' if sort == 'modified' else 'added'
+            items.sort(key=lambda it: it[key], reverse=(order != 'asc'))
+
+        total = len(items)
+        page = items[offset:offset + limit]
+
+        # Enrich the page's photo items (batched, order-preserving); build set cards.
+        photo_page = [it for it in page if it['kind'] == 'photo']
+        rows = [(file_rows[it['inst']['checksum']]['id'], file_rows[it['inst']['checksum']]['path'],
+                 False, it['inst']['checksum']) for it in photo_page]
+        enriched = _enrich_rows(rows)
+        _apply_instance_ages(enriched, [it['inst'] for it in photo_page], name, ages_by_ref)
+        estimated = manual.get_estimated_checksums([c['checksum'] for c in enriched])
+        for c in enriched:
+            c['kind'] = 'photo'
+            c['has_age_estimate'] = c['checksum'] in estimated
+
+        set_cards = {}
+        set_dicts = []
+        for idx, it in enumerate(page):
+            if it['kind'] != 'set':
+                continue
+            thumb_cs = it['members'][0] if it['members'] else None
+            sd = {'kind': 'set', 'id': it['set_id'], 'name': it['name'], 'studio': it['studio'],
+                  'image_count': len(it['members']),
+                  'thumb_id': file_rows[thumb_cs]['id'] if thumb_cs and thumb_cs in file_rows else None}
+            set_cards[idx] = sd
+            set_dicts.append(sd)
+        _attach_set_people([set_dicts])  # adds 'people' roster (with per-set ages)
+
+        cards = []
+        ei = iter(enriched)
+        for idx, it in enumerate(page):
+            cards.append(set_cards[idx] if it['kind'] == 'set' else next(ei))
+        return {'cards': cards, 'total': total, 'offset': offset, 'limit': limit}
+
     @app.get('/api/person/{name}/photos')
-    def api_person_photos(name: str, offset: int = 0, limit: int = 20, sort: str = 'added', order: str = 'desc'):
+    def api_person_photos(name: str, offset: int = 0, limit: int = 20, sort: str = 'added',
+                          order: str = 'desc', collapse: bool = False):
         """Paginated card feed backing person.html's infinite-scroll photo list.
         Built from per-face-instance appearances (see _identity_instances), not
         unique photos — a photo where this person has two separate detected
@@ -1420,6 +1501,9 @@ def create_app(data_root: str) -> FastAPI:
 
         face_refs = {inst['face_ref'] for inst in instances if inst['face_ref']}
         ages_by_ref = manual.get_ages_for_face_refs(face_refs)
+
+        if collapse:
+            return _person_photos_collapsed(name, instances, file_rows, ages_by_ref, offset, limit, sort, order)
 
         if sort == 'age':
             def age_key(inst):

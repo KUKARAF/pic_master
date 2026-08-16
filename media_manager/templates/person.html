@@ -61,6 +61,9 @@
       <option value="desc" data-added-label="Newest first" data-age-label="Oldest first">Newest first</option>
       <option value="asc" data-added-label="Oldest first" data-age-label="Youngest first">Oldest first</option>
     </select>
+    <label class="sub" style="display:inline-flex;align-items:center;gap:4px;" title="Hide photos that are in a set and show the set card instead">
+      <input type="checkbox" id="person-collapse-toggle"> Collapse to set
+    </label>
   </div>
 </div>
 <div class="grid" id="person-photo-grid" data-queue-source="Person: {{ name }}"></div>
@@ -97,6 +100,7 @@
   var done = false;
   var sort = 'added';
   var order = 'desc';
+  var collapse = false;
 
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -116,6 +120,25 @@
       return '<span class="set-people-tag">@' + escapeHtml(p.name) + age + '</span>';
     }).join('');
     return '<span class="set-meta-line">' + inner + '</span>';
+  }
+
+  // A collapsed set card (mixed into the grid when "Collapse to set" is on) —
+  // links to the whole set; shows this person's slice count + the set roster.
+  function setCardHtml(s) {
+    var thumb = s.thumb_id != null
+      ? '<img src="/thumb/' + s.thumb_id + '" alt="' + escapeHtml(s.name) + '" loading="lazy">'
+      : '<div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2rem;">🗂️</div>';
+    return (
+      '<div class="card">' +
+        '<a class="card-img-link" href="/sets/' + s.id + '">' + thumb + '</a>' +
+        '<span class="score-badge">SET</span>' +
+        '<div class="card-body">' +
+          '<a class="card-name" href="/sets/' + s.id + '" title="' + escapeHtml(s.name) + '">' + escapeHtml(s.name) + '</a>' +
+          setMetaLineHtml(s) +
+          '<div class="sub" style="font-size:0.78rem;">' + s.image_count + ' photo(s) of this person</div>' +
+        '</div>' +
+      '</div>'
+    );
   }
 
   function cardHtml(f) {
@@ -177,7 +200,8 @@
     loading = true;
     loadingEl.style.display = 'block';
     var url = '/api/person/' + encodeURIComponent(name) + '/photos?offset=' + offset + '&limit=' + limit +
-      '&sort=' + encodeURIComponent(sort) + '&order=' + encodeURIComponent(order);
+      '&sort=' + encodeURIComponent(sort) + '&order=' + encodeURIComponent(order) +
+      '&collapse=' + (collapse ? 'true' : 'false');
     fetch(url)
       .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
       .then(function (data) {
@@ -185,7 +209,7 @@
         var cards = data.cards || [];
         cards.forEach(function (f) {
           var wrap = document.createElement('div');
-          wrap.innerHTML = cardHtml(f);
+          wrap.innerHTML = (f.kind === 'set') ? setCardHtml(f) : cardHtml(f);
           var cardEl = wrap.firstElementChild;
           grid.appendChild(cardEl);
           var heartBtn = cardEl.querySelector('.file-heart-btn');
@@ -242,6 +266,15 @@
     setSort: function (newSort, newOrder) {
       sort = newSort;
       order = newOrder;
+      grid.innerHTML = '';
+      offset = 0;
+      total = Infinity;
+      done = false;
+      emptyEl.style.display = 'none';
+      loadMore();
+    },
+    setCollapse: function (val) {
+      collapse = !!val;
       grid.innerHTML = '';
       offset = 0;
       total = Infinity;
@@ -309,6 +342,13 @@
   refreshOrderLabels();
   sortSelect.addEventListener('change', apply);
   orderSelect.addEventListener('change', apply);
+
+  var collapseToggle = document.getElementById('person-collapse-toggle');
+  if (collapseToggle) {
+    collapseToggle.addEventListener('change', function () {
+      if (window.__personPhotoGrid) window.__personPhotoGrid.setCollapse(collapseToggle.checked);
+    });
+  }
 })();
 
 /* Bulk selection — mirrors search.html's "Select many" / shift-click
