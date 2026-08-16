@@ -3723,6 +3723,48 @@ def create_app(data_root: str) -> FastAPI:
         manual.exclude_identity_from_set(set_id, name)
         return {'excluded': True}
 
+    def _identity_in_set_checksums(name, set_id):
+        """Member checksums of `set_id` where `name` actually appears — via a named
+        face or a whole-photo assignment. Shared by the count + scrub endpoints."""
+        members = list(manual.get_files_by_set(set_id, limit=100_000_000))
+        ident_map = manual.get_identities_for_checksums(members)   # {checksum: [names]}
+        assigned = set(manual.get_photos_assigned_to_identity(name))
+        return [cs for cs in members if name in ident_map.get(cs, []) or cs in assigned]
+
+    @app.get('/api/identities/{name}/set-image-count/{set_id}')
+    def api_identity_set_image_count(name: str, set_id: int):
+        """How many of the set's images still contain this person — drives the
+        'also remove from N images?' confirm on the set page."""
+        return {'count': len(_identity_in_set_checksums(name, set_id))}
+
+    @app.post('/api/identities/{name}/scrub-from-set/{set_id}')
+    def api_scrub_identity_from_set(name: str, set_id: int):
+        """Remove a wrongly-tagged person from a set AND from its member images:
+        clear the face->identity link (reversible) and drop any whole-photo
+        assignment on each affected member, then exclude them from the roster.
+        NOTE: identity is library-global, so this affects those photos everywhere."""
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        assigned = set(manual.get_photos_assigned_to_identity(name))
+        cleared_faces = 0
+        cleared_assignments = 0
+        images = 0
+        for cs in _identity_in_set_checksums(name, set_id):
+            touched = False
+            n = manual.unassign_identity_for_checksum(cs, name) or 0
+            if n:
+                cleared_faces += n
+                touched = True
+            if cs in assigned:
+                manual.remove_identity_photo_assignment(cs, name)
+                cleared_assignments += 1
+                touched = True
+            if touched:
+                images += 1
+        manual.exclude_identity_from_set(set_id, name)
+        return {'excluded': True, 'images': images,
+                'cleared_faces': cleared_faces, 'cleared_assignments': cleared_assignments}
+
     @app.post('/api/files/{file_id}/identity-assignments')
     def api_assign_identity_to_file(file_id: int, body: IdentityBody):
         """Manual, whole-photo 'this person is in this picture' — for a photo
