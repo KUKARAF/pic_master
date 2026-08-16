@@ -1455,14 +1455,14 @@ def create_app(data_root: str) -> FastAPI:
         filename = os.path.basename(row['path'])
         files = []
         message = ''
+        no_embedding = False
+        source_is_video = os.path.splitext(row['path'])[1].lower() in VIDEO_EXTENSIONS
         all_tags = manual.list_all_tags()
 
         emb_bytes = db.get_embedding(file_id)
         if emb_bytes is None:
-            message = (
-                f'"{filename}" has no embedding yet — '
-                'run <code>media embed</code> to build CLIP embeddings.'
-            )
+            # The template shows an "embed now" button instead of a message here.
+            no_embedding = True
         else:
             try:
                 import numpy as np
@@ -1493,6 +1493,8 @@ def create_app(data_root: str) -> FastAPI:
             'source_id': file_id,
             'files': files,
             'message': message,
+            'no_embedding': no_embedding,
+            'source_is_video': source_is_video,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
         })
@@ -1813,6 +1815,29 @@ def create_app(data_root: str) -> FastAPI:
         db.insert_detections(file_id, detections, YOLOWorldDetector.model_id())
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
         return {'detected_classes': detected_classes, 'detection_bboxes': db.get_detection_bboxes(file_id)}
+
+    @app.post('/api/files/{file_id}/embed')
+    def api_embed_file(file_id: int):
+        """Build + store the CLIP embedding for a single file on demand — powers
+        the "embed now" button on the /similar page when a file has no embedding
+        yet (instead of telling the user to run `media embed`). Synchronous, same
+        shape as api_reindex_tags; the lazy CLIP singleton is usually already warm
+        from other endpoints (find-by-body / text search)."""
+        row = _file_or_404(file_id)
+        abs_path = os.path.join(data_root, row['path'])
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext not in IMAGE_EXTENSIONS:
+            raise HTTPException(status_code=400, detail='Only images can be embedded (CLIP is image-only).')
+
+        indexer = _get_clip_indexer()
+        embeddings, failed = indexer.embed_images([abs_path])
+        if len(embeddings) == 0:
+            detail = failed[0][1] if failed else 'no embedding produced'
+            raise HTTPException(status_code=500, detail=f'Embedding failed: {detail}')
+        db.insert_embedding(file_id, embeddings[0].tobytes(), indexer.model_id())
+        return {'embedded': True}
 
     @app.get('/api/tags')
     def api_list_tags():

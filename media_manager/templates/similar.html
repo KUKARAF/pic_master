@@ -9,7 +9,16 @@
   <a href="/photo/{{ source_id }}" class="sub">← Back to photo</a>
 </div>
 
-{% if message %}
+{% if no_embedding %}
+  {% if source_is_video %}
+  <div class="alert" style="margin-bottom:20px;">Videos can't be embedded — CLIP similarity is images only.</div>
+  {% else %}
+  <div class="alert" style="margin-bottom:20px;">
+    <button type="button" id="embed-now-btn" class="btn-similar" data-file-id="{{ source_id }}">No embeddings for this image — embed {{ source_filename }} now</button>
+    <span id="embed-now-status" class="sub" style="display:none;margin-left:10px;"></span>
+  </div>
+  {% endif %}
+{% elif message %}
 <div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
 {% endif %}
 
@@ -20,7 +29,7 @@
   {% endfor %}
 </div>
 
-{% elif not message %}
+{% elif not message and not no_embedding %}
 <div class="empty-state">
   <div class="icon">🖼️</div>
   <p>No similar images found.</p>
@@ -33,5 +42,26 @@
 document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
 });
+
+var embedBtn = document.getElementById('embed-now-btn');
+if (embedBtn) {
+  embedBtn.addEventListener('click', function () {
+    var id = embedBtn.dataset.fileId;
+    var status = document.getElementById('embed-now-status');
+    embedBtn.disabled = true;
+    if (status) { status.style.display = ''; status.textContent = 'Embedding…'; }
+    fetch('/api/files/' + id + '/embed', { method: 'POST' })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
+        return r.json();
+      })
+      .then(function () { location.reload(); })   // reload now finds the embedding -> renders the similar grid
+      .catch(function (err) {
+        embedBtn.disabled = false;
+        if (status) status.style.display = 'none';
+        showToast('Failed to embed: ' + err.message, 'error');   // window.showToast is app-wide
+      });
+  });
+}
 </script>
 {% endblock %}
