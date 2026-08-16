@@ -67,7 +67,18 @@
       <table class="meta-table">
         <tr>
           <td>Path</td>
-          <td>{{ file.path }}</td>
+          {# Each folder segment links to its /files view; the filename (last
+             segment) stays plain text. #}
+          <td class="path-breadcrumb">
+            {%- set parts = file.path.split('/') -%}
+            {%- for part in parts -%}
+              {%- if loop.last -%}
+                {{ part }}
+              {%- else -%}
+                <a href="/files/{{ parts[:loop.index] | join('/') }}">{{ part }}</a><span class="path-sep">/</span>
+              {%- endif -%}
+            {%- endfor -%}
+          </td>
         </tr>
         <tr>
           <td>Size</td>
