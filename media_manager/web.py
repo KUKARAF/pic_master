@@ -86,7 +86,9 @@ class SpatialTagBody(BaseModel):
     polarity: str = 'positive'
 
 class FavoriteBody(BaseModel):
-    favorite: bool
+    # Favorites are a counter now: the client sends a signed delta (+1 on
+    # left-click, -1 on right-click) and the endpoint returns the new count.
+    delta: int = 1
 
 class TagLabelBody(BaseModel):
     label: str
@@ -419,12 +421,12 @@ def create_app(data_root: str) -> FastAPI:
         promoted = {r['source_face_id'] for r in manual_rows if r['source_face_id']}
         out = [{'ref': f"manual:{r['id']}", 'bbox': [r['x1'], r['y1'], r['x2'], r['y2']],
                 'identity': r['identity'], 'frame_index': r['frame_index'],
-                'favorite': bool(r['favorite'])} for r in manual_rows]
+                'favorite': r['favorite']} for r in manual_rows]
         for r in db.get_faces_for_file(file_id):
             if r['id'] in promoted:
                 continue
             out.append({'ref': f"auto:{r['id']}", 'bbox': _json.loads(r['bbox']),
-                        'identity': None, 'frame_index': r['frame_index'], 'favorite': False})
+                        'identity': None, 'frame_index': r['frame_index'], 'favorite': 0})
         return out
 
     def _parse_face_ref(face_id: str):
@@ -446,7 +448,7 @@ def create_app(data_root: str) -> FastAPI:
             'modified_time': row['modified_time'],
             'checksum': row['checksum'],
             'tags': tags if tags is not None else [],
-            'favorite': manual.is_file_favorite(row['checksum']),
+            'favorite': manual.get_file_favorite_count(row['checksum']),
             'title': manual.get_file_title(row['checksum']),
         }
 
@@ -460,7 +462,7 @@ def create_app(data_root: str) -> FastAPI:
         similarity/relevance; when given, each card gets a 'score' key."""
         checksums = [row[3] for row in rows]
         tag_map = manual.list_tags_for_checksums(checksums)
-        favorite_checksums = manual.get_favorite_checksums(checksums)
+        favorite_counts = manual.get_favorite_counts(checksums)
         title_map = manual.get_titles_for_checksums(checksums)
         sets_map = manual.get_sets_for_checksums(checksums)
         _attach_set_people(sets_map.values())
@@ -481,7 +483,7 @@ def create_app(data_root: str) -> FastAPI:
                 'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
                 'has_embedding': bool(has_embedding),
                 'tags': tag_map.get(checksum, []),
-                'favorite': checksum in favorite_checksums,
+                'favorite': favorite_counts.get(checksum, 0),
                 'title': title_map.get(checksum),
                 'sets': card_sets,
                 'people': _people_not_in_sets(identities_map.get(checksum, []), card_sets),
@@ -947,17 +949,20 @@ def create_app(data_root: str) -> FastAPI:
     def gallery_page(request: Request, page: int = 1, favorite: bool = False, sort: str = 'added', order: str = 'desc'):
         limit = 60
         all_tags = manual.list_all_tags()
-        if favorite or sort == 'age':
-            # Favorites are typically a small subset, and "age" needs manual.db data
-            # SQL here can't join against — both filter/sort in Python rather than
-            # adding those paths to the paginated SQL query.
-            sql_sort = sort if sort != 'age' else 'added'
+        if favorite or sort in ('age', 'favorites'):
+            # Favorites are typically a small subset, and "age"/"favorites" need
+            # manual.db data the paginated SQL here can't join against — so filter/
+            # sort in Python rather than adding those paths to the SQL query.
+            sql_sort = sort if sort not in ('age', 'favorites') else 'added'
             all_rows = db.list_files_with_embedding_flag(limit=1_000_000, offset=0, sort=sql_sort, order=order)
             all_files = _enrich_rows(all_rows)
             if favorite:
                 all_files = [f for f in all_files if f['favorite']]
             if sort == 'age':
                 all_files = _sort_cards_by_age(all_files, order)
+            elif sort == 'favorites':
+                # 'favorite' is the counter now — most-favorited first (desc default).
+                all_files = sorted(all_files, key=lambda f: f['favorite'], reverse=(order != 'asc'))
             total = len(all_files)
             offset = (page - 1) * limit
             files = all_files[offset:offset + limit]
@@ -1007,7 +1012,7 @@ def create_app(data_root: str) -> FastAPI:
         checksum = row['checksum']
         tag_rows = manual.get_tags(checksum)
         whole_tags = [
-            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': bool(t['favorite'])}
+            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': t['favorite']}
             for t in tag_rows if t['x1'] is None
         ]
         spatial_tags = [
@@ -1035,10 +1040,10 @@ def create_app(data_root: str) -> FastAPI:
                 except Exception:
                     frame_count = 1
         file_info['frame_count'] = frame_count
-        file_info['favorite'] = manual.is_file_favorite(checksum)
+        file_info['favorite'] = manual.get_file_favorite_count(checksum)
         file_info['title'] = manual.get_file_title(checksum)
         current_sets = [
-            {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'favorite': bool(s['favorite'])}
+            {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'favorite': s['favorite']}
             for s in manual.get_sets_for_file(checksum)
         ]
         _attach_set_people([current_sets])
@@ -1716,7 +1721,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _whole_tags(checksum):
         return [
-            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': bool(t['favorite'])}
+            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': t['favorite']}
             for t in manual.get_tags(checksum) if t['x1'] is None
         ]
 
@@ -1764,8 +1769,8 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/tags/{tag_id}/favorite')
     def api_set_tag_favorite(tag_id: int, body: FavoriteBody):
-        manual.set_tag_favorite(tag_id, body.favorite)
-        return {'id': tag_id, 'favorite': body.favorite}
+        count = manual.bump_tag_favorite(tag_id, body.delta)
+        return {'id': tag_id, 'count': count}
 
     @app.post('/api/files/{file_id}/tags/region')
     def api_add_spatial_tag(file_id: int, body: SpatialTagBody):
@@ -2419,7 +2424,7 @@ def create_app(data_root: str) -> FastAPI:
             thumb_row = thumb_rows_by_checksum.get(checksum) if checksum else None
             sets.append({
                 'id': r['id'], 'name': r['name'], 'studio': r['studio'],
-                'image_count': r['image_count'], 'favorite': bool(r['favorite']),
+                'image_count': r['image_count'], 'favorite': r['favorite'],
                 'thumb_id': thumb_row['id'] if thumb_row else None,
             })
         _attach_set_people([sets])
@@ -2812,7 +2817,7 @@ def create_app(data_root: str) -> FastAPI:
         gets ages attached as before."""
         sets = [
             {'id': r['id'], 'name': r['name'], 'studio': r['studio'],
-             'image_count': r['image_count'], 'favorite': bool(r['favorite'])}
+             'image_count': r['image_count'], 'favorite': r['favorite']}
             for r in manual.list_sets(favorite_only=favorite)
         ]
         if light:
@@ -2913,8 +2918,8 @@ def create_app(data_root: str) -> FastAPI:
     def api_set_favorite_set(set_id: int, body: FavoriteBody):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
-        manual.set_set_favorite(set_id, body.favorite)
-        return {'id': set_id, 'favorite': body.favorite}
+        count = manual.bump_set_favorite(set_id, body.delta)
+        return {'id': set_id, 'count': count}
 
     @app.get('/api/sets/{set_id}/aliases')
     def api_list_set_aliases(set_id: int):
@@ -3228,8 +3233,8 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/files/{file_id}/favorite')
     def api_set_file_favorite(file_id: int, body: FavoriteBody):
         row = _file_or_404(file_id)
-        manual.set_file_favorite(row['checksum'], body.favorite)
-        return {'id': file_id, 'favorite': body.favorite}
+        count = manual.bump_file_favorite(row['checksum'], body.delta)
+        return {'id': file_id, 'count': count}
 
     @app.patch('/api/files/{file_id}/title')
     def api_set_file_title(file_id: int, body: TitleBody):
@@ -3939,8 +3944,8 @@ def create_app(data_root: str) -> FastAPI:
         row = manual.get_face(raw_id)
         if row is None:
             raise HTTPException(status_code=404, detail='Face not found')
-        manual.set_face_favorite(raw_id, body.favorite)
-        return {'face_id': face_id, 'favorite': body.favorite}
+        count = manual.bump_face_favorite(raw_id, body.delta)
+        return {'face_id': face_id, 'count': count}
 
     @app.post('/api/files/{file_id}/faces')
     def api_add_manual_face(file_id: int, body: ManualFaceBody):

@@ -722,8 +722,11 @@ input[type="range"] { accent-color: var(--accent); }
   background: rgba(7, 11, 7, .75);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  width: 28px;
+  min-width: 28px;   /* auto-width so the "♥ N" count doesn't clip (grows leftward) */
+  width: auto;
   height: 28px;
+  padding: 0 6px;
+  gap: 3px;
   display: flex;
   align-items: center;
   justify-content: center;

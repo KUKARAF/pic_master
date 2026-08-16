@@ -8,7 +8,8 @@
   <h1>
     {{ set.name }}
     <button type="button" id="set-heart-btn" class="heart-btn-inline {{ 'is-favorite' if set.favorite else '' }}"
-            title="Favorite this set">{{ '♥' if set.favorite else '♡' }}</button>
+            data-fav-count="{{ set.favorite or 0 }}"
+            title="Favorite this set (right-click to lower)">{% if set.favorite %}♥ {{ set.favorite }}{% else %}♡{% endif %}</button>
     <button type="button" id="set-edit-btn" class="heart-btn-inline" title="Rename set">✏️</button>
     <button type="button" id="set-add-folder-btn" class="heart-btn-inline" title="Add all photos under a folder">📁</button>
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>

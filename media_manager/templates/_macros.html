@@ -74,7 +74,8 @@
      title="{{ star_title or 'I am feeling lucky — find similar images' }}">{{ star_icon }}</a>
 
   <button type="button" class="heart-btn file-heart-btn {{ 'is-favorite' if f.favorite else '' }}"
-          data-file-id="{{ f.id }}" title="Favorite this photo">{{ '♥' if f.favorite else '♡' }}</button>
+          data-file-id="{{ f.id }}" data-fav-count="{{ f.favorite or 0 }}"
+          title="Favorite this photo (right-click to lower)">{% if f.favorite %}♥ {{ f.favorite }}{% else %}♡{% endif %}</button>
 
   {% if f.score is defined %}
   <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
@@ -104,7 +105,7 @@
 {# Sort control shared by gallery/search/set-detail — a plain GET form so it works
    without JS, preserving whatever other query params the page already has via
    hidden inputs passed in `extra_params` (a dict). #}
-{% macro sort_controls(sort, order, extra_params={}, show_filename=False, show_manual=False) %}
+{% macro sort_controls(sort, order, extra_params={}, show_filename=False, show_manual=False, show_favorites=False) %}
 <form class="sort-controls" method="get" style="display:inline-flex;align-items:center;gap:6px;">
   {% for key, value in extra_params.items() %}
   {% if value %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}
@@ -116,6 +117,7 @@
     <option value="age" {{ 'selected' if sort == 'age' }}>Estimated age</option>
     {% if show_filename %}<option value="filename" {{ 'selected' if sort == 'filename' }}>Filename</option>{% endif %}
     {% if show_manual %}<option value="manual" {{ 'selected' if sort == 'manual' }}>Manual order</option>{% endif %}
+    {% if show_favorites %}<option value="favorites" {{ 'selected' if sort == 'favorites' }}>Most favorited</option>{% endif %}
   </select>
   {# Manual order is absolute — no asc/desc, so the direction select is hidden for it. #}
   {% if sort != 'manual' %}
@@ -123,6 +125,9 @@
     {% if sort == 'filename' %}
     <option value="asc" {{ 'selected' if order == 'asc' }}>A → Z</option>
     <option value="desc" {{ 'selected' if order == 'desc' }}>Z → A</option>
+    {% elif sort == 'favorites' %}
+    <option value="desc" {{ 'selected' if order == 'desc' }}>Most favorited</option>
+    <option value="asc" {{ 'selected' if order == 'asc' }}>Least favorited</option>
     {% else %}
     <option value="desc" {{ 'selected' if order == 'desc' }}>{{ 'Oldest first' if sort == 'age' else 'Newest first' }}</option>
     <option value="asc" {{ 'selected' if order == 'asc' }}>{{ 'Youngest first' if sort == 'age' else 'Oldest first' }}</option>

@@ -201,9 +201,16 @@ class ManualDB(ThreadLocalDB):
         cur.execute('''
             CREATE TABLE IF NOT EXISTS file_favorites (
                 checksum TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                count INTEGER NOT NULL DEFAULT 1
             )
         ''')
+        # Favorites are a counter now, not a toggle. A row's presence still means
+        # "favorited" (count > 0) so all the existing presence-based queries stay
+        # correct; the count column just records how many times it was bumped.
+        existing_fav_cols = {row[1] for row in cur.execute('PRAGMA table_info(file_favorites)')}
+        if 'count' not in existing_fav_cols:
+            cur.execute('ALTER TABLE file_favorites ADD COLUMN count INTEGER NOT NULL DEFAULT 1')
         cur.execute('''
             CREATE TABLE IF NOT EXISTS file_titles (
                 checksum TEXT PRIMARY KEY,
@@ -617,10 +624,14 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE file_tags SET tag_id = ? WHERE id = ?', (new_tag_id, tag_id))
         self.conn.commit()
 
-    def set_tag_favorite(self, tag_id, favorite):
+    def bump_tag_favorite(self, tag_id, delta):
+        """Increment/decrement a tag instance's favorite count (floored at 0);
+        returns the new count. tag_id is file_tags.id."""
         cur = self.conn.cursor()
-        cur.execute('UPDATE file_tags SET favorite = ? WHERE id = ?', (1 if favorite else 0, tag_id))
+        cur.execute('UPDATE file_tags SET favorite = max(0, favorite + ?) WHERE id = ?', (delta, tag_id))
         self.conn.commit()
+        row = cur.execute('SELECT favorite FROM file_tags WHERE id = ?', (tag_id,)).fetchone()
+        return row[0] if row else 0
 
     def rename_tag_label(self, old_label, new_label):
         """Renames a label everywhere it's used. If new_label already belongs to a
@@ -782,16 +793,46 @@ class ManualDB(ThreadLocalDB):
     # File favorites
     # ------------------------------------------------------------------
 
-    def set_file_favorite(self, checksum, favorite):
+    def bump_file_favorite(self, checksum, delta):
+        """Increment/decrement a photo's favorite count by `delta`, floored at 0.
+        Presence in file_favorites still means favorited (count > 0): a decrement
+        that reaches 0 deletes the row so every presence-based query stays correct.
+        Returns the new count."""
         cur = self.conn.cursor()
-        if favorite:
+        if delta > 0:
             cur.execute(
-                'INSERT OR IGNORE INTO file_favorites (checksum, created_at) VALUES (?, ?)',
-                (checksum, int(time.time()))
+                'INSERT INTO file_favorites (checksum, count, created_at) VALUES (?, ?, ?) '
+                'ON CONFLICT(checksum) DO UPDATE SET count = count + excluded.count',
+                (checksum, delta, int(time.time()))
             )
-        else:
-            cur.execute('DELETE FROM file_favorites WHERE checksum = ?', (checksum,))
+        elif delta < 0:
+            cur.execute('UPDATE file_favorites SET count = count + ? WHERE checksum = ?', (delta, checksum))
+            cur.execute('DELETE FROM file_favorites WHERE checksum = ? AND count <= 0', (checksum,))
         self.conn.commit()
+        return self.get_file_favorite_count(checksum)
+
+    def get_file_favorite_count(self, checksum):
+        cur = self.conn.cursor()
+        cur.execute('SELECT count FROM file_favorites WHERE checksum = ?', (checksum,))
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def get_favorite_counts(self, checksums):
+        """Batched: {checksum: count} for the favorited subset of `checksums`
+        (count > 0). Mirrors get_favorite_checksums; absent checksums are 0."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'SELECT checksum, count FROM file_favorites WHERE checksum IN ({placeholders})',
+                tuple(chunk)
+            )
+            for row in cur.fetchall():
+                result[row[0]] = row[1]
+        return result
 
     def get_favorite_checksums(self, checksums):
         """Batched lookup: subset of `checksums` that are favorited. Chunked (see
@@ -1130,7 +1171,7 @@ class ManualDB(ThreadLocalDB):
         clauses = []
         params = []
         if favorite_only:
-            clauses.append('s.favorite = 1')
+            clauses.append('s.favorite > 0')
         if studio is not None:
             clauses.append('s.studio = ?')
             params.append(studio)
@@ -1273,7 +1314,8 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE OR IGNORE set_aliases SET set_id = ? WHERE set_id = ?', (dest_id, source_id))
         source = self.get_set(source_id)
         if source is not None and source['favorite']:
-            cur.execute('UPDATE sets SET favorite = 1 WHERE id = ?', (dest_id,))
+            # Favorites are counters now — sum the merged set's count into dest.
+            cur.execute('UPDATE sets SET favorite = favorite + ? WHERE id = ?', (source['favorite'], dest_id))
         cur.execute('DELETE FROM sets WHERE id = ?', (source_id,))
         self.conn.commit()
         return dest_id
@@ -1285,10 +1327,14 @@ class ManualDB(ThreadLocalDB):
         cur.execute('DELETE FROM sets WHERE id = ?', (set_id,))
         self.conn.commit()
 
-    def set_set_favorite(self, set_id, favorite):
+    def bump_set_favorite(self, set_id, delta):
+        """Increment/decrement a set's favorite count (floored at 0); returns
+        the new count."""
         cur = self.conn.cursor()
-        cur.execute('UPDATE sets SET favorite = ? WHERE id = ?', (1 if favorite else 0, set_id))
+        cur.execute('UPDATE sets SET favorite = max(0, favorite + ?) WHERE id = ?', (delta, set_id))
         self.conn.commit()
+        row = cur.execute('SELECT favorite FROM sets WHERE id = ?', (set_id,)).fetchone()
+        return row[0] if row else 0
 
     def add_set_alias(self, set_id, alias):
         """Record `alias` as an alternate name for this set — same shape/
@@ -1823,10 +1869,14 @@ class ManualDB(ThreadLocalDB):
         row = cur.fetchone()
         return row[0] if row else name
 
-    def set_face_favorite(self, manual_face_id, favorite):
+    def bump_face_favorite(self, manual_face_id, delta):
+        """Increment/decrement a manual face's favorite count (floored at 0);
+        returns the new count."""
         cur = self.conn.cursor()
-        cur.execute('UPDATE faces SET favorite = ? WHERE id = ?', (1 if favorite else 0, manual_face_id))
+        cur.execute('UPDATE faces SET favorite = max(0, favorite + ?) WHERE id = ?', (delta, manual_face_id))
         self.conn.commit()
+        row = cur.execute('SELECT favorite FROM faces WHERE id = ?', (manual_face_id,)).fetchone()
+        return row[0] if row else 0
 
     def get_faces_for_file(self, checksum):
         """Non-rejected face rows for a file — feeds the photo-page face chips.
@@ -1887,7 +1937,7 @@ class ManualDB(ThreadLocalDB):
         since only manual rows can be favorited)."""
         cur = self.conn.cursor()
         cur.execute(
-            'SELECT id, checksum, identity FROM faces WHERE favorite = 1 AND rejected = 0 ORDER BY identity, id'
+            'SELECT id, checksum, identity FROM faces WHERE favorite > 0 AND rejected = 0 ORDER BY identity, id'
         )
         return cur.fetchall()
 

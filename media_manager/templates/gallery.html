@@ -74,7 +74,7 @@
   {% else %}
   <a href="/?favorite=1&sort={{ sort }}&order={{ order }}" class="sub">♥ Favorites only</a>
   {% endif %}
-  {{ macros.sort_controls(sort, order, {'favorite': '1' if favorite_only else ''}) }}
+  {{ macros.sort_controls(sort, order, {'favorite': '1' if favorite_only else ''}, show_favorites=True) }}
 </div>
 
 {% if files %}

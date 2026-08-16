@@ -52,7 +52,8 @@
           <span id="photo-title-display">{{ file.title or file.filename }}</span>
           <button type="button" id="photo-title-edit-btn" class="heart-btn-inline" title="Edit title" style="font-size:0.8em;">✏️</button>
           <button type="button" id="file-heart-btn" class="heart-btn-inline heart-btn-file {{ 'is-favorite' if file.favorite else '' }}"
-                  title="Favorite this photo">{{ '♥' if file.favorite else '♡' }}</button>
+                  data-fav-count="{{ file.favorite or 0 }}"
+                  title="Favorite this photo (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
         </div>
         {% if file.title %}
         <div class="sidebar-filename" id="photo-filename-sub" title="Original filename">{{ file.filename }}</div>
@@ -106,7 +107,8 @@
           {% endif %}
           </span>
           <button class="heart-btn-inline tag-heart-btn {{ 'is-favorite' if tag.favorite else '' }}" type="button"
-                  title="Favorite this tag" style="font-size:0.85em;">{{ '♥' if tag.favorite else '♡' }}</button>
+                  data-fav-count="{{ tag.favorite or 0 }}"
+                  title="Favorite this tag (right-click to lower)" style="font-size:0.85em;">{% if tag.favorite %}♥ {{ tag.favorite }}{% else %}♡{% endif %}</button>
           <button class="tag-edit-btn" type="button" title="Edit label">✏️</button>
           <button class="rm" type="button" title="Remove tag">×</button>
         </span>
@@ -180,7 +182,8 @@
           <span style="display:flex;align-items:center;gap:5px;">
             <a href="/sets/{{ s.id }}">{{ s.name }}</a>
             <button class="heart-btn-inline set-heart-btn {{ 'is-favorite' if s.favorite else '' }}" type="button"
-                    data-set-id="{{ s.id }}" title="Favorite this set" style="font-size:0.85em;">{{ '♥' if s.favorite else '♡' }}</button>
+                    data-set-id="{{ s.id }}" data-fav-count="{{ s.favorite or 0 }}"
+                    title="Favorite this set (right-click to lower)" style="font-size:0.85em;">{% if s.favorite %}♥ {{ s.favorite }}{% else %}♡{% endif %}</button>
             <button class="rm set-remove-btn" type="button" data-set-id="{{ s.id }}" title="Remove from this set">×</button>
           </span>
           {{ macros.set_meta_line(s) }}
@@ -261,7 +264,8 @@
             </span>
             {% if face.ref.startswith('manual:') %}
             <button type="button" class="heart-btn-inline face-heart-btn {{ 'is-favorite' if face.favorite else '' }}"
-                    data-face-ref="{{ face.ref }}" title="Favorite this face" style="font-size:0.85em;">{{ '♥' if face.favorite else '♡' }}</button>
+                    data-face-ref="{{ face.ref }}" data-fav-count="{{ face.favorite or 0 }}"
+                    title="Favorite this face (right-click to lower)" style="font-size:0.85em;">{% if face.favorite %}♥ {{ face.favorite }}{% else %}♡{% endif %}</button>
             {% endif %}
             {% if face.frame_index is not none %}
             <span class="sub" style="font-size:0.75em;" title="Found at frame {{ face.frame_index }}">frame {{ face.frame_index }}</span>

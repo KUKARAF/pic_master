@@ -162,7 +162,8 @@
         '</a>' +
         '<a class="star-btn" href="/similar/' + f.id + '" title="I am feeling lucky — find similar images">⭐</a>' +
         '<button type="button" class="heart-btn file-heart-btn ' + (f.favorite ? 'is-favorite' : '') + '" ' +
-          'data-file-id="' + f.id + '" title="Favorite this photo">' + (f.favorite ? '♥' : '♡') + '</button>' +
+          'data-file-id="' + f.id + '" data-fav-count="' + (f.favorite || 0) + '" ' +
+          'title="Favorite this photo (right-click to lower)">' + (f.favorite ? '♥ ' + f.favorite : '♡') + '</button>' +
         '<div class="card-body">' +
           '<a class="card-name" href="/photo/' + f.id + '" title="' + escapeHtml(f.path) + '">' + escapeHtml(title) + '</a>' +
           tagsHtml +

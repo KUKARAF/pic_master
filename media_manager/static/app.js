@@ -307,34 +307,44 @@
     });
   };
 
-  /* Shared favorite-heart toggle — POSTs {favorite: bool} to `endpoint` and flips the
-     button's glyph/class on success. Used by every heart button across the app so
-     the toggle behaves identically everywhere. */
+  /* Render a heart button from a count: "♥ N" when favorited (count > 0), "♡"
+     when 0. Keeps the count in data-fav-count. Shared so JS-built markup can
+     seed the same look. */
+  window.renderHeart = function (btn, count) {
+    count = count || 0;
+    btn.dataset.favCount = count;
+    btn.classList.toggle('is-favorite', count > 0);
+    btn.textContent = count > 0 ? '♥ ' + count : '♡';
+  };
+
+  /* Shared favorite-heart COUNTER — left-click bumps +1, right-click -1 (floored
+     server-side at 0). POSTs {delta} to `endpoint`, reads the new {count} back,
+     and re-renders. Used by every heart button across the app so the behavior is
+     identical everywhere. */
   window.wireHeartButton = function (btn, endpoint) {
-    btn.addEventListener('click', function (e) {
-      e.preventDefault();
-      e.stopPropagation();
-      const goingTo = !btn.classList.contains('is-favorite');
+    function bump(delta) {
+      if (btn.disabled) return;
       btn.disabled = true;
       fetch(endpoint, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ favorite: goingTo }),
+        body: JSON.stringify({ delta: delta }),
       })
         .then(function (r) {
           if (!r.ok) throw new Error('Request failed: ' + r.status);
           return r.json();
         })
-        .then(function () {
-          btn.classList.toggle('is-favorite', goingTo);
-          btn.textContent = goingTo ? '♥' : '♡';
+        .then(function (data) {
+          window.renderHeart(btn, data.count);
           btn.disabled = false;
         })
         .catch(function (err) {
           btn.disabled = false;
           showToast('Failed to update favorite: ' + err.message);
         });
-    });
+    }
+    btn.addEventListener('click', function (e) { e.preventDefault(); e.stopPropagation(); bump(1); });
+    btn.addEventListener('contextmenu', function (e) { e.preventDefault(); e.stopPropagation(); bump(-1); });
   };
 
   /* Warning bell — populated on every page load, independent of photo context */
@@ -2115,10 +2125,10 @@
 
       const heartBtn = document.createElement('button');
       heartBtn.type = 'button';
-      heartBtn.className = 'heart-btn-inline tag-heart-btn' + (tag.favorite ? ' is-favorite' : '');
+      heartBtn.className = 'heart-btn-inline tag-heart-btn';
       heartBtn.style.fontSize = '0.85em';
-      heartBtn.title = 'Favorite this tag';
-      heartBtn.textContent = tag.favorite ? '♥' : '♡';
+      heartBtn.title = 'Favorite this tag (right-click to lower)';
+      window.renderHeart(heartBtn, tag.favorite);
       span.appendChild(heartBtn);
 
       const editBtn = document.createElement('button');
@@ -2170,24 +2180,34 @@
       });
   }
 
+  /* Tag favorite is a counter too — shared by the click (+1) and contextmenu (-1)
+     delegated handlers below. Renders "♥ N"/"♡" via the shared renderHeart. */
+  function bumpTagFavorite(heartBtn, chip, delta) {
+    fetch('/api/tags/' + chip.dataset.tagId + '/favorite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delta: delta }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+      .then(function (data) { window.renderHeart(heartBtn, data.count); })
+      .catch(function (err) { showToast('Failed to update favorite: ' + err.message); });
+  }
+
   if (tagList) {
+    tagList.addEventListener('contextmenu', function (e) {
+      const heartBtn = e.target.closest('.tag-heart-btn');
+      if (!heartBtn) return;
+      const chip = heartBtn.closest('.tag-removable, .tag-negative');
+      if (!chip) return;
+      e.preventDefault();
+      bumpTagFavorite(heartBtn, chip, -1);
+    });
     tagList.addEventListener('click', function (e) {
       const heartBtn = e.target.closest('.tag-heart-btn');
       if (heartBtn) {
         const chip = heartBtn.closest('.tag-removable, .tag-negative');
         if (!chip) return;
-        const goingTo = !heartBtn.classList.contains('is-favorite');
-        fetch('/api/tags/' + chip.dataset.tagId + '/favorite', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ favorite: goingTo }),
-        })
-          .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-          .then(function () {
-            heartBtn.classList.toggle('is-favorite', goingTo);
-            heartBtn.textContent = goingTo ? '♥' : '♡';
-          })
-          .catch(function (err) { showToast('Failed to update favorite: ' + err.message); });
+        bumpTagFavorite(heartBtn, chip, 1);
         return;
       }
 
@@ -3004,10 +3024,10 @@
 
       const heartBtn = document.createElement('button');
       heartBtn.type = 'button';
-      heartBtn.className = 'heart-btn-inline set-heart-btn' + (set.favorite ? ' is-favorite' : '');
+      heartBtn.className = 'heart-btn-inline set-heart-btn';
       heartBtn.style.fontSize = '0.85em';
-      heartBtn.title = 'Favorite this set';
-      heartBtn.textContent = set.favorite ? '♥' : '♡';
+      heartBtn.title = 'Favorite this set (right-click to lower)';
+      window.renderHeart(heartBtn, set.favorite);
       row.appendChild(heartBtn);
 
       const removeBtn = document.createElement('button');
@@ -3061,8 +3081,8 @@
     heartBtn.type = 'button';
     heartBtn.className = 'heart-btn-inline set-heart-btn';
     heartBtn.style.fontSize = '0.85em';
-    heartBtn.title = 'Favorite this set';
-    heartBtn.textContent = '♡';
+    heartBtn.title = 'Favorite this set (right-click to lower)';
+    window.renderHeart(heartBtn, 0);
     row.appendChild(heartBtn);
 
     const removeBtn = document.createElement('button');

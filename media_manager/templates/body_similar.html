@@ -114,7 +114,8 @@
         '</a>' +
         '<a class="star-btn" href="/body-similar/' + f.id + '?body_id=' + f.body_id + '" title="Find bodies similar to this one">🧍</a>' +
         '<button type="button" class="heart-btn file-heart-btn ' + (f.favorite ? 'is-favorite' : '') + '" ' +
-          'data-file-id="' + f.id + '" title="Favorite this photo">' + (f.favorite ? '♥' : '♡') + '</button>' +
+          'data-file-id="' + f.id + '" data-fav-count="' + (f.favorite || 0) + '" ' +
+          'title="Favorite this photo (right-click to lower)">' + (f.favorite ? '♥ ' + f.favorite : '♡') + '</button>' +
         (f.score !== undefined ? '<span class="score-badge">' + f.score.toFixed(3) + '</span>' : '') +
         '<div class="card-body">' +
           '<a class="card-name" href="/photo/' + f.id + '" title="' + escapeHtml(f.path) + '">' + escapeHtml(title) + '</a>' +

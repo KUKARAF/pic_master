@@ -56,7 +56,8 @@
             data-set-name="{{ s.name }}" data-set-studio="{{ s.studio or '' }}" title="Rename set">✏️</button>
     <button type="button" class="icon-btn delete-btn set-delete-btn" data-set-id="{{ s.id }}" title="Delete set">🗑️</button>
     <button type="button" class="heart-btn set-heart-btn {{ 'is-favorite' if s.favorite else '' }}"
-            data-set-id="{{ s.id }}" title="Favorite this set">{{ '♥' if s.favorite else '♡' }}</button>
+            data-set-id="{{ s.id }}" data-fav-count="{{ s.favorite or 0 }}"
+            title="Favorite this set (right-click to lower)">{% if s.favorite %}♥ {{ s.favorite }}{% else %}♡{% endif %}</button>
 
     <div class="card-body">
       <div class="card-name" title="{{ s.name }}">
