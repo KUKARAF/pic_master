@@ -1818,6 +1818,12 @@
       cellEls = queue.ids.map(function (id, i) {
         const cell = document.createElement('button');
         cell.type = 'button';
+        // Keep cells out of the keyboard focus path: a focused <button> fires a
+        // native click on Enter, which would race the single keydown handler
+        // below and make Enter ambiguous. With tabindex -1 + blur-on-click, Enter
+        // is handled ONLY by that handler (toggle-select in select mode, open in
+        // preview mode) — never by a phantom button activation.
+        cell.tabIndex = -1;
         cell.className = 'queue-grid-cell' + (i === queue.cursor ? ' is-current' : '');
         const img = document.createElement('img');
         img.src = '/thumb/' + id;
@@ -1825,6 +1831,7 @@
         cell.appendChild(img);
         cell.addEventListener('click', function (e) {
           if (!selectMode) { goTo(id); return; }
+          cell.blur();   // don't let the clicked cell keep focus (see tabindex note above)
           setSelected(i);
           if (alreadyIn.has(i)) return;   // greyed out — already in the set
           if (e.shiftKey && rangeAnchor !== null) {
