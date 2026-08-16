@@ -3673,9 +3673,20 @@
           else pod.classList.remove('is-open');
         });
       }
+      // Any interaction inside the menu (add/remove a tag, pick a category, etc.)
+      // pins the pod open so it doesn't vanish when the mouse wanders off or a
+      // picker modal opens mid-action.
+      pod.addEventListener('click', function (e) {
+        if (trigger && trigger.contains(e.target)) return; // the trigger toggles (above)
+        pod.__pinned = true;
+        openPod();
+      });
     });
     document.addEventListener('click', function (e) {
-      if (!e.target.closest('[data-pod]')) closeAllPods(null);
+      // Only a click on the page itself closes pods — not a click inside a pod, nor
+      // inside a modal/palette a pod opened (e.g. the add-tag / add-to-set picker).
+      if (e.target.closest('[data-pod], .modal-overlay, .palette-overlay')) return;
+      closeAllPods(null);
     });
 
     // Quick "＋ Add to set" in the top File-info pod reuses the set picker.
