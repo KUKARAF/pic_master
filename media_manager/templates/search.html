@@ -67,18 +67,6 @@
   {% endif %}
 </div>
 
-{% if not q and not tag %}
-<div class="face-search-box" style="margin-bottom:24px;">
-  <div class="section-title">Search by face photo</div>
-  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
-    <input type="file" id="face-upload" accept="image/*" style="font-size:0.9em;">
-    <button type="button" id="face-search-btn" class="btn-similar">Find face</button>
-    <span id="face-search-status" style="font-size:0.85em;color:#728C72;"></span>
-  </div>
-  <div id="face-results" class="grid" data-queue-source="Face search" style="margin-top:16px;"></div>
-</div>
-{% endif %}
-
 {% if message %}
 <div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
 {% endif %}
@@ -297,50 +285,6 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
 })();
 
 (function() {
-  const btn = document.getElementById('face-search-btn');
-  if (btn) {
-    btn.addEventListener('click', async function() {
-      const input = document.getElementById('face-upload');
-      const status = document.getElementById('face-search-status');
-      const resultsDiv = document.getElementById('face-results');
-      if (!input.files || !input.files[0]) {
-        status.textContent = 'Please select an image file first.';
-        return;
-      }
-      status.textContent = 'Searching…';
-      resultsDiv.innerHTML = '';
-      const fd = new FormData();
-      fd.append('file', input.files[0]);
-      try {
-        const resp = await fetch('/api/search/face', { method: 'POST', body: fd });
-        const data = await resp.json();
-        if (data.message) {
-          status.textContent = data.message;
-          return;
-        }
-        if (!data.results || data.results.length === 0) {
-          status.textContent = 'No matching faces found.';
-          return;
-        }
-        status.textContent = data.results.length + ' result(s)';
-        data.results.forEach(function(f) {
-          resultsDiv.innerHTML += `
-            <div class="card" data-file-id="${f.file_id}">
-              <a class="card-img-link" href="/photo/${f.file_id}">
-                <img src="/thumb/${f.file_id}" alt="${f.filename}" loading="lazy">
-              </a>
-              <span class="score-badge">${f.score.toFixed(3)}</span>
-              <div class="card-body">
-                <div class="card-name" title="${f.path}">${f.filename}</div>
-              </div>
-            </div>`;
-        });
-      } catch(e) {
-        status.textContent = 'Search error: ' + e.message;
-      }
-    });
-  }
-
   /* "Use this name" — only shown in face_ref mode, on a match that's already
      named. Assigns that name to the *query* face, then jumps back to its photo. */
   const queryFaceRef = {{ face_ref | tojson }};
