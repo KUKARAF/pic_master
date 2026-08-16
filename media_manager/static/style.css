@@ -423,7 +423,7 @@ input[type="range"] { accent-color: var(--accent); }
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
   padding: 20px;
-  width: 420px;
+  width: 560px;
   max-width: calc(100vw - 40px);
   max-height: calc(100vh - 80px);
   overflow-y: auto;
@@ -461,7 +461,7 @@ input[type="range"] { accent-color: var(--accent); }
   line-height: 1;
 }
 .modal-title .modal-close-btn:hover { color: var(--accent); }
-.modal-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; max-height: 260px; overflow-y: auto; }
+.modal-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; max-height: 420px; overflow-y: auto; }
 .modal-list-item {
   display: flex;
   justify-content: space-between;
@@ -473,7 +473,8 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .modal-list-item:hover, .modal-list-item.is-highlighted { background: var(--input-bg); color: var(--accent); }
 .modal-list-item .sub { font-size: 14px; color: var(--text-muted); }
-.modal-list-item-thumb { width: 32px; height: 32px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
+.modal-list-item-thumb { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
+.modal-list-item-thumb.square { border-radius: var(--radius-card); }
 .modal-empty { padding: 6px 2px; font-size: 15px; color: var(--text-muted); }
 .modal-divider { border-top: 1px dashed var(--border); margin: 12px 0; padding-top: 12px; }
 .modal-box input[type="text"] { width: 100%; padding: 9px 10px; }

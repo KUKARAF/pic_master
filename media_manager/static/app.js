@@ -801,7 +801,8 @@
         const aliasText = s.aliases && s.aliases.length ? 'aka ' + s.aliases.join(', ') : '';
         return [s.studio || '', peopleText, aliasText].filter(Boolean).join(' — ');
       },
-      image: null,
+      image: function (s) { return s.thumb_id != null ? '/thumb/' + s.thumb_id : null; },
+      imageSquare: true,
       // Matches today's exact chained behavior: a new set's studio is its own
       // keyboard-first step, not folded into this one.
       createFn: function (typedName) {
@@ -1039,7 +1040,7 @@
             const imgUrl = config.image ? config.image(item) : null;
             if (imgUrl) {
               const thumb = document.createElement('img');
-              thumb.className = 'modal-list-item-thumb';
+              thumb.className = 'modal-list-item-thumb' + (config.imageSquare ? ' square' : '');
               thumb.src = imgUrl;
               row.appendChild(thumb);
             }
@@ -3297,69 +3298,79 @@
     setCurrent.querySelectorAll('[data-set-id]').forEach(wireSetChip);
   }
 
-  /* Suggested sets — CLIP centroid match, fetched lazily so the page render
-     itself isn't blocked on scanning every set. Renders nothing when there's
-     nothing worth suggesting (no embedding yet, no sets, already in every
-     set, or nothing clears the match threshold) — this mirrors auto-detected
-     tags/faces elsewhere in the app, which stay silent rather than nagging.
+  /* Suggested sets — CLIP centroid match ("which set does this photo probably
+     belong to"). Auto-running this on every /photo load was too heavy (it scans
+     every set's embeddings), so it's now MANUAL: the ✨ button fetches 6, and the
+     result is cached in localStorage (browser-only, never stored server-side) so
+     reopening the photo shows them again without recomputing. */
+  const setSuggestions = document.getElementById('set-suggestions');
+  const suggestSetsBtn = document.getElementById('suggest-sets-btn');
+  const SUGGEST_CACHE_KEY = 'mm_suggested_sets:' + fileId;
 
-     DISABLED (2026-07-29): scanning every set's embedding on every /photo/
-     load was too heavy — page load speed matters more than this convenience.
-     Uncomment to re-enable; "+ Add to set" is unaffected (openSetPickerModal/
-     openSetSearchModal use the separate cached entity-list fetch, not this). */
-  // const setSuggestions = document.getElementById('set-suggestions');
-  // if (setSuggestions && fileId) {
-  //   fetch('/api/files/' + fileId + '/suggested-sets')
-  //     .then(function (r) { return r.ok ? r.json() : { results: [] }; })
-  //     .then(function (data) {
-  //       (data.results || []).forEach(function (set) {
-  //         const chip = document.createElement('a');
-  //         chip.className = 'chip-set';
-  //         chip.href = '#';
-  //         chip.style.marginRight = '6px';
-  //         chip.style.marginBottom = '4px';
-  //         chip.title = 'Suggested match — click to add';
-  //         chip.dataset.setId = set.id;
-  //
-  //         const row = document.createElement('span');
-  //         row.style.display = 'flex';
-  //         row.style.alignItems = 'center';
-  //         row.style.gap = '4px';
-  //         const nameSpan = document.createElement('span');
-  //         nameSpan.textContent = set.name;
-  //         row.appendChild(nameSpan);
-  //         const scoreSpan = document.createElement('span');
-  //         scoreSpan.className = 'score-badge';
-  //         scoreSpan.style.position = 'static';
-  //         scoreSpan.textContent = set.score.toFixed(2);
-  //         row.appendChild(scoreSpan);
-  //         chip.appendChild(row);
-  //
-  //         const metaLine = buildSetMetaLine(set);
-  //         if (metaLine) chip.appendChild(metaLine);
-  //
-  //         chip.addEventListener('click', function (e) {
-  //           e.preventDefault();
-  //           chip.style.pointerEvents = 'none';
-  //           assignSetById(set.id)
-  //             .then(function (data) {
-  //               appendSetChip(data);
-  //               chip.remove();
-  //             })
-  //             .catch(function (err) {
-  //               chip.style.pointerEvents = '';
-  //               showToast('Failed to add set: ' + err.message);
-  //             });
-  //         });
-  //
-  //         setSuggestions.appendChild(chip);
-  //       });
-  //     })
-  //     .catch(function () {
-  //       // Non-critical: leave the block empty rather than surfacing an error
-  //       // for what is, at worst, a missed convenience suggestion.
-  //     });
-  // }
+  function renderSuggestedSets(results) {
+    if (!setSuggestions) return;
+    setSuggestions.innerHTML = '';
+    (results || []).forEach(function (set) {
+      const chip = document.createElement('a');
+      chip.className = 'chip-set';
+      chip.href = '#';
+      chip.style.marginRight = '6px';
+      chip.style.marginBottom = '4px';
+      chip.title = 'Suggested match — click to add';
+      chip.dataset.setId = set.id;
+      const row = document.createElement('span');
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '4px';
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = set.name;
+      row.appendChild(nameSpan);
+      if (set.score != null) {
+        const scoreSpan = document.createElement('span');
+        scoreSpan.className = 'score-badge';
+        scoreSpan.style.position = 'static';
+        scoreSpan.textContent = Number(set.score).toFixed(2);
+        row.appendChild(scoreSpan);
+      }
+      chip.appendChild(row);
+      const metaLine = buildSetMetaLine(set);
+      if (metaLine) chip.appendChild(metaLine);
+      chip.addEventListener('click', function (e) {
+        e.preventDefault();
+        chip.style.pointerEvents = 'none';
+        assignSetById(set.id)
+          .then(function (data) { appendSetChip(data); chip.remove(); })
+          .catch(function (err) { chip.style.pointerEvents = ''; showToast('Failed to add set: ' + err.message); });
+      });
+      setSuggestions.appendChild(chip);
+    });
+  }
+
+  // Restore any previously-suggested sets for this photo (browser-only cache).
+  if (setSuggestions) {
+    try {
+      const cached = JSON.parse(localStorage.getItem(SUGGEST_CACHE_KEY) || 'null');
+      if (cached && cached.length) renderSuggestedSets(cached);
+    } catch (e) { /* ignore corrupt cache */ }
+  }
+
+  if (suggestSetsBtn) {
+    suggestSetsBtn.addEventListener('click', function () {
+      const label = suggestSetsBtn.textContent;
+      suggestSetsBtn.disabled = true;
+      suggestSetsBtn.textContent = '✨ …';
+      fetch('/api/files/' + fileId + '/suggested-sets?limit=6')
+        .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+        .then(function (data) {
+          const results = data.results || [];
+          renderSuggestedSets(results);
+          try { localStorage.setItem(SUGGEST_CACHE_KEY, JSON.stringify(results)); } catch (e) { /* quota */ }
+          if (!results.length) showToast('No similar sets found for this photo.');
+        })
+        .catch(function (err) { showToast('Failed to suggest sets: ' + err.message); })
+        .finally(function () { suggestSetsBtn.disabled = false; suggestSetsBtn.textContent = label; });
+    });
+  }
 
   /* Photo (file) favorite heart */
   const fileHeartBtn = document.getElementById('file-heart-btn');

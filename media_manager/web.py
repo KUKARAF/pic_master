@@ -2711,12 +2711,13 @@ def create_app(data_root: str) -> FastAPI:
         return results
 
     @app.get('/api/files/{file_id}/suggested-sets')
-    def api_suggested_sets_for_file(file_id: int, ids: str = ''):
+    def api_suggested_sets_for_file(file_id: int, ids: str = '', limit: int = 3):
         row = _file_or_404(file_id)
         set_ids = None
         if ids:
             set_ids = {int(s) for s in ids.split(',') if s.strip().isdigit()}
-        return {'results': _find_best_sets_for_file(file_id, row['checksum'], set_ids=set_ids)}
+        return {'results': _find_best_sets_for_file(file_id, row['checksum'],
+                                                    limit=max(1, min(limit, 24)), set_ids=set_ids)}
 
     def _people_present_in_set(set_id, member_checksums):
         """Everyone confirmed to appear in this set, for the "People present"
@@ -2911,6 +2912,20 @@ def create_app(data_root: str) -> FastAPI:
              'image_count': r['image_count'], 'favorite': r['favorite']}
             for r in manual.list_sets(favorite_only=favorite)
         ]
+        # Representative thumbnail per set (so the set picker can show one) — one
+        # whole-library checksum map + a single batched row lookup, not per-set.
+        set_checksums_map = _set_checksums_by_id()
+        repr_by_id = {}
+        for s in sets:
+            cks = set_checksums_map.get(s['id'])
+            if cks:
+                repr_by_id[s['id']] = next(iter(cks))
+        thumb_rows = ({row['checksum']: row for row in db.get_files_by_checksums(list(repr_by_id.values()))}
+                      if repr_by_id else {})
+        for s in sets:
+            cs = repr_by_id.get(s['id'])
+            row = thumb_rows.get(cs) if cs else None
+            s['thumb_id'] = row['id'] if row else None
         if light:
             _attach_set_people_names_only([sets])
         else:
