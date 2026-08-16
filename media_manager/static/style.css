@@ -978,6 +978,23 @@ input[type="range"] { accent-color: var(--accent); }
 .page-heading .sub { font-size: 16px; color: var(--text-muted); }
 .sub { color: var(--text-muted); }
 
+/* /files folder browser — the list of immediate subfolders above the file grid */
+.folder-list { display: flex; flex-direction: column; gap: 6px; }
+.folder-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  text-decoration: none;
+  color: inherit;
+}
+.folder-row:hover { border-color: var(--border-accent); }
+.folder-row .folder-name { font-weight: 500; }
+
 /* ------------------------------------------------------------------ */
 /* Photo detail — fullscreen stage + overlay sidebar                    */
 /* ------------------------------------------------------------------ */

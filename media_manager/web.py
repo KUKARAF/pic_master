@@ -979,6 +979,26 @@ def create_app(data_root: str) -> FastAPI:
             'homepage_stats': _homepage_stats(),
         })
 
+    @app.get('/files', response_class=HTMLResponse)
+    @app.get('/files/{subpath:path}', response_class=HTMLResponse)
+    def files_page(request: Request, subpath: str = ''):
+        """Browse the tracked library as a folder tree. `subpath` (via the {path}
+        converter, so it may contain slashes) is the current folder relative to
+        data_root; '' is the root. Shows immediate subfolders + the media directly
+        in this folder, and a "Use this folder" button that adds the whole subtree
+        to a set."""
+        folder = subpath.strip('/')
+        subfolders, file_rows = db.browse_folder(folder)
+        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+        files = _enrich_rows(rows)
+        return templates.TemplateResponse(request, 'files.html', {
+            'folder': folder,
+            'subfolders': subfolders,
+            'files': files,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
     @app.get('/photo/{file_id}', response_class=HTMLResponse)
     def photo_page(request: Request, file_id: int):
         row = _file_or_404(file_id)
@@ -2672,6 +2692,17 @@ def create_app(data_root: str) -> FastAPI:
             'order': order,
         })
 
+    def _files_under_folder(folder_path):
+        """Resolve a folder path (as sent by the add-folder endpoints / the /files
+        "Use this folder" button) to its tracked files. An empty path is the library
+        root — the /files root button uses this to add the entire library — so it
+        maps to every tracked file rather than being rejected. Any non-empty path
+        goes through the recursive, indexed find_files_under_folder."""
+        folder_path = (folder_path or '').strip().strip('/')
+        if not folder_path:
+            return db.list_files(limit=100_000_000)
+        return db.find_files_under_folder(folder_path)
+
     @app.get('/api/sets/{set_id}/add-folder/preview')
     def api_preview_add_folder_to_set(set_id: int, path: str):
         """Read-only counterpart to add-folder — lets the "add folder" modal show
@@ -2679,10 +2710,7 @@ def create_app(data_root: str) -> FastAPI:
         handful of new photos) before actually committing any membership."""
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
-        folder_path = (path or '').strip().strip('/')
-        if not folder_path:
-            raise HTTPException(status_code=400, detail='Folder path must not be empty')
-        matches = db.find_files_under_folder(folder_path)
+        matches = _files_under_folder(path)
         existing = set(manual.get_files_by_set(set_id, limit=100000))
         new_files = [
             {'id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path']}
@@ -2699,10 +2727,7 @@ def create_app(data_root: str) -> FastAPI:
     def api_add_folder_to_set(set_id: int, body: AddFolderBody):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
-        folder_path = (body.path or '').strip().strip('/')
-        if not folder_path:
-            raise HTTPException(status_code=400, detail='Folder path must not be empty')
-        matches = db.find_files_under_folder(folder_path)
+        matches = _files_under_folder(body.path)
         if not matches:
             return {'matched': 0, 'added': 0, 'already_present': 0}
         existing = {c for c in manual.get_files_by_set(set_id, limit=100000)}

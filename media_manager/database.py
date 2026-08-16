@@ -874,6 +874,46 @@ class Database(ThreadLocalDB):
             result.append(row)
         return result
 
+    def browse_folder(self, prefix):
+        """One level of the tracked-media folder tree under `prefix` (relative to
+        data_root, '/'-separated, no leading/trailing slash; '' means the root).
+        Returns (subfolders, file_rows):
+          subfolders: [{'name', 'path', 'count'}, ...] sorted by name — the immediate
+                      child directories, with count = tracked files anywhere under each
+                      (recursive), for a "42 files" hint next to each folder.
+          file_rows:  (id, path, checksum) Rows for files sitting DIRECTLY in `prefix`.
+
+        Powers the /files browser. Mirrors find_files_under_folder's GLOB-escaping and
+        strip('/') normalization; the one-level split is done in Python (like that
+        method's Python-side dedup) so the query stays a single indexed range-scan.
+        Root ('' prefix) necessarily scans every tracked path — that's inherent to
+        enumerating top-level folders — but every non-root call is an indexed
+        idx_file_paths_path seek over just that subtree."""
+        prefix = (prefix or '').strip().strip('/')
+        cur = self.conn.cursor()
+        if prefix:
+            esc = prefix.translate(str.maketrans({'*': '[*]', '?': '[?]', '[': '[[]', ']': '[]]'}))
+            cur.execute('SELECT f.id AS id, fp.path AS path, f.checksum AS checksum '
+                        'FROM file_paths fp JOIN files f ON f.id = fp.file_id '
+                        'WHERE fp.path GLOB ?', (f'{esc}/*',))
+        else:
+            cur.execute('SELECT f.id AS id, fp.path AS path, f.checksum AS checksum '
+                        'FROM file_paths fp JOIN files f ON f.id = fp.file_id')
+        base = len(prefix) + 1 if prefix else 0
+        folders = {}          # child folder name -> recursive file count
+        files, seen = [], set()
+        for row in cur.fetchall():
+            rest = row['path'][base:]
+            if '/' in rest:                        # lives in a subfolder of prefix
+                seg = rest.split('/', 1)[0]
+                folders[seg] = folders.get(seg, 0) + 1
+            elif row['id'] not in seen:            # a file directly in prefix
+                seen.add(row['id'])
+                files.append(row)
+        subfolders = [{'name': n, 'path': f'{prefix}/{n}' if prefix else n, 'count': c}
+                      for n, c in sorted(folders.items())]
+        return subfolders, files
+
     def remove_paths_under(self, path_prefix):
         """Untrack every currently-tracked path at or under `path_prefix` — a real
         path-segment prefix match, like find_files_under_folder above
