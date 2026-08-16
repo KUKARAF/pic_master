@@ -223,9 +223,20 @@
       <div id="add-face-status" class="sub" style="display:none;"></div>
       <div id="detect-faces-status" class="sub" style="display:none;"></div>
       <div id="estimate-age-status" class="sub" style="display:none;"></div>
+      {% elif file.is_video %}
+      {# Videos have no face-detection pipeline, but a person can still be assigned
+         without a face crop — same "no face" flow as an image. #}
+      <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px;">
+        <button type="button" id="assign-identity-btn" class="btn-similar" style="font-size:7px;padding:6px 7px;"
+                title="Confirm this person appears in the video even with no detected face">
+          ＋ This is… (no face)
+        </button>
+      </div>
+      {% endif %}
+      {% if file.is_image or file.is_video %}
       <div id="assign-identity-status" class="sub" style="display:none;"></div>
       {% endif %}
-      {% if whole_photo_identities or file.is_image %}
+      {% if whole_photo_identities or file.is_image or file.is_video %}
       <div id="identity-photo-chips-wrap" {% if not whole_photo_identities %}style="display:none;"{% endif %}>
         <div class="sub" style="margin-bottom:4px;">Assigned without a face:</div>
         <div class="face-chips" id="identity-photo-chips">
@@ -276,6 +287,10 @@
         {% endfor %}
       </div>
       <a href="/faces" class="sub" style="font-size:0.8em;">Label faces →</a>
+      {% elif file.is_video %}
+      <p class="alert">
+        No face detection for videos — use “＋ This is… (no face)” above to tag who appears.
+      </p>
       {% else %}
       <p class="alert">
         No faces indexed — run <code>media faces</code> to detect faces in this image.
