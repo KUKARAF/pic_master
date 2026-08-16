@@ -1097,6 +1097,10 @@ input[type="range"] { accent-color: var(--accent); }
   user-select: none;
   -webkit-user-select: none;
 }
+/* Wheel-zoom (app.js): transform is anchored to the image's top-left corner so
+   the zoom-toward-cursor math in app.js stays exact; the grab/grabbing cursor is
+   set inline by the JS only while zoomed in. */
+#photo-image { transform-origin: 0 0; will-change: transform; }
 
 /* fit modes — sized so the <img> element box always equals the visible
    image (no object-fit letterboxing), keeping draw coordinates correct

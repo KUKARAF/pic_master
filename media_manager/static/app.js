@@ -3504,7 +3504,97 @@
     const fitBtn = document.getElementById('fit-mode-btn');
     const fitLabel = document.getElementById('fit-mode-label');
 
+    /* Mouse-wheel zoom toward the cursor + click-drag pan (images only; the
+       video element is never touched — `photoImg` is null for videos). State is a
+       single scale + translate applied as `translate(tx,ty) scale(s)` on
+       #photo-image, whose transform-origin is 0 0 (see style.css). With that
+       origin, a local point l maps to screen  L0 + t + s*l, so the point under
+       the cursor stays fixed across a zoom step when we solve for the new t:
+         t' = t + (cursor - rect.left) * (1 - s'/s)
+       (rect.left is the image's current on-screen left, i.e. L0 + t = s*l + L0,
+       so cursor-rect.left = s*l and the identity falls out). Reused across the
+       fit-mode handlers below so zoom and fit modes never fight. */
+    let zScale = 1, zTx = 0, zTy = 0;
+    function applyZoom() {
+      if (!photoImg) return;
+      photoImg.style.transform = 'translate(' + zTx + 'px,' + zTy + 'px) scale(' + zScale + ')';
+      photoImg.style.cursor = zScale > 1 ? 'grab' : '';
+    }
+    function resetZoom() {
+      zScale = 1; zTx = 0; zTy = 0;
+      if (photoImg) { photoImg.style.transform = ''; photoImg.style.cursor = ''; }
+    }
+    // Best-effort pan clamp: when the image is larger than the stage on an axis,
+    // don't let a gap open at its edges; when smaller, keep it inside the stage.
+    // Works off live bounding rects, so it's fit-mode- and scroll-agnostic.
+    function clampPan() {
+      if (!photoImg || zScale <= 1) return;
+      const s = photoStage.getBoundingClientRect();
+      const i = photoImg.getBoundingClientRect();
+      let cx = 0, cy = 0;
+      if (i.width >= s.width) {
+        if (i.left > s.left) cx = s.left - i.left;
+        else if (i.right < s.right) cx = s.right - i.right;
+      } else {
+        if (i.left < s.left) cx = s.left - i.left;
+        else if (i.right > s.right) cx = s.right - i.right;
+      }
+      if (i.height >= s.height) {
+        if (i.top > s.top) cy = s.top - i.top;
+        else if (i.bottom < s.bottom) cy = s.bottom - i.bottom;
+      } else {
+        if (i.top < s.top) cy = s.top - i.top;
+        else if (i.bottom > s.bottom) cy = s.bottom - i.bottom;
+      }
+      if (cx || cy) { zTx += cx; zTy += cy; applyZoom(); }
+    }
+    if (photoImg) {
+      const ZOOM_STEP = 1.15, ZOOM_MIN = 1, ZOOM_MAX = 8;
+      photoStage.addEventListener('wheel', function (e) {
+        // Always swallow the wheel so the page/stage never scrolls under us.
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
+        const newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zScale * factor));
+        if (newScale === zScale) return;
+        const r = photoImg.getBoundingClientRect();
+        const k = 1 - newScale / zScale;
+        zTx += (e.clientX - r.left) * k;
+        zTy += (e.clientY - r.top) * k;
+        zScale = newScale;
+        if (zScale <= 1) { zScale = 1; zTx = 0; zTy = 0; }
+        applyZoom();
+        clampPan();
+      }, { passive: false });
+
+      // Drag-to-pan, active only while zoomed in. mousemove/up live on window so
+      // the drag survives the cursor leaving the image.
+      let dragging = false, lastX = 0, lastY = 0;
+      photoImg.addEventListener('mousedown', function (e) {
+        if (zScale <= 1) return;
+        dragging = true;
+        lastX = e.clientX; lastY = e.clientY;
+        photoImg.style.cursor = 'grabbing';
+        e.preventDefault();
+      });
+      window.addEventListener('mousemove', function (e) {
+        if (!dragging) return;
+        zTx += e.clientX - lastX;
+        zTy += e.clientY - lastY;
+        lastX = e.clientX; lastY = e.clientY;
+        applyZoom();
+        clampPan();
+      });
+      function endDrag() {
+        if (!dragging) return;
+        dragging = false;
+        if (photoImg) photoImg.style.cursor = zScale > 1 ? 'grab' : '';
+      }
+      window.addEventListener('mouseup', endDrag);
+      photoStage.addEventListener('mouseleave', endDrag);
+    }
+
     function setFit(key) {
+      resetZoom(); // zoom and fit modes must not fight — every mode change clears zoom
       const mode = FIT_MODES.find(function (m) { return m.key === key; }) || FIT_MODES[0];
       FIT_MODES.forEach(function (m) { photoStage.classList.remove(m.cls); });
       photoStage.classList.add(mode.cls);
