@@ -18,7 +18,7 @@ from urllib.parse import quote
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -1112,6 +1112,21 @@ def create_app(data_root: str) -> FastAPI:
             est = age_by_ref.get(face['ref'])
             face['age'] = est['age'] if est else None
             face['gender'] = est['gender'] if est else None
+        # Manually-captured stills of this video (for the Frames pod), and — when this
+        # file is itself a captured still — a link back to its source video.
+        captured_frames = []
+        if file_info['is_video']:
+            for cap in manual.get_frame_captures_for(checksum):
+                rows = db.get_files_by_checksums([cap['child_checksum']])
+                if rows:
+                    captured_frames.append({'id': rows[0]['id'], 'time_ms': cap['time_ms']})
+        parent_capture = None
+        pc = manual.get_parent_capture(checksum)
+        if pc:
+            prows = db.get_files_by_checksums([pc['parent_checksum']])
+            if prows:
+                parent_capture = {'id': prows[0]['id'], 'time_ms': pc['time_ms'],
+                                  'filename': os.path.basename(prows[0]['path'])}
         return templates.TemplateResponse(request, 'photo.html', {
             'file': file_info,
             'detected_classes': detected_classes,
@@ -1122,6 +1137,8 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': all_categories,
             'current_sets': current_sets,
+            'captured_frames': captured_frames,
+            'parent_capture': parent_capture,
         })
 
     def _identity_instances(name):
@@ -4230,6 +4247,31 @@ def create_app(data_root: str) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail='No scan job found for this file')
         return job
+
+    @app.post('/api/files/{file_id}/capture-frame')
+    async def api_capture_frame(file_id: int, frame: UploadFile = File(...), time_ms: int = Form(0)):
+        """Save a manually-captured video frame (the canvas JPEG blob) as a hidden,
+        real image file linked back to the source video at `time_ms`. Returns the new
+        file id so the client can open it. Idempotent per identical frame (checksum)."""
+        import xxhash
+        row = _file_or_404(file_id)
+        if os.path.splitext(row['path'])[1].lower() not in VIDEO_EXTENSIONS:
+            raise HTTPException(status_code=400, detail='Frame capture is only for videos')
+        data = await frame.read()
+        if not data:
+            raise HTTPException(status_code=400, detail='Empty frame')
+        checksum = xxhash.xxh64(data).hexdigest()
+        rel_path = 'captured_frames/' + checksum + '.jpg'
+        abs_path = os.path.join(data_root, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        if not os.path.exists(abs_path):
+            with open(abs_path, 'wb') as f:
+                f.write(data)
+        new_id = db.upsert_file_path(rel_path, checksum, size=len(data),
+                                     modified_time=int(os.path.getmtime(abs_path)))
+        db.set_file_hidden(new_id, True)   # commits (also persists the upsert above)
+        manual.add_frame_capture(checksum, row['checksum'], time_ms)
+        return {'file_id': new_id}
 
     @app.post('/api/search/face')
     async def api_search_by_face(file: UploadFile = File(...)):

@@ -38,6 +38,11 @@
   <!-- transient cross-page action banner (floats top-center) -->
   <div id="sidebar-custom-action" class="stage-custom-action"></div>
 
+  {% if parent_capture %}
+  <!-- This still was captured from a video — link back to it. -->
+  <a class="stage-frame-origin" href="/photo/{{ parent_capture.id }}">◄ frame of {{ parent_capture.filename }} @ {{ (parent_capture.time_ms / 1000) | round(1) }}s</a>
+  {% endif %}
+
   <!-- bottom-right: favorite (standalone, no menu) -->
   <div class="stage-pod stage-bottom-right">
     <button type="button" id="file-heart-btn" class="stage-pod-btn heart-fav-btn {{ 'is-favorite' if file.favorite else '' }}"
@@ -45,8 +50,9 @@
             title="Favorite (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
   </div>
 
-  <!-- TOP-CENTER: file info + title -->
-  <div class="stage-pod stage-top-center" data-pod>
+  <!-- TOP-CENTER: file info + title (and, for videos, the frames pod beside it) -->
+  <div class="stage-topbar">
+  <div class="stage-pod" data-pod>
     <button type="button" class="stage-pod-btn">ⓘ INFO</button>
     <div class="stage-pod-menu">
       <div class="sidebar-header">
@@ -93,6 +99,32 @@
       <button type="button" id="fileinfo-add-set-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
     </div>
   </div>
+  {% if file.is_video %}
+  <!-- Frames pod: grab the current frame as a still, list saved frames. -->
+  <div class="stage-pod" data-pod>
+    <button type="button" class="stage-pod-btn">🎞 Frames{% if captured_frames %} · {{ captured_frames | length }}{% endif %}</button>
+    <div class="stage-pod-menu">
+      <div class="sidebar-panel">
+        <div class="section-title">Frames</div>
+        <button type="button" id="capture-frame-btn" class="btn-similar" style="font-size:7px;padding:6px 8px;">📸 Capture current frame</button>
+        <div id="capture-frame-status" class="sub" style="display:none;"></div>
+        {% if captured_frames %}
+        <div class="frame-strip">
+          {% for cf in captured_frames %}
+          <a class="frame-strip-item" href="/photo/{{ cf.id }}" title="{{ (cf.time_ms / 1000) | round(1) }}s">
+            <img src="/thumb/{{ cf.id }}" loading="lazy" alt="frame">
+            <span class="frame-strip-t">{{ (cf.time_ms / 1000) | round(1) }}s</span>
+          </a>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="sub" style="margin-top:6px;">No frames captured yet.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+  </div><!-- /stage-topbar -->
 
   <!-- RIGHT RAIL: Tags / Categories / Sets metadata pods -->
   <div class="stage-pod-rail stage-right">
@@ -222,7 +254,25 @@
 
   <!-- TOP-LEFT: Faces -->
   <div class="stage-pod stage-top-left" data-pod>
-    <button type="button" class="stage-pod-btn">☺ Faces</button>
+    <div class="stage-pod-row">
+      <button type="button" class="stage-pod-btn">☺ Faces</button>
+      {# At-a-glance cluster: only faces that have a confirmed identity (a crop
+         we can show). Unknown/unidentified faces are intentionally omitted so
+         the cluster stays meaningful. Cap at 5 + a "+N" overflow chip. #}
+      {% set identified_faces = faces | selectattr('identity') | list if faces else [] %}
+      {% if identified_faces %}
+      <div class="face-avatar-cluster">
+        {% for face in identified_faces[:5] %}
+        <a class="face-avatar" href="/person/{{ face.identity | urlencode }}" title="{{ face.identity }}">
+          <img src="/face-crop/{{ face.ref }}" alt="{{ face.identity }}" width="28" height="28" loading="lazy">
+        </a>
+        {% endfor %}
+        {% if identified_faces | length > 5 %}
+        <span class="face-avatar-more" title="{{ identified_faces | length - 5 }} more identified">+{{ identified_faces | length - 5 }}</span>
+        {% endif %}
+      </div>
+      {% endif %}
+    </div>
     <div class="stage-pod-menu">
     <!-- Faces -->
     <div class="sidebar-panel">

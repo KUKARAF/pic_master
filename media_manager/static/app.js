@@ -3671,6 +3671,36 @@
     const fileinfoAddSet = document.getElementById('fileinfo-add-set-btn');
     if (fileinfoAddSet) fileinfoAddSet.addEventListener('click', openSetPickerModal);
 
+    // Capture the current video frame → a hidden still image, then open it.
+    const captureBtn = document.getElementById('capture-frame-btn');
+    const captureVideo = document.getElementById('photo-video');
+    if (captureBtn && captureVideo) {
+      captureBtn.addEventListener('click', function () {
+        const status = document.getElementById('capture-frame-status');
+        function say(t) { if (status) { status.style.display = ''; status.textContent = t; } }
+        if (!captureVideo.videoWidth) { say('Video not ready yet — press play/seek first.'); return; }
+        const canvas = document.createElement('canvas');
+        canvas.width = captureVideo.videoWidth;
+        canvas.height = captureVideo.videoHeight;
+        canvas.getContext('2d').drawImage(captureVideo, 0, 0, canvas.width, canvas.height);
+        captureBtn.disabled = true;
+        say('Capturing…');
+        canvas.toBlob(function (blob) {
+          if (!blob) { captureBtn.disabled = false; say('Capture failed.'); return; }
+          const fd = new FormData();
+          fd.append('frame', blob, 'frame.jpg');
+          fd.append('time_ms', String(Math.round((captureVideo.currentTime || 0) * 1000)));
+          fetch('/api/files/' + fileId + '/capture-frame', { method: 'POST', body: fd })
+            .then(function (r) {
+              if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
+              return r.json();
+            })
+            .then(function (data) { window.location.href = '/photo/' + data.file_id; })
+            .catch(function (err) { captureBtn.disabled = false; say(''); showToast('Capture failed: ' + err.message); });
+        }, 'image/jpeg', 0.92);
+      });
+    }
+
     window.addEventListener('keydown', function (e) {
       if (photoGridOpen) return;
       const tag = (e.target && e.target.tagName) || '';

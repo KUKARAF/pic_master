@@ -82,6 +82,10 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         # never treat it as photo content, regardless of .mediaignore.
         if rel_path == '.media' or rel_path.startswith('.media/'):
             continue
+        # captured_frames/ holds manually-grabbed video stills we register ourselves
+        # (as hidden files) — skip so a re-scan never re-adds them as normal photos.
+        if rel_path == 'captured_frames' or rel_path.startswith('captured_frames/'):
+            continue
         # respect .mediaignore
         if rules.is_ignored(rel_path):
             continue

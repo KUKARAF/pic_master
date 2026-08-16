@@ -218,6 +218,19 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
+        # Manually-captured video frames: each still (child_checksum, a hidden file in
+        # media.db) links back to the source video (parent_checksum) + the timestamp it
+        # was grabbed at. Lets the video's page list its saved frames and a captured
+        # still link back to its video. Checksum-keyed like everything else here.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS frame_captures (
+                child_checksum TEXT PRIMARY KEY,
+                parent_checksum TEXT NOT NULL,
+                time_ms INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_frame_captures_parent ON frame_captures (parent_checksum)')
         # Experimental age/gender estimation (MiVOLO, run in an isolated venv — see
         # age_estimator.py) — deliberately its own table, not touching files/faces at
         # all, so the whole feature can be dropped with a single DROP TABLE if it
@@ -810,6 +823,33 @@ class ManualDB(ThreadLocalDB):
             cur.execute('DELETE FROM file_favorites WHERE checksum = ? AND count <= 0', (checksum,))
         self.conn.commit()
         return self.get_file_favorite_count(checksum)
+
+    def add_frame_capture(self, child_checksum, parent_checksum, time_ms):
+        """Record that `child_checksum` (a captured still) came from `parent_checksum`
+        (a video) at `time_ms`. Idempotent — recapturing the identical frame reuses
+        the row (same child checksum)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT INTO frame_captures (child_checksum, parent_checksum, time_ms, created_at) '
+            'VALUES (?, ?, ?, ?) ON CONFLICT(child_checksum) DO UPDATE SET '
+            'parent_checksum=excluded.parent_checksum, time_ms=excluded.time_ms',
+            (child_checksum, parent_checksum, int(time_ms), int(time.time()))
+        )
+        self.conn.commit()
+
+    def get_frame_captures_for(self, parent_checksum):
+        """[{child_checksum, time_ms}] captured from this video, ordered by time."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT child_checksum, time_ms FROM frame_captures WHERE parent_checksum = ? ORDER BY time_ms',
+                    (parent_checksum,))
+        return [{'child_checksum': r[0], 'time_ms': r[1]} for r in cur.fetchall()]
+
+    def get_parent_capture(self, child_checksum):
+        """{parent_checksum, time_ms} for a captured still, or None if not a capture."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT parent_checksum, time_ms FROM frame_captures WHERE child_checksum = ?', (child_checksum,))
+        row = cur.fetchone()
+        return {'parent_checksum': row[0], 'time_ms': row[1]} if row else None
 
     def get_file_favorite_count(self, checksum):
         cur = self.conn.cursor()

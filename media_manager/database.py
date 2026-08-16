@@ -107,6 +107,11 @@ class Database(ThreadLocalDB):
         files_cols = {row[1] for row in cursor.execute('PRAGMA table_info(files)')}
         if 'noface' not in files_cols:
             cursor.execute('ALTER TABLE files ADD COLUMN noface INTEGER NOT NULL DEFAULT 0')
+        # hidden: derived content that shouldn't clutter the gallery/library listings
+        # (currently manually-captured video frames — see web.py capture-frame). Still
+        # a first-class file everywhere else (photo view, thumbnails, face search).
+        if 'hidden' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
         # file_paths: every location this content has been seen at. One-to-many — this
         # is where duplicates (same checksum, multiple paths) live. last_seen_at is
         # bumped on every scan that still finds the path on disk, so a path whose
@@ -123,8 +128,12 @@ class Database(ThreadLocalDB):
         # Read-only convenience view: resolves each content record's *primary* path
         # (most recently seen) so the rest of this file's queries can keep selecting a
         # single 'path' column, same shape as the old one-row-per-path schema.
+        # Recreated (not IF NOT EXISTS) every init so `f.*` always reflects the
+        # current files columns — an existing view is frozen at its creation-time
+        # column list, so a newly ALTER-added column (e.g. hidden) wouldn't appear.
+        cursor.execute('DROP VIEW IF EXISTS files_with_path')
         cursor.execute('''
-            CREATE VIEW IF NOT EXISTS files_with_path AS
+            CREATE VIEW files_with_path AS
             SELECT f.*, fp.path AS path, fp.modified_time AS modified_time
             FROM files f
             JOIN file_paths fp ON fp.id = (
@@ -343,6 +352,13 @@ class Database(ThreadLocalDB):
         ''', (file_id, path, modified_time, now))
         return file_id
 
+    def set_file_hidden(self, file_id, hidden=True):
+        """Mark content as hidden (excluded from gallery/library listings) or not.
+        Commits — also persists any pending upsert_file_path in the same transaction."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE files SET hidden = ? WHERE id = ?', (1 if hidden else 0, file_id))
+        self.conn.commit()
+
     def find_file_id_by_checksum(self, checksum):
         """Return the existing files.id for this checksum, or None. Used at scan time
         to detect a duplicate *before* writing anything — see fast_scan.py."""
@@ -396,15 +412,16 @@ class Database(ThreadLocalDB):
         return cursor.fetchall()
 
     def list_files(self, limit=100):
-        """List files (id, path, size, checksum), most-recently-seen path shown."""
+        """List files (id, path, size, checksum), most-recently-seen path shown.
+        Hidden (derived, e.g. captured video frames) content is excluded."""
         cursor = self.conn.cursor()
-        cursor.execute('SELECT id, path, size, checksum FROM files_with_path LIMIT ?', (limit,))
+        cursor.execute('SELECT id, path, size, checksum FROM files_with_path WHERE hidden = 0 LIMIT ?', (limit,))
         return cursor.fetchall()
 
     def count_files(self, limit=None):
-        """Return the number of content records. limit: maximum rows to count (None == unlimited)."""
+        """Return the number of (non-hidden) content records. limit: maximum rows to count."""
         cur = self.conn.cursor()
-        sql = 'SELECT COUNT(*) FROM files'
+        sql = 'SELECT COUNT(*) FROM files WHERE hidden = 0'
         if limit is not None:
             sql += ' LIMIT ?'
             cur.execute(sql, (limit,))
@@ -635,6 +652,7 @@ class Database(ThreadLocalDB):
                    f.checksum
             FROM files_with_path f
             LEFT JOIN embeddings e ON e.file_id = f.id
+            WHERE f.hidden = 0
             ORDER BY {column} {direction}, f.id {direction}
             LIMIT ? OFFSET ?
         ''', (limit, offset))
@@ -863,7 +881,7 @@ class Database(ThreadLocalDB):
             SELECT f.id AS id, fp.path AS path, f.checksum AS checksum
             FROM file_paths fp
             JOIN files f ON f.id = fp.file_id
-            WHERE fp.path = ? OR fp.path GLOB ?
+            WHERE (fp.path = ? OR fp.path GLOB ?) AND f.hidden = 0
         ''', (folder_path, f'{glob_escaped}/*'))
         seen_ids = set()
         result = []
@@ -895,10 +913,10 @@ class Database(ThreadLocalDB):
             esc = prefix.translate(str.maketrans({'*': '[*]', '?': '[?]', '[': '[[]', ']': '[]]'}))
             cur.execute('SELECT f.id AS id, fp.path AS path, f.checksum AS checksum '
                         'FROM file_paths fp JOIN files f ON f.id = fp.file_id '
-                        'WHERE fp.path GLOB ?', (f'{esc}/*',))
+                        'WHERE fp.path GLOB ? AND f.hidden = 0', (f'{esc}/*',))
         else:
             cur.execute('SELECT f.id AS id, fp.path AS path, f.checksum AS checksum '
-                        'FROM file_paths fp JOIN files f ON f.id = fp.file_id')
+                        'FROM file_paths fp JOIN files f ON f.id = fp.file_id WHERE f.hidden = 0')
         base = len(prefix) + 1 if prefix else 0
         folders = {}          # child folder name -> recursive file count
         files, seen = [], set()
