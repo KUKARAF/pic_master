@@ -1712,6 +1712,15 @@
     let cellEls = [];
     let selectedIndex = 0;
 
+    // Select mode ("Add queue to set"): the same grid, but Enter/Shift+Arrows/
+    // click toggle a multi-selection instead of navigating, and Ctrl+Enter (or
+    // the footer button) sends the picked items to a chosen set.
+    let selectMode = false;
+    let targetSet = null;
+    const picked = new Set();     // queue indices chosen for the set
+    const alreadyIn = new Set();  // queue indices already in the target set (greyed, unselectable)
+    let rangeAnchor = null;       // anchor index for Shift range-select
+
     function goTo(id) {
       // Tells the beforeunload guard above this is in-queue browsing, not
       // abandoning a pending custom action — see its comment for why.
@@ -1734,8 +1743,22 @@
       const panel = document.createElement('div');
       panel.className = 'queue-grid-panel';
       el.appendChild(panel);
+
+      const footer = document.createElement('div');
+      footer.className = 'queue-grid-footer';
+      const hint = document.createElement('span');
+      hint.className = 'queue-grid-hint';
+      hint.textContent = 'Enter select · Shift+Arrows range · click to toggle · Ctrl+Enter add · Esc cancel';
+      const commitBtn = document.createElement('button');
+      commitBtn.type = 'button';
+      commitBtn.className = 'stage-btn-accent queue-grid-commit-btn';
+      commitBtn.addEventListener('click', commitSelection);
+      footer.appendChild(hint);
+      footer.appendChild(commitBtn);
+      el.appendChild(footer);
+
       document.body.appendChild(el);
-      return { el: el, panel: panel };
+      return { el: el, panel: panel, footer: footer, commitBtn: commitBtn };
     }
 
     function render() {
@@ -1749,11 +1772,23 @@
         img.src = '/thumb/' + id;
         img.loading = 'lazy';
         cell.appendChild(img);
-        cell.addEventListener('click', function () { goTo(id); });
+        cell.addEventListener('click', function (e) {
+          if (!selectMode) { goTo(id); return; }
+          setSelected(i);
+          if (alreadyIn.has(i)) return;   // greyed out — already in the set
+          if (e.shiftKey && rangeAnchor !== null) {
+            selectRange(rangeAnchor, i);
+          } else {
+            togglePick(i);
+            rangeAnchor = i;
+          }
+        });
         overlay.panel.appendChild(cell);
         return cell;
       });
       setSelected(queue.cursor);
+      refreshMarks();
+      updateFooter();
     }
 
     function setSelected(i) {
@@ -1771,18 +1806,118 @@
       setSelected(next);
     }
 
-    function openGrid() {
+    function togglePick(i) {
+      if (alreadyIn.has(i)) return;
+      if (picked.has(i)) picked.delete(i); else picked.add(i);
+      refreshMarks();
+      updateFooter();
+    }
+
+    function selectRange(a, b) {
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      for (let i = lo; i <= hi; i++) {
+        if (!alreadyIn.has(i)) picked.add(i);
+      }
+      refreshMarks();
+      updateFooter();
+    }
+
+    function refreshMarks() {
+      cellEls.forEach(function (cell, i) {
+        cell.classList.toggle('is-picked', picked.has(i));
+        cell.classList.toggle('is-in-set', alreadyIn.has(i));
+      });
+    }
+
+    function updateFooter() {
+      if (!overlay || !overlay.commitBtn) return;
+      const n = picked.size;
+      overlay.commitBtn.textContent = 'Add ' + n + ' item' + (n === 1 ? '' : 's') +
+        ' to ' + (targetSet ? targetSet.name : '');
+      overlay.commitBtn.disabled = n === 0;
+    }
+
+    function commitSelection() {
+      if (!selectMode || !targetSet || picked.size === 0) return;
+      const queue = window.__photoQueue;
+      // Map picked indices -> file ids, deduped (a queue can repeat a file id,
+      // e.g. multiple face matches in one photo).
+      const ids = Array.from(new Set(
+        Array.from(picked).sort(function (a, b) { return a - b; })
+          .map(function (i) { return queue.ids[i]; })
+      ));
+      overlay.commitBtn.disabled = true;
+      overlay.commitBtn.textContent = 'Adding…';
+      // Sequential, not Promise.all — the backend shares one SQLite connection
+      // per db with no locking, so parallel writes corrupt cursor state (same
+      // reason as the search page's bulk add-to-set).
+      let added = 0, firstErr = null;
+      ids.reduce(function (chain, id) {
+        return chain.then(function () {
+          return window.assignFileToSet(id, targetSet.id)
+            .then(function () { added++; })
+            .catch(function (err) { if (!firstErr) firstErr = err; });
+        });
+      }, Promise.resolve()).then(function () {
+        if (firstErr) {
+          overlay.commitBtn.disabled = false;
+          updateFooter();
+          alert('Added ' + added + ' of ' + ids.length + ' — failed: ' + firstErr.message);
+        } else {
+          closeGrid();
+          alert('Added ' + added + ' item' + (added === 1 ? '' : 's') + ' to "' + targetSet.name + '".');
+        }
+      });
+    }
+
+    function openGrid(opts) {
       const queue = window.__photoQueue;
       if (!queue || !queue.ids.length) return;
+      opts = opts || {};
+      selectMode = !!opts.selectMode;
+      targetSet = opts.set || null;
+      picked.clear();
+      alreadyIn.clear();
+      rangeAnchor = null;
       if (!overlay) overlay = buildOverlay();
+      overlay.el.classList.toggle('select-mode', selectMode);
       render();
       overlay.el.classList.add('open');
       photoGridOpen = true;
+
+      // In select mode, grey out (but still show) items already in the set.
+      if (selectMode && targetSet) {
+        fetch('/api/sets/' + targetSet.id + '/file-ids')
+          .then(function (r) { return r.ok ? r.json() : { file_ids: [] }; })
+          .then(function (data) {
+            const member = new Set(data.file_ids || []);
+            queue.ids.forEach(function (id, i) {
+              if (member.has(id)) { alreadyIn.add(i); picked.delete(i); }
+            });
+            refreshMarks();
+            updateFooter();
+          })
+          .catch(function () { /* non-fatal: just don't grey anything */ });
+      }
     }
 
     function closeGrid() {
-      if (overlay) overlay.el.classList.remove('open');
+      if (overlay) {
+        overlay.el.classList.remove('open');
+        overlay.el.classList.remove('select-mode');
+      }
       photoGridOpen = false;
+      selectMode = false;
+    }
+
+    // Opened by the sidebar's "Add queue to set" button after a set is picked.
+    window.openQueueSelectGrid = function (set) { openGrid({ selectMode: true, set: set }); };
+
+    function moveAndMaybeRange(delta, shift) {
+      if (shift && rangeAnchor === null) rangeAnchor = selectedIndex;
+      moveSelection(delta);
+      if (shift) selectRange(rangeAnchor, selectedIndex);
+      else rangeAnchor = selectedIndex;
     }
 
     document.addEventListener('keydown', function (e) {
@@ -1791,11 +1926,22 @@
         if (e.altKey || e.ctrlKey || e.metaKey) return;
         if (!photoGridOpen && !window.__photoQueue) return;
         e.preventDefault();
-        if (photoGridOpen) closeGrid(); else openGrid();
+        if (photoGridOpen) closeGrid(); else openGrid();   // Space is always navigate mode
         return;
       }
       if (!photoGridOpen) return;
       if (e.key === 'Escape') { e.preventDefault(); closeGrid(); return; }
+
+      if (selectMode) {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); commitSelection(); return; }
+        if (e.key === 'Enter') { e.preventDefault(); togglePick(selectedIndex); rangeAnchor = selectedIndex; return; }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); moveAndMaybeRange(-1, e.shiftKey); return; }
+        if (e.key === 'ArrowRight') { e.preventDefault(); moveAndMaybeRange(1, e.shiftKey); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); moveAndMaybeRange(-3, e.shiftKey); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); moveAndMaybeRange(3, e.shiftKey); return; }
+        return;
+      }
+
       if (e.key === 'Enter') { e.preventDefault(); goTo(window.__photoQueue.ids[selectedIndex]); return; }
       if (e.key === 'ArrowLeft') { e.preventDefault(); moveSelection(-1); return; }
       if (e.key === 'ArrowRight') { e.preventDefault(); moveSelection(1); return; }
@@ -2903,6 +3049,20 @@
   if (setPickerBtn) {
     setPickerBtn.addEventListener('click', openSetPickerModal);
   }
+
+  // When more than one photo is in the watch queue, split "Add to set" into
+  // "Add this to set" (this photo) + "Add queue to set" (pick a set, then
+  // curate which queue items to add in the space-grid overlay).
+  const setPickerQueueBtn = document.getElementById('set-picker-queue-btn');
+  const photoQueue = window.__photoQueue;
+  if (setPickerQueueBtn && photoQueue && photoQueue.ids.length > 1) {
+    if (setPickerBtn) setPickerBtn.textContent = '＋ Add this to set';
+    setPickerQueueBtn.style.display = '';
+    setPickerQueueBtn.addEventListener('click', function () {
+      openSetSearchModal(function (set) { window.openQueueSelectGrid(set); });
+    });
+  }
+
   if (setCurrent) {
     setCurrent.querySelectorAll('[data-set-id]').forEach(wireSetChip);
   }

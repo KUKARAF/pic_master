@@ -1179,7 +1179,7 @@ input[type="range"] { accent-color: var(--accent); }
 /* sidebar sections become bracketed panels */
 .sidebar-panel {
   position: relative;
-  background: var(--surface);
+  background: rgba(9, 13, 9, .25);   /* transparent — matches the see-through sidebar */
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
   padding: 14px;
@@ -1622,6 +1622,46 @@ input[type="range"] { accent-color: var(--accent); }
 .queue-grid-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .queue-grid-cell.is-current { border-color: var(--accent); }
 .queue-grid-cell.is-selected { outline: 3px solid var(--accent); outline-offset: 2px; }
+
+/* Multi-select mode ("Add queue to set"). */
+.queue-grid-overlay.select-mode { flex-direction: column; }
+.queue-grid-overlay.select-mode .queue-grid-panel { max-height: calc(100% - 72px); }
+
+/* A chosen item: accent frame + check badge (top-left, so it never collides
+   with the is-current dot at top-right). */
+.queue-grid-cell.is-picked { border-color: var(--accent); }
+.queue-grid-cell.is-picked::before {
+  content: '✓';
+  position: absolute;
+  top: 4px;
+  left: 5px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: bold;
+  z-index: 2;
+}
+
+/* Already in the target set: dimmed but still visible, and not selectable. */
+.queue-grid-cell.is-in-set img { opacity: .32; }
+.queue-grid-cell.is-in-set { cursor: default; }
+
+.queue-grid-footer {
+  display: none;
+  align-items: center;
+  gap: 16px;
+  margin-top: 14px;
+  flex: 0 0 auto;
+}
+.queue-grid-overlay.select-mode .queue-grid-footer { display: flex; }
+.queue-grid-hint { color: var(--text-muted); font-size: 0.82em; }
+.queue-grid-commit-btn:disabled { opacity: .5; cursor: default; }
 .queue-grid-cell.is-current::after {
   content: '●';
   position: absolute;

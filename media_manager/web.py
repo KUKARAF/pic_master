@@ -2745,6 +2745,18 @@ def create_app(data_root: str) -> FastAPI:
             added += 1
         return {'matched': len(matches), 'added': added, 'already_present': already_present}
 
+    @app.get('/api/sets/{set_id}/file-ids')
+    def api_set_file_ids(set_id: int):
+        """Current member file ids of a set. Used by the photo viewer's
+        "Add queue to set" grid to grey out (but still show) queue items that
+        are already in the target set. Membership is checksum-keyed in manual.db,
+        so resolve those to live file ids via media.db."""
+        if manual.get_set(set_id) is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        checksums = manual.get_files_by_set(set_id, limit=100_000_000)
+        rows = db.get_files_by_checksums(checksums)
+        return {'file_ids': [r['id'] for r in rows]}
+
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
