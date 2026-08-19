@@ -2805,6 +2805,43 @@
   wireLabelRegion('label-region-btn', 'positive', 'Label this region');
   wireLabelRegion('label-region-negative-btn', 'negative', 'Label this region as NOT…');
 
+  /* Label person — drag a box around a person's body; it becomes a searchable
+     find-by-body crop (mirrors "Add face" but CLIP-embeds the body crop via
+     /api/files/{id}/bodies). Deep-linked from the find-by-body page's "Manually
+     label person" button via the #label-person hash. */
+  const labelPersonStatus = document.getElementById('label-person-status');
+  const labelPersonBtn = document.getElementById('label-person-btn');
+  const labelPersonState = wireBoxDraw(labelPersonBtn, 'Drag a box around the person…', '🧍 Label person', function (bbox) {
+    if (labelPersonStatus) { labelPersonStatus.style.display = 'block'; labelPersonStatus.textContent = 'Embedding…'; }
+    fetch('/api/files/' + fileId + '/bodies', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bbox: bbox }),
+    })
+      .then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
+        return r.json();
+      })
+      .then(function () {
+        if (labelPersonStatus) {
+          labelPersonStatus.textContent = 'Saved. ';
+          var a = document.createElement('a');
+          a.href = '/body-similar/' + fileId;
+          a.textContent = 'Find similar people →';
+          labelPersonStatus.appendChild(a);
+        }
+      })
+      .catch(function (err) {
+        if (labelPersonStatus) { labelPersonStatus.style.display = 'block'; labelPersonStatus.textContent = 'Failed: ' + err.message; }
+      });
+  });
+  if (labelPersonState) boxDrawStates.push(labelPersonState);
+
+  // Deep-link: /photo/{id}#label-person (from find-by-body) enters draw mode on load.
+  if (window.location.hash === '#label-person' && labelPersonBtn) {
+    labelPersonBtn.click();
+  }
+
   /* Face naming modal — click any face chip (named or "Unknown") to name/rename
      it. Goes through the shared entity picker: fuzzy-search known people, pick
      one, or type a new name (or none at all — "Save without a name" confirms a
@@ -3727,7 +3764,7 @@
     // Drag-to-draw (add face / label region) maps clicks through the img element
     // box, which only equals the visible image outside FILL mode — so entering a
     // draw tool snaps back to FIT.
-    ['add-face-btn', 'label-region-btn', 'label-region-negative-btn'].forEach(function (id) {
+    ['add-face-btn', 'label-region-btn', 'label-region-negative-btn', 'label-person-btn'].forEach(function (id) {
       const btn = document.getElementById(id);
       if (btn) btn.addEventListener('click', function () {
         if (photoStage.classList.contains('fit-cover')) setFit('fit');

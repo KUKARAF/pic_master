@@ -1212,6 +1212,24 @@ class Database(ThreadLocalDB):
                 )
         self.conn.commit()
 
+    def add_manual_body(self, file_id: int, bbox: list, embedding_bytes: bytes, model: str) -> int:
+        """Append one manually-drawn body crop (primary frame) and return its row id.
+        Clears the 'no people' sentinel (bbox='[]') first so the manual crop isn't
+        masked, but keeps any real body rows (unlike insert_body_embeddings, which
+        replaces them wholesale). Mirrors add_manual_face for find-by-body."""
+        import json
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "DELETE FROM body_embeddings WHERE file_id = ? AND bbox = '[]' AND frame_index IS NULL",
+            (file_id,)
+        )
+        cursor.execute(
+            'INSERT INTO body_embeddings (file_id, bbox, embedding, model, indexed_at) VALUES (?,?,?,?,?)',
+            (file_id, json.dumps(bbox), embedding_bytes, model, int(time.time()))
+        )
+        self.conn.commit()
+        return cursor.lastrowid
+
     def get_body_embeddings_for_file(self, file_id: int) -> list:
         """Return non-sentinel (id, bbox, embedding) rows for a file."""
         cursor = self.conn.cursor()

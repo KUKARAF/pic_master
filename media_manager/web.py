@@ -1818,8 +1818,10 @@ def create_app(data_root: str) -> FastAPI:
             message = str(exc.detail)
 
         crops = [{'id': r[0]} for r in own]
+        no_people = False
         if not own and not message:
             message = 'No people detected in this photo.'
+            no_people = True
         elif own:
             chosen = None
             if body_id is not None:
@@ -1837,7 +1839,61 @@ def create_app(data_root: str) -> FastAPI:
             'selected_id': selected_id,
             'results': results,
             'message': message,
+            'no_people': no_people,
         }
+
+    @app.post('/api/files/{file_id}/body-reindex')
+    def api_body_reindex(file_id: int):
+        """Force a fresh person-only YOLO pass for ONE photo and (re)embed its body
+        crops, overwriting any prior 'no people' result. Backs the find-by-body
+        page's "Reindex now" button: the normal path reuses the general object index
+        and only counts detections labeled exactly 'person', so a person YOLO-World
+        labeled as child/crowd/group/selfie/portrait is missed — this re-runs
+        detection with the vocab pinned to 'person' to recover it."""
+        from media_manager import body_index
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        detector = _get_object_detector()
+        detector.set_vocab(['person'])
+        try:
+            _, dets, err = detector.detect_images([abs_path])[0]
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f'Person detection failed: {exc}')
+        if err:
+            raise HTTPException(status_code=500, detail=f'Person detection failed: {err}')
+        person_boxes = [[x1, y1, x2, y2]
+                        for _cls, conf, x1, y1, x2, y2 in dets
+                        if conf >= body_index.MIN_PERSON_CONFIDENCE]
+        count = body_index.embed_bodies_for_file(
+            db, _get_clip_indexer(), file_id, abs_path, person_boxes=person_boxes)
+        return {'bodies': count}
+
+    @app.post('/api/files/{file_id}/bodies')
+    def api_add_manual_body(file_id: int, body: ManualFaceBody):
+        """Add one hand-drawn body box as a searchable body embedding (mirrors
+        api_add_manual_face, but crops+CLIP-embeds instead of face recognition).
+        Backs the photo view's "Label person" region tool."""
+        from media_manager import body_index
+        if len(body.bbox) != 4:
+            raise HTTPException(status_code=400, detail='bbox must be [x1, y1, x2, y2]')
+        x1, y1, x2, y2 = body.bbox
+        if x2 <= x1 or y2 <= y1 or (x2 - x1) < 20 or (y2 - y1) < 20:
+            raise HTTPException(status_code=400, detail='Region too small')
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        pairs = body_index.crop_bodies(abs_path, [[int(x1), int(y1), int(x2), int(y2)]])
+        if not pairs:
+            raise HTTPException(status_code=400, detail='Region too small or out of bounds')
+        indexer = _get_clip_indexer()
+        embs = indexer.embed_pil_images([crop for _, crop in pairs])
+        used_bbox = pairs[0][0]
+        body_id = db.add_manual_body(
+            file_id, used_bbox, embs[0].astype('float32').tobytes(), indexer.model_name)
+        return {'id': body_id, 'bbox': used_bbox}
 
     @app.get('/body-crop/{body_id}')
     def serve_body_crop(body_id: int):
@@ -3580,12 +3636,20 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             candidates.append((ref, file_row['id'], file_row['path'], identity, emb_bytes))
 
-        scored = []
-        for ref, file_id_, path_, identity, emb_bytes in candidates:
-            vec = np.frombuffer(emb_bytes, dtype=np.float32)
-            score = float(query_vec.dot(vec))
-            if score >= threshold:
-                scored.append((score, ref, file_id_, path_, identity))
+        if not candidates:
+            return []
+        # One BLAS matmul instead of a Python loop over N faces: pack all embeddings
+        # into a contiguous (N, D) matrix and score with `mat @ query_vec`. numpy's
+        # matmul runs in C and RELEASES the GIL, so a large library's scan no longer
+        # pins the interpreter and stalls every other request (the old per-face
+        # Python `.dot()` loop held the GIL for the whole scan).
+        dim = query_vec.shape[0]
+        mat = np.frombuffer(b''.join(c[4] for c in candidates), dtype=np.float32).reshape(len(candidates), dim)
+        scores = mat @ query_vec
+        scored = [
+            (float(scores[i]), candidates[i][0], candidates[i][1], candidates[i][2], candidates[i][3])
+            for i in range(len(candidates)) if scores[i] >= threshold
+        ]
         scored.sort(reverse=True)
         return [
             {

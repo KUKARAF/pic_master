@@ -139,6 +139,52 @@
       .then(function (data) {
         if (data.message) {
           messageEl.textContent = data.message;
+          // "No people detected" is often just the general index labeling the person
+          // as child/crowd/etc. Offer a forced person-only reindex, or manual labeling.
+          if (data.no_people) {
+            var actions = document.createElement('div');
+            actions.style.marginTop = '10px';
+
+            var reBtn = document.createElement('button');
+            reBtn.type = 'button';
+            reBtn.className = 'btn-similar';
+            reBtn.textContent = 'Reindex now';
+            reBtn.style.cssText = 'display:inline-block;width:auto;margin-right:8px;';
+            reBtn.addEventListener('click', function () {
+              reBtn.disabled = true;
+              reBtn.textContent = 'Reindexing…';
+              fetch('/api/files/' + sourceId + '/body-reindex', { method: 'POST' })
+                .then(function (r) {
+                  if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('status ' + r.status)); });
+                  return r.json();
+                })
+                .then(function () {
+                  // Clear the page and re-run the search with the fresh crops.
+                  messageEl.style.display = 'none';
+                  messageEl.textContent = '';
+                  grid.innerHTML = '';
+                  picker.innerHTML = '';
+                  pickerWrap.style.display = 'none';
+                  emptyEl.style.display = 'none';
+                  runSearch();
+                })
+                .catch(function (err) {
+                  reBtn.disabled = false;
+                  reBtn.textContent = 'Reindex now';
+                  messageEl.textContent = 'Reindex failed: ' + err.message;
+                });
+            });
+
+            var labelBtn = document.createElement('a');
+            labelBtn.className = 'btn-similar';
+            labelBtn.textContent = 'Manually label person';
+            labelBtn.href = '/photo/' + sourceId + '#label-person';
+            labelBtn.style.cssText = 'display:inline-block;width:auto;';
+
+            actions.appendChild(reBtn);
+            actions.appendChild(labelBtn);
+            messageEl.appendChild(actions);
+          }
           messageEl.style.display = 'block';
         }
 
