@@ -68,6 +68,7 @@ class Database(ThreadLocalDB):
         self._emb_ver = 0
         self._face_ver = 0
         self._body_ver = 0
+        self._tile_ver = 0
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
         self._emb_cache = None
@@ -245,6 +246,26 @@ class Database(ThreadLocalDB):
                 frame_index INTEGER
             )
         ''')
+        # Tile embeddings table: per-image grid crops, each CLIP-embedded, backing
+        # region search (a query crop can match a small/off-center region that the
+        # whole-image embedding would wash out). Derived, rebuildable data keyed by
+        # file_id like embeddings/detections/faces/body_embeddings — not part of the
+        # checksum-keyed manual ground truth. bbox (x1,y1,x2,y2) is in ORIGINAL image
+        # pixels; embedding is raw float32 (D,) np.tobytes(). Wholesale-replaced per
+        # file on re-index (see insert_tile_embeddings), so no sentinel/frame_index
+        # bookkeeping is needed. CREATE TABLE IF NOT EXISTS is itself the migration —
+        # it runs on every init, giving existing DBs the table (and index) too.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tile_embeddings (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                tile_index INTEGER NOT NULL,
+                x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+                embedding BLOB NOT NULL,
+                model TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_tile_file ON tile_embeddings(file_id)')
         # Categories: single-value ML auto-match result per file, keyed by file_id
         # like detections/faces (derived, rebuildable data). Stores the category as
         # a name string rather than manual.db's numeric category id, since a cross-
@@ -1059,7 +1080,7 @@ class Database(ThreadLocalDB):
         Only removes rows from THIS database (file_paths, and — for any content
         whose last remaining tracked path was just removed — the owning `files`
         row plus every table keyed off its file_id: embeddings/tags/detections/
-        faces/body_embeddings/file_category_matches). This connection never sets
+        faces/body_embeddings/tile_embeddings/file_category_matches). This connection never sets
         `PRAGMA foreign_keys=ON` (see ThreadLocalDB), so the schema's
         `ON DELETE CASCADE` declarations are not actually enforced — cleanup is
         done explicitly here instead of relying on them, to avoid leaving
@@ -1096,16 +1117,17 @@ class Database(ThreadLocalDB):
             cursor.execute('SELECT COUNT(*) FROM file_paths WHERE file_id = ?', (file_id,))
             if cursor.fetchone()[0] > 0:
                 continue  # still tracked at another path (a duplicate) — keep its content row
-            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings', 'file_category_matches'):
+            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings', 'tile_embeddings', 'file_category_matches'):
                 cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
             files_removed += 1
         self.conn.commit()
         if files_removed:
-            # Deleted rows from embeddings/faces/body_embeddings — invalidate all.
+            # Deleted rows from embeddings/faces/body_embeddings/tile_embeddings — invalidate all.
             self._emb_ver += 1
             self._face_ver += 1
             self._body_ver += 1
+            self._tile_ver += 1
         return (len(file_path_ids), files_removed)
 
     def count_detected(self):
@@ -1430,6 +1452,103 @@ class Database(ThreadLocalDB):
         else:
             cursor.execute(sql)
         return cursor.fetchall()
+
+    # ------------------------------------------------------------------
+    # Tile embeddings methods (region search)
+    # ------------------------------------------------------------------
+
+    def insert_tile_embeddings(self, file_id: int, tiles: list, model: str) -> None:
+        """Replace the tile-embedding rows for a file (idempotent re-index).
+        tiles: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray} — one per
+        grid crop, bbox in ORIGINAL image pixels. DELETEs any existing rows for the
+        file first so a re-index never leaves stale/duplicate tiles, then inserts
+        each with tile_index = its position in the list. Mirrors
+        insert_body_embeddings; unlike it there is no sentinel row — a file with no
+        tiles simply gets no rows (get_untiled_files re-queues it), which is fine
+        because the tile scan skips non-images rather than marking them done here."""
+        import numpy as np
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM tile_embeddings WHERE file_id = ?', (file_id,))
+        for tile_index, tile in enumerate(tiles):
+            x1, y1, x2, y2 = tile['bbox']
+            cursor.execute(
+                'INSERT INTO tile_embeddings (file_id, tile_index, x1, y1, x2, y2, embedding, model) '
+                'VALUES (?,?,?,?,?,?,?,?)',
+                (file_id, tile_index, x1, y1, x2, y2,
+                 tile['embedding'].astype(np.float32).tobytes(), model)
+            )
+        self.conn.commit()
+        self._tile_ver += 1  # invalidate anything keyed off the tile version
+
+    def count_tiled_files(self) -> int:
+        """Number of distinct files that have at least one tile-embedding row.
+        Used to decide tile-vs-whole-image search and to show a "pending" status."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM tile_embeddings')
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_untiled_files(self, limit=None) -> list:
+        """Return (id, path) for tracked files that have NO tile_embeddings row.
+        Mirrors get_unbody_indexed_files; the caller skips non-images, so there is
+        no kind filter here."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN tile_embeddings t ON t.file_id = f.id
+            WHERE t.file_id IS NULL
+        '''
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def iter_tile_embeddings(self, batch_size=20000):
+        """Yield (file_ids: np.ndarray[int64], matrix: np.ndarray[k, D] float32)
+        chunks over ALL tile rows, ordered by id, up to batch_size rows per chunk.
+
+        This is the RAM-bounded region-search primitive: the library may hold
+        hundreds of thousands of tiles, so — unlike get_body_embeddings_matrix —
+        we deliberately never build or cache one full matrix. Each chunk's blobs
+        are joined and reshaped in a single allocation (D inferred from the first
+        blob length // 4). A malformed/empty blob is skipped with a printed
+        WARNING (the scan keeps going), and file_ids stay aligned to matrix rows
+        because the skipped row is dropped from both."""
+        import numpy as np
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, file_id, embedding FROM tile_embeddings ORDER BY id')
+        batch_fids = []
+        batch_blobs = []
+        D = None
+
+        def _flush():
+            nonlocal D
+            fids = np.array(batch_fids, dtype=np.int64)
+            matrix = np.frombuffer(b''.join(batch_blobs), np.float32).reshape(len(batch_blobs), D)
+            return fids, matrix
+
+        for row_id, file_id, blob in cursor:
+            if not blob or (len(blob) % 4) != 0:
+                print(f"[iter_tile_embeddings] WARNING: skipping tile row id {row_id} "
+                      f"(file_id {file_id}): blob length {len(blob) if blob else 0} not a float32 vector")
+                continue
+            row_D = len(blob) // 4
+            if D is None:
+                D = row_D
+            elif row_D != D:
+                print(f"[iter_tile_embeddings] WARNING: skipping tile row id {row_id} "
+                      f"(file_id {file_id}): D={row_D} != expected D={D}")
+                continue
+            batch_fids.append(file_id)
+            batch_blobs.append(blob)
+            if len(batch_blobs) >= batch_size:
+                yield _flush()
+                batch_fids = []
+                batch_blobs = []
+        if batch_blobs:
+            yield _flush()
 
     def has_object_detections(self, file_id: int) -> bool:
         """True if `media index` has already processed this file — a primary-frame

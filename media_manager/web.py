@@ -1755,9 +1755,32 @@ def create_app(data_root: str) -> FastAPI:
         import numpy as np
         from media_manager.similarity import top_k_indices
         query = np.asarray(embs[0], dtype=np.float32)
+
+        # Prefer the tile index when it's been built: rank each photo by its
+        # BEST-matching tile, which localizes small/off-center regions (a wall in
+        # a corner) that a whole-image embedding would miss. Scanned in RAM-bounded
+        # chunks (see db.iter_tile_embeddings) rather than one giant resident matrix.
+        if db.count_tiled_files() > 0:
+            best = {}  # file_id -> best tile cosine
+            for file_ids, matrix in db.iter_tile_embeddings():
+                if matrix.shape[0] == 0:
+                    continue
+                scores = matrix.dot(query)
+                for idx in range(scores.shape[0]):
+                    fid = int(file_ids[idx])
+                    if fid == file_id:
+                        continue
+                    s = float(scores[idx])
+                    if s > best.get(fid, -1.0):
+                        best[fid] = s
+            ranked = sorted(best.items(), key=lambda kv: -kv[1])[:limit]
+            return {'mode': 'tiles',
+                    'results': [{'file_id': fid, 'score': round(s, 4)} for fid, s in ranked]}
+
+        # Whole-image fallback (no tile index yet): rank the cached whole-image matrix.
         file_ids, _checksums, matrix = db.get_embeddings_matrix()
         if matrix.shape[0] == 0:
-            return {'results': []}
+            return {'mode': 'whole', 'results': []}
         scores = matrix.dot(query)
         results = []
         for i in top_k_indices(scores, min(matrix.shape[0], max(1, limit) + 1)):
@@ -1767,7 +1790,7 @@ def create_app(data_root: str) -> FastAPI:
             results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
             if len(results) >= limit:
                 break
-        return {'results': results}
+        return {'mode': 'whole', 'results': results}
 
     # ------------------------------------------------------------------
     # Find-by-body: person re-ID by outfit/build (see body_index.py).
@@ -1784,6 +1807,10 @@ def create_app(data_root: str) -> FastAPI:
     # 'matched' count).
     index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
+    # Tile (region) index: per-image CLIP crops of an overlapping grid, so region
+    # search can localize small/off-center things (see tile_index.py + the region
+    # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
+    tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2127,6 +2154,45 @@ def create_app(data_root: str) -> FastAPI:
             'total': match_faces_job['total'],
             'matched': match_faces_job['matched'],
             'error': match_faces_job['error'],
+        }
+
+    @app.post('/api/tile-index/start')
+    def api_tile_index_start():
+        """Build the per-image CLIP tile index that powers precise region search —
+        an overlapping grid of crops embedded per photo. Same background-job shape
+        as the body index; CLIP goes through _get_clip_indexer() so it offloads to
+        the worker when configured."""
+        import threading
+        from media_manager import tile_index
+
+        if tile_index_job['running']:
+            return {'started': False, 'message': 'Region indexing already running.'}
+        tile_index_job.update(
+            running=True, done=0, total=len(db.get_untiled_files()), error=None)
+
+        def _run():
+            try:
+                def _progress(done, total):
+                    tile_index_job['done'] = done
+                    tile_index_job['total'] = total
+                tile_index.build_tile_index(
+                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress)
+            except Exception as exc:
+                tile_index_job['error'] = str(exc)
+            finally:
+                tile_index_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': tile_index_job['total']}
+
+    @app.get('/api/tile-index/status')
+    def api_tile_index_status():
+        return {
+            'running': tile_index_job['running'],
+            'done': tile_index_job['done'],
+            'total': tile_index_job['total'],
+            'error': tile_index_job['error'],
+            'pending': len(db.get_untiled_files()),
         }
 
     # ------------------------------------------------------------------
