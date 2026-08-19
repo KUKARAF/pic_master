@@ -2595,9 +2595,6 @@ def create_app(data_root: str) -> FastAPI:
         startup/imports to write anything."""
         from media_manager.clip_tag_classifier import classifier_dir, write_status
 
-        out_dir = classifier_dir(data_root, label, kind)
-        os.makedirs(out_dir, exist_ok=True)
-        write_status(out_dir, status='running', pid=None, started_at=int(time.time()))
         # When a worker is configured, offload the heavy training: launch the
         # remote_tag_trainer driver (ships the data to the worker, polls it)
         # instead of the local trainer, passing --kind so one driver handles
@@ -2606,9 +2603,25 @@ def create_app(data_root: str) -> FastAPI:
         if _worker_client is not None and _worker_client.is_configured():
             argv = [sys.executable, '-m', 'media_manager.remote_tag_trainer',
                     '--data-root', data_root, '--tag', label, '--kind', kind]
-        else:
+        elif os.environ.get('MEDIA_ALLOW_LOCAL_TRAINING') == '1':
+            # Explicit opt-in for a standalone/beefy host with no worker.
             argv = [sys.executable, '-m', module_name,
                     '--data-root', data_root, '--tag', label]
+        else:
+            # No worker AND no opt-in: refuse. Local training (YOLO-World fine-tune
+            # especially) is the heaviest job in the app and will exhaust memory on
+            # a low-RAM host — this is the exact click that OOM'd a prod box. Fail
+            # loud instead of silently launching it.
+            raise HTTPException(
+                status_code=400,
+                detail='No ML worker is configured, so training would run locally and can '
+                       'exhaust this host\'s memory (YOLO-World fine-tuning is the heaviest '
+                       'job in the app). Connect a worker with `media worker-connect` to '
+                       'offload it, or set MEDIA_ALLOW_LOCAL_TRAINING=1 to train locally anyway.')
+
+        out_dir = classifier_dir(data_root, label, kind)
+        os.makedirs(out_dir, exist_ok=True)
+        write_status(out_dir, status='running', pid=None, started_at=int(time.time()))
         subprocess.Popen(argv, start_new_session=True)
 
     @app.post('/api/tags/{label}/train-clip')
