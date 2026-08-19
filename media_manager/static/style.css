@@ -504,7 +504,7 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .modal-list-item:hover, .modal-list-item.is-highlighted { background: var(--input-bg); color: var(--accent); }
 .modal-list-item .sub { font-size: 14px; color: var(--text-muted); }
-.modal-list-item-thumb { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
+.modal-list-item-thumb { width: 76px; height: 76px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
 .modal-list-item-thumb.square { border-radius: var(--radius-card); }
 
 /* Suggested sets pre-listed at the top of the set picker (photo page only). */

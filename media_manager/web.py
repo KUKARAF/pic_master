@@ -2867,13 +2867,17 @@ def create_app(data_root: str) -> FastAPI:
             centroid = centroid / norm
             score = float(centroid.dot(query_emb))
             if set_ids is not None or score >= threshold:
-                scored.append((set_row, score))
+                # Representative thumbnail = a member photo we already resolved
+                # to a file id above (no extra query).
+                thumb_id = member_ids[0] if member_ids else None
+                scored.append((set_row, score, thumb_id))
 
         scored.sort(key=lambda item: item[1], reverse=True)
         page = scored if set_ids is not None else scored[:limit]
         results = [
-            {'id': s['id'], 'name': s['name'], 'studio': s['studio'], 'score': round(score, 3)}
-            for s, score in page
+            {'id': s['id'], 'name': s['name'], 'studio': s['studio'],
+             'score': round(score, 3), 'thumb_id': thumb_id}
+            for s, score, thumb_id in page
         ]
         _attach_set_people([results])
         return results

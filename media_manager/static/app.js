@@ -1102,6 +1102,13 @@
                 scoreSpan.textContent = Number(set.score).toFixed(2);
                 row.appendChild(scoreSpan);
               }
+              // Representative cover thumbnail, same square style as set search rows.
+              if (set.thumb_id != null) {
+                const thumb = document.createElement('img');
+                thumb.className = 'modal-list-item-thumb square';
+                thumb.src = '/thumb/' + set.thumb_id;
+                row.appendChild(thumb);
+              }
               row.addEventListener('click', function () { resolveWith(set); });
               suggestWrap.appendChild(row);
             });
