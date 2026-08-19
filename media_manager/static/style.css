@@ -1377,6 +1377,53 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-bottom-left > .stage-pod-menu { left: 0; top: auto; bottom: 100%; margin: 0 0 8px; }
 .stage-pod-rail .stage-pod > .stage-pod-menu { right: 100%; top: 0; margin: 0 8px 0 0; }
 
+/* --- Sets pod, populated state (.has-sets): make the set name a single control.
+   Instead of printing the name on the trigger AND again inside the menu, the menu
+   is anchored to OVERLAP the trigger so its first set link renders exactly where
+   the collapsed name was. Two clicks at the same screen point (no mouse move):
+   1st opens the pod, 2nd lands on the /sets/{id} link. The empty "＋ Add set"
+   state keeps the default rail popover (unstyled here). */
+.stage-pod-rail .stage-pod[data-pod-kind="set"].has-sets { position: relative; }
+.stage-pod-rail .stage-pod[data-pod-kind="set"].has-sets > .stage-pod-menu {
+  right: 0;               /* menu right edge == trigger right edge */
+  left: auto;
+  top: 0;                 /* menu top == trigger top */
+  margin: 0;
+  padding-top: 8px;       /* == trigger padding-top, so the first link's top aligns */
+  padding-right: 11px;    /* == trigger padding-right, so the first link's right aligns */
+}
+/* the "Sets" heading would push the first link below the trigger — drop it here
+   (the name itself already identifies the pod) */
+.stage-pod[data-pod-kind="set"].has-sets > .stage-pod-menu .section-title { display: none; }
+/* hide the underlying trigger while open so the name is visible exactly once —
+   the menu's first set link now occupies its former position */
+.stage-pod[data-pod-kind="set"].has-sets.is-open > .stage-pod-btn { visibility: hidden; }
+
+/* Primary (first) set entry: pull the name row to the TOP-RIGHT so it overlays the
+   trigger name. row-reverse puts the link last-in-DOM == right-most, so the name
+   (not the ×/heart) sits under the click point; the remove/favorite controls sit to
+   its left and the meta line below. Remaining sets list normally beneath it. */
+.stage-pod[data-pod-kind="set"].has-sets #set-current .tag-removable:first-child > span:first-child {
+  align-self: flex-end;
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+}
+/* style the primary link to match the trigger label exactly (same pixel font/size)
+   so the swap on open is visually seamless */
+.stage-pod[data-pod-kind="set"].has-sets #set-current .tag-removable:first-child > span:first-child > a {
+  font-family: var(--font-pixel);
+  font-size: 8px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text);
+  text-decoration: none;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, .6);
+}
+.stage-pod[data-pod-kind="set"].has-sets #set-current .tag-removable:first-child > span:first-child > a:hover { color: var(--accent); }
+
+/* subtle count badge on the collapsed trigger when in several sets */
+.pod-more-count { opacity: .55; }
+
 /* inside a pod the menu IS the container — drop the panel's own frame/brackets */
 .stage-pod-menu .sidebar-panel { background: transparent; border: none; border-radius: 0; padding: 0; margin-bottom: 6px; }
 .stage-pod-menu .sidebar-panel::before,

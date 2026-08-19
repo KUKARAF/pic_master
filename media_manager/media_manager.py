@@ -230,7 +230,7 @@ class MediaManager:
         base_vocab = load_vocab_from_file(vocab_path)
         vocab = merge_vocab(base_vocab, self.manual.get_all_positive_labels())
         client = self._worker()
-        if client.is_available():
+        if client.is_configured():
             from . import worker_client
             # The worker runs a fixed model_size='s' @ conf 0.15; it does not honor
             # per-request model_size/conf_threshold. Warn loudly if the caller asked
@@ -292,7 +292,7 @@ class MediaManager:
         from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
 
         client = self._worker()
-        if client.is_available():
+        if client.is_configured():
             from . import worker_client
             # The worker runs the default CLIPIndexer (ViT-B-32/openai) and ignores a
             # requested model_name/pretrained. Warn and record the worker's actual
@@ -427,7 +427,7 @@ class MediaManager:
         from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
 
         client = self._worker()
-        if client.is_available():
+        if client.is_configured():
             from . import worker_client
             print("[media] offloading body indexing (person detection + CLIP) to remote worker")
             detector = worker_client.RemoteYOLODetector(
@@ -472,7 +472,7 @@ class MediaManager:
         from .face_detector import FaceDetector, SUPPORTED_EXTENSIONS
 
         client = self._worker()
-        if client.is_available():
+        if client.is_configured():
             from . import worker_client
             # The worker runs the default FaceDetector (buffalo_l @ det_thresh 0.5) and
             # ignores per-request model_name/det_thresh. Warn and record the worker's

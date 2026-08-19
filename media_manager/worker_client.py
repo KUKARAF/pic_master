@@ -53,6 +53,12 @@ _AVAIL_TTL = 15.0
 # fast when the worker is configured-but-down instead of stalling a web request.
 _PROBE_TIMEOUT = 3.0
 _PROBE_PING_TIMEOUT = 4.0
+# Real requests retry a couple of times (re-establishing the link) to ride out a
+# transient worker blip WITHOUT falling back to a local model — the whole point of
+# the offload is to keep heavy models out of a memory-constrained host. If the
+# worker is genuinely gone the error is raised so the caller surfaces it.
+_MAX_RETRIES = 1
+_RETRY_BACKOFF = 1.5
 
 
 def _warn(msg: str) -> None:
@@ -170,14 +176,16 @@ class WorkerClient:
 
     # -- Request dispatch ---------------------------------------------------
 
-    def request(self, path: str, req_dict: dict, timeout: float = 120) -> dict:
+    def request(self, path: str, req_dict: dict, timeout: float = 120,
+                retries: int = _MAX_RETRIES) -> dict:
         """Send a request to the worker and return the unpacked response dict.
 
-        All requests are serialized with ``self._lock`` — at most one outstanding
-        request at a time (simplest correct v1). Raises :class:`WorkerUnavailable`
-        if the link cannot be established, :class:`WorkerError` on transport failure
-        or timeout. A response dict whose ``"error"`` field is set is a *per-item*
-        processing error and is returned as-is (the proxy decides what to do).
+        Retries up to ``retries`` times, dropping the (possibly dead) link between
+        attempts, to ride out a transient worker blip. Raises :class:`WorkerUnavailable`
+        / :class:`WorkerError` if it still can't reach the worker — callers surface that
+        rather than loading a local model. A response dict whose ``"error"`` field is
+        set is a *per-item* processing error (the worker ran but the model failed on
+        that item) and is returned as-is; that is NOT retried.
         """
         address = self.address()
         if not address:
@@ -185,6 +193,22 @@ class WorkerClient:
 
         self._ensure_rns()
 
+        last_exc = None
+        for attempt in range(retries + 1):
+            try:
+                return self._request_once(path, req_dict, timeout)
+            except (WorkerUnavailable, WorkerError) as exc:
+                last_exc = exc
+                with self._lock:
+                    self._link = None  # force a fresh link on the next attempt
+                if attempt < retries:
+                    _warn(f"worker request {path!r} failed ({exc}); "
+                          f"retry {attempt + 1}/{retries}")
+                    time.sleep(_RETRY_BACKOFF * (attempt + 1))
+        raise last_exc
+
+    def _request_once(self, path: str, req_dict: dict, timeout: float) -> dict:
+        address = self.address()
         with self._lock:
             link = self._ensure_link_locked(address)
 
@@ -248,7 +272,8 @@ class WorkerClient:
                 # is down rather than stalling the caller for the full request budget.
                 self._ensure_link(cfg["address"],
                                   path_timeout=_PROBE_TIMEOUT, link_timeout=_PROBE_TIMEOUT)
-                resp = self.request(worker_protocol.PATH_PING, {}, timeout=_PROBE_PING_TIMEOUT)
+                resp = self.request(worker_protocol.PATH_PING, {},
+                                    timeout=_PROBE_PING_TIMEOUT, retries=0)
                 result = resp.get("ok") is True
             except Exception as exc:
                 _warn(f"availability check failed: {exc}")
@@ -258,6 +283,17 @@ class WorkerClient:
         self._avail_expiry = time.time() + _AVAIL_TTL
         self._connected = result
         return result
+
+    def is_configured(self) -> bool:
+        """True if a worker is enabled and has an address — CHEAP (no network probe).
+
+        Model getters use this (not :meth:`is_available`) to decide proxy-vs-local: when
+        a worker is configured the host must ALWAYS use the proxy and NEVER build a local
+        model, even if the worker is momentarily down (the proxy retries and then raises,
+        which the caller surfaces). Loading a local model here is exactly what OOMs a
+        memory-constrained web process, so we don't."""
+        cfg = self._load_cfg()
+        return bool(cfg.get("enabled") and cfg.get("address"))
 
     # -- Activity / introspection ------------------------------------------
 
@@ -303,9 +339,14 @@ def get_client(data_root: str) -> WorkerClient:
 
 
 # ---------------------------------------------------------------------------
-# Drop-in proxies. Each holds a WorkerClient and a lazily-built local fallback of
-# the REAL model (built on first fallback use, then cached). On a per-item request
-# failure the proxy runs THAT item on the local model and logs why.
+# Drop-in proxies. Each holds a WorkerClient and forwards to the remote worker.
+# They hold NO local model: when a request fails the WorkerClient has already
+# retried, so the exception propagates and the caller surfaces it — the host must
+# never load a heavy model to "fall back" (that reintroduces the OOM the offload
+# exists to prevent). A getter returns a proxy only when a worker is configured;
+# with no worker configured the getter returns the real local model instead.
+# A response dict with "error" set is a per-item model failure (not a worker
+# outage) and is surfaced through the normal return value / raised in-place.
 # ---------------------------------------------------------------------------
 
 
@@ -314,64 +355,48 @@ class RemoteFaceDetector:
 
     def __init__(self, client: WorkerClient):
         self.client = client
-        self._local = None
         # Callers (e.g. web.py detect-faces) read `detector._model_name` to compute
         # the DB model_id. The worker always runs the default buffalo_l, so mirror it.
         self._model_name = 'buffalo_l'
-
-    def _local_model(self):
-        if self._local is None:
-            from .face_detector import FaceDetector
-            self._local = FaceDetector()
-        return self._local
 
     def detect_faces(self, paths: list) -> list:
         results = []
         for path in paths:
             basename = os.path.basename(path)
-            try:
-                with open(path, "rb") as f:
-                    image_bytes = f.read()
-                self.client.record("detect_faces", basename)
-                resp = self.client.request(
-                    worker_protocol.PATH_DETECT_FACES,
-                    {"name": basename, "image": image_bytes},
-                )
-                faces = []
-                for face in (resp.get("faces") or []):
-                    faces.append({
-                        "bbox": [float(v) for v in face["bbox"]],
-                        "embedding": np.frombuffer(face["embedding"], dtype=np.float32),
-                        "det_score": float(face["det_score"]),
-                    })
-                results.append((path, faces, resp.get("error")))
-            except (WorkerUnavailable, WorkerError) as exc:
-                _warn(f"worker request failed: {exc}, running detect_faces locally for {basename}")
-                results.extend(self._local_model().detect_faces([path]))
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+            self.client.record("detect_faces", basename)
+            resp = self.client.request(
+                worker_protocol.PATH_DETECT_FACES,
+                {"name": basename, "image": image_bytes},
+            )
+            faces = []
+            for face in (resp.get("faces") or []):
+                faces.append({
+                    "bbox": [float(v) for v in face["bbox"]],
+                    # .copy() so the array owns its memory instead of pinning the
+                    # whole response buffer for the lifetime of the embedding.
+                    "embedding": np.frombuffer(face["embedding"], dtype=np.float32).copy(),
+                    "det_score": float(face["det_score"]),
+                })
+            results.append((path, faces, resp.get("error")))
         return results
 
     def embed_bbox(self, img, bbox: list, pad_ratio: float = 0.3) -> dict:
-        try:
-            image_bytes = cv2.imencode('.png', img)[1].tobytes()
-            self.client.record("embed_bbox", "<crop>")
-            resp = self.client.request(
-                worker_protocol.PATH_EMBED_BBOX,
-                {"name": "<crop>", "image": image_bytes,
-                 "bbox": [float(v) for v in bbox], "pad_ratio": float(pad_ratio)},
-            )
-            # A worker-side per-item error returns embedding=None; route it through
-            # the local fallback (which always yields a usable embedding) instead of
-            # crashing on np.frombuffer(None).
-            if resp.get("error") or resp.get("embedding") is None:
-                raise WorkerError(resp.get("error") or "embed_bbox returned no embedding")
-            return {
-                "bbox": resp["bbox"],
-                "embedding": np.frombuffer(resp["embedding"], dtype=np.float32),
-                "det_score": float(resp["det_score"]),
-            }
-        except (WorkerUnavailable, WorkerError) as exc:
-            _warn(f"worker request failed: {exc}, running embed_bbox locally")
-            return self._local_model().embed_bbox(img, bbox, pad_ratio)
+        image_bytes = cv2.imencode('.png', img)[1].tobytes()
+        self.client.record("embed_bbox", "<crop>")
+        resp = self.client.request(
+            worker_protocol.PATH_EMBED_BBOX,
+            {"name": "<crop>", "image": image_bytes,
+             "bbox": [float(v) for v in bbox], "pad_ratio": float(pad_ratio)},
+        )
+        if resp.get("error") or resp.get("embedding") is None:
+            raise WorkerError(resp.get("error") or "embed_bbox returned no embedding")
+        return {
+            "bbox": resp["bbox"],
+            "embedding": np.frombuffer(resp["embedding"], dtype=np.float32).copy(),
+            "det_score": float(resp["det_score"]),
+        }
 
     @staticmethod
     def model_id(*args, **kwargs) -> str:
@@ -384,43 +409,27 @@ class RemoteCLIPIndexer:
 
     def __init__(self, client: WorkerClient):
         self.client = client
-        self._local = None
         # Must equal the model the worker uses so the DB 'model' column matches.
         from .indexer import CLIPIndexer
         self.model_name = CLIPIndexer.model_id()
-
-    def _local_model(self):
-        if self._local is None:
-            from .indexer import CLIPIndexer
-            self._local = CLIPIndexer()
-        return self._local
 
     def embed_images(self, paths):
         vectors = []
         failed = []
         for path in paths:
             basename = os.path.basename(path)
-            try:
-                with open(path, "rb") as f:
-                    image_bytes = f.read()
-                self.client.record("embed_image", basename)
-                resp = self.client.request(
-                    worker_protocol.PATH_EMBED_IMAGE,
-                    {"name": basename, "image": image_bytes},
-                )
-                emb = resp.get("embedding")
-                if emb is None or resp.get("error"):
-                    failed.append((path, resp.get("error") or "no embedding returned"))
-                else:
-                    vectors.append(np.frombuffer(emb, dtype=np.float32))
-            except (WorkerUnavailable, WorkerError) as exc:
-                _warn(f"worker request failed: {exc}, running embed_image locally for {basename}")
-                emb_arr, local_failed = self._local_model().embed_images([path])
-                failed.extend(local_failed)
-                # embed_images returns (N_success, D); merge each success row.
-                if emb_arr.ndim == 2 and emb_arr.shape[0] > 0:
-                    for row in emb_arr:
-                        vectors.append(row.astype(np.float32))
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+            self.client.record("embed_image", basename)
+            resp = self.client.request(
+                worker_protocol.PATH_EMBED_IMAGE,
+                {"name": basename, "image": image_bytes},
+            )
+            emb = resp.get("embedding")
+            if emb is None or resp.get("error"):
+                failed.append((path, resp.get("error") or "no embedding returned"))
+            else:
+                vectors.append(np.frombuffer(emb, dtype=np.float32).copy())
 
         if vectors:
             embeddings = np.stack(vectors).astype(np.float32)
@@ -433,39 +442,29 @@ class RemoteCLIPIndexer:
             return np.empty((0,), dtype=np.float32)
         vectors = []
         for img in images:
-            try:
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                image_bytes = buf.getvalue()
-                self.client.record("embed_image", "<crop>")
-                resp = self.client.request(
-                    worker_protocol.PATH_EMBED_IMAGE,
-                    {"name": "<crop>", "image": image_bytes},
-                )
-                emb = resp.get("embedding")
-                if emb is None or resp.get("error"):
-                    raise WorkerError(resp.get("error") or "no embedding returned")
-                vectors.append(np.frombuffer(emb, dtype=np.float32))
-            except (WorkerUnavailable, WorkerError) as exc:
-                _warn(f"worker request failed: {exc}, running embed_pil_images locally for one crop")
-                local = self._local_model().embed_pil_images([img])
-                for row in local:
-                    vectors.append(row.astype(np.float32))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            image_bytes = buf.getvalue()
+            self.client.record("embed_image", "<crop>")
+            resp = self.client.request(
+                worker_protocol.PATH_EMBED_IMAGE,
+                {"name": "<crop>", "image": image_bytes},
+            )
+            emb = resp.get("embedding")
+            if emb is None or resp.get("error"):
+                raise WorkerError(resp.get("error") or "no embedding returned")
+            vectors.append(np.frombuffer(emb, dtype=np.float32).copy())
         return np.stack(vectors).astype(np.float32)
 
     def embed_text(self, text):
-        try:
-            self.client.record("embed_text", text[:40])
-            resp = self.client.request(
-                worker_protocol.PATH_EMBED_TEXT,
-                {"text": text},
-            )
-            if resp.get("error"):
-                raise WorkerError(resp["error"])
-            return np.frombuffer(resp["embedding"], dtype=np.float32)
-        except (WorkerUnavailable, WorkerError) as exc:
-            _warn(f"worker request failed: {exc}, running embed_text locally")
-            return self._local_model().embed_text(text)
+        self.client.record("embed_text", text[:40])
+        resp = self.client.request(
+            worker_protocol.PATH_EMBED_TEXT,
+            {"text": text},
+        )
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        return np.frombuffer(resp["embedding"], dtype=np.float32).copy()
 
     @staticmethod
     def model_id(*args, **kwargs):
@@ -481,22 +480,9 @@ class RemoteYOLODetector:
         self._model_size = model_size
         self._conf_threshold = conf_threshold
         self._vocab = list(vocab) if vocab is not None else None
-        self._local = None
-
-    def _local_model(self):
-        if self._local is None:
-            from .detector import YOLOWorldDetector
-            self._local = YOLOWorldDetector(
-                model_size=self._model_size,
-                conf_threshold=self._conf_threshold,
-                vocab=self._vocab,
-            )
-        return self._local
 
     def set_vocab(self, vocab):
         self._vocab = list(vocab)
-        if self._local is not None:
-            self._local.set_vocab(self._vocab)
 
     def set_classes(self, vocab):
         self.set_vocab(vocab)
@@ -505,27 +491,20 @@ class RemoteYOLODetector:
         results_out = []
         for path in paths:
             basename = os.path.basename(path)
-            try:
-                with open(path, "rb") as f:
-                    image_bytes = f.read()
-                self.client.record("detect_objects", basename)
-                resp = self.client.request(
-                    worker_protocol.PATH_DETECT_OBJECTS,
-                    {"name": basename, "image": image_bytes, "vocab": self._vocab},
-                )
-                detections = []
-                for d in (resp.get("detections") or []):
-                    class_name = d[0]
-                    conf = float(d[1])
-                    x1, y1, x2, y2 = (float(d[2]), float(d[3]), float(d[4]), float(d[5]))
-                    detections.append((class_name, conf, x1, y1, x2, y2))
-                results_out.append((path, detections, resp.get("error")))
-            except (WorkerUnavailable, WorkerError) as exc:
-                _warn(f"worker request failed: {exc}, running detect_objects locally for {basename}")
-                local = self._local_model()
-                if self._vocab is not None:
-                    local.set_vocab(self._vocab)
-                results_out.extend(local.detect_images([path]))
+            with open(path, "rb") as f:
+                image_bytes = f.read()
+            self.client.record("detect_objects", basename)
+            resp = self.client.request(
+                worker_protocol.PATH_DETECT_OBJECTS,
+                {"name": basename, "image": image_bytes, "vocab": self._vocab},
+            )
+            detections = []
+            for d in (resp.get("detections") or []):
+                class_name = d[0]
+                conf = float(d[1])
+                x1, y1, x2, y2 = (float(d[2]), float(d[3]), float(d[4]), float(d[5]))
+                detections.append((class_name, conf, x1, y1, x2, y2))
+            results_out.append((path, detections, resp.get("error")))
         return results_out
 
     @staticmethod

@@ -273,12 +273,12 @@ def main():
                          help='Serve over plain HTTP. By default the gallery is served over '
                               'HTTPS using a self-signed cert (auto-generated via the openssl '
                               'binary, cached in .media/).')
-    web_cmd.add_argument('--workers', type=int, default=2,
-                         help='Number of worker processes (default: 2). Independent processes '
-                              'avoid one heavy request (a CLIP/embedding scan) blocking every '
-                              'other request behind the single-process GIL. Each worker '
-                              'independently loads ML models (CLIP/YOLO-World), so higher counts '
-                              'cost more RAM; pass 1 to keep today\'s single-process behavior.')
+    web_cmd.add_argument('--workers', type=int, default=1,
+                         help='Number of worker processes (default: 1). Each extra process '
+                              'independently holds its own ML models / embedding matrices, so '
+                              'RAM multiplies by worker count — the top cause of web-server OOM. '
+                              'Raise it only if you offload ML to a `media worker` (so the web '
+                              'process stays model-free) and need more request concurrency.')
 
     worker_cmd = sub.add_parser('worker',
                                 help='Run the Reticulum media worker server (heavy ML offload target)')

@@ -221,8 +221,13 @@
     </div>
   </div>
 
-  <div class="stage-pod" data-pod data-pod-kind="set">
-    <button type="button" class="stage-pod-btn" id="set-pod-trigger"{% if not current_sets %} data-pod-action="add-set" title="Add to a set"{% endif %}>{% if current_sets %}<span class="pod-collapsed-label">{{ current_sets | map(attribute='name') | join(', ') }}</span>{% else %}＋ Add set{% endif %}</button>
+  <div class="stage-pod{% if current_sets %} has-sets{% endif %}" data-pod data-pod-kind="set">
+    {# Collapsed trigger shows the FIRST set's name (right-aligned in the pill), plus
+       a subtle count badge to its LEFT when the photo is in several sets. The name is
+       the last inline node so its right edge lines up with the pod's right edge — the
+       open menu's first set link is anchored to that exact spot (see .has-sets rules in
+       style.css) so a second click in place navigates to /sets/{id}. #}
+    <button type="button" class="stage-pod-btn" id="set-pod-trigger"{% if not current_sets %} data-pod-action="add-set" title="Add to a set"{% endif %}>{% if current_sets %}<span class="pod-collapsed-label">{% if current_sets | length > 1 %}<span class="pod-more-count" aria-hidden="true" title="{{ current_sets | length }} sets">{{ current_sets | length }}</span> {% endif %}{{ current_sets[0].name }}</span>{% else %}＋ Add set{% endif %}</button>
     <div class="stage-pod-menu">
     <!-- Sets — a photo can belong to any number of sets -->
     <div class="sidebar-panel">

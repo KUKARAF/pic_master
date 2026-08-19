@@ -236,10 +236,14 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
 
 # Remote-worker offload. `_worker_client` is set by create_app() to the
 # process-global WorkerClient for this data_root; it stays None on code paths that
-# never build an app (getters then behave exactly as before — local only). Each
-# getter caches the LOCAL model and the REMOTE proxy SEPARATELY and picks per call
-# via _worker_client.is_available() (TTL-cached ~15s), so toggling the worker on/off
-# at runtime routes subsequent calls without rebuilding either side.
+# never build an app (getters then behave exactly as before — local only).
+#
+# Choice is by is_configured() (cheap: worker enabled + address, NO network probe),
+# NOT is_available(): when a worker is CONFIGURED the web process ALWAYS uses the
+# remote proxy and NEVER builds a local model — even if the worker is momentarily
+# down (the proxy retries and then raises, which the caller surfaces). Building a
+# local model here is exactly what OOMs a memory-constrained web process. Only with
+# no worker configured does a getter build the real local model.
 _worker_client = None
 
 _face_detector_local = None
@@ -248,7 +252,7 @@ _face_detector_remote = None
 
 def _get_face_detector():
     global _face_detector_local, _face_detector_remote
-    if _worker_client is not None and _worker_client.is_available():
+    if _worker_client is not None and _worker_client.is_configured():
         if _face_detector_remote is None:
             _face_detector_remote = worker_client.RemoteFaceDetector(_worker_client)
         return _face_detector_remote
@@ -269,7 +273,7 @@ def _get_object_detector():
     # .set_vocab(...) after getting it — the proxy stores + forwards that, same as
     # the local model.
     global _object_detector_local, _object_detector_remote
-    if _worker_client is not None and _worker_client.is_available():
+    if _worker_client is not None and _worker_client.is_configured():
         if _object_detector_remote is None:
             from media_manager.detector import DEFAULT_VOCAB
             _object_detector_remote = worker_client.RemoteYOLODetector(
@@ -287,7 +291,7 @@ _clip_indexer_remote = None
 
 def _get_clip_indexer():
     global _clip_indexer_local, _clip_indexer_remote
-    if _worker_client is not None and _worker_client.is_available():
+    if _worker_client is not None and _worker_client.is_configured():
         if _clip_indexer_remote is None:
             _clip_indexer_remote = worker_client.RemoteCLIPIndexer(_worker_client)
         return _clip_indexer_remote
