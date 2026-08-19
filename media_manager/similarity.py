@@ -35,14 +35,48 @@ def adjusted_centroid(positive_embeddings, negative_embeddings, negative_weight=
     return positive_centroid if norm == 0 else adjusted / norm
 
 
-def rank_by_similarity(centroid, candidates, embedding_index=2):
+def top_k_indices(scores, k=None):
+    """Indices into `scores` (a 1-D np array) for the top-k values, descending.
+    Uses argpartition (O(N)) to avoid a full sort when k < N; both argpartition
+    and argsort release the GIL, unlike Python's sorted(). k=None (or k>=N)
+    returns every index in descending order."""
+    n = int(scores.shape[0])
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    if k is None or k >= n:
+        return np.argsort(scores)[::-1]
+    # top-k partition, then sort just those k descending
+    part = np.argpartition(scores, n - k)[n - k:]
+    return part[np.argsort(scores[part])[::-1]]
+
+
+def rank_matrix(centroid, matrix, k=None):
+    """Dot a pre-built [N, D] float32 matrix against `centroid`, returning
+    (indices, scores) for the top-k rows descending. Vectorized end-to-end
+    (BLAS dot + argpartition) — the path that keeps the GIL free. Assumes rows
+    are already unit-normalized; only the centroid is normalized by callers as
+    needed."""
+    if matrix.shape[0] == 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
+    scores = matrix.dot(np.asarray(centroid, dtype=np.float32))
+    idx = top_k_indices(scores, k)
+    return idx, scores[idx]
+
+
+def rank_by_similarity(centroid, candidates, embedding_index=2, k=None):
     """candidates: rows containing embedding bytes at embedding_index (matches
     the shape of db.get_all_embeddings()/get_embeddings_for_files() rows).
-    Returns [(candidate, score), ...] sorted descending. Assumes stored
-    embeddings are already unit-normalized — only the centroid is explicitly
-    normalized here."""
+    Returns [(candidate, score), ...] sorted descending; pass k to get only the
+    top-k (argpartition, no full sort). Assumes stored embeddings are already
+    unit-normalized — only the centroid is explicitly normalized here.
+
+    The matrix is built in a single allocation (one join + frombuffer) rather
+    than a per-row np.stack, and ranking uses numpy sorts (GIL-releasing)
+    instead of Python's sorted()."""
     if not candidates:
         return []
-    matrix = np.stack([np.frombuffer(c[embedding_index], dtype=np.float32) for c in candidates])
-    scores = matrix.dot(centroid)
-    return sorted(zip(candidates, scores.tolist()), key=lambda x: x[1], reverse=True)
+    matrix = np.frombuffer(
+        b''.join(c[embedding_index] for c in candidates), dtype=np.float32
+    ).reshape(len(candidates), -1)
+    idx, scores = rank_matrix(centroid, matrix, k=k)
+    return [(candidates[i], float(scores[j])) for j, i in enumerate(idx)]

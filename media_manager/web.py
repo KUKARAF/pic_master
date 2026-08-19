@@ -1739,32 +1739,33 @@ def create_app(data_root: str) -> FastAPI:
         import numpy as np
 
         query_emb = np.frombuffer(query_row[2], dtype=np.float32)
-        rows = db.get_all_body_embeddings()
-        if not rows:
+        # Cached, write-invalidated [N, D] body matrix — no per-request full
+        # re-load + np.stack of every body embedding.
+        body_ids_arr, file_ids_arr, _bboxes, matrix = db.get_body_embeddings_matrix()
+        if matrix.shape[0] == 0:
             return []
-        matrix = np.stack([np.frombuffer(r[4], dtype=np.float32) for r in rows])
         scores = matrix.dot(query_emb)
 
         best_per_file = {}
         for i in np.argsort(-scores):
-            score = float(scores[int(i)])
+            i = int(i)
+            score = float(scores[i])
             if score < threshold or len(best_per_file) >= limit:
                 break
-            r = rows[int(i)]
-            if r[1] == exclude_file_id or r[1] in best_per_file:
+            fid = int(file_ids_arr[i])
+            if fid == exclude_file_id or fid in best_per_file:
                 continue
-            best_per_file[r[1]] = (r, score)
+            best_per_file[fid] = (int(body_ids_arr[i]), score)
 
         body_ids = {}
         rows = []
         scores = {}
-        for r, score in best_per_file.values():
-            body_id, fid, path, _bbox_json, _emb = r
+        for fid, (body_id, score) in best_per_file.items():
             file_row = db.get_file_by_id(fid)
             if file_row is None:
                 continue
             body_ids[fid] = body_id
-            rows.append((fid, path, False, file_row['checksum']))
+            rows.append((fid, file_row['path'], False, file_row['checksum']))
             scores[fid] = round(score, 4)
 
         results = _enrich_rows(rows, scores=scores)
@@ -4536,17 +4537,20 @@ def create_app(data_root: str) -> FastAPI:
             if not combined:
                 return {'results': [], 'message': 'No faces indexed yet — run <code>media faces</code> first.'}
 
-            matrix = np.stack([np.frombuffer(c[3], dtype=np.float32) for c in combined])
-            scores = matrix.dot(query_emb).tolist()
-
-            ranked = sorted(
-                zip(combined, scores),
-                key=lambda x: x[1], reverse=True,
-            )
+            # Single-allocation matrix (one join + frombuffer, no per-row
+            # np.stack) and a GIL-releasing numpy sort instead of a full Python
+            # sorted() over every indexed face.
+            matrix = np.frombuffer(
+                b''.join(c[3] for c in combined), dtype=np.float32
+            ).reshape(len(combined), -1)
+            scores = matrix.dot(np.asarray(query_emb, dtype=np.float32))
+            order = np.argsort(scores)[::-1]  # descending
 
             seen = {}
             results_out = []
-            for (ref, file_id, fpath, _emb, identity), score in ranked:
+            for i in order:
+                ref, file_id, fpath, _emb, identity = combined[i]
+                score = float(scores[i])
                 if score < 0.3:
                     break
                 if file_id not in seen:

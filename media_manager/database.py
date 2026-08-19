@@ -57,6 +57,22 @@ class ThreadLocalDB:
 class Database(ThreadLocalDB):
     def __init__(self, db_path="media.db"):
         super().__init__(db_path)
+        # --- Cached embedding matrices (write-invalidated) -----------------
+        # get_all_*embeddings() fetchall() the whole table's float32 BLOBs on
+        # every web request; callers then build a second numpy matrix. Under
+        # concurrency that is a top OOM driver. The *_matrix() accessors below
+        # build one shared numpy matrix, reuse it across requests, and rebuild
+        # only when the underlying table changes. Each write bumps the matching
+        # version counter; each accessor rebuilds iff its cached version is
+        # stale. Single-process shared cache (fine for uvicorn --workers 1).
+        self._emb_ver = 0
+        self._face_ver = 0
+        self._body_ver = 0
+        self._matrix_lock = threading.Lock()
+        # Each cache slot holds (version_it_was_built_at, built_result_tuple).
+        self._emb_cache = None
+        self._face_cache = None
+        self._body_cache = None
         self.create_tables()
 
     def create_tables(self):
@@ -479,6 +495,7 @@ class Database(ThreadLocalDB):
             VALUES (?, ?, ?, ?, ?)
         ''', (file_id, frame_index, embedding_bytes, model, int(time.time())))
         self.conn.commit()
+        self._emb_ver += 1  # invalidate cached embeddings matrix
 
     def get_all_embeddings(self):
         """Return list of (file_id, path, embedding_bytes, checksum) joining with
@@ -493,6 +510,74 @@ class Database(ThreadLocalDB):
             WHERE e.frame_index = 0
         ''')
         return cursor.fetchall()
+
+    @staticmethod
+    def _stack_embeddings(blobs, label):
+        """Stack a list of float32 embedding BLOBs into one (N, D) float32
+        matrix in a single allocation. D is inferred from the first usable
+        blob (dim usually 512). Any row whose blob is empty or whose byte
+        length != D*4 is dropped so one bad row can't crash the whole matrix
+        (shouldn't happen; each drop is printed loudly). Returns
+        (matrix, keep) where keep is a bool list aligned with `blobs` marking
+        which rows made it into the matrix, so the caller can filter its id
+        arrays identically."""
+        import numpy as np
+        keep = [False] * len(blobs)
+        # Infer D from the first non-empty blob.
+        D = None
+        for b in blobs:
+            if b:
+                D = len(b) // 4
+                break
+        if not D:
+            return np.empty((0, 0), np.float32), keep
+        row_nbytes = D * 4
+        good = []
+        for i, b in enumerate(blobs):
+            if b and len(b) == row_nbytes:
+                good.append(b)
+                keep[i] = True
+            else:
+                print(f"[{label}] dropping row index {i}: blob length "
+                      f"{len(b) if b else 0} != expected {row_nbytes} (D={D})")
+        if not good:
+            return np.empty((0, 0), np.float32), keep
+        matrix = np.frombuffer(b''.join(good), np.float32).reshape(len(good), D)
+        return matrix, keep
+
+    def get_embeddings_matrix(self):
+        """Cached, write-invalidated matrix form of get_all_embeddings for
+        whole-file similarity search. Returns
+        (file_ids: np.ndarray[int64], checksums: list[str], matrix: float32[N, D])
+        over the same rows as get_all_embeddings (primary frame_index=0). The
+        heavy numpy matrix is built ONCE and reused across requests until an
+        embeddings write bumps self._emb_ver — avoiding the per-request
+        full-table BLOB fetchall()+rebuild that drives the web-server OOM.
+        `path` is intentionally not selected (resolved later for the top-K
+        only)."""
+        import numpy as np
+        with self._matrix_lock:
+            if self._emb_cache is not None and self._emb_cache[0] == self._emb_ver:
+                return self._emb_cache[1]
+            ver = self._emb_ver
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT e.file_id, f.checksum, e.embedding
+                FROM embeddings e
+                JOIN files_with_path f ON f.id = e.file_id
+                WHERE e.frame_index = 0
+            ''')
+            rows = cursor.fetchall()
+            if not rows:
+                result = (np.array([], dtype=np.int64), [], np.empty((0, 0), np.float32))
+                self._emb_cache = (ver, result)
+                return result
+            matrix, keep = self._stack_embeddings([r[2] for r in rows], 'embeddings-matrix')
+            file_ids = np.array([rows[i][0] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            checksums = [rows[i][1] for i in range(len(rows)) if keep[i]]
+            result = (file_ids, checksums, matrix)
+            self._emb_cache = (ver, result)
+            return result
 
     def get_embeddings_for_files(self, file_ids):
         """Return [(file_id, embedding_bytes), ...] for a specific set of files'
@@ -1016,6 +1101,11 @@ class Database(ThreadLocalDB):
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
             files_removed += 1
         self.conn.commit()
+        if files_removed:
+            # Deleted rows from embeddings/faces/body_embeddings — invalidate all.
+            self._emb_ver += 1
+            self._face_ver += 1
+            self._body_ver += 1
         return (len(file_path_ids), files_removed)
 
     def count_detected(self):
@@ -1052,6 +1142,7 @@ class Database(ThreadLocalDB):
                     (file_id, json.dumps(face['bbox']), face['embedding'].tobytes(), face['det_score'], None, now)
                 )
         self.conn.commit()
+        self._face_ver += 1  # invalidate cached face-embeddings matrix
 
     def add_manual_face(self, file_id, bbox, embedding_bytes, det_score, frame_index=None) -> int:
         """Insert a single manually-added (or per-frame auto-detected) face row
@@ -1067,6 +1158,7 @@ class Database(ThreadLocalDB):
             (file_id, json.dumps(bbox), embedding_bytes, det_score, None, int(time.time()), frame_index)
         )
         self.conn.commit()
+        self._face_ver += 1  # invalidate cached face-embeddings matrix
         return cursor.lastrowid
 
     def get_unface_indexed_files(self, limit=None) -> list:
@@ -1127,6 +1219,38 @@ class Database(ThreadLocalDB):
             WHERE (fa.identity IS NULL OR fa.identity != '__indexed__') AND fa.embedding != x''
         ''')
         return cursor.fetchall()
+
+    def get_face_embeddings_matrix(self):
+        """Cached, write-invalidated matrix form of get_all_face_embeddings.
+        Returns (face_ids: np.ndarray[int64], file_ids: np.ndarray[int64],
+        matrix: float32[N, D]) over the same non-sentinel face rows
+        (identity != '__indexed__' and embedding != b''). Built once and reused
+        across requests until a faces write bumps self._face_ver. `path` is
+        dropped (resolved later for the top-K only)."""
+        import numpy as np
+        with self._matrix_lock:
+            if self._face_cache is not None and self._face_cache[0] == self._face_ver:
+                return self._face_cache[1]
+            ver = self._face_ver
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT fa.id, fa.file_id, fa.embedding
+                FROM faces fa
+                JOIN files_with_path f ON f.id = fa.file_id
+                WHERE (fa.identity IS NULL OR fa.identity != '__indexed__') AND fa.embedding != x''
+            ''')
+            rows = cursor.fetchall()
+            if not rows:
+                result = (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                          np.empty((0, 0), np.float32))
+                self._face_cache = (ver, result)
+                return result
+            matrix, keep = self._stack_embeddings([r[2] for r in rows], 'face-embeddings-matrix')
+            face_ids = np.array([rows[i][0] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            file_ids = np.array([rows[i][1] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            result = (face_ids, file_ids, matrix)
+            self._face_cache = (ver, result)
+            return result
 
     def assign_identity(self, face_id: int, name: str) -> None:
         """Set identity = name for a single face row."""
@@ -1211,6 +1335,7 @@ class Database(ThreadLocalDB):
                     (file_id, json.dumps(body['bbox']), body['embedding'].tobytes(), model, now)
                 )
         self.conn.commit()
+        self._body_ver += 1  # invalidate cached body-embeddings matrix
 
     def add_manual_body(self, file_id: int, bbox: list, embedding_bytes: bytes, model: str) -> int:
         """Append one manually-drawn body crop (primary frame) and return its row id.
@@ -1228,6 +1353,7 @@ class Database(ThreadLocalDB):
             (file_id, json.dumps(bbox), embedding_bytes, model, int(time.time()))
         )
         self.conn.commit()
+        self._body_ver += 1  # invalidate cached body-embeddings matrix
         return cursor.lastrowid
 
     def get_body_embeddings_for_file(self, file_id: int) -> list:
@@ -1255,6 +1381,39 @@ class Database(ThreadLocalDB):
             WHERE b.bbox != '[]' AND b.embedding != x''
         ''')
         return cursor.fetchall()
+
+    def get_body_embeddings_matrix(self):
+        """Cached, write-invalidated matrix form of get_all_body_embeddings.
+        Returns (body_ids: np.ndarray[int64], file_ids: np.ndarray[int64],
+        bboxes: list, matrix: float32[N, D]) over the same non-sentinel body
+        rows (bbox != '[]' and embedding != b''). Built once and reused across
+        requests until a body write bumps self._body_ver. `path` is dropped
+        (resolved later for the top-K only)."""
+        import numpy as np
+        with self._matrix_lock:
+            if self._body_cache is not None and self._body_cache[0] == self._body_ver:
+                return self._body_cache[1]
+            ver = self._body_ver
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT b.id, b.file_id, b.bbox, b.embedding
+                FROM body_embeddings b
+                JOIN files_with_path f ON f.id = b.file_id
+                WHERE b.bbox != '[]' AND b.embedding != x''
+            ''')
+            rows = cursor.fetchall()
+            if not rows:
+                result = (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
+                          [], np.empty((0, 0), np.float32))
+                self._body_cache = (ver, result)
+                return result
+            matrix, keep = self._stack_embeddings([r[3] for r in rows], 'body-embeddings-matrix')
+            body_ids = np.array([rows[i][0] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            file_ids = np.array([rows[i][1] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            bboxes = [rows[i][2] for i in range(len(rows)) if keep[i]]
+            result = (body_ids, file_ids, bboxes, matrix)
+            self._body_cache = (ver, result)
+            return result
 
     def get_unbody_indexed_files(self, limit=None) -> list:
         """Return (id, path) for files that have no primary (frame_index IS NULL)
@@ -1378,6 +1537,12 @@ class Database(ThreadLocalDB):
         cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         self.conn.commit()
+        # Invalidate all cached matrices: this cleared embeddings, body, and
+        # (unless skip_faces) faces rows for the file.
+        self._emb_ver += 1
+        self._body_ver += 1
+        if not skip_faces:
+            self._face_ver += 1
 
     def close(self):
         """Close the database connection."""

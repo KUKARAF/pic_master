@@ -12,6 +12,7 @@ that photo forever, independent of anything that ever happens to media.db."""
 import os
 import shutil
 import sqlite3
+import threading
 import time
 from collections import Counter
 
@@ -120,6 +121,19 @@ class ManualDB(ThreadLocalDB):
     def __init__(self, db_path):
         super().__init__(db_path)
         self._create_tables()
+        # Cache invalidation for the face-embedding matrices below. Every method
+        # that inserts/updates/deletes a row in `faces` bumps self._face_ver; each
+        # cached matrix accessor stores the version it was built at and rebuilds
+        # only when that stored version != self._face_ver. Coarse over-invalidation
+        # (bumping on a write that couldn't actually change the matrix, e.g. a
+        # favorite bump) is deliberately fine — a stale-cache MISS is not. Shared
+        # single-process cache (uvicorn --workers 1); the lock guards concurrent
+        # rebuilds across request threads (ThreadLocalDB gives each thread its own
+        # connection, but these Python-side attributes are shared on the instance).
+        self._face_ver = 0
+        self._matrix_lock = threading.Lock()
+        self._named_matrix_cache = None   # (version, (identities, matrix))
+        self._all_faces_matrix_cache = None  # (version, (face_ids, checksums, identities, matrix))
 
     def _create_tables(self):
         cur = self.conn.cursor()
@@ -1779,6 +1793,7 @@ class ManualDB(ThreadLocalDB):
             VALUES (?, NULL, ?,?,?,?, ?, 'manual', NULL, ?, ?, ?, ?)
         ''', (checksum, x1, y1, x2, y2, embedding_bytes, image_width, image_height, int(time.time()), frame_index))
         self.conn.commit()
+        self._face_ver += 1
         return cur.lastrowid
 
     def promote_auto_face(self, source_face_id, checksum, bbox, embedding_bytes, identity,
@@ -1822,6 +1837,7 @@ class ManualDB(ThreadLocalDB):
                 (new_ref, old_ref)
             )
         self.conn.commit()
+        self._face_ver += 1
         return new_id
 
     def reject_auto_face(self, source_face_id, checksum, bbox, embedding_bytes, image_width, image_height, frame_index=None):
@@ -1840,6 +1856,7 @@ class ManualDB(ThreadLocalDB):
         ''', (checksum, x1, y1, x2, y2, embedding_bytes, source_face_id,
               image_width, image_height, int(time.time()), frame_index))
         self.conn.commit()
+        self._face_ver += 1
 
     def delete_face_decision_by_source(self, source_face_id):
         """Hard-delete the manual.db row (if any) created by promote_auto_face or
@@ -1852,6 +1869,7 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('DELETE FROM faces WHERE source_face_id = ?', (source_face_id,))
         self.conn.commit()
+        self._face_ver += 1
 
     def reject_face(self, manual_face_id):
         """Reject an existing manual.db row (manually-added or already-promoted) — kept,
@@ -1859,11 +1877,13 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET rejected = 1, identity = NULL WHERE id = ?', (manual_face_id,))
         self.conn.commit()
+        self._face_ver += 1
 
     def assign_identity(self, manual_face_id, name):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET identity = ?, rejected = 0 WHERE id = ?', (name.strip(), manual_face_id))
         self.conn.commit()
+        self._face_ver += 1
 
     def mark_face_reviewed_ok(self, manual_face_id):
         """"Correct, don't ask again" from the cleanup-low-confidence-matches
@@ -1872,6 +1892,7 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET reviewed_ok = 1 WHERE id = ?', (manual_face_id,))
         self.conn.commit()
+        self._face_ver += 1
 
     def unassign_identity_for_checksum(self, checksum, name):
         """Clear the identity (back to unidentified, not rejected) for every
@@ -1886,6 +1907,7 @@ class ManualDB(ThreadLocalDB):
             (checksum, name)
         )
         self.conn.commit()
+        self._face_ver += 1
         return cur.rowcount
 
     def rename_identity(self, old_name, new_name):
@@ -1901,6 +1923,7 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))
         self.conn.commit()
+        self._face_ver += 1
 
     def add_identity_alias(self, identity, alias):
         """Record `alias` as an alternate name for `identity` ("babe" for
@@ -1946,6 +1969,7 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET favorite = max(0, favorite + ?) WHERE id = ?', (delta, manual_face_id))
         self.conn.commit()
+        self._face_ver += 1
         row = cur.execute('SELECT favorite FROM faces WHERE id = ?', (manual_face_id,)).fetchone()
         return row[0] if row else 0
 
@@ -2058,19 +2082,140 @@ class ManualDB(ThreadLocalDB):
         cur.execute("SELECT identity, embedding FROM faces WHERE identity IS NOT NULL AND rejected = 0")
         return cur.fetchall()
 
+    def get_named_face_matrix(self):
+        """Cached, write-invalidated counterpart to get_named_face_embeddings for the
+        hot auto-match path (find_matching_identity): returns
+        (identities: list[str], matrix: np.ndarray[K, D] float32) where row i of
+        matrix is the embedding of face identities[i]. The K×D matrix is built once
+        and reused across requests, rebuilt only when the faces table changes (see
+        self._face_ver) — instead of re-SELECTing every named embedding blob and
+        re-stacking it on EVERY newly detected face, which is a web-server OOM cause.
+
+        Empty result → ([], np.empty((0, 0), np.float32)). Rows with an empty or
+        wrong-length embedding blob are skipped (with a printed warning) so one bad
+        row can't crash the rebuild. Returns the SAME cached objects on a cache hit
+        — callers must treat the matrix as read-only (don't mutate in place)."""
+        import numpy as np
+        with self._matrix_lock:
+            cached = self._named_matrix_cache
+            if cached is not None and cached[0] == self._face_ver:
+                return cached[1]
+
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT identity, embedding FROM faces "
+                "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''"
+            )
+            rows = cur.fetchall()
+
+            identities = []
+            blobs = []
+            dim = None
+            for identity, blob in rows:
+                if not blob:
+                    print(f"WARNING: get_named_face_matrix dropping face for identity "
+                          f"{identity!r} — empty embedding blob")
+                    continue
+                if len(blob) % 4 != 0:
+                    print(f"WARNING: get_named_face_matrix dropping face for identity "
+                          f"{identity!r} — embedding blob length {len(blob)} not a "
+                          f"multiple of 4 (not float32)")
+                    continue
+                row_dim = len(blob) // 4
+                if dim is None:
+                    dim = row_dim
+                elif row_dim != dim:
+                    print(f"WARNING: get_named_face_matrix dropping face for identity "
+                          f"{identity!r} — embedding dim {row_dim} != expected {dim}")
+                    continue
+                identities.append(identity)
+                blobs.append(blob)
+
+            if not blobs:
+                result = ([], np.empty((0, 0), dtype=np.float32))
+            else:
+                matrix = np.frombuffer(b''.join(blobs), dtype=np.float32).reshape(len(blobs), dim)
+                result = (identities, matrix)
+
+            self._named_matrix_cache = (self._face_ver, result)
+            return result
+
+    def get_all_faces_matrix(self):
+        """Cached, write-invalidated counterpart to get_all_faces_with_embedding:
+        returns (face_ids: np.ndarray[int64], checksums: list[str],
+        identities: list, matrix: np.ndarray[K, D] float32), where row i of matrix is
+        the embedding of the face face_ids[i] / checksums[i] / identities[i] (identity
+        may be None for an unnamed face). Built once and reused across requests,
+        rebuilt only when the faces table changes (see self._face_ver) — instead of
+        dumping every non-rejected embedding blob per request (a web-server OOM cause).
+
+        Empty result → (np.empty(0, np.int64), [], [], np.empty((0, 0), np.float32)).
+        Rows with an empty or wrong-length embedding blob are skipped (with a printed
+        warning). Returns the SAME cached objects on a cache hit — callers must treat
+        the returned arrays/lists as read-only (don't mutate in place)."""
+        import numpy as np
+        with self._matrix_lock:
+            cached = self._all_faces_matrix_cache
+            if cached is not None and cached[0] == self._face_ver:
+                return cached[1]
+
+            cur = self.conn.cursor()
+            cur.execute(
+                "SELECT id, checksum, identity, embedding FROM faces "
+                "WHERE rejected = 0 AND embedding != x''"
+            )
+            rows = cur.fetchall()
+
+            face_ids = []
+            checksums = []
+            identities = []
+            blobs = []
+            dim = None
+            for face_id, checksum, identity, blob in rows:
+                if not blob:
+                    print(f"WARNING: get_all_faces_matrix dropping face id {face_id} "
+                          f"(checksum {checksum}) — empty embedding blob")
+                    continue
+                if len(blob) % 4 != 0:
+                    print(f"WARNING: get_all_faces_matrix dropping face id {face_id} "
+                          f"(checksum {checksum}) — embedding blob length {len(blob)} "
+                          f"not a multiple of 4 (not float32)")
+                    continue
+                row_dim = len(blob) // 4
+                if dim is None:
+                    dim = row_dim
+                elif row_dim != dim:
+                    print(f"WARNING: get_all_faces_matrix dropping face id {face_id} "
+                          f"(checksum {checksum}) — embedding dim {row_dim} != "
+                          f"expected {dim}")
+                    continue
+                face_ids.append(face_id)
+                checksums.append(checksum)
+                identities.append(identity)
+                blobs.append(blob)
+
+            if not blobs:
+                result = (np.empty(0, dtype=np.int64), [], [], np.empty((0, 0), dtype=np.float32))
+            else:
+                matrix = np.frombuffer(b''.join(blobs), dtype=np.float32).reshape(len(blobs), dim)
+                result = (np.asarray(face_ids, dtype=np.int64), checksums, identities, matrix)
+
+            self._all_faces_matrix_cache = (self._face_ver, result)
+            return result
+
     def find_matching_identity(self, embedding_bytes, threshold=None):
         """Return (identity, score) for the closest known person if similarity clears
         `threshold` (defaults to AUTO_MATCH_THRESHOLD), else (None, None). Powers
         auto-matching a newly detected face to an existing identity without asking."""
         if threshold is None:
             threshold = AUTO_MATCH_THRESHOLD
-        named = self.get_named_face_embeddings()
-        if not named:
-            return None, None
         import numpy as np
+        # Cached, write-invalidated K×D matrix — no per-call re-SELECT/re-stack of
+        # every named embedding (this method runs once per newly detected face).
+        names, matrix = self.get_named_face_matrix()
+        if matrix.shape[0] == 0:
+            return None, None
         query = np.frombuffer(embedding_bytes, dtype=np.float32)
-        names = [n for n, _ in named]
-        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
         scores = matrix.dot(query)
         best_idx = int(scores.argmax())
         if scores[best_idx] >= threshold:
