@@ -1341,7 +1341,7 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-pod-split .split-seg:hover { color: var(--accent); }
 .stage-pod-split .split-div { width: 1px; align-self: stretch; background: rgba(255, 255, 255, .22); }
 
-/* Find pill — emoji-icon split (⌛ label · 🧍 by body · 📏 similar images). The
+/* Find pill — emoji-icon split (🔍 label · 🧍 by body · 📏 similar images). The
    segments are <button>s, so strip the native button chrome; bump the glyph
    size since the pixel-font 8px base is far too small for emoji. */
 .find-split .split-seg {

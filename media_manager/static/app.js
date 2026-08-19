@@ -3900,11 +3900,15 @@
     }
     pods.forEach(function (pod) {
       const trigger = pod.querySelector('.stage-pod-btn');
-      // Sets + Categories are click-to-open only (no hover) — their collapsed
-      // trigger doubles as a label/direct-add button, so a hover popover would
-      // fight the pointer. Faces and everything else (info/frames/tags) keep the
-      // hover-open behavior.
-      const clickOnly = pod.dataset.podKind === 'set' || pod.dataset.podKind === 'category';
+      // Categories, and an EMPTY Sets pod, are click-to-open only — their
+      // collapsed trigger doubles as a label/direct-add button, so a hover
+      // popover would fight the pointer. A POPULATED Sets pod (.has-sets) is the
+      // exception: it opens on HOVER, swapping its trigger name for the in-place
+      // set link (same screen spot), so hovering replaces the button with the
+      // clickable set. Faces and the rest (info/frames/tags) keep hover-open.
+      const isSetWithSets = pod.dataset.podKind === 'set' && pod.classList.contains('has-sets');
+      const clickOnly = (pod.dataset.podKind === 'set' || pod.dataset.podKind === 'category')
+                        && !isSetWithSets;
       let hideTimer = null;
       function openPod() { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } pod.classList.add('is-open'); }
       function scheduleClose() {
