@@ -15,14 +15,14 @@
   <a href="/files">root</a>
   {% set parts = folder.split('/') if folder else [] %}
   {% for part in parts %}
-  / <a href="/files/{{ parts[:loop.index] | join('/') }}">{{ part }}</a>
+  / <a href="/files/{{ parts[:loop.index] | join('/') | urlencode }}">{{ part }}</a>
   {% endfor %}
 </div>
 
 {% if subfolders %}
 <div class="folder-list">
   {% for sub in subfolders %}
-  <a class="folder-row" href="/files/{{ sub.path }}">
+  <a class="folder-row" href="/files/{{ sub.path | urlencode }}">
     <span class="folder-name">📁 {{ sub.name }}</span>
     <span class="sub">{{ sub.count }} file{{ '' if sub.count == 1 else 's' }}</span>
   </a>

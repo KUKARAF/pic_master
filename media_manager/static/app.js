@@ -2959,11 +2959,12 @@
   });
   if (labelPersonState) boxDrawStates.push(labelPersonState);
 
-  /* Search region — drag a box around something (e.g. a brick wall); CLIP-embed
-     the crop and rank the library's whole-image embeddings, opening the matches
-     in the browsable watch-queue. Cheap semantic search: crop-vs-whole-image. */
-  const searchRegionBtn = document.getElementById('search-region-btn');
-  const searchRegionState = wireBoxDraw(searchRegionBtn, 'Drag a box around the thing to find…', '🔲 Search region', function (bbox) {
+  /* Find pill — 🔲 region segment: click to enter draw mode (segment shows ✏️ +
+     the photo gets a crosshair), then drag a box around a thing (e.g. a wall);
+     the crop is CLIP-embedded and ranked (tile index if built, else whole-image),
+     opening the matches in the browsable watch-queue. */
+  const searchRegionBtn = document.querySelector('.find-by-region-btn');
+  const searchRegionState = wireBoxDraw(searchRegionBtn, '✏️', '🔲', function (bbox) {
     openMatchesAsQueue({
       el: searchRegionBtn,
       url: '/api/files/' + fileId + '/region-search',

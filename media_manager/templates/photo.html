@@ -81,7 +81,7 @@
               {%- if loop.last -%}
                 {{ part }}
               {%- else -%}
-                <a href="/files/{{ parts[:loop.index] | join('/') }}">{{ part }}</a><span class="path-sep">/</span>
+                <a href="/files/{{ parts[:loop.index] | join('/') | urlencode }}">{{ part }}</a><span class="path-sep">/</span>
               {%- endif -%}
             {%- endfor -%}
           </td>
@@ -186,7 +186,6 @@
 
       {% if file.is_image %}
       <button type="button" id="label-region-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">＋ Label region</button>
-      <button type="button" id="search-region-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🔲 Search region</button>
       <button type="button" id="label-region-negative-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🚫 Label region as NOT</button>
       <button type="button" id="label-person-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🧍 Label person</button>
       <div id="label-region-status" class="sub" style="display:none;"></div>
@@ -402,6 +401,12 @@
       <button type="button" class="split-seg find-by-distance-btn" data-file-id="{{ file.id }}"
               title="Find similar images — visually closest photos (CLIP distance)"
               aria-label="Find similar images">📏</button>
+      {% if file.is_image %}
+      <span class="split-div"></span>
+      <button type="button" class="split-seg find-by-region-btn" data-file-id="{{ file.id }}"
+              title="Search a region — click, then drag a box around a thing (e.g. a wall) to find it in other photos"
+              aria-label="Search a region">🔲</button>
+      {% endif %}
     </div>
   </div>
 </div>
