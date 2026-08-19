@@ -120,8 +120,10 @@ def _write_temp(image_bytes, name):
 def _cleanup(path):
     try:
         os.unlink(path)
-    except OSError:
-        pass
+    except OSError as e:
+        # Surface rather than swallow — a persistent failure here means temp
+        # images (full-size decoded frames) are piling up in the temp dir.
+        print(f"[worker] WARNING: could not remove temp file {path}: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -261,11 +263,14 @@ def handle_detect_objects(path, data, request_id, link_id, remote_identity, requ
         vocab = req.get("vocab")
         tmp = _write_temp(req["image"], name)
         # Hold the lock across set_vocab + detect so a concurrent request can't
-        # swap the shared detector's vocabulary between the two calls.
+        # swap the shared detector's vocabulary between the two calls. The detector
+        # is a shared singleton, so ALWAYS set the vocab for this request — falling
+        # back to the default when the caller sent none, rather than silently reusing
+        # whatever the previous request left on it.
+        from .detector import DEFAULT_VOCAB
         with models.lock:
             det = models.get_object_detector()
-            if vocab:
-                det.set_vocab(vocab)
+            det.set_vocab(vocab if vocab else list(DEFAULT_VOCAB))
             res = det.detect_images([tmp])
         _, detections, error = res[0]
         out = [[d[0], float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])]

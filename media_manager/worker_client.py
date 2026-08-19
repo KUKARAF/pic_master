@@ -48,6 +48,11 @@ _PATH_TIMEOUT = 8.0
 _LINK_TIMEOUT = 8.0
 _POLL_INTERVAL = 0.1
 _AVAIL_TTL = 15.0
+# The availability probe (is_available) uses much shorter timeouts than a real
+# request: it is a liveness check, often driven by a UI poll, and must degrade
+# fast when the worker is configured-but-down instead of stalling a web request.
+_PROBE_TIMEOUT = 3.0
+_PROBE_PING_TIMEOUT = 4.0
 
 
 def _warn(msg: str) -> None:
@@ -77,6 +82,11 @@ class WorkerClient:
         self._avail_expiry = 0.0
         self._connected = False
 
+        # Config cache (address/enabled). worker.json is read through here so a
+        # per-item call like record() doesn't re-open+parse the file every image.
+        self._cfg_cache = None
+        self._cfg_expiry = 0.0
+
         # Activity ring buffer for the web status endpoint. Monotonic id counter.
         self._activity = collections.deque(maxlen=100)
         self._activity_counter = 0
@@ -96,16 +106,16 @@ class WorkerClient:
                 self.reticulum = RNS.Reticulum.get_instance() or RNS.Reticulum(None)
         return self.reticulum
 
-    def _ensure_link(self, address: str):
+    def _ensure_link(self, address, path_timeout=_PATH_TIMEOUT, link_timeout=_LINK_TIMEOUT):
         """Return an ACTIVE link to the worker, (re)establishing it if needed.
 
         Must be called with an initialised RNS. Guarded by ``self._lock`` — callers
         that already hold the lock (like :meth:`request`) invoke ``_ensure_link_locked``.
         """
         with self._lock:
-            return self._ensure_link_locked(address)
+            return self._ensure_link_locked(address, path_timeout, link_timeout)
 
-    def _ensure_link_locked(self, address: str):
+    def _ensure_link_locked(self, address, path_timeout=_PATH_TIMEOUT, link_timeout=_LINK_TIMEOUT):
         """Link establishment core; assumes ``self._lock`` is already held."""
         if self._link is not None and self._link.status == RNS.Link.ACTIVE:
             return self._link
@@ -115,11 +125,11 @@ class WorkerClient:
         # Ensure we know a network path to the destination.
         if not RNS.Transport.has_path(dest_hash):
             RNS.Transport.request_path(dest_hash)
-            deadline = time.time() + _PATH_TIMEOUT
+            deadline = time.time() + path_timeout
             while not RNS.Transport.has_path(dest_hash):
                 if time.time() > deadline:
                     raise WorkerUnavailable(
-                        f"no path to worker {address[:8]} after {_PATH_TIMEOUT}s")
+                        f"no path to worker {address[:8]} after {path_timeout}s")
                 time.sleep(_POLL_INTERVAL)
 
         server_identity = RNS.Identity.recall(dest_hash)
@@ -136,16 +146,27 @@ class WorkerClient:
         )
 
         link = RNS.Link(dest)
-        deadline = time.time() + _LINK_TIMEOUT
+        deadline = time.time() + link_timeout
         while link.status != RNS.Link.ACTIVE:
             if time.time() > deadline:
                 raise WorkerUnavailable(
-                    f"link to worker {address[:8]} not active after {_LINK_TIMEOUT}s "
+                    f"link to worker {address[:8]} not active after {link_timeout}s "
                     f"(status={link.status})")
             time.sleep(_POLL_INTERVAL)
 
         self._link = link
         return link
+
+    def _load_cfg(self):
+        """Return the worker config (address/enabled), cached for ~_AVAIL_TTL so a
+        per-item caller (record/address) doesn't re-read+parse worker.json each time."""
+        now = time.time()
+        if self._cfg_cache is not None and now < self._cfg_expiry:
+            return self._cfg_cache
+        cfg = worker_config.load(self.data_root)
+        self._cfg_cache = cfg
+        self._cfg_expiry = now + _AVAIL_TTL
+        return cfg
 
     # -- Request dispatch ---------------------------------------------------
 
@@ -211,14 +232,23 @@ class WorkerClient:
         if self._avail is not None and now < self._avail_expiry:
             return self._avail
 
-        cfg = worker_config.load(self.data_root)
+        cfg = self._load_cfg()
         if not cfg.get("enabled") or not cfg.get("address"):
             result = False
+        elif not self._lock.acquire(blocking=False):
+            # A request is in flight (the lock is held) — the worker is actively
+            # reachable. Don't block this caller (often a UI status poll) behind a
+            # long ML request; serve the last-known value and refresh next time.
+            return self._avail if self._avail is not None else True
         else:
+            self._lock.release()  # was only probing for contention
             try:
                 self._ensure_rns()
-                self._ensure_link(cfg["address"])
-                resp = self.request(worker_protocol.PATH_PING, {}, timeout=8)
+                # Short timeouts: a liveness probe must fail fast when the worker
+                # is down rather than stalling the caller for the full request budget.
+                self._ensure_link(cfg["address"],
+                                  path_timeout=_PROBE_TIMEOUT, link_timeout=_PROBE_TIMEOUT)
+                resp = self.request(worker_protocol.PATH_PING, {}, timeout=_PROBE_PING_TIMEOUT)
                 result = resp.get("ok") is True
             except Exception as exc:
                 _warn(f"availability check failed: {exc}")
@@ -250,7 +280,7 @@ class WorkerClient:
 
     def address(self):
         """Return the configured worker address string, or None."""
-        return worker_config.load(self.data_root).get("address")
+        return self._load_cfg().get("address")
 
     def connected(self) -> bool:
         """Return the result of the last availability check."""
@@ -285,6 +315,9 @@ class RemoteFaceDetector:
     def __init__(self, client: WorkerClient):
         self.client = client
         self._local = None
+        # Callers (e.g. web.py detect-faces) read `detector._model_name` to compute
+        # the DB model_id. The worker always runs the default buffalo_l, so mirror it.
+        self._model_name = 'buffalo_l'
 
     def _local_model(self):
         if self._local is None:
@@ -326,6 +359,11 @@ class RemoteFaceDetector:
                 {"name": "<crop>", "image": image_bytes,
                  "bbox": [float(v) for v in bbox], "pad_ratio": float(pad_ratio)},
             )
+            # A worker-side per-item error returns embedding=None; route it through
+            # the local fallback (which always yields a usable embedding) instead of
+            # crashing on np.frombuffer(None).
+            if resp.get("error") or resp.get("embedding") is None:
+                raise WorkerError(resp.get("error") or "embed_bbox returned no embedding")
             return {
                 "bbox": resp["bbox"],
                 "embedding": np.frombuffer(resp["embedding"], dtype=np.float32),
@@ -387,7 +425,7 @@ class RemoteCLIPIndexer:
         if vectors:
             embeddings = np.stack(vectors).astype(np.float32)
         else:
-            embeddings = np.empty((0, 0), dtype=np.float32)
+            embeddings = np.empty((0,), dtype=np.float32)  # match CLIPIndexer.embed_images
         return embeddings, failed
 
     def embed_pil_images(self, images):

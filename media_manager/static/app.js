@@ -500,12 +500,23 @@
       }
     }
 
+    var lastPollErr = null;
     function poll() {
       var url = '/api/worker/status' + (seeded ? '?since=' + since : '');
       fetch(url)
         .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
-        .then(function (data) { render(data); handleRecent(data.recent); })
-        .catch(function () { /* older/erroring backend — skip this cycle silently */ });
+        .then(function (data) { lastPollErr = null; render(data); handleRecent(data.recent); })
+        .catch(function (e) {
+          // 404 = older backend without the endpoint (expected, stay quiet). Any
+          // other error (e.g. a 500 from the backend raising on a corrupt
+          // worker.json) is real — surface it once per distinct message rather
+          // than swallowing it, but don't spam the console every 5s.
+          var msg = e && e.message ? e.message : String(e);
+          if (msg.indexOf('404') === -1 && msg !== lastPollErr) {
+            lastPollErr = msg;
+            if (window.console && console.warn) console.warn('worker status poll failed:', msg);
+          }
+        });
     }
 
     poll();

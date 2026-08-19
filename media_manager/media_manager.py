@@ -232,12 +232,20 @@ class MediaManager:
         client = self._worker()
         if client.is_available():
             from . import worker_client
+            # The worker runs a fixed model_size='s' @ conf 0.15; it does not honor
+            # per-request model_size/conf_threshold. Warn loudly if the caller asked
+            # for something else, and record the model_id the worker ACTUALLY used
+            # (not the requested one) so the DB isn't mislabeled.
+            if model_size != 's' or conf_threshold != 0.15:
+                print(f"[media] WARNING: remote worker runs YOLO-World 's' @ conf 0.15; "
+                      f"requested model_size={model_size} conf_threshold={conf_threshold} ignored")
             print("[media] offloading object detection to remote worker")
             detector = worker_client.RemoteYOLODetector(
                 client, model_size=model_size, conf_threshold=conf_threshold, vocab=vocab)
+            model_id = YOLOWorldDetector.model_id('s')
         else:
             detector = YOLOWorldDetector(model_size=model_size, conf_threshold=conf_threshold, vocab=vocab)
-        model_id = YOLOWorldDetector.model_id(model_size)
+            model_id = YOLOWorldDetector.model_id(model_size)
 
         undetected = self.db.get_undetected_files(limit=None)
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
@@ -286,11 +294,18 @@ class MediaManager:
         client = self._worker()
         if client.is_available():
             from . import worker_client
+            # The worker runs the default CLIPIndexer (ViT-B-32/openai) and ignores a
+            # requested model_name/pretrained. Warn and record the worker's actual
+            # model_id so embeddings aren't stored under a model tag they don't match.
+            if model_name != 'ViT-B-32' or pretrained != 'openai':
+                print(f"[media] WARNING: remote worker runs CLIP ViT-B-32/openai; "
+                      f"requested model_name={model_name} pretrained={pretrained} ignored")
             print("[media] offloading CLIP embedding to remote worker")
             indexer = worker_client.RemoteCLIPIndexer(client)
+            model_id = CLIPIndexer.model_id()
         else:
             indexer = CLIPIndexer(model_name=model_name, pretrained=pretrained)
-        model_id = CLIPIndexer.model_id(model_name, pretrained)
+            model_id = CLIPIndexer.model_id(model_name, pretrained)
 
         unindexed = self.db.get_unindexed_files(limit=None)
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
@@ -459,11 +474,18 @@ class MediaManager:
         client = self._worker()
         if client.is_available():
             from . import worker_client
+            # The worker runs the default FaceDetector (buffalo_l @ det_thresh 0.5) and
+            # ignores per-request model_name/det_thresh. Warn and record the worker's
+            # actual model_id so faces aren't mislabeled in the DB.
+            if model_name != 'buffalo_l' or det_thresh != 0.5:
+                print(f"[media] WARNING: remote worker runs InsightFace buffalo_l @ 0.5; "
+                      f"requested model_name={model_name} det_thresh={det_thresh} ignored")
             print("[media] offloading face detection to remote worker")
             detector = worker_client.RemoteFaceDetector(client)
+            model_id = FaceDetector.model_id('buffalo_l')
         else:
             detector = FaceDetector(model_name=model_name, det_thresh=det_thresh)
-        model_id = FaceDetector.model_id(model_name)
+            model_id = FaceDetector.model_id(model_name)
 
         unindexed = self.db.get_unface_indexed_files(limit=None)
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
