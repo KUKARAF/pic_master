@@ -280,6 +280,24 @@ def main():
                               'independently loads ML models (CLIP/YOLO-World), so higher counts '
                               'cost more RAM; pass 1 to keep today\'s single-process behavior.')
 
+    worker_cmd = sub.add_parser('worker',
+                                help='Run the Reticulum media worker server (heavy ML offload target)')
+    worker_cmd.add_argument('--identity-file', default=None,
+                            help='Path to the RNS identity file (default: '
+                                 '~/.config/media_manager/worker_identity)')
+    worker_cmd.add_argument('--config-dir', default=None,
+                            help='RNS config directory (default: RNS default)')
+    worker_cmd.add_argument('--announce-interval', type=int, default=300,
+                            help='Seconds between destination announces (default: 300)')
+    worker_cmd.add_argument('--preload', action='store_true',
+                            help='Load all ML models up front instead of lazily on first request')
+
+    worker_connect_cmd = sub.add_parser('worker-connect',
+                                        help='Point this host at a media worker to offload heavy ML')
+    worker_connect_cmd.add_argument('address', help='Worker RNS destination hash (hex)')
+    worker_connect_cmd.add_argument('--disable', action='store_true',
+                                    help='Save the address but leave offloading disabled')
+
     args = parser.parse_args()
 
     # strict-check helper
@@ -704,6 +722,24 @@ def main():
                         host=host, port=args.port, workers=args.workers, **ssl_kwargs)
         else:
             uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
+        return 0
+
+    elif args.cmd == 'worker':
+        from .worker_server import run as worker_run
+        worker_run(identity_file=args.identity_file, config_dir=args.config_dir,
+                   announce_interval=args.announce_interval, preload=args.preload)
+        return 0
+
+    elif args.cmd == 'worker-connect':
+        from . import worker_config
+        # Validate the address is well-formed before saving (raises loudly on
+        # bad input — no silent acceptance of a garbage hash).
+        worker_config.address_hash_bytes(args.address)
+        from .media_manager import MediaManager
+        m = MediaManager()
+        path = worker_config.save(m.data_root, args.address, enabled=not args.disable)
+        state = 'disabled' if args.disable else 'enabled'
+        print(f"Saved worker config to {path} (address={args.address}, offloading {state})")
         return 0
 
     else:

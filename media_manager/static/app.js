@@ -435,6 +435,83 @@
 
   loadWarnings();
 
+  /* ------------------------------------------------------------------ */
+  /* Media worker status — nav badge + "outsourced" toasts.              */
+  /* Polls /api/worker/status every 5s. `since` tracks the max recent    */
+  /* task id we've toasted so we only toast NEW dispatches; the first    */
+  /* successful load seeds `since` from the backlog WITHOUT toasting.    */
+  /* A failed fetch (older backend / transient) just skips the cycle.    */
+  /* ------------------------------------------------------------------ */
+  (function initWorkerStatus() {
+    var badge = document.getElementById('worker-badge');
+    if (!badge) return;
+    var label = badge.querySelector('.worker-label');
+    var since = 0;      // max recent id we've accounted for
+    var seeded = false; // set on the first successful poll
+    var OP_LABELS = {
+      detect_faces: 'face match',
+      embed_bbox: 'face embed',
+      embed_image: 'CLIP embed',
+      embed_text: 'text embed',
+      detect_objects: 'object detect',
+    };
+
+    function setBadge(cls, text, title) {
+      badge.className = 'worker-badge ' + cls;
+      label.textContent = text;
+      badge.title = title || '';
+      badge.style.display = 'inline-flex';
+    }
+
+    function render(data) {
+      if (!data.enabled) {         // no worker configured — stay out of the way
+        badge.style.display = 'none';
+        return;
+      }
+      var addr = data.address ? String(data.address).slice(0, 8) : '';
+      if (data.connected) {
+        setBadge('is-online', 'Worker ✓', addr ? 'Worker ' + addr : 'Worker connected');
+      } else {
+        setBadge('is-offline', 'Worker offline',
+                 addr ? 'Worker ' + addr + ' (unreachable)' : 'Worker unreachable');
+      }
+    }
+
+    function handleRecent(recent) {
+      // Seed on the FIRST successful poll — even when the buffer is empty — so
+      // the first real dispatch after page load toasts instead of being
+      // swallowed as backlog.
+      if (!seeded) {
+        (recent || []).forEach(function (t) { if (t.id > since) since = t.id; });
+        seeded = true;
+        return;
+      }
+      if (!recent || !recent.length) return;
+      var fresh = recent.filter(function (t) { return t.id > since; });
+      recent.forEach(function (t) { if (t.id > since) since = t.id; });
+      if (!fresh.length) return;
+      if (fresh.length > 3) {
+        window.showToast('Outsourced ' + fresh.length + ' tasks to worker', 'info');
+      } else {
+        fresh.forEach(function (t) {
+          var op = OP_LABELS[t.op] || t.op;
+          window.showToast('Outsourced ' + op + ' → ' + t.name, 'info');
+        });
+      }
+    }
+
+    function poll() {
+      var url = '/api/worker/status' + (seeded ? '?since=' + since : '');
+      fetch(url)
+        .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
+        .then(function (data) { render(data); handleRecent(data.recent); })
+        .catch(function () { /* older/erroring backend — skip this cycle silently */ });
+    }
+
+    poll();
+    setInterval(poll, 5000);
+  })();
+
   /* Shared "pick or create a set" flow — keyboard-first, same shape everywhere it's
      used (photo page's "Add to set", the search page's bulk "Add to set"): one big
      autofocused input backed by a native <datalist> of existing sets; Enter either

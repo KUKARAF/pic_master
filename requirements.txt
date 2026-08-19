@@ -12,3 +12,5 @@ insightface
 onnxruntime
 open_clip_torch
 torch
+# Reticulum stack for the `media worker` remote-offload feature (worker_*.py)
+rns

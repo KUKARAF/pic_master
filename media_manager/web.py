@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
-from media_manager import frames
+from media_manager import frames, worker_client, worker_config
 from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
 from media_manager.category_resolver import (
     get_category_counts,
@@ -234,37 +234,67 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
         return False, str(exc)
 
 
-_face_detector = None
+# Remote-worker offload. `_worker_client` is set by create_app() to the
+# process-global WorkerClient for this data_root; it stays None on code paths that
+# never build an app (getters then behave exactly as before — local only). Each
+# getter caches the LOCAL model and the REMOTE proxy SEPARATELY and picks per call
+# via _worker_client.is_available() (TTL-cached ~15s), so toggling the worker on/off
+# at runtime routes subsequent calls without rebuilding either side.
+_worker_client = None
+
+_face_detector_local = None
+_face_detector_remote = None
 
 
 def _get_face_detector():
-    global _face_detector
-    if _face_detector is None:
+    global _face_detector_local, _face_detector_remote
+    if _worker_client is not None and _worker_client.is_available():
+        if _face_detector_remote is None:
+            _face_detector_remote = worker_client.RemoteFaceDetector(_worker_client)
+        return _face_detector_remote
+    if _face_detector_local is None:
         from media_manager.face_detector import FaceDetector
-        _face_detector = FaceDetector()
-    return _face_detector
+        _face_detector_local = FaceDetector()
+    return _face_detector_local
 
 
-_object_detector = None
+_object_detector_local = None
+_object_detector_remote = None
 
 
 def _get_object_detector():
-    global _object_detector
-    if _object_detector is None:
+    # Local YOLOWorldDetector() defaults its vocab to detector.DEFAULT_VOCAB; build
+    # the remote proxy with the SAME default so it is never left with vocab=None.
+    # Callers that need a different vocab (reindex, body_index person-only pass) call
+    # .set_vocab(...) after getting it — the proxy stores + forwards that, same as
+    # the local model.
+    global _object_detector_local, _object_detector_remote
+    if _worker_client is not None and _worker_client.is_available():
+        if _object_detector_remote is None:
+            from media_manager.detector import DEFAULT_VOCAB
+            _object_detector_remote = worker_client.RemoteYOLODetector(
+                _worker_client, vocab=list(DEFAULT_VOCAB))
+        return _object_detector_remote
+    if _object_detector_local is None:
         from media_manager.detector import YOLOWorldDetector
-        _object_detector = YOLOWorldDetector()
-    return _object_detector
+        _object_detector_local = YOLOWorldDetector()
+    return _object_detector_local
 
 
-_clip_indexer = None
+_clip_indexer_local = None
+_clip_indexer_remote = None
 
 
 def _get_clip_indexer():
-    global _clip_indexer
-    if _clip_indexer is None:
+    global _clip_indexer_local, _clip_indexer_remote
+    if _worker_client is not None and _worker_client.is_available():
+        if _clip_indexer_remote is None:
+            _clip_indexer_remote = worker_client.RemoteCLIPIndexer(_worker_client)
+        return _clip_indexer_remote
+    if _clip_indexer_local is None:
         from media_manager.indexer import CLIPIndexer
-        _clip_indexer = CLIPIndexer()
-    return _clip_indexer
+        _clip_indexer_local = CLIPIndexer()
+    return _clip_indexer_local
 
 
 _age_estimator = None
@@ -340,6 +370,13 @@ def create_app(data_root: str) -> FastAPI:
     """Create and return the FastAPI application rooted at data_root."""
     data_root = os.path.abspath(data_root)
     media_dir = os.path.join(data_root, '.media')
+
+    # Wire the process-global worker client for this data_root so the model getters
+    # can offload to a remote worker when one is configured + reachable. Cheap: no
+    # RNS init and no network until is_available() is first called (and that pays
+    # nothing when no worker is configured).
+    global _worker_client
+    _worker_client = worker_client.get_client(data_root)
 
     if not os.path.isdir(media_dir):
         raise RuntimeError(
@@ -4470,6 +4507,19 @@ def create_app(data_root: str) -> FastAPI:
     def api_mark_all_errors_read():
         errors.mark_all_read()
         return {'ok': True}
+
+    @app.get('/api/worker/status')
+    def worker_status(since: int = 0):
+        client = _worker_client
+        if client is None:
+            return {'enabled': False, 'connected': False, 'address': None, 'recent': []}
+        cfg = worker_config.load(data_root)
+        return {
+            'enabled': bool(cfg.get('enabled') and cfg.get('address')),
+            'connected': client.is_available(),
+            'address': cfg.get('address'),
+            'recent': client.recent(since_id=since),
+        }
 
     @app.on_event('shutdown')
     def _close_databases():

@@ -27,6 +27,13 @@
     <button type="submit">Search</button>
   </form>
 
+  <!-- Media worker status: green ✓ when a worker is reachable, red when
+       configured-but-offline, hidden when no worker is enabled. Populated by
+       app.js polling /api/worker/status. -->
+  <span id="worker-badge" class="worker-badge" style="display:none;" title="">
+    <span class="worker-dot"></span><span class="worker-label">Worker</span>
+  </span>
+
   <div style="position:relative;">
     <button class="nav-tags-btn" id="warn-dropdown-btn" type="button">
       ⚠️<span id="warn-badge" class="warn-badge" style="display:none;">0</span>
