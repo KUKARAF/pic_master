@@ -43,6 +43,13 @@ class MediaManager:
         os.makedirs(media_dir, exist_ok=True)
         return os.getcwd()
 
+    def _worker(self):
+        """Return the process WorkerClient for this data_root. is_available() on it
+        is TTL-cached and returns False cheaply when no worker is configured (no RNS
+        init), so calling this per batch method is free when nothing is offloaded."""
+        from . import worker_client
+        return worker_client.get_client(self.data_root)
+
     def start_scan(self, path, recursive=True, reindex=False):
         """
         Scan a directory: find candidates, hash them (content is the file's identity —
@@ -222,7 +229,14 @@ class MediaManager:
         vocab_path = os.path.join(self.data_root, '.media', 'search_terms.txt')
         base_vocab = load_vocab_from_file(vocab_path)
         vocab = merge_vocab(base_vocab, self.manual.get_all_positive_labels())
-        detector = YOLOWorldDetector(model_size=model_size, conf_threshold=conf_threshold, vocab=vocab)
+        client = self._worker()
+        if client.is_available():
+            from . import worker_client
+            print("[media] offloading object detection to remote worker")
+            detector = worker_client.RemoteYOLODetector(
+                client, model_size=model_size, conf_threshold=conf_threshold, vocab=vocab)
+        else:
+            detector = YOLOWorldDetector(model_size=model_size, conf_threshold=conf_threshold, vocab=vocab)
         model_id = YOLOWorldDetector.model_id(model_size)
 
         undetected = self.db.get_undetected_files(limit=None)
@@ -269,7 +283,13 @@ class MediaManager:
         """
         from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
 
-        indexer = CLIPIndexer(model_name=model_name, pretrained=pretrained)
+        client = self._worker()
+        if client.is_available():
+            from . import worker_client
+            print("[media] offloading CLIP embedding to remote worker")
+            indexer = worker_client.RemoteCLIPIndexer(client)
+        else:
+            indexer = CLIPIndexer(model_name=model_name, pretrained=pretrained)
         model_id = CLIPIndexer.model_id(model_name, pretrained)
 
         unindexed = self.db.get_unindexed_files(limit=None)
@@ -391,8 +411,16 @@ class MediaManager:
         from .detector import YOLOWorldDetector
         from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
 
-        detector = YOLOWorldDetector(conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
-        clip_indexer = CLIPIndexer()
+        client = self._worker()
+        if client.is_available():
+            from . import worker_client
+            print("[media] offloading body indexing (person detection + CLIP) to remote worker")
+            detector = worker_client.RemoteYOLODetector(
+                client, conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
+            clip_indexer = worker_client.RemoteCLIPIndexer(client)
+        else:
+            detector = YOLOWorldDetector(conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
+            clip_indexer = CLIPIndexer()
 
         unindexed = self.db.get_unbody_indexed_files()
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
@@ -428,7 +456,13 @@ class MediaManager:
         """
         from .face_detector import FaceDetector, SUPPORTED_EXTENSIONS
 
-        detector = FaceDetector(model_name=model_name, det_thresh=det_thresh)
+        client = self._worker()
+        if client.is_available():
+            from . import worker_client
+            print("[media] offloading face detection to remote worker")
+            detector = worker_client.RemoteFaceDetector(client)
+        else:
+            detector = FaceDetector(model_name=model_name, det_thresh=det_thresh)
         model_id = FaceDetector.model_id(model_name)
 
         unindexed = self.db.get_unface_indexed_files(limit=None)

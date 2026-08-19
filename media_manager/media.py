@@ -735,7 +735,6 @@ def main():
         # Validate the address is well-formed before saving (raises loudly on
         # bad input — no silent acceptance of a garbage hash).
         worker_config.address_hash_bytes(args.address)
-        from .media_manager import MediaManager
         m = MediaManager()
         path = worker_config.save(m.data_root, args.address, enabled=not args.disable)
         state = 'disabled' if args.disable else 'enabled'
