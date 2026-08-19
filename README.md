@@ -85,9 +85,11 @@ low-RAM host (or one running the web UI with multiple workers) they can OOM. The
 the host offloads to it over [Reticulum](https://reticulum.network/) (RNS, an
 encrypted networking stack). When a worker is reachable, `media faces` /
 `media index` / `media embed` / `media bodies`, the web reindex/embed/face
-endpoints, and find-by-body all send their work to it — each dispatch is logged
-(`[worker] outsourced …`) and shown in the web UI's worker badge. If the worker
-is unreachable, the host transparently falls back to running locally.
+endpoints, find-by-body, **and per-tag classifier training** (the CLIP and
+YOLO-World "Train" buttons) all send their work to it — each dispatch is logged
+(`[worker] outsourced …`) and shown in the web UI's worker badge. For the
+*inference* offloads the host transparently falls back to running locally if the
+worker is unreachable; **training does not fall back** — see below.
 
 Only the *models* run remotely; your media files never need to live on the
 worker (images are streamed to it per request). Results come back as embeddings
@@ -168,6 +170,25 @@ offload to the worker. You can also set `MEDIA_WORKER_ADDR` /
 `MEDIA_WORKER_ENABLED` as environment variables instead of the file, and
 `media worker-connect <hash> --disable` saves the address but turns offloading
 off.
+
+### 5. Per-tag classifier training on the worker
+
+When a worker is configured, clicking **Train** on a tag trains its CLIP linear
+classifier and/or YOLO-World fine-tune **on the worker**, not the host — the
+host only gathers the tag's examples, downscales the images, and streams them
+over. Progress, logs, and cancel work exactly as with local training (the same
+metadata/status the UI already polls). Two things to know:
+
+- **The worker keeps its trained YOLO checkpoints** (under
+  `~/.cache/media_manager/tag_models/` on the worker) and also serves the
+  fine-tuned detection for the "find more" swipe, so the heavy YOLO model never
+  loads on the host. The small CLIP weights come back to the host. If the
+  worker's cache is wiped or the worker is replaced, a tag's YOLO suggestions
+  will report a missing model — just retrain it.
+- **No local fallback for training.** If the worker is configured but
+  unreachable, a Train click fails with a clear "worker unavailable" status
+  rather than falling back to training on the (low-RAM) host. Start the worker,
+  then retry.
 
 ## Project Structure
 

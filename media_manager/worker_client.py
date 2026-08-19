@@ -295,6 +295,66 @@ class WorkerClient:
         cfg = self._load_cfg()
         return bool(cfg.get("enabled") and cfg.get("address"))
 
+    # -- Per-tag training + fine-tuned inference ---------------------------
+    # These drive the worker's job/poll training protocol. Unlike the inference
+    # proxies they are called from the host-side driver subprocess
+    # (remote_tag_trainer.py) and, for tag_detect, from web.py's suggestion path.
+
+    def train_create(self, kind: str, tag: str, slug: str, epochs=None) -> str:
+        resp = self.request(
+            worker_protocol.PATH_TRAIN_CREATE,
+            {"kind": kind, "tag": tag, "slug": slug, "epochs": epochs},
+            timeout=30)
+        if resp.get("error") or not resp.get("job_id"):
+            raise WorkerError(resp.get("error") or "train_create returned no job_id")
+        return resp["job_id"]
+
+    def train_add(self, job_id: str, kind: str, batch: list) -> int:
+        # A batch of (downscaled) images can be a few MB — RNS ships it as a
+        # segmented Resource, so allow a generous upload window.
+        resp = self.request(
+            worker_protocol.PATH_TRAIN_ADD,
+            {"job_id": job_id, "kind": kind, "batch": batch},
+            timeout=600)
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        return resp.get("received", 0)
+
+    def train_run(self, job_id: str) -> None:
+        resp = self.request(worker_protocol.PATH_TRAIN_RUN, {"job_id": job_id}, timeout=30)
+        if resp.get("error") or not resp.get("ok"):
+            raise WorkerError(resp.get("error") or "train_run failed")
+
+    def train_status(self, job_id: str, want_artifact: bool = False) -> dict:
+        # retries=0: this is polled in a loop, so a transient blip is handled by
+        # the next poll rather than by an in-call retry that would double the wait.
+        return self.request(
+            worker_protocol.PATH_TRAIN_STATUS,
+            {"job_id": job_id, "want_artifact": want_artifact},
+            timeout=60, retries=0)
+
+    def train_cancel(self, job_id: str) -> None:
+        resp = self.request(worker_protocol.PATH_TRAIN_CANCEL, {"job_id": job_id}, timeout=30)
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+
+    def tag_detect(self, slug: str, image_bytes: bytes, name: str = "<image>", conf=None) -> list:
+        """Run a tag's fine-tuned YOLO checkpoint (kept on the worker) on one
+        image. Returns [(class_name, conf, x1, y1, x2, y2), ...] — same shape as
+        RemoteYOLODetector.detect_images per-image. Raises WorkerError if the
+        worker has no trained model for this slug (host surfaces "retrain")."""
+        self.record("tag_detect", name)
+        resp = self.request(
+            worker_protocol.PATH_TAG_DETECT,
+            {"slug": slug, "kind": "yolo_model", "name": name,
+             "image": image_bytes, "conf": conf})
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        out = []
+        for d in (resp.get("detections") or []):
+            out.append((d[0], float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])))
+        return out
+
     # -- Activity / introspection ------------------------------------------
 
     def record(self, op: str, name: str) -> None:

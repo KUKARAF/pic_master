@@ -26,6 +26,58 @@ MIN_BOXES = 10
 EPOCHS = 30
 
 
+class TrainingCancelled(Exception):
+    """Raised inside the epoch callback to abort an in-progress ultralytics run
+    (used by the remote worker's cancel path; the local trainer passes no
+    cancel_cb, so it never fires there)."""
+
+
+def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None, cancel_cb=None):
+    """Run the ultralytics YOLO-World fine-tune over a PREBUILT dataset dir
+    (images/{train,val} + labels/{train,val}, referenced by data_yaml_path),
+    copy the resulting best.pt into out_dir, and return
+    ``{'held_out_map': float|None, 'best_path': str}``.
+
+    Shared verbatim by the local subprocess trainer and the remote worker so the
+    training logic exists once. ``progress_cb(current_epoch, total_epochs)`` is
+    called at each epoch end; ``cancel_cb() -> bool``, when it returns True,
+    aborts the run (raises :class:`TrainingCancelled`). Both are optional — the
+    local trainer passes only progress_cb."""
+    from media_manager.detector import WEIGHTS_DIR
+    from ultralytics import YOLOWorld
+
+    os.makedirs(out_dir, exist_ok=True)
+    base_weights = os.path.join(WEIGHTS_DIR, 'yolov8s-worldv2.pt')
+    model = YOLOWorld(base_weights)
+
+    # trainer.epoch is 0-indexed, hence the +1. The cancel check runs at each
+    # epoch boundary — ultralytics has no finer cooperative-stop hook, so a
+    # cancel takes effect at the next epoch end (a known, documented wrinkle).
+    def _on_epoch_end(trainer):
+        if cancel_cb is not None and cancel_cb():
+            raise TrainingCancelled('training cancelled')
+        if progress_cb is not None:
+            progress_cb(trainer.epoch + 1, epochs)
+    model.add_callback('on_train_epoch_end', _on_epoch_end)
+
+    results = model.train(data=data_yaml_path, epochs=epochs, imgsz=640,
+                          project=out_dir, name='run', exist_ok=True)
+
+    run_dir = getattr(results, 'save_dir', os.path.join(out_dir, 'run'))
+    best_src = os.path.join(run_dir, 'weights', 'best.pt')
+    best_dst = os.path.join(out_dir, 'best.pt')
+    if not os.path.isfile(best_src):
+        raise RuntimeError(f'Training finished but no checkpoint was produced at {best_src}.')
+    shutil.copyfile(best_src, best_dst)
+
+    held_out_map = None
+    try:
+        held_out_map = float(results.results_dict.get('metrics/mAP50-95(B)'))
+    except Exception:
+        pass  # metric extraction is best-effort — a missing/renamed key shouldn't fail an otherwise-successful run
+    return {'held_out_map': held_out_map, 'best_path': best_dst}
+
+
 def train_for_tag(data_root, tag_label):
     """Core trainable entry point. Never raises: any failure is caught and
     recorded in metadata.json as status='failed' — see clip_tag_classifier's
@@ -47,7 +99,6 @@ def train_for_tag(data_root, tag_label):
 def _train(data_root, tag_label, out_dir, pid, started_at):
     from media_manager.database import Database
     from media_manager.manual_db import ManualDB
-    from media_manager.detector import WEIGHTS_DIR
 
     data_root = os.path.abspath(data_root)
     media_dir = os.path.join(data_root, '.media')
@@ -143,40 +194,20 @@ def _train(data_root, tag_label, out_dir, pid, started_at):
             f"nc: 1\nnames: ['{tag_label}']\n"
         )
 
-    from ultralytics import YOLOWorld
-
-    base_weights = os.path.join(WEIGHTS_DIR, 'yolov8s-worldv2.pt')
-    model = YOLOWorld(base_weights)
-
-    # Surfaces real progress (not just "running" + elapsed time) for a job
-    # that can take minutes — trainer.epoch is 0-indexed, hence the +1.
-    # Re-supplies pid/started_at on every write since write_status overwrites
-    # the whole file rather than merging.
-    def _on_epoch_end(trainer):
+    # Surfaces real progress (not just "running" + elapsed time) for a job that
+    # can take minutes. Re-supplies pid/started_at on every write since
+    # write_status overwrites the whole file rather than merging.
+    def _progress(current_epoch, total_epochs):
         write_status(
             out_dir, status='running', pid=pid, started_at=started_at,
-            current_epoch=trainer.epoch + 1, total_epochs=EPOCHS,
+            current_epoch=current_epoch, total_epochs=total_epochs,
         )
-    model.add_callback('on_train_epoch_end', _on_epoch_end)
 
-    results = model.train(data=data_yaml_path, epochs=EPOCHS, imgsz=640, project=out_dir, name='run', exist_ok=True)
-
-    run_dir = getattr(results, 'save_dir', os.path.join(out_dir, 'run'))
-    best_src = os.path.join(run_dir, 'weights', 'best.pt')
-    best_dst = os.path.join(out_dir, 'best.pt')
-    if not os.path.isfile(best_src):
-        raise RuntimeError(f'Training finished but no checkpoint was produced at {best_src}.')
-    shutil.copyfile(best_src, best_dst)
-
-    held_out_map = None
-    try:
-        held_out_map = float(results.results_dict.get('metrics/mAP50-95(B)'))
-    except Exception:
-        pass  # metric extraction is best-effort — a missing/renamed key shouldn't fail an otherwise-successful run
+    res = train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=_progress)
 
     write_status(
         out_dir, status='done', trained_at=int(time.time()),
-        n_boxes=len(rows), n_images=len(examples), held_out_map=held_out_map,
+        n_boxes=len(rows), n_images=len(examples), held_out_map=res['held_out_map'],
         checkpoint='best.pt',
     )
     shutil.rmtree(scratch_dir, ignore_errors=True)

@@ -120,44 +120,7 @@ def _train(data_root, tag_label, out_dir):
 
     X = np.stack(xs).astype(np.float32)
     y = np.array(ys, dtype=np.float32)
-
-    # Stratified 80/20 split so both classes appear in the held-out set —
-    # a plain random split can accidentally put all of one tiny class into
-    # training only, making the reported accuracy meaningless. Falls back to
-    # 5-fold CV (averaged accuracy) when there's too little data for a clean
-    # single split to mean anything.
-    rng = np.random.default_rng(0)
-    pos_idx = rng.permutation(np.where(y == 1.0)[0])
-    neg_idx = rng.permutation(np.where(y == 0.0)[0])
-
-    if len(pos_idx) >= 10 and len(neg_idx) >= 10:
-        pos_split = max(1, int(len(pos_idx) * 0.2))
-        neg_split = max(1, int(len(neg_idx) * 0.2))
-        val_idx = np.concatenate([pos_idx[:pos_split], neg_idx[:neg_split]])
-        train_idx = np.concatenate([pos_idx[pos_split:], neg_idx[neg_split:]])
-        held_out_w, held_out_b = _fit_logistic(X[train_idx], y[train_idx])
-        cv_accuracy = _accuracy(X[val_idx], y[val_idx], held_out_w, held_out_b)
-        # The held-out split model is only for measuring cv_accuracy — the
-        # artifact actually saved is retrained on every example, so the 20%
-        # held out for evaluation isn't simply thrown away in the deployed model.
-        w, b = _fit_logistic(X, y)
-    else:
-        # 5-fold (or fewer, if a class is smaller than 5) CV accuracy, then a
-        # final model trained on everything for the artifact that actually
-        # gets saved.
-        k = min(5, len(pos_idx), len(neg_idx))
-        pos_folds = np.array_split(pos_idx, k)
-        neg_folds = np.array_split(neg_idx, k)
-        accuracies = []
-        for i in range(k):
-            val_idx = np.concatenate([pos_folds[i], neg_folds[i]])
-            train_idx = np.concatenate(
-                [f for j, f in enumerate(pos_folds) if j != i] + [f for j, f in enumerate(neg_folds) if j != i]
-            )
-            fw, fb = _fit_logistic(X[train_idx], y[train_idx])
-            accuracies.append(_accuracy(X[val_idx], y[val_idx], fw, fb))
-        cv_accuracy = float(np.mean(accuracies))
-        w, b = _fit_logistic(X, y)
+    w, b, cv_accuracy = fit_from_examples(X, y)
 
     np.savez(os.path.join(out_dir, 'weights.npz'), w=w, b=np.float32(b), embedding_model='ViT-B-32/openai')
     write_status(
@@ -207,6 +170,51 @@ def _add_region_examples(db, data_root, region_rows, xs, ys):
         xs.append(emb.astype(np.float32))
         ys.append(label)
     return len(crops), n_skipped
+
+
+def fit_from_examples(X, y):
+    """Train the per-tag logistic model from stacked embeddings ``X`` [N, D] and
+    labels ``y`` [N] (1.0 positive / 0.0 negative). Returns ``(w, b, cv_accuracy)``.
+    Shared verbatim by the local subprocess trainer and the remote worker so the
+    fit/evaluation logic lives once.
+
+    Stratified 80/20 split so both classes appear in the held-out set — a plain
+    random split can accidentally put all of one tiny class into training only,
+    making the reported accuracy meaningless. Falls back to 5-fold CV (averaged
+    accuracy) when there's too little data for a clean single split. The
+    cv_accuracy model is only for measuring; the returned (w, b) is always
+    retrained on every example so the 20% held out for evaluation isn't thrown
+    away in the deployed artifact."""
+    rng = np.random.default_rng(0)
+    pos_idx = rng.permutation(np.where(y == 1.0)[0])
+    neg_idx = rng.permutation(np.where(y == 0.0)[0])
+
+    if len(pos_idx) >= 10 and len(neg_idx) >= 10:
+        pos_split = max(1, int(len(pos_idx) * 0.2))
+        neg_split = max(1, int(len(neg_idx) * 0.2))
+        val_idx = np.concatenate([pos_idx[:pos_split], neg_idx[:neg_split]])
+        train_idx = np.concatenate([pos_idx[pos_split:], neg_idx[neg_split:]])
+        held_out_w, held_out_b = _fit_logistic(X[train_idx], y[train_idx])
+        cv_accuracy = _accuracy(X[val_idx], y[val_idx], held_out_w, held_out_b)
+        w, b = _fit_logistic(X, y)
+    else:
+        # 5-fold (or fewer, if a class is smaller than 5) CV accuracy, then a
+        # final model trained on everything for the artifact that gets saved.
+        k = min(5, len(pos_idx), len(neg_idx))
+        pos_folds = np.array_split(pos_idx, k)
+        neg_folds = np.array_split(neg_idx, k)
+        accuracies = []
+        for i in range(k):
+            val_idx = np.concatenate([pos_folds[i], neg_folds[i]])
+            train_idx = np.concatenate(
+                [f for j, f in enumerate(pos_folds) if j != i] + [f for j, f in enumerate(neg_folds) if j != i]
+            )
+            fw, fb = _fit_logistic(X[train_idx], y[train_idx])
+            accuracies.append(_accuracy(X[val_idx], y[val_idx], fw, fb))
+        cv_accuracy = float(np.mean(accuracies))
+        w, b = _fit_logistic(X, y)
+
+    return w, b, cv_accuracy
 
 
 def _fit_logistic(X, y, epochs=200, lr=0.01):

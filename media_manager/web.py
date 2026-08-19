@@ -2162,6 +2162,10 @@ def create_app(data_root: str) -> FastAPI:
     # call. Bounded so a real library doesn't turn one fetch into hundreds of
     # sequential/batched model calls (see _next_tag_suggestions_by_model).
     YOLO_CANDIDATE_SAMPLE_SIZE = 60
+    # When the fine-tuned checkpoint lives on the worker, each detection is a
+    # separate RNS round-trip shipping an image (not one batched local predict),
+    # so scan far fewer per fetch — repeated refills still cover the library.
+    WORKER_YOLO_SAMPLE_SIZE = 8
 
     def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None):
         """Rank not-yet-decided files against the centroid of files already
@@ -2363,10 +2367,18 @@ def create_app(data_root: str) -> FastAPI:
         out_dir = classifier_dir(data_root, label, kind)
         os.makedirs(out_dir, exist_ok=True)
         write_status(out_dir, status='running', pid=None, started_at=int(time.time()))
-        subprocess.Popen(
-            [sys.executable, '-m', module_name, '--data-root', data_root, '--tag', label],
-            start_new_session=True,
-        )
+        # When a worker is configured, offload the heavy training: launch the
+        # remote_tag_trainer driver (ships the data to the worker, polls it)
+        # instead of the local trainer, passing --kind so one driver handles
+        # both. The driver honours the same metadata.json/train.log/pid contract,
+        # so the status/log/cancel routes below are unchanged.
+        if _worker_client is not None and _worker_client.is_configured():
+            argv = [sys.executable, '-m', 'media_manager.remote_tag_trainer',
+                    '--data-root', data_root, '--tag', label, '--kind', kind]
+        else:
+            argv = [sys.executable, '-m', module_name,
+                    '--data-root', data_root, '--tag', label]
+        subprocess.Popen(argv, start_new_session=True)
 
     @app.post('/api/tags/{label}/train-clip')
     def api_train_clip_classifier(label: str):
@@ -2460,11 +2472,21 @@ def create_app(data_root: str) -> FastAPI:
         decided = manual.get_decided_checksums_for_tag(label)
 
         if model_kind == 'yolo':
-            from media_manager.clip_tag_classifier import classifier_dir
+            from media_manager.clip_tag_classifier import classifier_dir, slugify
 
-            checkpoint = os.path.join(classifier_dir(data_root, label, 'yolo_model'), 'best.pt')
-            if not os.path.isfile(checkpoint):
-                return []
+            # With a worker configured the checkpoint lives on the worker (kept
+            # there so the heavy YOLO predict never runs on this host); gate on
+            # the tag being trained (metadata status=done) instead of a local
+            # best.pt. Otherwise the checkpoint is local as before.
+            use_worker = _worker_client is not None and _worker_client.is_configured()
+            if use_worker:
+                st = _read_classifier_status(label, 'yolo_model')
+                if not st or st.get('status') != 'done':
+                    return []
+            else:
+                checkpoint = os.path.join(classifier_dir(data_root, label, 'yolo_model'), 'best.pt')
+                if not os.path.isfile(checkpoint):
+                    return []
 
             candidates = [
                 row for row in db.get_all_embeddings()
@@ -2477,13 +2499,14 @@ def create_app(data_root: str) -> FastAPI:
             # like the CLIP path) — scanning the WHOLE undecided-photo pool
             # synchronously on every single fetch was the actual cause of the
             # swipe stream getting stuck on "searching" forever on a real
-            # library: hundreds of sequential predict() calls before the
-            # request could ever return, no error, no timeout, just a very
-            # long wait. Bounded random sample keeps each fetch fast; repeated
+            # library. Bounded random sample keeps each fetch fast; repeated
             # fetches (the swipe stack's own refill, each excluding what it's
             # already seen) progressively cover more of the library over a
-            # session instead of exhaustively scanning it on every call.
-            sample = random.sample(candidates, min(len(candidates), YOLO_CANDIDATE_SAMPLE_SIZE))
+            # session. The worker path samples fewer, since each detection is a
+            # separate RNS round-trip shipping an image rather than one batched
+            # local predict() call.
+            sample_size = WORKER_YOLO_SAMPLE_SIZE if use_worker else YOLO_CANDIDATE_SAMPLE_SIZE
+            sample = random.sample(candidates, min(len(candidates), sample_size))
 
             path_by_file_id = {}
             for file_id, path, _emb, _checksum in sample:
@@ -2493,33 +2516,56 @@ def create_app(data_root: str) -> FastAPI:
             if not path_by_file_id:
                 return []
 
-            try:
-                from ultralytics import YOLOWorld
-                model = YOLOWorld(checkpoint)
-                # Batched in one call (not one predict() per image) — batching
-                # amortizes real per-call model overhead, meaningfully faster
-                # than the same total number of images predicted one at a time.
-                results_list = model.predict(list(path_by_file_id.values()), verbose=False)
-            except Exception:
-                # Loud, not silent — a bad/incompatible checkpoint or a
-                # transient inference failure should show up in the server
-                # console immediately, not just look like an empty result or
-                # (worse) hang the request.
-                print(f'[tag classifier] YOLO inference failed for tag "{label}" using {checkpoint}:')
-                traceback.print_exc()
-                return []
-
             scored = []
-            for file_id, results in zip(path_by_file_id.keys(), results_list):
-                confs = results.boxes.conf if results.boxes is not None else []
-                if len(confs):
-                    best_idx = int(confs.argmax())
-                    # Normalized (0..1) xyxy — resolution-independent, so the
-                    # frontend can position a highlight box as plain CSS
-                    # percentages over whatever size the photo actually
-                    # renders at, no pixel math needed on either side.
-                    bbox = [round(float(v), 4) for v in results.boxes.xyxyn[best_idx]]
-                    scored.append((file_id, float(confs[best_idx]), bbox))
+            if use_worker:
+                # Offload each detection to the worker's fine-tuned checkpoint.
+                # Ship a downscaled JPEG (same 640px cap training used). tag_detect
+                # returns [(class, conf, x1,y1,x2,y2)] with NORMALIZED coords.
+                from media_manager.remote_tag_trainer import _downscale_jpeg
+                from media_manager.worker_client import WorkerError
+                from PIL import Image as PILImage
+                slug = slugify(label)
+                for file_id, abs_path in path_by_file_id.items():
+                    try:
+                        with PILImage.open(abs_path) as im:
+                            image_bytes = _downscale_jpeg(im.convert('RGB'))
+                        dets = _worker_client.tag_detect(slug, image_bytes,
+                                                         name=os.path.basename(abs_path))
+                    except WorkerError as exc:
+                        # e.g. checkpoint missing on the worker (wiped/replaced) —
+                        # loud, not silent, then stop scanning this fetch.
+                        print(f'[tag classifier] worker tag_detect failed for tag "{label}": {exc}')
+                        break
+                    except Exception:
+                        print(f'[tag classifier] worker tag_detect error for tag "{label}":')
+                        traceback.print_exc()
+                        break
+                    if dets:
+                        _cls, conf, x1, y1, x2, y2 = max(dets, key=lambda d: d[1])
+                        scored.append((file_id, float(conf),
+                                       [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]))
+            else:
+                try:
+                    from ultralytics import YOLOWorld
+                    model = YOLOWorld(checkpoint)
+                    # Batched in one call (not one predict() per image) — batching
+                    # amortizes real per-call model overhead.
+                    results_list = model.predict(list(path_by_file_id.values()), verbose=False)
+                except Exception:
+                    # Loud, not silent — a bad/incompatible checkpoint or a
+                    # transient inference failure should show up in the server
+                    # console immediately, not hang the request or look empty.
+                    print(f'[tag classifier] YOLO inference failed for tag "{label}" using {checkpoint}:')
+                    traceback.print_exc()
+                    return []
+                for file_id, results in zip(path_by_file_id.keys(), results_list):
+                    confs = results.boxes.conf if results.boxes is not None else []
+                    if len(confs):
+                        best_idx = int(confs.argmax())
+                        # Normalized (0..1) xyxy — resolution-independent.
+                        bbox = [round(float(v), 4) for v in results.boxes.xyxyn[best_idx]]
+                        scored.append((file_id, float(confs[best_idx]), bbox))
+
             scored.sort(key=lambda x: -x[1])
             return _attach_file_meta([
                 {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3), 'bbox': bbox}

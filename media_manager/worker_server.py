@@ -21,10 +21,13 @@ Design notes:
     fake success.
 """
 import os
+import io
 import time
+import shutil
 import threading
 import tempfile
 import traceback
+import collections
 
 import numpy as np
 
@@ -289,6 +292,400 @@ def handle_detect_objects(path, data, request_id, link_id, remote_identity, requ
             _cleanup(tmp)
 
 
+# ---------------------------------------------------------------------------
+# Per-tag model training (job/poll) + fine-tuned inference.
+#
+# Training is stateful and long-running, unlike the stateless inference ops
+# above: each job carries an id, accumulates uploaded data into a scratch dir,
+# and runs in its OWN daemon thread that does NOT hold models.lock — so ping and
+# inference stay responsive during a multi-minute fine-tune. YOLO checkpoints are
+# persisted under TAG_MODELS_DIR and served by handle_tag_detect; the small CLIP
+# artifact (weights.npz) is handed back in the final status response. Per-job
+# progress/log is tracked explicitly (ultralytics' own stdout can't be captured
+# per-job without clobbering other requests' prints).
+# ---------------------------------------------------------------------------
+
+TAG_MODELS_DIR = os.path.expanduser('~/.cache/media_manager/tag_models')
+_TRAIN_DEFAULT_EPOCHS = 30
+_MAX_JOBS = 32
+_TAG_MODEL_CACHE_MAX = 4
+
+
+class TrainingJob:
+    def __init__(self, job_id, kind, tag, slug, epochs):
+        self.job_id = job_id
+        self.kind = kind
+        self.tag = tag
+        self.slug = slug
+        self.total_epochs = epochs
+        self.current_epoch = 0
+        self.status = 'created'          # created|running|done|failed|cancelled
+        self.error = None
+        self.metrics = {}
+        self.cancel_event = threading.Event()
+        self.thread = None
+        self.artifact_bytes = None       # clip weights.npz bytes, set on done
+        self.scratch_dir = tempfile.mkdtemp(prefix=f'mmtrain_{slug}_')
+        self._log = collections.deque(maxlen=300)
+        # YOLO staging: [(staging_image_path, [[cx,cy,w,h] normalized, ...]), ...]
+        self.yolo_examples = []
+        self._yolo_counter = 0
+        # CLIP: whole-image [(emb_bytes, label)] and region [(crop_jpeg, label)]
+        self.clip_whole = []
+        self.clip_regions = []
+
+    def log(self, msg):
+        self._log.append(f'[{int(time.time())}] {msg}')
+        print(f'[worker][train {self.job_id}] {msg}', flush=True)
+
+    def log_text(self):
+        return '\n'.join(self._log)
+
+
+class TrainingJobs:
+    """In-memory registry of training jobs, guarded by its OWN lock (never
+    models.lock) so status polls don't queue behind inference."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._jobs = collections.OrderedDict()
+        self._counter = 0
+
+    def create(self, kind, tag, slug, epochs):
+        with self.lock:
+            self._counter += 1
+            job = TrainingJob(f'{os.getpid()}-{self._counter}', kind, tag, slug, epochs)
+            self._jobs[job.job_id] = job
+            # Evict oldest FINISHED jobs beyond the cap (and clean their scratch).
+            for old_id in list(self._jobs):
+                if len(self._jobs) <= _MAX_JOBS:
+                    break
+                old = self._jobs[old_id]
+                if old.status in ('running', 'created'):
+                    continue
+                del self._jobs[old_id]
+                shutil.rmtree(old.scratch_dir, ignore_errors=True)
+            return job
+
+    def get(self, job_id):
+        with self.lock:
+            return self._jobs.get(job_id)
+
+
+training_jobs = TrainingJobs()
+
+# Loaded per-tag YOLO checkpoints for inference, slug -> (mtime, model). Bounded
+# LRU; only touched while holding models.lock (it's inference).
+_tag_model_cache = collections.OrderedDict()
+
+
+def _write_yolo_split(dataset_dir, split_name, examples):
+    """Write one ultralytics split (images/{split} + labels/{split}) from
+    (staging_image_path, normalized_boxes) tuples. Boxes are already
+    [cx, cy, w, h] in [0,1] (the host normalized them before shipping)."""
+    images_dir = os.path.join(dataset_dir, 'images', split_name)
+    labels_dir = os.path.join(dataset_dir, 'labels', split_name)
+    os.makedirs(images_dir, exist_ok=True)
+    os.makedirs(labels_dir, exist_ok=True)
+    for i, (src_path, boxes) in enumerate(examples):
+        ext = os.path.splitext(src_path)[1] or '.jpg'
+        name = f'{i:05d}'
+        shutil.copyfile(src_path, os.path.join(images_dir, name + ext))
+        lines = [f'0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}' for cx, cy, w, h in boxes]
+        with open(os.path.join(labels_dir, name + '.txt'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+
+
+def _run_yolo_job(job):
+    from media_manager import yolo_tag_classifier as yt
+    try:
+        examples = job.yolo_examples
+        if not examples:
+            raise ValueError('no training images were uploaded')
+        # 80/20 split by image (deterministic seed), same as the local trainer.
+        import random
+        rng = random.Random(0)
+        shuffled = examples[:]
+        rng.shuffle(shuffled)
+        split = max(1, int(len(shuffled) * 0.2))
+        val_ex, train_ex = shuffled[:split], shuffled[split:]
+        if not train_ex:
+            train_ex, val_ex = val_ex, train_ex
+
+        dataset_dir = os.path.join(job.scratch_dir, 'dataset')
+        _write_yolo_split(dataset_dir, 'train', train_ex)
+        _write_yolo_split(dataset_dir, 'val', val_ex or train_ex)
+        data_yaml = os.path.join(dataset_dir, 'data.yaml')
+        with open(data_yaml, 'w') as f:
+            f.write(f"path: {dataset_dir}\ntrain: images/train\nval: images/val\n"
+                    f"nc: 1\nnames: ['{job.tag}']\n")
+
+        out_dir = os.path.join(TAG_MODELS_DIR, job.slug, 'yolo_model')
+        n_boxes = sum(len(b) for _p, b in examples)
+        job.log(f'training YOLO on {len(examples)} images / {n_boxes} boxes, {job.total_epochs} epochs')
+
+        def progress(current_epoch, total_epochs):
+            job.current_epoch = current_epoch
+            job.total_epochs = total_epochs
+            job.log(f'epoch {current_epoch}/{total_epochs}')
+
+        res = yt.train_from_dataset(data_yaml, out_dir, epochs=job.total_epochs,
+                                    progress_cb=progress, cancel_cb=job.cancel_event.is_set)
+        job.metrics = {'held_out_map': res['held_out_map'],
+                       'n_images': len(examples), 'n_boxes': n_boxes}
+        job.status = 'done'
+        job.log(f'done; checkpoint {res["best_path"]} map={res["held_out_map"]}')
+    except yt.TrainingCancelled:
+        job.status = 'cancelled'
+        job.error = 'Cancelled by user.'
+        job.log('cancelled')
+    except Exception as e:
+        traceback.print_exc()
+        job.status = 'failed'
+        job.error = str(e)
+        job.log(f'failed: {e}')
+    finally:
+        shutil.rmtree(os.path.join(job.scratch_dir, 'staging'), ignore_errors=True)
+
+
+def _run_clip_job(job):
+    from media_manager import clip_tag_classifier as ct
+    try:
+        xs, ys = [], []
+        for emb_bytes, label in job.clip_whole:
+            xs.append(np.frombuffer(emb_bytes, dtype=np.float32))
+            ys.append(label)
+        if job.clip_regions:
+            from PIL import Image as PILImage
+            crops, labels = [], []
+            for crop_bytes, label in job.clip_regions:
+                crops.append(PILImage.open(io.BytesIO(crop_bytes)).convert('RGB'))
+                labels.append(label)
+            job.log(f'embedding {len(crops)} region crops on the worker CLIP model')
+            with models.lock:
+                embs = models.get_clip_indexer().embed_pil_images(crops)
+            for e, l in zip(embs, labels):
+                xs.append(e.astype(np.float32))
+                ys.append(l)
+
+        n_pos = sum(1 for y in ys if y == 1.0)
+        n_neg = sum(1 for y in ys if y == 0.0)
+        if n_pos < ct.MIN_EXAMPLES_PER_CLASS or n_neg < ct.MIN_EXAMPLES_PER_CLASS:
+            raise ValueError(
+                f'Need at least {ct.MIN_EXAMPLES_PER_CLASS} of each class; '
+                f'have {n_pos} confirmed, {n_neg} rejected.')
+        if job.cancel_event.is_set():
+            job.status = 'cancelled'
+            job.error = 'Cancelled by user.'
+            job.log('cancelled')
+            return
+
+        X = np.stack(xs).astype(np.float32)
+        y = np.array(ys, dtype=np.float32)
+        job.log(f'fitting CLIP logistic on {n_pos} pos / {n_neg} neg')
+        w, b, cv = ct.fit_from_examples(X, y)
+
+        out_dir = os.path.join(TAG_MODELS_DIR, job.slug, 'clip_model')
+        os.makedirs(out_dir, exist_ok=True)
+        weights_path = os.path.join(out_dir, 'weights.npz')
+        np.savez(weights_path, w=w, b=np.float32(b), embedding_model='ViT-B-32/openai')
+        with open(weights_path, 'rb') as f:
+            job.artifact_bytes = f.read()
+        job.metrics = {'cv_accuracy': round(cv, 4), 'n_positive': n_pos, 'n_negative': n_neg}
+        job.status = 'done'
+        job.log(f'done; cv_accuracy={round(cv, 4)}')
+    except Exception as e:
+        traceback.print_exc()
+        job.status = 'failed'
+        job.error = str(e)
+        job.log(f'failed: {e}')
+
+
+def _get_tag_model(slug, checkpoint):
+    """Load (cached, LRU) a per-tag YOLO checkpoint for inference. MUST be called
+    while holding models.lock (mirrors the other inference paths)."""
+    from ultralytics import YOLOWorld
+    mtime = os.path.getmtime(checkpoint)
+    cached = _tag_model_cache.get(slug)
+    if cached is not None and cached[0] == mtime:
+        _tag_model_cache.move_to_end(slug)
+        return cached[1]
+    print(f"[worker] loading tag YOLO checkpoint for {slug}...", flush=True)
+    model = YOLOWorld(checkpoint)
+    _tag_model_cache[slug] = (mtime, model)
+    _tag_model_cache.move_to_end(slug)
+    while len(_tag_model_cache) > _TAG_MODEL_CACHE_MAX:
+        _tag_model_cache.popitem(last=False)
+    return model
+
+
+def _parse_yolo_results(results):
+    """[[class_name, conf, x1, y1, x2, y2], ...] with NORMALIZED (0..1) xyxy —
+    the tag-suggestion swipe frontend positions a highlight box as plain CSS
+    percentages, so it wants resolution-independent coords."""
+    out = []
+    for r in results:
+        names = getattr(r, 'names', {}) or {}
+        boxes = getattr(r, 'boxes', None)
+        if boxes is None:
+            continue
+        for b in boxes:
+            cls = int(b.cls[0]) if b.cls is not None else 0
+            conf = float(b.conf[0]) if b.conf is not None else 0.0
+            x1, y1, x2, y2 = [float(v) for v in b.xyxyn[0].tolist()]
+            out.append([names.get(cls, str(cls)), conf, x1, y1, x2, y2])
+    return out
+
+
+def handle_train_create(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        kind = req['kind']
+        if kind not in ('yolo_model', 'clip_model'):
+            raise ValueError(f'unknown training kind {kind!r}')
+        tag = req.get('tag', '')
+        slug = req['slug']
+        epochs = int(req.get('epochs') or _TRAIN_DEFAULT_EPOCHS)
+        job = training_jobs.create(kind, tag, slug, epochs)
+        job.log(f'created {kind} job for tag {tag!r} (slug={slug})')
+        print(f"[worker] handled {worker_protocol.PATH_TRAIN_CREATE} ({kind} {slug}) "
+              f"-> {job.job_id}", flush=True)
+        return worker_protocol.pack({'job_id': job.job_id, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'job_id': None, 'error': str(e)})
+
+
+def handle_train_add(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        job = training_jobs.get(req.get('job_id'))
+        if job is None:
+            raise ValueError(f"unknown job {req.get('job_id')!r}")
+        if job.status != 'created':
+            raise ValueError(f'job {job.job_id} is {job.status}; cannot add data')
+        batch = req.get('batch') or []
+        if job.kind == 'yolo_model':
+            staging = os.path.join(job.scratch_dir, 'staging')
+            os.makedirs(staging, exist_ok=True)
+            for item in batch:
+                ext = _ext_from_name(item.get('name'))
+                if ext.lower() not in ('.jpg', '.jpeg', '.png'):
+                    ext = '.jpg'  # host always ships JPEG; keep a decodable ext
+                p = os.path.join(staging, f'{job._yolo_counter:06d}{ext}')
+                with open(p, 'wb') as f:
+                    f.write(item['image'])
+                job._yolo_counter += 1
+                job.yolo_examples.append(
+                    (p, [[float(v) for v in box] for box in item['boxes']]))
+        else:
+            for item in batch:
+                label = float(item['label'])
+                if item.get('embedding') is not None:
+                    job.clip_whole.append((item['embedding'], label))
+                elif item.get('image') is not None:
+                    job.clip_regions.append((item['image'], label))
+        return worker_protocol.pack({'received': len(batch), 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'received': 0, 'error': str(e)})
+
+
+def handle_train_run(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        job = training_jobs.get(req.get('job_id'))
+        if job is None:
+            raise ValueError(f"unknown job {req.get('job_id')!r}")
+        if job.status != 'created':
+            raise ValueError(f'job {job.job_id} already {job.status}')
+        job.status = 'running'
+        target = _run_yolo_job if job.kind == 'yolo_model' else _run_clip_job
+        job.thread = threading.Thread(target=target, args=(job,), daemon=True)
+        job.thread.start()
+        print(f"[worker] handled {worker_protocol.PATH_TRAIN_RUN} ({job.job_id}) -> started",
+              flush=True)
+        return worker_protocol.pack({'ok': True, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'ok': False, 'error': str(e)})
+
+
+def handle_train_status(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        job = training_jobs.get(req.get('job_id'))
+        if job is None:
+            return worker_protocol.pack({
+                'status': 'failed', 'error': 'unknown job',
+                'current_epoch': 0, 'total_epochs': 0, 'metrics': {},
+                'log_tail': '', 'artifact': None})
+        want_artifact = bool(req.get('want_artifact'))
+        return worker_protocol.pack({
+            'status': job.status,
+            'current_epoch': job.current_epoch,
+            'total_epochs': job.total_epochs,
+            'metrics': job.metrics,
+            'log_tail': job.log_text(),
+            'error': job.error,
+            'artifact': job.artifact_bytes if (want_artifact and job.status == 'done') else None,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({
+            'status': 'failed', 'error': str(e),
+            'current_epoch': 0, 'total_epochs': 0, 'metrics': {},
+            'log_tail': '', 'artifact': None})
+
+
+def handle_train_cancel(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        job = training_jobs.get(req.get('job_id'))
+        if job is None:
+            raise ValueError(f"unknown job {req.get('job_id')!r}")
+        job.cancel_event.set()
+        job.log('cancel requested')
+        if job.status == 'created':   # never started — mark cancelled now
+            job.status = 'cancelled'
+            job.error = 'Cancelled by user.'
+        return worker_protocol.pack({'ok': True, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'ok': False, 'error': str(e)})
+
+
+def handle_tag_detect(path, data, request_id, link_id, remote_identity, requested_at):
+    name = None
+    tmp = None
+    try:
+        req = worker_protocol.unpack(data)
+        slug = req['slug']
+        name = req.get('name')
+        conf = float(req.get('conf') or DEFAULT_CONF_THRESHOLD)
+        checkpoint = os.path.join(TAG_MODELS_DIR, slug, 'yolo_model', 'best.pt')
+        if not os.path.isfile(checkpoint):
+            return worker_protocol.pack({
+                'detections': [],
+                'error': f'no trained model for slug {slug!r} on worker'})
+        tmp = _write_temp(req['image'], name)
+        with models.lock:
+            model = _get_tag_model(slug, checkpoint)
+            results = model.predict(tmp, conf=conf, verbose=False)
+        detections = _parse_yolo_results(results)
+        print(f"[worker] handled {worker_protocol.PATH_TAG_DETECT} ({slug}/{name}) -> "
+              f"{len(detections)} detections", flush=True)
+        return worker_protocol.pack({'detections': detections, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_TAG_DETECT} ({name}) -> ERROR {e}",
+              flush=True)
+        return worker_protocol.pack({'detections': [], 'error': str(e)})
+    finally:
+        if tmp is not None:
+            _cleanup(tmp)
+
+
 # Map of request path -> handler, used both by run() and the loopback test.
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
@@ -297,6 +694,12 @@ HANDLERS = {
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
     worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,
+    worker_protocol.PATH_TRAIN_CREATE: handle_train_create,
+    worker_protocol.PATH_TRAIN_ADD: handle_train_add,
+    worker_protocol.PATH_TRAIN_RUN: handle_train_run,
+    worker_protocol.PATH_TRAIN_STATUS: handle_train_status,
+    worker_protocol.PATH_TRAIN_CANCEL: handle_train_cancel,
+    worker_protocol.PATH_TAG_DETECT: handle_tag_detect,
 }
 
 
