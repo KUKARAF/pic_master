@@ -1402,7 +1402,14 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-top-left > .stage-pod-menu { left: 0; }
 .stage-top-center > .stage-pod-menu { left: 50%; transform: translateX(-50%); }
 .stage-bottom-left > .stage-pod-menu { left: 0; top: auto; bottom: 100%; margin: 0 0 8px; }
-.stage-pod-rail .stage-pod > .stage-pod-menu { right: 100%; top: 0; margin: 0 8px 0 0; }
+.stage-pod-rail .stage-pod > .stage-pod-menu {
+  right: 100%;
+  top: 50%;
+  transform: translateY(-50%);            /* center on the (centered) rail -> grows symmetrically, stays on-screen */
+  margin: 0 8px 0 0;
+  max-height: min(72vh, calc(100vh - 120px));   /* guard short viewports */
+  max-width: min(380px, calc(100vw - 120px));   /* keep the left-opening menu inside a narrow viewport */
+}
 
 /* --- Sets pod, populated state (.has-sets): make the set name a single control.
    Instead of printing the name on the trigger AND again inside the menu, the menu
@@ -1414,6 +1421,7 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-pod-rail .stage-pod[data-pod-kind="set"].has-sets > .stage-pod-menu {
   right: 0;               /* menu right edge == trigger right edge */
   left: auto;
+  transform: none;
   top: 0;                 /* menu top == trigger top */
   margin: 0;
   padding-top: 8px;       /* == trigger padding-top, so the first link's top aligns */
