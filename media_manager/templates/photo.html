@@ -8,6 +8,7 @@
 {% block head %}
 <script>
   window.MEDIA_FILE_ID = {{ file.id }};
+  window.MEDIA_FRAME_COUNT = {{ file.frame_count or 1 }};
   window.DETECTED_CLASSES = {{ detected_classes | tojson }};
   window.DETECTED_BBOXES = {{ detection_bboxes | tojson }};
 </script>
@@ -34,6 +35,19 @@
     <button type="button" id="fit-mode-btn" class="stage-btn stage-btn-accent" title="cycle image fit (F)">▣ MODE · <span id="fit-mode-label">FIT</span></button>
     {% endif %}
   </div>
+
+  {% if file.is_image and file.frame_count and file.frame_count > 1 %}
+  <!-- Frame stepper for animated images (GIF/WEBP). The browser has no API to read
+       the currently-shown animation frame, so we scrub server-rendered frames here:
+       each step swaps #photo-image to /api/files/{id}/frame/{n} (a static frame) and
+       "📸 Capture current frame" then grabs that exact frame by index. -->
+  <div class="stage-chrome stage-bottom-center" id="frame-stepper">
+    <button type="button" id="frame-prev-btn" class="stage-btn" title="Previous frame ([ or ,)">◄</button>
+    <input type="range" id="frame-slider" min="0" max="{{ file.frame_count - 1 }}" value="0" step="1" title="Scrub frames" style="width:180px;">
+    <button type="button" id="frame-next-btn" class="stage-btn" title="Next frame (] or .)">►</button>
+    <span class="stage-btn" id="frame-counter" style="cursor:default;">1 / {{ file.frame_count }}</span>
+  </div>
+  {% endif %}
 
   <!-- transient cross-page action banner (floats top-center) -->
   <div id="sidebar-custom-action" class="stage-custom-action"></div>

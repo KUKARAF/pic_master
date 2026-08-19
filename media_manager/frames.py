@@ -25,3 +25,20 @@ def extract_frame(path, frame_index: int):
             return img.convert('RGB')
     except (EOFError, OSError, ValueError):
         return None
+
+
+def frame_time_ms(path, frame_index: int) -> int:
+    """Cumulative display time (ms) of the frames before `frame_index`, summed
+    from each frame's GIF/WEBP `duration`. Animated images have a real (if coarse)
+    timeline, so this gives a captured still a meaningful '@ Xs' label and a stable
+    sort order in the Frames strip. Returns 0 when durations aren't available."""
+    try:
+        total = 0
+        with Image.open(path) as img:
+            n = getattr(img, 'n_frames', 1)
+            for i in range(min(frame_index, n)):
+                img.seek(i)
+                total += int(img.info.get('duration', 0) or 0)
+        return total
+    except (EOFError, OSError, ValueError):
+        return 0

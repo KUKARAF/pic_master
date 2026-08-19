@@ -4087,15 +4087,84 @@
     const fileinfoAddSet = document.getElementById('fileinfo-add-set-btn');
     if (fileinfoAddSet) fileinfoAddSet.addEventListener('click', openSetPickerModal);
 
-    // Capture the current frame → a hidden still image, then open it. Works for a
-    // <video> (currentTime) and for an animated <img> (GIF/WEBP) — drawImage grabs
-    // whichever frame the element is showing right now.
+    // Frame stepper for animated images (GIF/WEBP). The browser can't read the
+    // currently-shown animation frame, so we scrub server-rendered frames: each step
+    // swaps #photo-image's src to /api/files/{id}/frame/{n} (a static, non-playing
+    // frame). `selectedFrameIndex` stays null while the GIF is still autoplaying
+    // (nothing picked yet); once the user steps, it holds the shown frame index so
+    // "📸 Capture" can grab that exact frame by index.
+    const frameCount = Number(window.MEDIA_FRAME_COUNT) || 1;
+    let selectedFrameIndex = null;
+    (function wireFrameStepper() {
+      const stepper = document.getElementById('frame-stepper');
+      const img = document.getElementById('photo-image');
+      if (!stepper || !img || frameCount <= 1) return;
+      const slider = document.getElementById('frame-slider');
+      const counter = document.getElementById('frame-counter');
+      const prevBtn = document.getElementById('frame-prev-btn');
+      const nextBtn = document.getElementById('frame-next-btn');
+
+      function showFrame(n) {
+        const idx = Math.max(0, Math.min(n, frameCount - 1));
+        selectedFrameIndex = idx;
+        // Swapping src to a single-frame JPEG stops the animation and pins this frame.
+        img.src = '/api/files/' + fileId + '/frame/' + idx;
+        if (slider) slider.value = String(idx);
+        if (counter) counter.textContent = (idx + 1) + ' / ' + frameCount;
+      }
+
+      if (prevBtn) prevBtn.addEventListener('click', function () {
+        showFrame((selectedFrameIndex === null ? 0 : selectedFrameIndex) - 1);
+      });
+      if (nextBtn) nextBtn.addEventListener('click', function () {
+        showFrame((selectedFrameIndex === null ? -1 : selectedFrameIndex) + 1);
+      });
+      if (slider) slider.addEventListener('input', function () {
+        showFrame(parseInt(slider.value, 10) || 0);
+      });
+
+      // Keyboard: [ / , = prev, ] / . = next (ignored while typing / grid open).
+      window.addEventListener('keydown', function (e) {
+        if (photoGridOpen) return;
+        const tag = (e.target && e.target.tagName) || '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        if (e.key === '[' || e.key === ',') { e.preventDefault(); prevBtn && prevBtn.click(); }
+        else if (e.key === ']' || e.key === '.') { e.preventDefault(); nextBtn && nextBtn.click(); }
+      });
+    })();
+
+    // Capture the current frame → a hidden still image, then open it.
+    //  • <video>: draw the currently-shown frame (currentTime) to a canvas + upload.
+    //  • animated <img>: no canvas — ask the server to extract the frame the stepper
+    //    is showing (selectedFrameIndex, or 0 if still autoplaying) by index.
     const captureBtn = document.getElementById('capture-frame-btn');
     const captureSrc = document.getElementById('photo-video') || document.getElementById('photo-image');
     if (captureBtn && captureSrc) {
+      const isAnimatedImage = captureSrc.tagName === 'IMG' && frameCount > 1;
       captureBtn.addEventListener('click', function () {
         const status = document.getElementById('capture-frame-status');
         function say(t) { if (status) { status.style.display = ''; status.textContent = t; } }
+        function onCaptured(r) {
+          if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
+          return r.json();
+        }
+        function onError(err) { captureBtn.disabled = false; say(''); showToast('Capture failed: ' + err.message); }
+
+        if (isAnimatedImage) {
+          const idx = selectedFrameIndex === null ? 0 : selectedFrameIndex;
+          captureBtn.disabled = true;
+          say('Capturing frame ' + (idx + 1) + '…');
+          fetch('/api/files/' + fileId + '/capture-frame-index', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ frame_index: idx }),
+          })
+            .then(onCaptured)
+            .then(function (data) { window.location.href = '/photo/' + data.file_id; })
+            .catch(onError);
+          return;
+        }
+
         const isVideo = captureSrc.tagName === 'VIDEO';
         const w = isVideo ? captureSrc.videoWidth : captureSrc.naturalWidth;
         const h = isVideo ? captureSrc.videoHeight : captureSrc.naturalHeight;
@@ -4113,12 +4182,9 @@
           fd.append('frame', blob, 'frame.jpg');
           fd.append('time_ms', String(isVideo ? Math.round((captureSrc.currentTime || 0) * 1000) : 0));
           fetch('/api/files/' + fileId + '/capture-frame', { method: 'POST', body: fd })
-            .then(function (r) {
-              if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
-              return r.json();
-            })
+            .then(onCaptured)
             .then(function (data) { window.location.href = '/photo/' + data.file_id; })
-            .catch(function (err) { captureBtn.disabled = false; say(''); showToast('Capture failed: ' + err.message); });
+            .catch(onError);
         }, 'image/jpeg', 0.92);
       });
     }

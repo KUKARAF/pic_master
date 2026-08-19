@@ -120,6 +120,9 @@ class CategoryBody(BaseModel):
     temperature: Optional[float] = None
     category_id: Optional[int] = None
 
+class CaptureFrameIndexBody(BaseModel):
+    frame_index: int
+
 class SearchChip(BaseModel):
     type: str
     value: str
@@ -4777,12 +4780,31 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='No scan job found for this file')
         return job
 
+    def _save_captured_still(parent_row, jpeg_bytes: bytes, time_ms: int):
+        """Persist `jpeg_bytes` (a captured frame) as a hidden, real image file under
+        captured_frames/ and link it back to `parent_row`'s content at `time_ms`.
+        Returns the new file id. Idempotent per identical frame (keyed by checksum) —
+        recapturing the same frame reuses the row. Shared by both capture endpoints
+        (client canvas upload for videos, server-side extract for animated images)."""
+        import xxhash
+        checksum = xxhash.xxh64(jpeg_bytes).hexdigest()
+        rel_path = 'captured_frames/' + checksum + '.jpg'
+        abs_path = os.path.join(data_root, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        if not os.path.exists(abs_path):
+            with open(abs_path, 'wb') as f:
+                f.write(jpeg_bytes)
+        new_id = db.upsert_file_path(rel_path, checksum, size=len(jpeg_bytes),
+                                     modified_time=int(os.path.getmtime(abs_path)))
+        db.set_file_hidden(new_id, True)   # commits (also persists the upsert above)
+        manual.add_frame_capture(checksum, parent_row['checksum'], time_ms)
+        return new_id
+
     @app.post('/api/files/{file_id}/capture-frame')
     async def api_capture_frame(file_id: int, frame: UploadFile = File(...), time_ms: int = Form(0)):
         """Save a manually-captured video frame (the canvas JPEG blob) as a hidden,
         real image file linked back to the source video at `time_ms`. Returns the new
         file id so the client can open it. Idempotent per identical frame (checksum)."""
-        import xxhash
         row = _file_or_404(file_id)
         # Videos and animated images (GIF/WEBP) both capture a frame the same way —
         # the client draws the currently-shown frame of <video>/<img> to a canvas.
@@ -4791,17 +4813,50 @@ def create_app(data_root: str) -> FastAPI:
         data = await frame.read()
         if not data:
             raise HTTPException(status_code=400, detail='Empty frame')
-        checksum = xxhash.xxh64(data).hexdigest()
-        rel_path = 'captured_frames/' + checksum + '.jpg'
-        abs_path = os.path.join(data_root, rel_path)
-        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-        if not os.path.exists(abs_path):
-            with open(abs_path, 'wb') as f:
-                f.write(data)
-        new_id = db.upsert_file_path(rel_path, checksum, size=len(data),
-                                     modified_time=int(os.path.getmtime(abs_path)))
-        db.set_file_hidden(new_id, True)   # commits (also persists the upsert above)
-        manual.add_frame_capture(checksum, row['checksum'], time_ms)
+        new_id = _save_captured_still(row, data, time_ms)
+        return {'file_id': new_id}
+
+    @app.get('/api/files/{file_id}/frame/{frame_index}')
+    def api_render_frame(file_id: int, frame_index: int):
+        """Render one frame of an animated image (GIF/WEBP) as a JPEG. The <img>
+        stepper on the photo page points its src here to show an exact, non-playing
+        frame — the browser can't read the currently-displayed frame of an animation,
+        so it asks the server to decode a specific one. frame_index is clamped."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        count = frames.get_frame_count(abs_path)
+        idx = max(0, min(frame_index, count - 1))
+        img = frames.extract_frame(abs_path, idx)
+        if img is None:
+            raise HTTPException(status_code=404, detail='Could not read that frame')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=92)
+        return Response(content=buf.getvalue(), media_type='image/jpeg',
+                        headers=IMMUTABLE_CACHE_HEADERS)
+
+    @app.post('/api/files/{file_id}/capture-frame-index')
+    def api_capture_frame_index(file_id: int, body: CaptureFrameIndexBody):
+        """Capture a specific frame of an animated image by index — no client upload.
+        The server decodes frame `body.frame_index` and saves it via the same helper
+        the canvas-upload path uses. time_ms is derived from the frames' GIF/WEBP
+        durations so the still gets a meaningful '@ Xs' label (0 if unavailable)."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        if os.path.splitext(row['path'])[1].lower() not in IMAGE_EXTENSIONS:
+            raise HTTPException(status_code=400, detail='Frame-index capture needs an animated image')
+        count = frames.get_frame_count(abs_path)
+        idx = max(0, min(body.frame_index, count - 1))
+        img = frames.extract_frame(abs_path, idx)
+        if img is None:
+            raise HTTPException(status_code=400, detail='Could not read that frame')
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=92)
+        time_ms = frames.frame_time_ms(abs_path, idx)
+        new_id = _save_captured_still(row, buf.getvalue(), time_ms)
         return {'file_id': new_id}
 
     @app.post('/api/search/face')
