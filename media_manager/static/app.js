@@ -68,6 +68,62 @@
     });
   }
   wireDropdown('warn-dropdown-btn', 'warn-dropdown-menu');
+  wireDropdown('bulk-actions-btn', 'bulk-actions-menu');
+
+  /* ⚡ Bulk actions menu: each button POSTs its data-start, then polls
+     data-status and shows done/total (+ matched) until the job finishes — mirrors
+     the body-index build poll. On page load each row also checks its status once,
+     so a job started elsewhere keeps updating and idle rows show "N pending". */
+  (function () {
+    function fmt(d, countKey) {
+      if (d.error) return 'error: ' + d.error;
+      var s = (d.done || 0) + '/' + (d.total || 0);
+      if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' matched';
+      return s;
+    }
+    document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
+      var statusEl = btn.parentElement.querySelector('[data-role="status"]');
+      var countKey = btn.dataset.count || null;
+
+      function done() { btn.disabled = false; delete btn.dataset.busy; }
+
+      function poll() {
+        fetch(btn.dataset.status)
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (d.running) { statusEl.textContent = fmt(d, countKey); setTimeout(poll, 1500); return; }
+            statusEl.textContent = d.error ? ('error: ' + d.error) : ('done · ' + fmt(d, countKey));
+            done();
+          })
+          .catch(function (err) { statusEl.textContent = 'poll failed: ' + err.message; done(); });
+      }
+
+      btn.addEventListener('click', function (e) {
+        e.stopPropagation();  // keep the dropdown open while it runs
+        if (btn.dataset.busy) return;
+        btn.dataset.busy = '1';
+        btn.disabled = true;
+        statusEl.textContent = 'starting…';
+        fetch(btn.dataset.start, { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function (d) {
+            if (d.started === false) { statusEl.textContent = d.message || 'already running'; done(); return; }
+            if (!d.total) { statusEl.textContent = 'nothing to do'; done(); return; }
+            poll();
+          })
+          .catch(function (err) { statusEl.textContent = 'failed: ' + err.message; done(); });
+      });
+
+      // On load: resume polling if a job is already running, else surface a pending count.
+      fetch(btn.dataset.status)
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d.running) { btn.dataset.busy = '1'; btn.disabled = true; poll(); }
+          else if (d.pending) { statusEl.textContent = d.pending + ' pending'; }
+        })
+        .catch(function () { /* status is best-effort on load */ });
+    });
+  })();
 
   /* Mobile hamburger — toggles the collapsed nav links (see .nav-links in CSS). */
   (function () {

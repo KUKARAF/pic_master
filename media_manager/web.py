@@ -1738,6 +1738,14 @@ def create_app(data_root: str) -> FastAPI:
     # ------------------------------------------------------------------
 
     body_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Two more library-wide bulk jobs surfaced from the navbar's ⚡ menu, same
+    # {running,done,total,error} shape as body_index_job (see the ⚡ dropdown in
+    # base.html + runBulkAction in app.js). index_job = CLIP-embed every
+    # not-yet-indexed photo; match_faces_job = match unnamed auto-detected faces
+    # to known people (no model — pure embedding math, so it also carries a
+    # 'matched' count).
+    index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -1973,6 +1981,114 @@ def create_app(data_root: str) -> FastAPI:
             'total': body_index_job['total'],
             'error': body_index_job['error'],
             'pending': len(db.get_unbody_indexed_files()),
+        }
+
+    @app.post('/api/index/start')
+    def api_index_start():
+        """Bulk-embed every photo that has no CLIP embedding yet — the library-wide
+        equivalent of the /similar page's per-file "embed now". Mirrors
+        MediaManager.embed_files but with progress + the web CLIP accessor (so it
+        offloads to the worker when configured)."""
+        import threading
+        from media_manager.indexer import SUPPORTED_EXTENSIONS
+
+        if index_job['running']:
+            return {'started': False, 'message': 'Indexing already running.'}
+        candidates = [
+            (fid, os.path.join(data_root, rel_path))
+            for fid, rel_path in db.get_unindexed_files(limit=None)
+            if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS
+        ]
+        index_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                indexer = _get_clip_indexer()
+                model_id = indexer.model_id()
+                done = 0
+                for start in range(0, len(candidates), 32):
+                    batch = candidates[start:start + 32]
+                    paths = [p for _fid, p in batch]
+                    embeddings, failed = indexer.embed_images(paths)
+                    failed_messages = dict(failed)
+                    emb_iter = iter(embeddings)
+                    for fid, fpath in batch:
+                        if fpath in failed_messages:
+                            errors.log(fpath, failed_messages[fpath])
+                        else:
+                            db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
+                        done += 1
+                        index_job['done'] = done
+            except Exception as exc:
+                index_job['error'] = str(exc)
+            finally:
+                index_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': index_job['total']}
+
+    @app.get('/api/index/status')
+    def api_index_status():
+        return {
+            'running': index_job['running'],
+            'done': index_job['done'],
+            'total': index_job['total'],
+            'error': index_job['error'],
+            'pending': len(db.get_unindexed_files()),
+        }
+
+    @app.post('/api/match-faces/start')
+    def api_match_faces_start():
+        """Match every not-yet-named auto-detected face against known identities and
+        promote the confident hits — the library-wide version of the auto-match that
+        api_detect_faces already does per photo. Needs no model: find_matching_identity
+        is a dot-product against the cached named-face matrix, so this is fast and
+        never touches the worker."""
+        import threading
+
+        if match_faces_job['running']:
+            return {'started': False, 'message': 'Face matching already running.'}
+        pool = _unpromoted_auto_faces(limit=None)
+        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, error=None)
+
+        def _run():
+            try:
+                # One file_id -> checksum lookup per hit is fine (hits are the rare
+                # case); get_file_by_id is a single indexed row read.
+                done = 0
+                matched = 0
+                for face_id, file_id, _path, bbox, emb_bytes in pool:
+                    done += 1
+                    match_faces_job['done'] = done
+                    if not emb_bytes:
+                        continue
+                    name, _score = manual.find_matching_identity(emb_bytes)
+                    if name is None:
+                        continue
+                    file_row = db.get_file_by_id(file_id)
+                    if file_row is None:
+                        continue
+                    manual.promote_auto_face(
+                        face_id, file_row['checksum'], json.loads(bbox), emb_bytes,
+                        name, None, None)
+                    matched += 1
+                    match_faces_job['matched'] = matched
+            except Exception as exc:
+                match_faces_job['error'] = str(exc)
+            finally:
+                match_faces_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': match_faces_job['total']}
+
+    @app.get('/api/match-faces/status')
+    def api_match_faces_status():
+        return {
+            'running': match_faces_job['running'],
+            'done': match_faces_job['done'],
+            'total': match_faces_job['total'],
+            'matched': match_faces_job['matched'],
+            'error': match_faces_job['error'],
         }
 
     # ------------------------------------------------------------------

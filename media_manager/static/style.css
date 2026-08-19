@@ -339,6 +339,10 @@ input[type="range"] { accent-color: var(--accent); }
   z-index: 200;
 }
 .tags-dropdown.open { display: block; }
+/* ⚡ Bulk-actions rows: a full-width action button + a muted live-status line. */
+.bulk-action-row { display: flex; flex-direction: column; gap: 3px; margin-bottom: 8px; }
+.bulk-action-btn { width: 100%; text-align: left; }
+.bulk-action-status { font-family: var(--font-pixel); font-size: 8px; color: var(--text-muted); min-height: 10px; }
 .tags-dropdown a {
   display: flex;
   justify-content: space-between;

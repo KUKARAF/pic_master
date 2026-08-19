@@ -35,6 +35,25 @@
   </span>
 
   <div style="position:relative;">
+    <button class="nav-tags-btn" id="bulk-actions-btn" type="button" title="Bulk actions">⚡</button>
+    <div class="tags-dropdown" id="bulk-actions-menu">
+      <div class="section-title" style="margin-bottom:6px;">Bulk actions</div>
+      <div class="bulk-action-row">
+        <button type="button" class="bulk-action-btn" data-start="/api/index/start" data-status="/api/index/status">⚡ Index unindexed</button>
+        <span class="bulk-action-status" data-role="status"></span>
+      </div>
+      <div class="bulk-action-row">
+        <button type="button" class="bulk-action-btn" data-start="/api/body-index/start" data-status="/api/body-index/status">🧍 Index bodies</button>
+        <span class="bulk-action-status" data-role="status"></span>
+      </div>
+      <div class="bulk-action-row">
+        <button type="button" class="bulk-action-btn" data-start="/api/match-faces/start" data-status="/api/match-faces/status" data-count="matched">👤 Match faces</button>
+        <span class="bulk-action-status" data-role="status"></span>
+      </div>
+    </div>
+  </div>
+
+  <div style="position:relative;">
     <button class="nav-tags-btn" id="warn-dropdown-btn" type="button">
       ⚠️<span id="warn-badge" class="warn-badge" style="display:none;">0</span>
     </button>
