@@ -146,6 +146,9 @@ class SwipeExcludeBody(BaseModel):
     client's known-set to empty) would then reveal."""
     exclude: List[str] = []
 
+class RegionSearchBody(BaseModel):
+    bbox: list[float]
+
 
 def _gray_placeholder() -> bytes:
     """Return a gray 400×400 JPEG as bytes (used when thumbnail generation fails)."""
@@ -1723,6 +1726,41 @@ def create_app(data_root: str) -> FastAPI:
         k = min(matrix.shape[0], max(1, limit) + 1)  # +1 to absorb self-match
         results = []
         for i in top_k_indices(scores, k):
+            fid = int(file_ids[i])
+            if fid == file_id:
+                continue
+            results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
+            if len(results) >= limit:
+                break
+        return {'results': results}
+
+    @app.post('/api/files/{file_id}/region-search')
+    def api_region_search(file_id: int, body: RegionSearchBody, limit: int = 50):
+        """Semantic 'search by region': CLIP-embed the drawn crop and rank the library's
+        whole-image embeddings by cosine similarity. Opens matches in the watch-queue."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None or not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        x1, y1, x2, y2 = [float(v) for v in body.bbox]
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            raise HTTPException(status_code=400, detail='Region too small.')
+        from PIL import Image as PILImage
+        with PILImage.open(abs_path) as im:
+            crop = im.convert('RGB').crop((x1, y1, x2, y2))
+            crop.load()
+        embs = _get_clip_indexer().embed_pil_images([crop])
+        if len(embs) == 0:
+            raise HTTPException(status_code=500, detail='Could not embed the region.')
+        import numpy as np
+        from media_manager.similarity import top_k_indices
+        query = np.asarray(embs[0], dtype=np.float32)
+        file_ids, _checksums, matrix = db.get_embeddings_matrix()
+        if matrix.shape[0] == 0:
+            return {'results': []}
+        scores = matrix.dot(query)
+        results = []
+        for i in top_k_indices(scores, min(matrix.shape[0], max(1, limit) + 1)):
             fid = int(file_ids[i])
             if fid == file_id:
                 continue

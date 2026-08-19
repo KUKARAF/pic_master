@@ -2959,6 +2959,22 @@
   });
   if (labelPersonState) boxDrawStates.push(labelPersonState);
 
+  /* Search region — drag a box around something (e.g. a brick wall); CLIP-embed
+     the crop and rank the library's whole-image embeddings, opening the matches
+     in the browsable watch-queue. Cheap semantic search: crop-vs-whole-image. */
+  const searchRegionBtn = document.getElementById('search-region-btn');
+  const searchRegionState = wireBoxDraw(searchRegionBtn, 'Drag a box around the thing to find…', '🔲 Search region', function (bbox) {
+    openMatchesAsQueue({
+      el: searchRegionBtn,
+      url: '/api/files/' + fileId + '/region-search',
+      fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
+      label: 'Region matches',
+      extractIds: function (data) { return (data.results || []).map(function (r) { return r.file_id; }); },
+      onEmpty: function () { if (window.showToast) showToast('No matches found for that region.'); },
+    });
+  });
+  if (searchRegionState) boxDrawStates.push(searchRegionState);
+
   // Deep-link: /photo/{id}#label-person (from find-by-body) enters draw mode on load.
   if (window.location.hash === '#label-person' && labelPersonBtn) {
     labelPersonBtn.click();
@@ -2975,7 +2991,7 @@
     el.dataset.busy = '1';
     var glyph = el.textContent;
     el.textContent = '⏳';
-    fetch(opts.url)
+    fetch(opts.url, opts.fetchInit)
       .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
       .then(function (data) {
         var seen = {}, ids = [];
