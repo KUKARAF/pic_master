@@ -1287,27 +1287,6 @@ def create_app(data_root: str) -> FastAPI:
                     files = _sort_cards_by_age(files, order)
             queue_label = 'Search: ' + ' + '.join(f'{c["type"]}:{c["value"]}' for c in chips)
 
-        elif face_ref:
-            # "Find similar faces" from a specific face chip — reuses the same
-            # grid+expand-slider UI as searching by person name, but seeded from one
-            # face's embedding instead of a name, so it works on faces with no name yet.
-            similar_faces = _find_similar_faces_to_ref(face_ref, SUGGEST_THRESHOLD)
-            return templates.TemplateResponse(request, 'search.html', {
-                'files': files,
-                'q': q,
-                'tag': tag,
-                'start': start,
-                'face_ref': face_ref,
-                'category': category,
-                'query_face_file_id': _get_face_file_id(face_ref),
-                'similar_faces': similar_faces,
-                'message': message,
-                'all_tags': all_tags,
-                'all_categories': all_categories,
-                'similar_unknown_faces': similar_unknown_faces,
-                **(_classifier_ui_state(tag) if tag else {}),
-            })
-
         if f:
             pass
         elif tag:
@@ -1371,9 +1350,7 @@ def create_app(data_root: str) -> FastAPI:
             'q': q,
             'tag': tag,
             'start': start,
-            'face_ref': '',
             'category': category,
-            'query_face_file_id': None,
             'message': message,
             'all_tags': all_tags,
             'all_categories': all_categories,
@@ -3589,21 +3566,6 @@ def create_app(data_root: str) -> FastAPI:
             return row['embedding'] if row is not None else None
         cursor = db.conn.cursor()
         cursor.execute('SELECT embedding FROM faces WHERE id = ?', (raw_id,))
-        row = cursor.fetchone()
-        return row[0] if row is not None else None
-
-    def _get_face_file_id(face_id):
-        """The id of the file this face belongs to — used to jump back to that photo
-        after acting on a face (e.g. assigning a name found via similar-faces search)."""
-        kind, raw_id = _parse_face_ref(face_id)
-        if kind == 'manual':
-            row = manual.get_face(raw_id)
-            if row is None:
-                return None
-            file_row = db.get_file_by_checksum(row['checksum'])
-            return file_row['id'] if file_row is not None else None
-        cursor = db.conn.cursor()
-        cursor.execute('SELECT file_id FROM faces WHERE id = ?', (raw_id,))
         row = cursor.fetchone()
         return row[0] if row is not None else None
 

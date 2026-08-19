@@ -2842,6 +2842,40 @@
     labelPersonBtn.click();
   }
 
+  /* Face 🔎 "Find similar faces" — opens the similar faces as a browsable photo
+     watch-queue (Left/Right + Space grid) instead of a separate results page.
+     Fetches the ranked matches, seeds the queue with their file_ids, and jumps
+     straight to the first photo. */
+  document.querySelectorAll('.find-similar-faces-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var ref = btn.getAttribute('data-face-ref');
+      if (!ref || btn.dataset.busy) return;
+      btn.dataset.busy = '1';
+      var glyph = btn.textContent;
+      btn.textContent = '⏳';
+      fetch('/api/faces/' + encodeURIComponent(ref) + '/similar')
+        .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
+        .then(function (data) {
+          var seen = {}, ids = [];
+          (data.results || []).forEach(function (f) {
+            if (f.file_id != null && !seen[f.file_id]) { seen[f.file_id] = 1; ids.push(f.file_id); }
+          });
+          if (!ids.length) {
+            btn.textContent = glyph; delete btn.dataset.busy;
+            if (window.showToast) showToast('No similar faces found.');
+            return;
+          }
+          setPhotoQueue(ids, 'Similar faces', 0);
+          sessionStorage.setItem('photoQueueNavigating', '1');
+          window.location.href = '/photo/' + ids[0];
+        })
+        .catch(function (err) {
+          btn.textContent = glyph; delete btn.dataset.busy;
+          if (window.showToast) showToast('Failed to find similar faces: ' + err.message);
+        });
+    });
+  });
+
   /* Face naming modal — click any face chip (named or "Unknown") to name/rename
      it. Goes through the shared entity picker: fuzzy-search known people, pick
      one, or type a new name (or none at all — "Save without a name" confirms a
@@ -3039,9 +3073,10 @@
     });
   }
 
-  /* "Find similar faces" (🔎 next to each face chip) is now a plain navigation
-     link to /search?face_ref=... — see search.html for the results page, which
-     reuses the same similar-faces grid/slider UI as searching by person name. */
+  /* "Find similar faces" (🔎 next to each face chip) opens the matches as a
+     browsable photo watch-queue — see the .find-similar-faces-btn handler in
+     the photo-page init block above (it hits /api/faces/{ref}/similar, seeds
+     setPhotoQueue with the result file_ids, and navigates to the first). */
 
   const detectFacesBtn = document.getElementById('detect-faces-btn');
   const detectFacesStatus = document.getElementById('detect-faces-status');

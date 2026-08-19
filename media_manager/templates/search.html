@@ -6,51 +6,6 @@
 {% endblock %}
 
 {% block content %}
-{% if face_ref %}
-<div class="page-heading">
-  <h1>Similar faces</h1>
-  {% if query_face_file_id %}
-  <a href="/photo/{{ query_face_file_id }}" class="sub">← Back to photo</a>
-  {% endif %}
-</div>
-<div style="display:flex;align-items:center;gap:12px;margin-bottom:20px;">
-  <img src="/face-crop/{{ face_ref }}" width="72" height="72" style="border-radius:50%;object-fit:cover;">
-  <span class="sub">Faces that look like this one</span>
-</div>
-
-{% if similar_faces %}
-<div class="grid" id="similar-unknown-grid" data-queue-source="Similar faces">
-  {% for f in similar_faces %}
-  <div class="card" id="unknown-card-{{ f.ref }}" data-face-ref="{{ f.ref }}" data-file-id="{{ f.file_id }}">
-    <a class="card-img-link" href="/photo/{{ f.file_id }}">
-      <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
-    </a>
-    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
-    <div class="card-body">
-      <div class="card-name" title="{{ f.path }}">{% if f.identity %}{{ f.identity }}{% else %}{{ f.filename }}{% endif %}</div>
-      {% if f.identity %}
-      <button type="button" class="btn-similar use-name-btn" data-name="{{ f.identity }}"
-              style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "{{ f.identity }}"</button>
-      {% endif %}
-    </div>
-  </div>
-  {% endfor %}
-</div>
-{% else %}
-<div class="alert" id="similar-empty-state">
-  <p style="margin-bottom:10px;">No similar faces found at the default threshold.</p>
-  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-    <label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>
-    <input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">
-    <span id="similar-threshold-value" class="sub">0.30</span>
-    <button type="button" id="expand-similar-btn" class="btn-similar" data-face-ref="{{ face_ref }}" style="font-size:0.85em;">Expand similar face search</button>
-  </div>
-  <div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>
-</div>
-<div class="grid" id="similar-unknown-grid" data-queue-source="Similar faces" style="margin-top:16px;"></div>
-{% endif %}
-
-{% else %}
 <div class="page-heading">
   {% if q %}
   <h1>Results for "{{ q }}"</h1>
@@ -94,7 +49,6 @@
   <div class="icon">🔍</div>
   <p>No results found.</p>
 </div>
-{% endif %}
 {% endif %}
 
 {% if tag %}
@@ -282,108 +236,6 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
         }
       });
   });
-})();
-
-(function() {
-  /* "Use this name" — only shown in face_ref mode, on a match that's already
-     named. Assigns that name to the *query* face, then jumps back to its photo. */
-  const queryFaceRef = {{ face_ref | tojson }};
-  const queryFaceFileId = {{ query_face_file_id | tojson }};
-
-  function wireUseNameButton(ubtn) {
-    ubtn.addEventListener('click', function() {
-      const name = ubtn.dataset.name;
-      ubtn.disabled = true;
-      ubtn.textContent = 'Saving…';
-      fetch('/api/faces/' + queryFaceRef + '/identity', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: name}),
-      })
-        .then(function(r) {
-          if (!r.ok) throw new Error('Request failed: ' + r.status);
-          return r.json();
-        })
-        .then(function() {
-          window.location.href = queryFaceFileId ? '/photo/' + queryFaceFileId : '/faces';
-        })
-        .catch(function(err) {
-          ubtn.disabled = false;
-          ubtn.textContent = 'Use "' + name + '"';
-          showToast('Failed to assign name: ' + err.message);
-        });
-    });
-  }
-  document.querySelectorAll('.use-name-btn').forEach(wireUseNameButton);
-
-  /* Expand similar face search — for a single face with no name yet, seeded
-     from `face_ref` (hits /api/faces/{ref}/similar). Only meaningful in
-     face_ref mode (the elements it wires only render there), guarded by the
-     null checks below so it's a no-op elsewhere. */
-  function wireExpandSimilarSearch(byFaceRef) {
-    if (!byFaceRef) return;
-    const slider = document.getElementById('similar-threshold-slider');
-    const sliderValue = document.getElementById('similar-threshold-value');
-    const expandBtn = document.getElementById('expand-similar-btn');
-    const expandStatus = document.getElementById('expand-similar-status');
-    const similarGrid = document.getElementById('similar-unknown-grid');
-
-    if (slider && sliderValue) {
-      slider.addEventListener('input', function() {
-        sliderValue.textContent = parseFloat(slider.value).toFixed(2);
-      });
-    }
-
-    if (expandBtn) {
-      expandBtn.addEventListener('click', function() {
-        const threshold = slider ? slider.value : 0.3;
-        const url = '/api/faces/' + byFaceRef + '/similar?threshold=' + threshold;
-        expandStatus.style.display = 'block';
-        expandStatus.textContent = 'Searching…';
-        fetch(url)
-          .then(function(r) {
-            if (!r.ok) throw new Error('Request failed: ' + r.status);
-            return r.json();
-          })
-          .then(function(data) {
-            const results = data.results || [];
-            if (!results.length) {
-              expandStatus.textContent = 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
-              return;
-            }
-            expandStatus.style.display = 'none';
-            similarGrid.innerHTML = '';
-            results.forEach(function(f) {
-              const card = document.createElement('div');
-              card.className = 'card';
-              card.id = 'unknown-card-' + f.ref;
-              card.dataset.faceRef = f.ref;
-              card.dataset.fileId = f.file_id;
-              const actionHtml = f.identity
-                ? '<button type="button" class="btn-similar use-name-btn" data-name="' + f.identity + '" ' +
-                  'style="font-size:0.8em;padding:4px 10px;margin-top:6px;">Use "' + f.identity + '"</button>'
-                : '';
-              card.innerHTML =
-                '<a class="card-img-link" href="/photo/' + f.file_id + '">' +
-                  '<img src="/face-crop/' + f.ref + '" alt="' + f.filename + '" loading="lazy">' +
-                '</a>' +
-                '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
-                '<div class="card-body">' +
-                  '<div class="card-name" title="' + f.path + '">' + (f.identity || f.filename) + '</div>' +
-                  actionHtml +
-                '</div>';
-              similarGrid.appendChild(card);
-              const useNameBtn = card.querySelector('.use-name-btn');
-              if (useNameBtn) wireUseNameButton(useNameBtn);
-            });
-          })
-          .catch(function(err) {
-            expandStatus.textContent = 'Search error: ' + err.message;
-          });
-      });
-    }
-  }
-  wireExpandSimilarSearch(queryFaceRef || null);
 })();
 
 /* Three explicit review modes instead of one auto-started stream — "Start
