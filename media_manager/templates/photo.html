@@ -270,7 +270,7 @@
       <button type="button" class="stage-pod-btn stage-pod-btn-faces" title="Faces">☺</button>
       <div class="face-avatar-cluster">
         {% for face in identified_faces[:3] %}
-        <a class="face-glance" href="/person/{{ face.identity | urlencode }}" title="{{ face.identity }}">
+        <a class="face-glance" href="/person/{{ face.identity | urlencode }}" title="{{ face.identity }}" data-bbox='{{ face.bbox | tojson }}'>
           <img class="face-glance-img" src="/face-crop/{{ face.ref }}" alt="{{ face.identity }}" width="24" height="24" loading="lazy">
           <span class="face-glance-name">{{ face.identity }}</span>
           {% if face.age is not none %}<span class="face-glance-age {{ 'gender-male' if face.gender == 'male' else ('gender-female' if face.gender == 'female' else '') }}">{{ face.age | round(0) | int }}</span>{% endif %}
@@ -343,7 +343,7 @@
       {% if faces %}
       <div class="face-chips" id="face-chips">
         {% for face in faces %}
-        <div class="face-chip" data-face-ref="{{ face.ref }}">
+        <div class="face-chip" data-face-ref="{{ face.ref }}" data-bbox='{{ face.bbox | tojson }}'>
           <a class="face-crop-link" href="{% if face.identity %}/person/{{ face.identity | urlencode }}{% else %}/face/{{ face.ref }}{% endif %}" title="{% if face.identity %}{{ face.identity }}{% else %}View this face{% endif %}">
             <img src="/face-crop/{{ face.ref }}" alt="face" width="56" height="56">
           </a>

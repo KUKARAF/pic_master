@@ -2769,14 +2769,14 @@
       if (hoverBox) { hoverBox.remove(); hoverBox = null; }
     }
 
-    function showHoverBbox(bbox) {
+    function showHoverBbox(bbox, className) {
       hideHoverBbox();
       if (!photoImg.naturalWidth || !photoImg.clientWidth) return; // image not loaded yet
       const scaleX = photoImg.clientWidth / photoImg.naturalWidth;
       const scaleY = photoImg.clientHeight / photoImg.naturalHeight;
       const [x1, y1, x2, y2] = bbox;
       hoverBox = document.createElement('div');
-      hoverBox.className = 'face-draw-box';
+      hoverBox.className = className || 'face-draw-box';
       hoverBox.style.left = (x1 * scaleX) + 'px';
       hoverBox.style.top = (y1 * scaleY) + 'px';
       hoverBox.style.width = ((x2 - x1) * scaleX) + 'px';
@@ -2790,6 +2790,19 @@
       if (!bbox) return; // detected before bboxes were stored, or a stale/renamed label — nothing to show
       chip.addEventListener('mouseenter', function () { showHoverBbox(bbox); });
       chip.addEventListener('mouseleave', hideHoverBbox);
+    });
+
+    /* Hover a face (its chip in the Faces menu, or its at-a-glance avatar) to
+       highlight WHERE that face is on the photo — same overlay + coordinate
+       mapping as the detected-object hover, with a distinct solid box so a face
+       highlight doesn't read as a draw-in-progress. Face bbox is [x1,y1,x2,y2]
+       in ORIGINAL image pixels (see _combined_faces_for_file). */
+    document.querySelectorAll('.face-chip[data-bbox], .face-glance[data-bbox]').forEach(function (el) {
+      let bbox;
+      try { bbox = JSON.parse(el.getAttribute('data-bbox')); } catch (e) { return; }
+      if (!Array.isArray(bbox) || bbox.length !== 4) return;
+      el.addEventListener('mouseenter', function () { showHoverBbox(bbox, 'face-hilite-box'); });
+      el.addEventListener('mouseleave', hideHoverBbox);
     });
   }
 

@@ -1204,6 +1204,16 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
+/* Highlight overlay shown while hovering a face chip/avatar — a solid, glowing
+   box (vs. the dashed draw box) so it clearly reads as "here is this face". */
+.face-hilite-box {
+  position: absolute;
+  border: 2px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), 0 0 14px rgba(121, 242, 121, .55);
+  pointer-events: none;
+}
+
 /* ------------------------------------------------------------------ */
 /* Floating stage chrome + corner "pods" — liquid-glass overlays.       */
 /* Very transparent fill + heavy backdrop blur/saturate so controls     */
