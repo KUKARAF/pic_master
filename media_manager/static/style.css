@@ -1331,6 +1331,23 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-pod-split .split-seg:hover { color: var(--accent); }
 .stage-pod-split .split-div { width: 1px; align-self: stretch; background: rgba(255, 255, 255, .22); }
 
+/* Find pill — emoji-icon split (⌛ label · 🧍 by body · 📏 similar images). The
+   segments are <button>s, so strip the native button chrome; bump the glyph
+   size since the pixel-font 8px base is far too small for emoji. */
+.find-split .split-seg {
+  display: inline-flex;
+  align-items: center;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1;
+  background: none;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+}
+.find-split .split-seg.is-static { color: var(--text-muted); cursor: default; }
+.find-split .split-seg.is-static:hover { color: var(--text-muted); }
+
 /* Corner pods — a glass trigger + a glass popover menu opened on hover and
    pinned by click (JS toggles .is-open). */
 .stage-pod { position: absolute; z-index: 12; }

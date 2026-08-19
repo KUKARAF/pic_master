@@ -2895,42 +2895,95 @@
     labelPersonBtn.click();
   }
 
-  /* Face 🔎 "Find similar faces" — opens the similar faces as a browsable photo
-     watch-queue (Left/Right + Space grid) instead of a separate results page.
-     Fetches the ranked matches, seeds the queue with their file_ids, and jumps
-     straight to the first photo. */
+  /* "Open ranked matches as a browsable watch-queue" — the UX the face 🔎
+     pioneered (Left/Right browse + Space grid) instead of a separate results
+     page. Shared verbatim by find-by-face, find-by-body, and find-similar-images:
+     fetch the ranked matches, seed the queue with their file_ids, jump to the
+     first. Swaps the clicked control to ⏳ while the request is in flight. */
+  function openMatchesAsQueue(opts) {
+    var el = opts.el;
+    if (!el || el.dataset.busy) return;
+    el.dataset.busy = '1';
+    var glyph = el.textContent;
+    el.textContent = '⏳';
+    fetch(opts.url)
+      .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
+      .then(function (data) {
+        var seen = {}, ids = [];
+        (opts.extractIds(data) || []).forEach(function (id) {
+          if (id != null && !seen[id]) { seen[id] = 1; ids.push(id); }
+        });
+        if (!ids.length) {
+          el.textContent = glyph; delete el.dataset.busy;
+          if (opts.onEmpty) opts.onEmpty(data);
+          else if (window.showToast) showToast('No matches found.');
+          return;
+        }
+        setPhotoQueue(ids, opts.label, 0);
+        sessionStorage.setItem('photoQueueNavigating', '1');
+        window.location.href = '/photo/' + ids[0];
+      })
+      .catch(function (err) {
+        el.textContent = glyph; delete el.dataset.busy;
+        if (window.showToast) showToast('Failed: ' + err.message);
+      });
+  }
+
+  /* Face 🔎 — similar faces. Looser 0.3 threshold: same-person crops often land
+     ~0.35-0.45, and this is a browse-and-skip queue (restores the reach of the
+     old "expand similar" slider we removed). */
   document.querySelectorAll('.find-similar-faces-btn').forEach(function (btn) {
     btn.addEventListener('click', function () {
       var ref = btn.getAttribute('data-face-ref');
-      if (!ref || btn.dataset.busy) return;
-      btn.dataset.busy = '1';
-      var glyph = btn.textContent;
-      btn.textContent = '⏳';
-      // Looser than the 0.45 default: face crops of the same person often land
-      // ~0.35-0.45, and this is a browse-and-skip queue, so surface near-matches
-      // (restores the reach of the old "expand similar" slider we removed).
-      fetch('/api/faces/' + encodeURIComponent(ref) + '/similar?threshold=0.3')
-        .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
-        .then(function (data) {
-          var seen = {}, ids = [];
-          (data.results || []).forEach(function (f) {
-            if (f.file_id != null && !seen[f.file_id]) { seen[f.file_id] = 1; ids.push(f.file_id); }
-          });
-          if (!ids.length) {
-            btn.textContent = glyph; delete btn.dataset.busy;
-            if (window.showToast) showToast('No similar faces found.');
-            return;
-          }
-          setPhotoQueue(ids, 'Similar faces', 0);
-          sessionStorage.setItem('photoQueueNavigating', '1');
-          window.location.href = '/photo/' + ids[0];
-        })
-        .catch(function (err) {
-          btn.textContent = glyph; delete btn.dataset.busy;
-          if (window.showToast) showToast('Failed to find similar faces: ' + err.message);
-        });
+      if (!ref) return;
+      openMatchesAsQueue({
+        el: btn,
+        url: '/api/faces/' + encodeURIComponent(ref) + '/similar?threshold=0.3',
+        label: 'Similar faces',
+        extractIds: function (data) { return (data.results || []).map(function (f) { return f.file_id; }); },
+        onEmpty: function () { if (window.showToast) showToast('No similar faces found.'); },
+      });
     });
   });
+
+  /* Find pill — 📏 distance segment: whole-image CLIP similarity into the queue. */
+  var findDistanceBtn = document.querySelector('.find-by-distance-btn');
+  if (findDistanceBtn) {
+    findDistanceBtn.addEventListener('click', function () {
+      openMatchesAsQueue({
+        el: findDistanceBtn,
+        url: '/api/files/' + findDistanceBtn.dataset.fileId + '/similar',
+        label: 'Similar images',
+        extractIds: function (data) { return (data.results || []).map(function (r) { return r.file_id; }); },
+        onEmpty: function (data) { if (window.showToast) showToast((data && data.message) || 'No similar images found.'); },
+      });
+    });
+  }
+
+  /* Find pill — 🧍 body segment: find-by-body into the queue. First open of a
+     not-yet-indexed photo runs a person-only YOLO/CLIP pass server-side (hence
+     the ⏳). If the photo has multiple people and none is pre-selected the API
+     returns no ranked results — fall back to the /body-similar page so the user
+     can pick which person. */
+  var findBodyBtn = document.querySelector('.find-by-body-btn');
+  if (findBodyBtn) {
+    findBodyBtn.addEventListener('click', function () {
+      openMatchesAsQueue({
+        el: findBodyBtn,
+        url: '/api/files/' + findBodyBtn.dataset.fileId + '/body-similar',
+        label: 'Similar people',
+        extractIds: function (data) { return (data.results || []).map(function (r) { return r.id; }); },
+        onEmpty: function (data) {
+          if (data && data.no_people) { if (window.showToast) showToast('No people detected in this photo.'); return; }
+          if (data && data.crops && data.crops.length > 1) {
+            window.location.href = '/body-similar/' + findBodyBtn.dataset.fileId;
+            return;
+          }
+          if (window.showToast) showToast((data && data.message) || 'No similar people found.');
+        },
+      });
+    });
+  }
 
   /* Face naming modal — click any face chip (named or "Unknown") to name/rename
      it. Goes through the shared entity picker: fuzzy-search known people, pick

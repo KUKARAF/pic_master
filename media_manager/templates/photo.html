@@ -387,14 +387,20 @@
     </div>
   </div>
 
-  <!-- BOTTOM-LEFT: find -->
-  <div class="stage-pod stage-bottom-left" data-pod>
-    <button type="button" class="stage-pod-btn">🔎 Find</button>
-    <div class="stage-pod-menu">
-      <div style="display:flex;flex-direction:column;gap:8px;">
-        <a class="btn-similar btn-primary btn-block" href="/similar/{{ file.id }}">◈ Find similar images</a>
-        <a class="btn-similar btn-block" href="/body-similar/{{ file.id }}">⛶ Find by body</a>
-      </div>
+  <!-- BOTTOM-LEFT: find — a single split pill. The hourglass is a static label;
+       the body and distance segments open their matches straight into the photo
+       watch-queue (same UX as the face 🔎), each with a hover tooltip. -->
+  <div class="stage-pod stage-bottom-left">
+    <div class="stage-pod-btn stage-pod-split find-split" role="group" aria-label="Find similar">
+      <span class="split-seg is-static" aria-hidden="true">⌛</span>
+      <span class="split-div"></span>
+      <button type="button" class="split-seg find-by-body-btn" data-file-id="{{ file.id }}"
+              title="Find by body — match this person's build/outfit across your library"
+              aria-label="Find by body">🧍</button>
+      <span class="split-div"></span>
+      <button type="button" class="split-seg find-by-distance-btn" data-file-id="{{ file.id }}"
+              title="Find similar images — visually closest photos (CLIP distance)"
+              aria-label="Find similar images">📏</button>
     </div>
   </div>
 </div>

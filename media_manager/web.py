@@ -1694,6 +1694,35 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    @app.get('/api/files/{file_id}/similar')
+    def api_similar_files(file_id: int, limit: int = 50):
+        """Whole-image CLIP similarity as JSON: file_ids ranked most-similar first.
+        Lets the photo page's "distance" quick-action open the matches straight
+        into the browsable watch-queue (same UX as find-by-face) instead of the
+        /similar/{id} results page. Uses the cached embeddings matrix + a
+        GIL-free argpartition top-K."""
+        _file_or_404(file_id)
+        emb_bytes = db.get_embedding(file_id)
+        if emb_bytes is None:
+            return {'results': [], 'message': 'This photo has no embedding yet.'}
+        import numpy as np
+        from media_manager.similarity import top_k_indices
+        query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
+        file_ids, _checksums, matrix = db.get_embeddings_matrix()
+        if matrix.shape[0] == 0:
+            return {'results': []}
+        scores = matrix.dot(query_emb)
+        k = min(matrix.shape[0], max(1, limit) + 1)  # +1 to absorb self-match
+        results = []
+        for i in top_k_indices(scores, k):
+            fid = int(file_ids[i])
+            if fid == file_id:
+                continue
+            results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
+            if len(results) >= limit:
+                break
+        return {'results': results}
+
     # ------------------------------------------------------------------
     # Find-by-body: person re-ID by outfit/build (see body_index.py).
     # Web-only by design — the body index is built and queried from here,
