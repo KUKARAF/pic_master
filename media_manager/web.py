@@ -1649,23 +1649,32 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 import numpy as np
                 query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-
-                all_embs = db.get_all_embeddings()
-                matrix = np.stack([
-                    np.frombuffer(r[2], dtype=np.float32) for r in all_embs
-                ])
-                scores = matrix.dot(query_emb).tolist()
-                ranked = sorted(
-                    zip([r[0] for r in all_embs], [r[1] for r in all_embs], scores, [r[3] for r in all_embs]),
-                    key=lambda x: x[2],
-                    reverse=True,
-                )
-                # skip self
-                ranked = [(fid, path, score, cs) for fid, path, score, cs in ranked if fid != file_id][:20]
-
-                rows = [(fid, path, True, cs) for fid, path, _score, cs in ranked]
-                scores = {fid: round(score, 4) for fid, _path, score, _cs in ranked}
-                files = _enrich_rows(rows, scores=scores)
+                dim = query_emb.shape[0]
+                all_embs = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
+                if all_embs:
+                    # One contiguous (N,D) matrix + a single BLAS matmul (GIL released),
+                    # then a C-level top-K select via argpartition — NOT a Python
+                    # sorted(zip(...)) over the whole embeddings table plus four full
+                    # list comprehensions, which held the GIL long enough to stall the
+                    # entire server on a large library.
+                    matrix = np.frombuffer(
+                        b''.join(r[2] for r in all_embs), dtype=np.float32
+                    ).reshape(len(all_embs), dim)
+                    scores = matrix @ query_emb
+                    k = min(len(all_embs), 21)  # 20 results + room to drop self
+                    top = np.argpartition(scores, -k)[-k:]
+                    top = top[np.argsort(scores[top])[::-1]]
+                    ranked = []
+                    for i in top:
+                        r = all_embs[int(i)]
+                        if r[0] == file_id:
+                            continue
+                        ranked.append((r[0], r[1], float(scores[i]), r[3]))
+                        if len(ranked) >= 20:
+                            break
+                    rows = [(fid, path, True, cs) for fid, path, _score, cs in ranked]
+                    scoremap = {fid: round(score, 4) for fid, _path, score, _cs in ranked}
+                    files = _enrich_rows(rows, scores=scoremap)
             except Exception as exc:
                 message = f'Similarity search error: {exc}'
 
