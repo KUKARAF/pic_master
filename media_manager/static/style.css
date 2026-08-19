@@ -1995,10 +1995,17 @@ input[type="range"] { accent-color: var(--accent); }
 /* In column layout the panel's width is the flex CROSS axis; with the overlay's
    align-items:center it would be indefinite, so the grid's auto-fill can't
    resolve a stable column count and the aspect-ratio cells overlap. Stretch it
-   to a definite full width (then re-cap + re-center) so it renders exactly like
-   the row-layout Space grid. Also leave room for the footer below. */
+   to a definite full width (then re-center) so it renders exactly like the
+   row-layout Space grid.
+   For HEIGHT: let the panel flex into whatever space is left after the footer
+   (which is flex:0 0 auto, so it reserves its true rendered height) and add
+   min-height:0 so overflow-y:auto actually scrolls. This replaces a former
+   `max-height: calc(100% - 84px)` — a hardcoded footer reservation that broke
+   whenever the footer wrapped (long set name / many items → footer > 84px →
+   it overlapped the last grid row). */
 .queue-grid-overlay.select-mode .queue-grid-panel {
-  max-height: calc(100% - 84px);
+  flex: 1 1 auto;
+  min-height: 0;
   align-self: stretch;
   margin-inline: auto;
 }
