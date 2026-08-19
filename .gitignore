@@ -55,3 +55,4 @@ Thumbs.db
 # person detector) — never something to commit.
 *.pt
 
+howto_start_worker_on_bigboy.md
