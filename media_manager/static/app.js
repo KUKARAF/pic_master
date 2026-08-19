@@ -1066,6 +1066,49 @@
       const extraBox = document.createElement('div');
       box.appendChild(extraBox);
 
+      // Suggested sets surfaced INSIDE the picker (only when opened from a photo
+      // page, which passes suggestForFileId). CLIP-centroid ranked matches shown
+      // above the search list as one-click picks — clicking one assigns it, the
+      // same as picking a search result. Absent for bulk-add-from-search callers.
+      let suggestWrap = null;
+      if (options.suggestForFileId != null && options.type === 'set') {
+        suggestWrap = document.createElement('div');
+        suggestWrap.className = 'modal-suggest';
+        box.insertBefore(suggestWrap, list);
+        fetch('/api/files/' + options.suggestForFileId + '/suggested-sets?limit=6')
+          .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+          .then(function (data) {
+            const results = (data.results || []).filter(function (s) { return excludeIds.indexOf(s.id) === -1; });
+            if (!results.length || resolved) return;
+            const heading = document.createElement('div');
+            heading.className = 'modal-suggest-title';
+            heading.textContent = '✨ Suggested sets';
+            suggestWrap.appendChild(heading);
+            results.forEach(function (set) {
+              const row = document.createElement('div');
+              row.className = 'modal-list-item';
+              const text = document.createElement('div');
+              const label = document.createElement('div');
+              label.textContent = set.name;
+              text.appendChild(label);
+              const metaLine = buildSetMetaLine(set);
+              if (metaLine) { const sub = document.createElement('div'); sub.className = 'sub'; sub.appendChild(metaLine); text.appendChild(sub); }
+              row.appendChild(text);
+              if (set.score != null) {
+                const scoreSpan = document.createElement('span');
+                scoreSpan.className = 'score-badge';
+                scoreSpan.style.position = 'static';
+                scoreSpan.style.marginLeft = 'auto';
+                scoreSpan.textContent = Number(set.score).toFixed(2);
+                row.appendChild(scoreSpan);
+              }
+              row.addEventListener('click', function () { resolveWith(set); });
+              suggestWrap.appendChild(row);
+            });
+          })
+          .catch(function () { /* suggestions are best-effort; search still works */ });
+      }
+
       let allItems = [];
       let visible = []; // [{kind:'existing', item} | {kind:'create', text}]
       let highlighted = -1;
@@ -1231,8 +1274,11 @@
 
   window.openEntitySearchModal = openEntitySearchModal;
 
-  function openSetSearchModal(onResolved, excludeSetId) {
-    openEntitySearchModal({ type: 'set', excludeIds: excludeSetId, onResolved: onResolved });
+  function openSetSearchModal(onResolved, excludeSetId, opts) {
+    openEntitySearchModal(Object.assign(
+      { type: 'set', excludeIds: excludeSetId, onResolved: onResolved },
+      opts || {}
+    ));
   }
 
   window.openSetSearchModal = openSetSearchModal;
@@ -2853,7 +2899,10 @@
       btn.dataset.busy = '1';
       var glyph = btn.textContent;
       btn.textContent = '⏳';
-      fetch('/api/faces/' + encodeURIComponent(ref) + '/similar')
+      // Looser than the 0.45 default: face crops of the same person often land
+      // ~0.35-0.45, and this is a browse-and-skip queue, so surface near-matches
+      // (restores the reach of the old "expand similar" slider we removed).
+      fetch('/api/faces/' + encodeURIComponent(ref) + '/similar?threshold=0.3')
         .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
         .then(function (data) {
           var seen = {}, ids = [];
@@ -3430,11 +3479,13 @@
   }
 
   function openSetPickerModal() {
+    // Opened from the photo page → surface CLIP-ranked suggested sets inside the
+    // picker (suggestForFileId). See openEntitySearchModal's set-suggestion block.
     openSetSearchModal(function (set) {
       assignSetById(set.id)
         .then(function (data) { appendSetChip(data); })
         .catch(function (err) { showToast('Failed to add set: ' + err.message); });
-    });
+    }, undefined, { suggestForFileId: fileId });
   }
 
   if (setPickerBtn) {
@@ -3446,91 +3497,51 @@
   // curate which queue items to add in the space-grid overlay).
   const setPickerQueueBtn = document.getElementById('set-picker-queue-btn');
   const photoQueue = window.__photoQueue;
+  function addQueueToSet() {
+    openSetSearchModal(function (set) { window.openQueueSelectGrid(set); });
+  }
   if (setPickerQueueBtn && photoQueue && photoQueue.ids.length > 1) {
     if (setPickerBtn) setPickerBtn.textContent = '＋ Add this to set';
     setPickerQueueBtn.style.display = '';
-    setPickerQueueBtn.addEventListener('click', function () {
-      openSetSearchModal(function (set) { window.openQueueSelectGrid(set); });
-    });
+    setPickerQueueBtn.addEventListener('click', addQueueToSet);
+  }
+
+  // The Set pod trigger. When there are no sets yet it's a direct "＋ Add set"
+  // action (data-pod-action, handled by the pod controller). If a queue is
+  // present too, upgrade it here (queue is only known at runtime) into a split
+  // pill: left half adds THIS photo, right half adds the WHOLE queue.
+  const setPodTrigger = document.getElementById('set-pod-trigger');
+  if (setPodTrigger && setPodTrigger.dataset.podAction === 'add-set'
+      && photoQueue && photoQueue.ids && photoQueue.ids.length) {
+    setPodTrigger.dataset.podAction = '';   // segments handle their own clicks now
+    setPodTrigger.classList.add('stage-pod-split');
+    setPodTrigger.innerHTML = '';
+    const photoSeg = document.createElement('span');
+    photoSeg.className = 'split-seg';
+    photoSeg.textContent = '＋ photo';
+    photoSeg.title = 'Add this photo to a set';
+    const divider = document.createElement('span');
+    divider.className = 'split-div';
+    const queueSeg = document.createElement('span');
+    queueSeg.className = 'split-seg';
+    queueSeg.textContent = '＋ queue';
+    queueSeg.title = 'Add the whole queue to a set';
+    setPodTrigger.appendChild(photoSeg);
+    setPodTrigger.appendChild(divider);
+    setPodTrigger.appendChild(queueSeg);
+    // stopPropagation so the click never bubbles to the pod controller (which
+    // would otherwise toggle the menu / pin the pod open).
+    photoSeg.addEventListener('click', function (e) { e.stopPropagation(); openSetPickerModal(); });
+    queueSeg.addEventListener('click', function (e) { e.stopPropagation(); addQueueToSet(); });
   }
 
   if (setCurrent) {
     setCurrent.querySelectorAll('[data-set-id]').forEach(wireSetChip);
   }
 
-  /* Suggested sets — CLIP centroid match ("which set does this photo probably
-     belong to"). Auto-running this on every /photo load was too heavy (it scans
-     every set's embeddings), so it's now MANUAL: the ✨ button fetches 6, and the
-     result is cached in localStorage (browser-only, never stored server-side) so
-     reopening the photo shows them again without recomputing. */
-  const setSuggestions = document.getElementById('set-suggestions');
-  const suggestSetsBtn = document.getElementById('suggest-sets-btn');
-  const SUGGEST_CACHE_KEY = 'mm_suggested_sets:' + fileId;
-
-  function renderSuggestedSets(results) {
-    if (!setSuggestions) return;
-    setSuggestions.innerHTML = '';
-    (results || []).forEach(function (set) {
-      const chip = document.createElement('a');
-      chip.className = 'chip-set';
-      chip.href = '#';
-      chip.style.marginRight = '6px';
-      chip.style.marginBottom = '4px';
-      chip.title = 'Suggested match — click to add';
-      chip.dataset.setId = set.id;
-      const row = document.createElement('span');
-      row.style.display = 'flex';
-      row.style.alignItems = 'center';
-      row.style.gap = '4px';
-      const nameSpan = document.createElement('span');
-      nameSpan.textContent = set.name;
-      row.appendChild(nameSpan);
-      if (set.score != null) {
-        const scoreSpan = document.createElement('span');
-        scoreSpan.className = 'score-badge';
-        scoreSpan.style.position = 'static';
-        scoreSpan.textContent = Number(set.score).toFixed(2);
-        row.appendChild(scoreSpan);
-      }
-      chip.appendChild(row);
-      const metaLine = buildSetMetaLine(set);
-      if (metaLine) chip.appendChild(metaLine);
-      chip.addEventListener('click', function (e) {
-        e.preventDefault();
-        chip.style.pointerEvents = 'none';
-        assignSetById(set.id)
-          .then(function (data) { appendSetChip(data); chip.remove(); })
-          .catch(function (err) { chip.style.pointerEvents = ''; showToast('Failed to add set: ' + err.message); });
-      });
-      setSuggestions.appendChild(chip);
-    });
-  }
-
-  // Restore any previously-suggested sets for this photo (browser-only cache).
-  if (setSuggestions) {
-    try {
-      const cached = JSON.parse(localStorage.getItem(SUGGEST_CACHE_KEY) || 'null');
-      if (cached && cached.length) renderSuggestedSets(cached);
-    } catch (e) { /* ignore corrupt cache */ }
-  }
-
-  if (suggestSetsBtn) {
-    suggestSetsBtn.addEventListener('click', function () {
-      const label = suggestSetsBtn.textContent;
-      suggestSetsBtn.disabled = true;
-      suggestSetsBtn.textContent = '✨ …';
-      fetch('/api/files/' + fileId + '/suggested-sets?limit=6')
-        .then(function (r) { return r.ok ? r.json() : { results: [] }; })
-        .then(function (data) {
-          const results = data.results || [];
-          renderSuggestedSets(results);
-          try { localStorage.setItem(SUGGEST_CACHE_KEY, JSON.stringify(results)); } catch (e) { /* quota */ }
-          if (!results.length) showToast('No similar sets found for this photo.');
-        })
-        .catch(function (err) { showToast('Failed to suggest sets: ' + err.message); })
-        .finally(function () { suggestSetsBtn.disabled = false; suggestSetsBtn.textContent = label; });
-    });
-  }
+  // Suggested sets are now surfaced INSIDE the set picker modal (see
+  // openEntitySearchModal's suggestForFileId block) instead of a separate
+  // "✨ Suggest sets" button + inline list on the page.
 
   /* Photo (file) favorite heart */
   const fileHeartBtn = document.getElementById('file-heart-btn');
@@ -3816,6 +3827,11 @@
     }
     pods.forEach(function (pod) {
       const trigger = pod.querySelector('.stage-pod-btn');
+      // Sets + Categories are click-to-open only (no hover) — their collapsed
+      // trigger doubles as a label/direct-add button, so a hover popover would
+      // fight the pointer. Faces and everything else (info/frames/tags) keep the
+      // hover-open behavior.
+      const clickOnly = pod.dataset.podKind === 'set' || pod.dataset.podKind === 'category';
       let hideTimer = null;
       function openPod() { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } pod.classList.add('is-open'); }
       function scheduleClose() {
@@ -3823,11 +3839,18 @@
         if (hideTimer) clearTimeout(hideTimer);
         hideTimer = setTimeout(function () { pod.classList.remove('is-open'); }, 160);
       }
-      pod.addEventListener('mouseenter', openPod);
-      pod.addEventListener('mouseleave', scheduleClose);
+      if (!clickOnly) {
+        pod.addEventListener('mouseenter', openPod);
+        pod.addEventListener('mouseleave', scheduleClose);
+      }
       if (trigger) {
         trigger.addEventListener('click', function (e) {
           e.stopPropagation();
+          // An empty Sets/Categories trigger is a direct "add" shortcut: it opens
+          // the picker modal straight away instead of toggling the (near-empty) menu.
+          const action = trigger.dataset.podAction;
+          if (action === 'add-category') { closeAllPods(null); openCategoryPickerModal(); return; }
+          if (action === 'add-set') { closeAllPods(null); openSetPickerModal(); return; }
           pod.__pinned = !pod.__pinned;
           if (pod.__pinned) { closeAllPods(pod); openPod(); }
           else pod.classList.remove('is-open');

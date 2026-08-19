@@ -4036,6 +4036,43 @@ def create_app(data_root: str) -> FastAPI:
         threshold = max(0.0, min(1.0, threshold))
         return {'results': _find_similar_faces_to_ref(face_id, threshold, limit=limit)}
 
+    @app.get('/face/{face_ref}', response_class=HTMLResponse)
+    def face_page(request: Request, face_ref: str):
+        """Landing page for a single face. A named face IS just that person, so we
+        redirect to their existing /person page (the person view is the named-face
+        view). An unknown face gets its own view: the crop, age/gender if known, a
+        "name this face" action, a link back to its photo, and a grid of
+        visually-similar faces to help decide who they are."""
+        kind, raw_id = _parse_face_ref(face_ref)  # 400s on a malformed ref
+        if kind == 'manual':
+            row = manual.get_face(raw_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail='Face not found')
+            identity = row['identity']
+            file_row = db.get_file_by_checksum(row['checksum'])
+            file_id = file_row['id'] if file_row is not None else None
+        else:
+            cursor = db.conn.cursor()
+            cursor.execute('SELECT identity, file_id FROM faces WHERE id = ?', (raw_id,))
+            row = cursor.fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail='Face not found')
+            identity = row['identity']
+            file_id = row['file_id']
+        if identity:
+            return RedirectResponse(url=f'/person/{quote(identity)}', status_code=307)
+        est = manual.get_age_estimate_for_face_ref(face_ref)
+        age = est['age'] if est is not None and est['age'] is not None else None
+        gender = est['gender'] if age is not None else None
+        similar = _find_similar_faces_to_ref(face_ref, FACE_SIMILAR_THRESHOLD, limit=40)
+        return templates.TemplateResponse(request, 'face.html', {
+            'ref': face_ref,
+            'file_id': file_id,
+            'age': age,
+            'gender': gender,
+            'similar': similar,
+        })
+
     # ------------------------------------------------------------------
     # Tinder-style face-suggestion card stack (swipe to confirm/reject)
     # ------------------------------------------------------------------

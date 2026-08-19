@@ -195,8 +195,8 @@
     </div>
   </div>
 
-  <div class="stage-pod" data-pod>
-    <button type="button" class="stage-pod-btn">▦ Categories</button>
+  <div class="stage-pod" data-pod data-pod-kind="category">
+    <button type="button" class="stage-pod-btn" id="category-pod-trigger"{% if not file.categories %} data-pod-action="add-category" title="Add a category"{% endif %}>{% if file.categories %}<span class="pod-collapsed-label">{{ file.categories | map(attribute='name') | join(', ') }}</span>{% else %}＋ Add category{% endif %}</button>
     <div class="stage-pod-menu">
     <!-- Categories — a photo can belong to any number of categories, same as
          tags/sets. Each chip is either a manual assignment or an unsuppressed
@@ -221,8 +221,8 @@
     </div>
   </div>
 
-  <div class="stage-pod" data-pod>
-    <button type="button" class="stage-pod-btn">▤ Sets</button>
+  <div class="stage-pod" data-pod data-pod-kind="set">
+    <button type="button" class="stage-pod-btn" id="set-pod-trigger"{% if not current_sets %} data-pod-action="add-set" title="Add to a set"{% endif %}>{% if current_sets %}<span class="pod-collapsed-label">{{ current_sets | map(attribute='name') | join(', ') }}</span>{% else %}＋ Add set{% endif %}</button>
     <div class="stage-pod-menu">
     <!-- Sets — a photo can belong to any number of sets -->
     <div class="sidebar-panel">
@@ -245,8 +245,6 @@
         <span class="sub">Not in any set.</span>
         {% endif %}
       </div>
-      <button type="button" id="suggest-sets-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;" title="Suggest 6 similar sets (by image similarity)">✨ Suggest sets</button>
-      <div id="set-suggestions" style="margin-top:8px;"></div>
       <button type="button" id="set-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
       <button type="button" id="set-picker-queue-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;display:none;">＋ Add queue to set</button>
     </div>
@@ -256,24 +254,29 @@
   </div><!-- /right rail -->
 
   <!-- TOP-LEFT: Faces -->
-  <div class="stage-pod stage-top-left" data-pod>
+  <div class="stage-pod stage-top-left" data-pod data-pod-kind="faces">
+    {# At-a-glance cluster: only faces that have a confirmed identity (a crop
+       we can show). Unknown/unidentified faces are intentionally omitted so
+       the cluster stays meaningful. Each is a small circular crop + name (+ age)
+       and links to that person; capped at 3 + a "+N" overflow chip. #}
+    {% set identified_faces = faces | selectattr('identity') | list if faces else [] %}
     <div class="stage-pod-row">
-      <button type="button" class="stage-pod-btn">☺ Faces</button>
-      {# At-a-glance cluster: only faces that have a confirmed identity (a crop
-         we can show). Unknown/unidentified faces are intentionally omitted so
-         the cluster stays meaningful. Cap at 5 + a "+N" overflow chip. #}
-      {% set identified_faces = faces | selectattr('identity') | list if faces else [] %}
       {% if identified_faces %}
+      <button type="button" class="stage-pod-btn stage-pod-btn-faces" title="Faces">☺</button>
       <div class="face-avatar-cluster">
-        {% for face in identified_faces[:5] %}
-        <a class="face-avatar" href="/person/{{ face.identity | urlencode }}" title="{{ face.identity }}">
-          <img src="/face-crop/{{ face.ref }}" alt="{{ face.identity }}" width="28" height="28" loading="lazy">
+        {% for face in identified_faces[:3] %}
+        <a class="face-glance" href="/person/{{ face.identity | urlencode }}" title="{{ face.identity }}">
+          <img class="face-glance-img" src="/face-crop/{{ face.ref }}" alt="{{ face.identity }}" width="24" height="24" loading="lazy">
+          <span class="face-glance-name">{{ face.identity }}</span>
+          {% if face.age is not none %}<span class="face-glance-age {{ 'gender-male' if face.gender == 'male' else ('gender-female' if face.gender == 'female' else '') }}">{{ face.age | round(0) | int }}</span>{% endif %}
         </a>
         {% endfor %}
-        {% if identified_faces | length > 5 %}
-        <span class="face-avatar-more" title="{{ identified_faces | length - 5 }} more identified">+{{ identified_faces | length - 5 }}</span>
+        {% if identified_faces | length > 3 %}
+        <span class="face-avatar-more" title="{{ identified_faces | length - 3 }} more identified">+{{ identified_faces | length - 3 }}</span>
         {% endif %}
       </div>
+      {% else %}
+      <button type="button" class="stage-pod-btn">☺ Faces</button>
       {% endif %}
     </div>
     <div class="stage-pod-menu">
@@ -336,7 +339,7 @@
       <div class="face-chips" id="face-chips">
         {% for face in faces %}
         <div class="face-chip" data-face-ref="{{ face.ref }}">
-          <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}">
+          <a class="face-crop-link" href="{% if face.identity %}/person/{{ face.identity | urlencode }}{% else %}/face/{{ face.ref }}{% endif %}" title="{% if face.identity %}{{ face.identity }}{% else %}View this face{% endif %}">
             <img src="/face-crop/{{ face.ref }}" alt="face" width="56" height="56">
           </a>
           <span class="face-name">

@@ -506,6 +506,18 @@ input[type="range"] { accent-color: var(--accent); }
 .modal-list-item .sub { font-size: 14px; color: var(--text-muted); }
 .modal-list-item-thumb { width: 56px; height: 56px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
 .modal-list-item-thumb.square { border-radius: var(--radius-card); }
+
+/* Suggested sets pre-listed at the top of the set picker (photo page only). */
+.modal-suggest { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
+.modal-suggest .modal-list-item { align-items: center; }
+.modal-suggest-title {
+  font-family: var(--font-pixel);
+  font-size: 8px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 2px 0 4px;
+}
 .modal-empty { padding: 6px 2px; font-size: 15px; color: var(--text-muted); }
 .modal-divider { border-top: 1px dashed var(--border); margin: 12px 0; padding-top: 12px; }
 .modal-box input[type="text"] { width: 100%; padding: 9px 10px; }
@@ -1265,6 +1277,59 @@ input[type="range"] { accent-color: var(--accent); }
   -webkit-backdrop-filter: blur(18px) saturate(150%);
   text-shadow: 0 1px 3px rgba(0, 0, 0, .6);
 }
+
+/* At-a-glance identified-face pills next to the ☺ trigger: circular crop + name
+   (+ age). Each links to that person. Names ellipsis so the row stays compact. */
+.face-avatar-cluster { gap: 6px; }
+.face-glance {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 140px;
+  padding: 2px 8px 2px 2px;
+  border-radius: 999px;
+  color: var(--text);
+  background: rgba(10, 14, 10, .3);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, .14);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, .35);
+  text-decoration: none;
+  font-family: var(--font-pixel);
+  font-size: 8px;
+  letter-spacing: .04em;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, .6);
+  transition: border-color .12s ease, color .12s ease;
+}
+.face-glance:hover { color: var(--accent); border-color: var(--border-accent); }
+.face-glance-img {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  object-fit: cover;
+  display: block;
+  flex: 0 0 auto;
+  border: 1.5px solid rgba(255, 255, 255, .6);
+}
+.face-glance-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 76px; }
+.face-glance-age { opacity: .85; }
+
+/* Collapsed Set/Category trigger label: comma-joined names, truncated so the
+   pill stays short (the full list is always visible inside the open menu). */
+.pod-collapsed-label {
+  display: inline-block;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+/* Split "＋ photo | ＋ queue" Set trigger — two clickable halves + a divider. */
+.stage-pod-btn.stage-pod-split { padding: 0; gap: 0; overflow: hidden; }
+.stage-pod-split .split-seg { padding: 8px 11px; transition: color .12s ease; }
+.stage-pod-split .split-seg:hover { color: var(--accent); }
+.stage-pod-split .split-div { width: 1px; align-self: stretch; background: rgba(255, 255, 255, .22); }
 
 /* Corner pods — a glass trigger + a glass popover menu opened on hover and
    pinned by click (JS toggles .is-open). */

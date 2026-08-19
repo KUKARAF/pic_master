@@ -1,0 +1,106 @@
+{% extends "base.html" %}
+
+{% block title %}Face — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Face</h1>
+  {% if file_id is not none %}
+  <span class="sub"><a href="/photo/{{ file_id }}">← Back to photo</a></span>
+  {% endif %}
+</div>
+
+<div style="display:flex;gap:20px;align-items:flex-start;flex-wrap:wrap;margin-bottom:28px;">
+  <img src="/face-crop/{{ ref }}" alt="Face crop"
+       style="width:160px;height:160px;object-fit:cover;border-radius:12px;">
+  <div style="display:flex;flex-direction:column;gap:12px;">
+    {% if age is not none %}
+    <div>
+      <span class="face-age-gender {{ 'gender-male' if gender == 'male' else ('gender-female' if gender == 'female' else '') }}">
+        {{ age | round(0) | int }}{% if gender %} · {{ gender }}{% endif %}
+      </span>
+    </div>
+    {% endif %}
+    <div>
+      <button type="button" id="face-name-btn" class="btn-similar">Name this face</button>
+    </div>
+  </div>
+</div>
+
+<div class="section-title" style="margin-bottom:12px;">Similar faces</div>
+{% if similar %}
+<div class="grid" data-queue-source="Similar to this face">
+  {% for f in similar %}
+  <div class="card" data-file-id="{{ f.file_id }}">
+    <a class="card-img-link" href="/photo/{{ f.file_id }}">
+      <img src="/face-crop/{{ f.ref }}" alt="{{ f.filename }}" loading="lazy">
+    </a>
+    <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
+    <div class="card-body">
+      <a class="card-name" href="/photo/{{ f.file_id }}" title="{{ f.filename }}">
+        {% if f.identity %}{{ f.identity }}{% else %}{{ f.filename }}{% endif %}
+      </a>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<p class="sub">No similar faces found yet.</p>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var btn = document.getElementById('face-name-btn');
+  if (!btn || !window.openEntitySearchModal) return;
+  var faceRef = {{ ref | tojson }};
+  btn.addEventListener('click', function () {
+    window.openEntitySearchModal({
+      type: 'identity',
+      title: 'Name this face',
+      previewImage: '/face-crop/' + faceRef,
+      allowEmpty: true,
+      extraSuggestion: function (resolve, box) {
+        fetch('/api/faces/' + faceRef + '/suggestions')
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            var top = data.suggestions && data.suggestions[0];
+            if (!top) return;
+            var suggestBtn = document.createElement('button');
+            suggestBtn.type = 'button';
+            suggestBtn.className = 'btn-similar';
+            suggestBtn.style.fontSize = '0.85em';
+            suggestBtn.style.marginTop = '8px';
+            suggestBtn.textContent = 'Looks like ' + top.name + '? (' + top.score.toFixed(2) + ')';
+            suggestBtn.addEventListener('click', function () { resolve({ name: top.name }); });
+            box.appendChild(suggestBtn);
+          })
+          .catch(function () {});
+      },
+      onResolved: function (entity) {
+        fetch('/api/faces/' + faceRef + '/identity', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: entity.name || null }),
+        })
+          .then(function (r) {
+            if (!r.ok) throw new Error('Request failed: ' + r.status);
+            return r.json();
+          })
+          .then(function () {
+            if (entity.name) {
+              window.location.href = '/person/' + encodeURIComponent(entity.name);
+            } else {
+              window.location.reload();
+            }
+          })
+          .catch(function (err) {
+            if (window.showToast) window.showToast('Failed to save name: ' + err.message);
+          });
+      },
+    });
+  });
+})();
+</script>
+{% endblock %}
