@@ -8,16 +8,21 @@ from media_manager import MediaManager
 
 def _ensure_self_signed_cert(media_dir, host):
     """Return (certfile, keyfile), generating a self-signed cert via the
-    system openssl binary if one isn't already cached in .media/."""
+    system openssl binary if one isn't already cached in .media/.
+
+    Returns None if the openssl binary is unavailable, so the caller can
+    fall back to plain HTTP rather than failing to start."""
     certfile = os.path.join(media_dir, 'https_cert.pem')
     keyfile = os.path.join(media_dir, 'https_key.pem')
     if os.path.exists(certfile) and os.path.exists(keyfile):
         return certfile, keyfile
 
     if not shutil.which('openssl'):
-        print("ERROR: --https requires the 'openssl' command-line tool, which "
-              "was not found on PATH.", file=sys.stderr)
-        sys.exit(1)
+        print("WARNING: HTTPS requires the 'openssl' command-line tool, which "
+              "was not found on PATH. Falling back to plain HTTP. "
+              "Install openssl or pass --http to silence this warning.",
+              file=sys.stderr)
+        return None
 
     print("Generating self-signed HTTPS certificate (first run)...")
     subj = f'/CN={host}'
@@ -256,7 +261,7 @@ def main():
                                   'Without this flag, only reports what would change.')
 
     # media web - launch the FastAPI gallery server
-    web_cmd = sub.add_parser('web', help='Start the web gallery UI at localhost:8000')
+    web_cmd = sub.add_parser('web', help='Start the web gallery UI at https://localhost:8000')
     web_cmd.add_argument('host_pos', nargs='?', metavar='host', default=None,
                          help='Host to bind to, e.g. 192.168.1.231 to expose on the local '
                               'network (shorthand for --host)')
@@ -264,9 +269,10 @@ def main():
                          help='Host to bind to (default: 127.0.0.1)')
     web_cmd.add_argument('--port', type=int, default=8000,
                          help='Port to listen on (default: 8000)')
-    web_cmd.add_argument('--https', action='store_true',
-                         help='Serve over HTTPS using a self-signed cert '
-                              '(auto-generated via the openssl binary, cached in .media/)')
+    web_cmd.add_argument('--http', action='store_true',
+                         help='Serve over plain HTTP. By default the gallery is served over '
+                              'HTTPS using a self-signed cert (auto-generated via the openssl '
+                              'binary, cached in .media/).')
     web_cmd.add_argument('--workers', type=int, default=2,
                          help='Number of worker processes (default: 2). Independent processes '
                               'avoid one heavy request (a CLIP/embedding scan) blocking every '
@@ -676,11 +682,13 @@ def main():
         host = args.host_pos or args.host
         ssl_kwargs = {}
         scheme = 'http'
-        if args.https:
+        if not args.http:
             media_dir = os.path.join(data_root, '.media')
-            certfile, keyfile = _ensure_self_signed_cert(media_dir, host)
-            ssl_kwargs = {'ssl_certfile': certfile, 'ssl_keyfile': keyfile}
-            scheme = 'https'
+            cert = _ensure_self_signed_cert(media_dir, host)
+            if cert is not None:
+                certfile, keyfile = cert
+                ssl_kwargs = {'ssl_certfile': certfile, 'ssl_keyfile': keyfile}
+                scheme = 'https'
         print(f"Starting media gallery at {scheme}://{host}:{args.port}/")
         if args.workers > 1:
             # uvicorn's multi-worker mode spawns separate processes that each
