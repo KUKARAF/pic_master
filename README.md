@@ -85,8 +85,9 @@ low-RAM host (or one running the web UI with multiple workers) they can OOM. The
 the host offloads to it over [Reticulum](https://reticulum.network/) (RNS, an
 encrypted networking stack). When a worker is reachable, `media faces` /
 `media index` / `media embed` / `media bodies`, the web reindex/embed/face
-endpoints, find-by-body, **and per-tag classifier training** (the CLIP and
-YOLO-World "Train" buttons) all send their work to it — each dispatch is logged
+endpoints, find-by-body, **per-tag classifier training** (the CLIP and
+YOLO-World "Train" buttons), **and age/gender estimation** all send their work
+to it — each dispatch is logged
 (`[worker] outsourced …`) and shown in the web UI's worker badge. For the
 *inference* offloads the host transparently falls back to running locally if the
 worker is unreachable; **training does not fall back** — see below.
@@ -189,6 +190,22 @@ metadata/status the UI already polls). Two things to know:
   unreachable, a Train click fails with a clear "worker unavailable" status
   rather than falling back to training on the (low-RAM) host. Start the worker,
   then retry.
+
+### 6. Age/gender estimation on the worker
+
+Age/gender (MiVOLO) is also offloaded when a worker is configured — the
+`/person/` "🎂 Estimate all" button and the per-photo estimate run on the
+worker, not the host. MiVOLO pins an old torch/timm/ultralytics, so it lives in
+its **own isolated venv** separate from the worker's main environment; set it up
+once **on the worker**:
+
+```bash
+media age-setup      # creates ~/.local/share/media_manager/age-venv (uses uv if present)
+```
+
+Like the other offloads it is **worker-only, no local fallback**: if the worker
+is unreachable — or you skipped `media age-setup` on it — an Estimate click fails
+loudly rather than running MiVOLO on the host.
 
 ## Project Structure
 

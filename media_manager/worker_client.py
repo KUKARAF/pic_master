@@ -532,6 +532,39 @@ class RemoteCLIPIndexer:
         return CLIPIndexer.model_id(*args, **kwargs)
 
 
+class RemoteAgeEstimator:
+    """Drop-in for :class:`age_estimator.AgeGenderEstimator` backed by the worker.
+
+    Same ``estimate(image_path, faces)`` signature — ships the image + face
+    bboxes to the worker, which runs MiVOLO in its OWN isolated ``.age-venv``
+    there. Raises :class:`RuntimeError` (matching the local estimator's error
+    contract, which web.py's ``api_estimate_age`` already handles) rather than
+    WorkerError, so a failure surfaces cleanly with no web.py change."""
+
+    def __init__(self, client: WorkerClient):
+        self.client = client
+
+    def estimate(self, image_path: str, faces: list) -> list:
+        if not faces:
+            return []
+        basename = os.path.basename(image_path)
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+        self.client.record("estimate_age", basename)
+        # MiVOLO's per-call subprocess caps at 120s on the worker, plus the image
+        # upload; give the round-trip generous headroom (first run also downloads
+        # weights on the worker — that first estimate may need a retry).
+        resp = self.client.request(
+            worker_protocol.PATH_ESTIMATE_AGE,
+            {"name": basename, "image": image_bytes,
+             "faces": [{"face_ref": fc["ref"], "bbox": [float(v) for v in fc["bbox"]]}
+                       for fc in faces]},
+            timeout=200)
+        if resp.get("error"):
+            raise RuntimeError(resp["error"])
+        return resp.get("results") or []
+
+
 class RemoteYOLODetector:
     """Drop-in for :class:`detector.YOLOWorldDetector` backed by the worker."""
 

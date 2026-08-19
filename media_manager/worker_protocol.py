@@ -22,6 +22,7 @@ PATH_EMBED_BBOX = "embed_bbox"
 PATH_EMBED_IMAGE = "embed_image"
 PATH_EMBED_TEXT = "embed_text"
 PATH_DETECT_OBJECTS = "detect_objects"
+PATH_ESTIMATE_AGE = "estimate_age"
 # Per-tag model TRAINING (job/poll pattern) + fine-tuned inference. Unlike the
 # stateless inference ops above, these carry a job_id and the worker keeps
 # state (a scratch dataset while training, a persisted checkpoint after).
@@ -39,6 +40,7 @@ ALL_PATHS = [
     PATH_EMBED_IMAGE,
     PATH_EMBED_TEXT,
     PATH_DETECT_OBJECTS,
+    PATH_ESTIMATE_AGE,
     PATH_TRAIN_CREATE,
     PATH_TRAIN_ADD,
     PATH_TRAIN_RUN,
@@ -84,6 +86,14 @@ ALL_PATHS = [
 #     resp: {"detections": [[class_name(str), conf(float),
 #                            x1, y1, x2, y2 (floats)]],
 #            "error": <None|str>}
+#
+#   PATH_ESTIMATE_AGE   (MiVOLO age/gender, run in the worker's isolated .age-venv)
+#     req:  {"name": <str>, "image": <bytes: encoded image>,
+#            "faces": [{"face_ref": <str>, "bbox": [x1, y1, x2, y2]}, ...]}
+#     resp: {"results": [{"face_ref": <str>, "age": <float|None>,
+#                         "gender": <str|None>}, ...],
+#            "error": <None|str>}   # error e.g. "run media age-setup" when the
+#                                   # worker has no .age-venv
 #
 # --- Per-tag training (job/poll) + fine-tuned inference --------------------
 # The host driver (remote_tag_trainer.py) creates a job, uploads the training

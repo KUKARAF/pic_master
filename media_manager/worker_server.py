@@ -91,6 +91,22 @@ class WorkerModels:
 # Module-level singleton holder shared by all request handlers.
 models = WorkerModels()
 
+# Age/gender (MiVOLO) runs in its OWN isolated .age-venv subprocess (see
+# age_estimator.py), NOT in this process — so it doesn't contend with the three
+# in-process models above, and gets its own lock rather than models.lock. The
+# lock just serializes concurrent age requests so two MiVOLO subprocesses can't
+# spike RAM at once. Lazily built (its __init__ only resolves the venv path).
+_age_estimator = None
+_age_lock = threading.Lock()
+
+
+def _get_age_estimator():
+    global _age_estimator
+    if _age_estimator is None:
+        from .age_estimator import AgeGenderEstimator
+        _age_estimator = AgeGenderEstimator()
+    return _age_estimator
+
 
 def _ext_from_name(name):
     """Return a file extension (with dot) derived from the request's basename,
@@ -287,6 +303,31 @@ def handle_detect_objects(path, data, request_id, link_id, remote_identity, requ
         print(f"[worker] handled {worker_protocol.PATH_DETECT_OBJECTS} ({name}) -> ERROR {e}",
               flush=True)
         return worker_protocol.pack({"detections": [], "error": str(e)})
+    finally:
+        if tmp is not None:
+            _cleanup(tmp)
+
+
+def handle_estimate_age(path, data, request_id, link_id, remote_identity, requested_at):
+    name = None
+    tmp = None
+    try:
+        req = worker_protocol.unpack(data)
+        name = req.get("name")
+        # Map the wire faces to the shape AgeGenderEstimator.estimate expects
+        # ('ref' + 'bbox'); it returns [{face_ref, age, gender}, ...] already.
+        faces = [{"ref": f["face_ref"], "bbox": f["bbox"]} for f in (req.get("faces") or [])]
+        tmp = _write_temp(req["image"], name)
+        with _age_lock:
+            results = _get_age_estimator().estimate(tmp, faces)
+        print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> "
+              f"{len(results)} face(s)", flush=True)
+        return worker_protocol.pack({"results": results, "error": None})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> ERROR {e}",
+              flush=True)
+        return worker_protocol.pack({"results": [], "error": str(e)})
     finally:
         if tmp is not None:
             _cleanup(tmp)
@@ -694,6 +735,7 @@ HANDLERS = {
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
     worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,
+    worker_protocol.PATH_ESTIMATE_AGE: handle_estimate_age,
     worker_protocol.PATH_TRAIN_CREATE: handle_train_create,
     worker_protocol.PATH_TRAIN_ADD: handle_train_add,
     worker_protocol.PATH_TRAIN_RUN: handle_train_run,

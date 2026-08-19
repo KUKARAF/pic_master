@@ -302,13 +302,21 @@ def _get_clip_indexer():
 
 
 _age_estimator = None
+_age_estimator_remote = None
 
 
 def _get_age_estimator():
     """Experimental — see age_estimator.py. Runs in a separate, isolated venv (MiVOLO
     pins an old timm/ultralytics that conflict with this app's own detector/indexer),
-    so this lazy singleton is a thin subprocess client, not a loaded model."""
-    global _age_estimator
+    so this lazy singleton is a thin subprocess client, not a loaded model. When a
+    worker is configured, offload it too (the worker runs MiVOLO in ITS .age-venv) —
+    same is_configured() gating as the other model getters, worker-only with no local
+    fallback so the low-RAM host never runs MiVOLO."""
+    global _age_estimator, _age_estimator_remote
+    if _worker_client is not None and _worker_client.is_configured():
+        if _age_estimator_remote is None:
+            _age_estimator_remote = worker_client.RemoteAgeEstimator(_worker_client)
+        return _age_estimator_remote
     if _age_estimator is None:
         from media_manager.age_estimator import AgeGenderEstimator
         _age_estimator = AgeGenderEstimator()
