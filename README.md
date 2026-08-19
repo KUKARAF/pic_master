@@ -57,6 +57,8 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media metadata [path]` | Read EXIF capture time + GPS |
 | `media set create/ls/assign/files` | Manage named sets (e.g. a studio shoot) |
 | `media web` | Launch the FastAPI gallery UI |
+| `media worker` | Run the remote ML-offload worker on a beefy machine (see below) |
+| `media worker-connect <hash>` | Point this host at a worker to offload heavy ML |
 
 ## Optional: age/gender estimation (MiVOLO)
 
@@ -75,6 +77,98 @@ you built yourself, set `MEDIA_AGE_VENV_PYTHON` to its python executable; a
 repo checkout's `.age-venv` is also still picked up automatically for
 development. Everything else works fine without this step.
 
+## Optional: remote ML worker (offload heavy models over Reticulum)
+
+Face detection/embedding, CLIP, and YOLO-World are memory-hungry. On a
+low-RAM host (or one running the web UI with multiple workers) they can OOM. The
+`media worker` command runs those models on a **separate, beefier machine** and
+the host offloads to it over [Reticulum](https://reticulum.network/) (RNS, an
+encrypted networking stack). When a worker is reachable, `media faces` /
+`media index` / `media embed` / `media bodies`, the web reindex/embed/face
+endpoints, and find-by-body all send their work to it — each dispatch is logged
+(`[worker] outsourced …`) and shown in the web UI's worker badge. If the worker
+is unreachable, the host transparently falls back to running locally.
+
+Only the *models* run remotely; your media files never need to live on the
+worker (images are streamed to it per request). Results come back as embeddings
+and are written to the host's `.media/` database exactly as if computed locally.
+
+### 1. Install the package on both machines
+
+Install `media` (this package) on the host and the worker the same way. The
+worker also needs the ML dependencies (they ship in `requirements.txt`); use a
+Python with wheels for your ML stack (3.11/3.12 are safe — very new interpreters
+may lack torch/onnxruntime wheels).
+
+### 2. Give both machines a Reticulum path to each other
+
+The two machines must share a Reticulum network. The simplest reliable setup is
+an explicit TCP link: run a **TCP server** interface on the worker and a **TCP
+client** interface on the host. Create `~/.reticulum/config` on each:
+
+**Worker** (`~/.reticulum/config`):
+
+```ini
+[reticulum]
+  enable_transport = No
+  share_instance = No
+
+[interfaces]
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    interface_enabled = yes
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+```
+
+**Host** (`~/.reticulum/config`) — point `target_host` at the worker's IP:
+
+```ini
+[reticulum]
+  enable_transport = No
+  share_instance = No
+
+[interfaces]
+  [[Worker link]]
+    type = TCPClientInterface
+    interface_enabled = yes
+    target_host = 192.168.1.66
+    target_port = 4242
+```
+
+Make sure the worker's port (4242 here) is reachable from the host (open it in
+any firewall). On a single flat LAN you can instead rely on Reticulum's default
+`AutoInterface` (no IPs needed), but an explicit TCP interface is more
+predictable — especially on a machine with many virtual/bridge interfaces (e.g.
+a Docker host), where AutoInterface gets noisy.
+
+### 3. Start the worker
+
+On the worker machine:
+
+```bash
+media worker            # add --preload to load all models at startup
+```
+
+It prints its **destination address** (a hex hash) and keeps running, announcing
+itself periodically. The address is stable across restarts (the worker persists
+its identity under `~/.config/media_manager/`). Leave it running (in tmux/screen,
+or `nohup media worker &`).
+
+### 4. Point the host at the worker
+
+On the host, inside your media repo:
+
+```bash
+media worker-connect <hex-address-from-step-3>
+```
+
+This writes `.media/worker.json`. From now on `media` commands and the web UI
+offload to the worker. You can also set `MEDIA_WORKER_ADDR` /
+`MEDIA_WORKER_ENABLED` as environment variables instead of the file, and
+`media worker-connect <hash> --disable` saves the address but turns offloading
+off.
+
 ## Project Structure
 
 ```
@@ -89,6 +183,10 @@ media_manager/
 ├── face_detector.py      # InsightFace detection + embeddings
 ├── exif_reader.py        # EXIF capture time + GPS
 ├── age_estimator.py      # MiVOLO client (isolated-venv subprocess)
+├── worker_server.py      # `media worker` — remote ML-offload server (Reticulum)
+├── worker_client.py      # host-side client + drop-in Remote* model proxies
+├── worker_protocol.py    # shared RNS wire contract
+├── worker_config.py      # .media/worker.json + MEDIA_WORKER_* env
 ├── web.py                # FastAPI gallery
 ├── templates/, static/   # Web UI assets
 └── ...
