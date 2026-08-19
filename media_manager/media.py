@@ -302,6 +302,10 @@ def main():
 
     # strict-check helper
     def _ensure_repo():
+        # `worker` is the remote-offload server: it runs on a device that has no
+        # media library of its own, so it must never require a .media/ repo.
+        if args.cmd == 'worker':
+            return
         if args.strict and not os.path.isdir('.media'):
             print("ERROR: no media repo found (.media/ missing)", file=sys.stderr)
             sys.exit(1)
