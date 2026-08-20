@@ -1488,6 +1488,16 @@ class Database(ThreadLocalDB):
         row = cursor.fetchone()
         return row[0] if row else 0
 
+    def get_tiles_for_file(self, file_id):
+        """(x1, y1, x2, y2, embedding_bytes) for every tile of one file, in tile
+        order. Used to localize a whole-image match to its best sub-region (e.g.
+        the swipe fullview highlight for centroid tag suggestions). [] if untiled."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT x1, y1, x2, y2, embedding FROM tile_embeddings '
+            'WHERE file_id = ? ORDER BY tile_index', (file_id,))
+        return cursor.fetchall()
+
     def get_untiled_files(self, limit=None) -> list:
         """Return (id, path) for tracked files that have NO tile_embeddings row.
         Mirrors get_unbody_indexed_files; the caller skips non-images, so there is

@@ -2444,10 +2444,43 @@ def create_app(data_root: str) -> FastAPI:
 
                 qualifying.sort(key=blended, reverse=True)
 
-        return _attach_file_meta([
-            {'ref': str(row[0]), 'file_id': row[0], 'label': label, 'score': round(float(score), 3)}
-            for row, score in qualifying[:count]
-        ])
+        # Whole-image centroid ranking has no inherent "where", so the swipe
+        # fullview (Right arrow) had nothing to highlight for this path. If the
+        # tile index is built, localize each match to its best-matching sub-tile
+        # vs the centroid and attach a normalized bbox — same shape the YOLO path
+        # emits, so swipe-core highlights it identically.
+        cards = []
+        for row, score in qualifying[:count]:
+            card = {'ref': str(row[0]), 'file_id': row[0], 'label': label,
+                    'score': round(float(score), 3)}
+            bbox = _best_tile_bbox(row[0], centroid)
+            if bbox is not None:
+                card['bbox'] = bbox
+            cards.append(card)
+        return _attach_file_meta(cards)
+
+    def _best_tile_bbox(file_id, centroid):
+        """Normalized [x1,y1,x2,y2] of the sub-tile of `file_id` most similar to
+        `centroid` — "where in this photo the tag matches", for the swipe fullview
+        highlight. The whole-image tile is skipped (it can't localize). None when
+        the file has no tile index yet (▦ Index regions not run)."""
+        tiles = db.get_tiles_for_file(file_id)
+        if not tiles:
+            return None
+        import numpy as np
+        w = max((t[2] for t in tiles), default=0) or 1.0
+        h = max((t[3] for t in tiles), default=0) or 1.0
+        best, best_score = None, -2.0
+        for x1, y1, x2, y2, emb in tiles:
+            if (x2 - x1) * (y2 - y1) >= 0.9 * w * h:
+                continue  # the whole-image tile — highlighting it tells you nothing
+            s = float(np.frombuffer(emb, dtype=np.float32).dot(centroid))
+            if s > best_score:
+                best_score, best = s, (x1, y1, x2, y2)
+        if best is None:
+            return None
+        x1, y1, x2, y2 = best
+        return [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
 
     @app.post('/api/tags/{label}/suggestions/next')
     def api_next_tag_suggestions(label: str, body: SwipeExcludeBody, count: int = 10,
