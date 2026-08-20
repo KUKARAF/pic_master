@@ -1040,12 +1040,35 @@
         box.appendChild(preview);
       }
 
+      // Input + an inline "＋ Create" button (replaces the old create-as-a-list-row):
+      // creating a new entity lives right in the search box now.
+      const inputRow = document.createElement('div');
+      inputRow.style.cssText = 'display:flex;gap:6px;align-items:stretch;margin-bottom:8px;';
       const input = document.createElement('input');
       input.type = 'text';
       input.placeholder = config.placeholder;
       input.autocomplete = 'off';
-      input.style.marginBottom = '8px';
-      box.appendChild(input);
+      input.style.flex = '1';
+      inputRow.appendChild(input);
+      const createBtn = document.createElement('button');
+      createBtn.type = 'button';
+      createBtn.className = 'btn-similar';
+      createBtn.style.cssText = 'white-space:nowrap;display:none;';
+      createBtn.textContent = '＋ Create';
+      createBtn.addEventListener('click', function () {
+        const q = input.value.trim();
+        if (q) resolveEntry({ kind: 'create', text: q });
+      });
+      inputRow.appendChild(createBtn);
+      box.appendChild(inputRow);
+
+      // Create is offered only with no active person filter (a person chip means
+      // "pick from Joe's sets", not "make an unrelated new set").
+      function updateCreateBtn() {
+        const q = input.value.trim();
+        createBtn.style.display = (q && !personChips.length) ? '' : 'none';
+        createBtn.title = q ? ('Create "' + q + '"') : '';
+      }
 
       // Person chips — only wired up for types that opt in (currently just
       // 'set'). identityNames is populated once, below, alongside the entity
@@ -1127,6 +1150,7 @@
       // above the search list as one-click picks — clicking one assigns it, the
       // same as picking a search result. Absent for bulk-add-from-search callers.
       let suggestWrap = null;
+      let suggestSets = [];
       if (options.suggestForFileId != null && options.type === 'set') {
         suggestWrap = document.createElement('div');
         suggestWrap.className = 'modal-suggest';
@@ -1134,42 +1158,73 @@
         fetch('/api/files/' + options.suggestForFileId + '/suggested-sets?limit=6')
           .then(function (r) { return r.ok ? r.json() : { results: [] }; })
           .then(function (data) {
-            const results = (data.results || []).filter(function (s) { return excludeIds.indexOf(s.id) === -1; });
-            if (!results.length || resolved) return;
-            const heading = document.createElement('div');
-            heading.className = 'modal-suggest-title';
-            heading.textContent = '✨ Suggested sets';
-            suggestWrap.appendChild(heading);
-            results.forEach(function (set) {
-              const row = document.createElement('div');
-              row.className = 'modal-list-item';
-              const text = document.createElement('div');
-              const label = document.createElement('div');
-              label.textContent = set.name;
-              text.appendChild(label);
-              const metaLine = buildSetMetaLine(set);
-              if (metaLine) { const sub = document.createElement('div'); sub.className = 'sub'; sub.appendChild(metaLine); text.appendChild(sub); }
-              row.appendChild(text);
-              if (set.score != null) {
-                const scoreSpan = document.createElement('span');
-                scoreSpan.className = 'score-badge';
-                scoreSpan.style.position = 'static';
-                scoreSpan.style.marginLeft = 'auto';
-                scoreSpan.textContent = Number(set.score).toFixed(2);
-                row.appendChild(scoreSpan);
-              }
-              // Representative cover thumbnail, same square style as set search rows.
-              if (set.thumb_id != null) {
-                const thumb = document.createElement('img');
-                thumb.className = 'modal-list-item-thumb square';
-                thumb.src = '/thumb/' + set.thumb_id;
-                row.appendChild(thumb);
-              }
-              row.addEventListener('click', function () { resolveWith(set); });
-              suggestWrap.appendChild(row);
-            });
+            if (resolved) return;
+            suggestSets = (data.results || []).filter(function (s) { return excludeIds.indexOf(s.id) === -1; });
+            renderSuggestions();
           })
           .catch(function () { /* suggestions are best-effort; search still works */ });
+      }
+
+      // The smart suggestions are NOT filtered by the person chips / text (that
+      // would often empty them) — they're RE-RANKED: a set matching the active
+      // person chips (and then the typed text) floats to the top, so selecting
+      // "Joe" honors the filter by surfacing Joe's sets first. Re-run from
+      // applyFilter on every keystroke / chip change.
+      function suggestionSortKey(set) {
+        const people = (set.people || []).map(function (p) { return p.name.toLowerCase(); });
+        const chipMatches = personChips.filter(function (c) { return people.indexOf(c.toLowerCase()) !== -1; }).length;
+        const q = input.value.trim();
+        let textMiss = 0, textScore = 0;
+        if (q) {
+          const s = fuzzyScore(q, [set.name, set.studio || '', people.join(' ')].join(' '));
+          if (s === null) { textMiss = 1; textScore = Infinity; } else { textScore = s; }
+        }
+        return { chipMatches: chipMatches, textMiss: textMiss, textScore: textScore, clip: -(set.score || 0) };
+      }
+
+      function renderSuggestions() {
+        if (!suggestWrap) return;
+        suggestWrap.innerHTML = '';
+        if (!suggestSets.length || resolved) return;
+        const ordered = suggestSets.slice().sort(function (a, b) {
+          const ka = suggestionSortKey(a), kb = suggestionSortKey(b);
+          return (kb.chipMatches - ka.chipMatches)
+            || (ka.textMiss - kb.textMiss)
+            || (ka.textScore - kb.textScore)
+            || (ka.clip - kb.clip);
+        });
+        const heading = document.createElement('div');
+        heading.className = 'modal-suggest-title';
+        heading.textContent = '✨ Suggested sets';
+        suggestWrap.appendChild(heading);
+        ordered.forEach(function (set) {
+          const row = document.createElement('div');
+          row.className = 'modal-list-item';
+          const text = document.createElement('div');
+          const label = document.createElement('div');
+          label.textContent = set.name;
+          text.appendChild(label);
+          const metaLine = buildSetMetaLine(set);
+          if (metaLine) { const sub = document.createElement('div'); sub.className = 'sub'; sub.appendChild(metaLine); text.appendChild(sub); }
+          row.appendChild(text);
+          if (set.score != null) {
+            const scoreSpan = document.createElement('span');
+            scoreSpan.className = 'score-badge';
+            scoreSpan.style.position = 'static';
+            scoreSpan.style.marginLeft = 'auto';
+            scoreSpan.textContent = Number(set.score).toFixed(2);
+            row.appendChild(scoreSpan);
+          }
+          // Representative cover thumbnail, same square style as set search rows.
+          if (set.thumb_id != null) {
+            const thumb = document.createElement('img');
+            thumb.className = 'modal-list-item-thumb square';
+            thumb.src = '/thumb/' + set.thumb_id;
+            row.appendChild(thumb);
+          }
+          row.addEventListener('click', function () { resolveWith(set); });
+          suggestWrap.appendChild(row);
+        });
       }
 
       let allItems = [];
@@ -1268,12 +1323,10 @@
             .map(function (x) { return x.item; });
         }
         visible = matched.map(function (item) { return { kind: 'existing', item: item }; });
-        // Once a person chip is narrowing the set, "＋ Create" would create an
-        // unrelated brand-new set instead of picking from the (already
-        // filtered) matches — only offer it with no active person filter.
-        if (query && !personChips.length) visible.push({ kind: 'create', text: query });
         highlighted = visible.length ? 0 : -1;
         renderList();
+        updateCreateBtn();       // create now lives in the input row, not the list
+        renderSuggestions();     // re-rank the smart suggestions for the new filter
       }
 
       input.addEventListener('input', function () {
@@ -1290,7 +1343,13 @@
           if (highlighted > 0) { highlighted--; updateHighlight(); }
         } else if (e.key === 'Enter') {
           e.preventDefault();
-          if (highlighted >= 0 && visible[highlighted]) resolveEntry(visible[highlighted]);
+          if (highlighted >= 0 && visible[highlighted]) {
+            resolveEntry(visible[highlighted]);
+          } else {
+            // Nothing matched/highlighted — Enter creates, same as the ＋ Create button.
+            const q = input.value.trim();
+            if (q && !personChips.length) resolveEntry({ kind: 'create', text: q });
+          }
         } else if (e.key === 'Escape') {
           e.preventDefault();
           closeModal();
