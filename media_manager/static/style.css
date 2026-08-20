@@ -512,6 +512,21 @@ input[type="range"] { accent-color: var(--accent); }
 .modal-list-item-thumb.square { border-radius: var(--radius-card); }
 
 /* Suggested sets pre-listed at the top of the set picker (photo page only). */
+/* Clickable person-name suggestions that pop up as you type in the set picker. */
+.modal-name-suggest { display: flex; flex-wrap: wrap; gap: 6px; }
+.modal-name-suggest:not(:empty) { margin-bottom: 8px; }
+.modal-name-suggest-chip {
+  font-size: 15px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--input-bg);
+  color: var(--text);
+  cursor: pointer;
+}
+.modal-name-suggest-chip::before { content: '＋ '; color: var(--text-muted); }
+.modal-name-suggest-chip:hover { border-color: var(--border-accent); color: var(--accent); }
+
 .modal-suggest { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; }
 .modal-suggest .modal-list-item { align-items: center; }
 .modal-suggest-title {

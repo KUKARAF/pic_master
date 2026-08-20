@@ -1105,6 +1105,14 @@
         personChipsEl.style.marginBottom = '8px';
         box.appendChild(personChipsEl);
       }
+      // Live, clickable person-name suggestions that pop up as you type (replaces
+      // the old "type a name + Space to auto-chip" magic — see renderNameSuggestions).
+      let nameSuggestEl = null;
+      if (config.personAware) {
+        nameSuggestEl = document.createElement('div');
+        nameSuggestEl.className = 'modal-name-suggest';
+        box.appendChild(nameSuggestEl);
+      }
 
       function renderPersonChips() {
         if (!personChipsEl) return;
@@ -1127,32 +1135,61 @@
           chip.addEventListener('click', function () {
             personChips.splice(i, 1);
             renderPersonChips();
+            renderNameSuggestions();
             applyFilter();
           });
           personChipsEl.appendChild(chip);
         });
       }
 
-      // Called on every keystroke, before applyFilter: if the word just
-      // finished (i.e. the box now ends in whitespace) starts with a capital
-      // letter and exactly matches (case-insensitively) a known person's
-      // name, pull it out of the input and turn it into a chip instead —
-      // "Joe " becomes chip "Joe" + an empty box ready for "trip 2022".
-      function extractPersonChipIfComplete() {
-        if (!config.personAware || !identityNames || !identityNames.length) return;
-        const val = input.value;
-        if (!/\s$/.test(val)) return;
-        const trimmed = val.replace(/\s+$/, '');
-        if (!trimmed) return;
-        const parts = trimmed.split(/\s+/);
-        const lastWord = parts[parts.length - 1];
-        if (!lastWord || !/^[A-Z]/.test(lastWord)) return;
-        const canonical = identityNames.find(function (n) { return n.toLowerCase() === lastWord.toLowerCase(); });
-        if (!canonical) return;
-        parts.pop();
+      // The word currently being typed (last whitespace-delimited token) — what
+      // the name suggestions match against.
+      function currentNameToken() {
+        const parts = input.value.split(/\s+/);
+        return parts[parts.length - 1] || '';
+      }
+
+      // Add `canonical` as a person filter, consuming the token being typed, then
+      // refresh chips/suggestions/results. Shared by clicking a suggestion and
+      // Enter-picking the top one.
+      function addPersonChip(canonical) {
         if (personChips.indexOf(canonical) === -1) personChips.push(canonical);
+        const parts = input.value.split(/\s+/);
+        parts.pop();                                   // drop the just-typed token
         input.value = parts.join(' ') + (parts.length ? ' ' : '');
         renderPersonChips();
+        renderNameSuggestions();
+        applyFilter();
+        input.focus();
+      }
+
+      // Grid of known people whose names match what's being typed — click one to
+      // add it as a filter (like the search palette). Shown only while typing a
+      // token that matches at least one not-yet-selected person.
+      function renderNameSuggestions() {
+        if (!nameSuggestEl) return;
+        nameSuggestEl.innerHTML = '';
+        if (!identityNames || !identityNames.length) return;
+        const token = currentNameToken();
+        if (!token) return;
+        const matches = identityNames
+          .filter(function (n) { return personChips.indexOf(n) === -1; })
+          .map(function (n) { return { name: n, score: fuzzyScore(token, n) }; })
+          .filter(function (x) { return x.score !== null; })
+          .sort(function (a, b) { return a.score - b.score; })
+          .slice(0, 12);
+        if (!matches.length) return;
+        matches.forEach(function (m) {
+          const chip = document.createElement('button');
+          chip.type = 'button';
+          chip.className = 'modal-name-suggest-chip';
+          chip.textContent = m.name;
+          chip.title = 'Filter to sets with ' + m.name;
+          // mousedown (not click) so it fires before the input's blur, and prevent
+          // the input from losing focus.
+          chip.addEventListener('mousedown', function (e) { e.preventDefault(); addPersonChip(m.name); });
+          nameSuggestEl.appendChild(chip);
+        });
       }
 
       const status = document.createElement('div');
@@ -1352,7 +1389,7 @@
       }
 
       input.addEventListener('input', function () {
-        extractPersonChipIfComplete();
+        renderNameSuggestions();
         applyFilter();
       });
 
