@@ -2227,6 +2227,54 @@
     let cellEls = [];
     let selectedIndex = 0;
 
+    // Per-photo caption metadata (name + set names). The queue only carries ids,
+    // so name/sets are fetched in one batch from /api/files/meta and cached here
+    // across grid opens (queue contents don't change within a page). captionEls
+    // maps id -> the caption <div> so a returning fetch can fill cells that were
+    // already rendered.
+    const metaCache = {};        // id -> { name, sets: [{id, name}] }
+    let captionEls = {};         // id -> caption element (rebuilt each render)
+
+    function applyCaption(el, meta) {
+      if (!meta) { el.textContent = ''; return; }
+      el.textContent = '';
+      const nameEl = document.createElement('div');
+      nameEl.className = 'queue-grid-caption-name';
+      nameEl.textContent = meta.name || '';
+      nameEl.title = meta.name || '';
+      el.appendChild(nameEl);
+      if (meta.sets && meta.sets.length) {
+        const setsEl = document.createElement('div');
+        setsEl.className = 'queue-grid-caption-sets';
+        const setNames = meta.sets.map(function (s) { return s.name; });
+        setsEl.textContent = setNames.join(', ');
+        setsEl.title = setNames.join(', ');
+        el.appendChild(setsEl);
+      }
+    }
+
+    // Fetch name+sets for any queue ids not already cached, in one POST, then
+    // fill their (already-rendered) caption elements. Non-blocking and
+    // non-fatal: a failure just leaves captions empty rather than breaking the
+    // grid (which is usable for navigation without them).
+    function fillCaptions(ids) {
+      const missing = ids.filter(function (id) { return !(id in metaCache); });
+      if (!missing.length) return;
+      fetch('/api/files/meta', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: missing }),
+      })
+        .then(function (r) { return r.ok ? r.json() : []; })
+        .then(function (rows) {
+          rows.forEach(function (row) {
+            metaCache[row.id] = row;
+            if (captionEls[row.id]) applyCaption(captionEls[row.id], row);
+          });
+        })
+        .catch(function () { /* non-fatal: captions just stay empty */ });
+    }
+
     // Select mode ("Add queue to set"): the same grid, but Enter/Shift+Arrows/
     // click toggle a multi-selection instead of navigating, and Ctrl+Enter (or
     // the footer button) sends the picked items to a chosen set.
@@ -2279,6 +2327,7 @@
     function render() {
       const queue = window.__photoQueue;
       overlay.panel.innerHTML = '';
+      captionEls = {};   // rebuilt below; stale nodes are discarded with innerHTML
       cellEls = queue.ids.map(function (id, i) {
         const cell = document.createElement('button');
         cell.type = 'button';
@@ -2293,6 +2342,15 @@
         img.src = '/thumb/' + id;
         img.loading = 'lazy';
         cell.appendChild(img);
+        // Caption (name + set names) sits over the bottom of the thumbnail. It's
+        // pointer-events:none (see CSS) so it never intercepts the cell's click.
+        // Filled asynchronously by fillCaptions() once the batch meta fetch
+        // returns — cells render immediately without blocking on the network.
+        const caption = document.createElement('div');
+        caption.className = 'queue-grid-caption';
+        applyCaption(caption, metaCache[id]);
+        cell.appendChild(caption);
+        captionEls[id] = caption;
         cell.addEventListener('click', function (e) {
           if (!selectMode) { goTo(id); return; }
           cell.blur();   // don't let the clicked cell keep focus (see tabindex note above)
@@ -2311,6 +2369,7 @@
       setSelected(queue.cursor);
       refreshMarks();
       updateFooter();
+      fillCaptions(queue.ids);   // async; fills captions when the batch returns
     }
 
     function setSelected(i) {
@@ -2326,6 +2385,21 @@
     function moveSelection(delta) {
       const next = Math.max(0, Math.min(cellEls.length - 1, selectedIndex + delta));
       setSelected(next);
+    }
+
+    // The grid is responsive (grid-template-columns: repeat(auto-fill,
+    // minmax(170px, 1fr))), so the column count depends on viewport width and
+    // is NOT a fixed constant. Measure it live from the rendered DOM: the first
+    // row is every leading cell that shares cellEls[0]'s offsetTop; the count of
+    // those cells IS the column count. Recompute on each Up/Down press because
+    // the window may have been resized since the grid opened. Fall back to a
+    // single column so a Down press never becomes a no-op / moves by 0.
+    function currentColumns() {
+      if (!cellEls.length) return 1;
+      const top0 = cellEls[0].offsetTop;
+      let cols = cellEls.findIndex(function (c) { return c.offsetTop > top0; });
+      if (cols <= 0) cols = cellEls.length;   // -1: all cells fit in one row
+      return cols;
     }
 
     function togglePick(i) {
@@ -2459,16 +2533,16 @@
         if (e.key === 'Enter') { e.preventDefault(); togglePick(selectedIndex); rangeAnchor = selectedIndex; return; }
         if (e.key === 'ArrowLeft') { e.preventDefault(); moveAndMaybeRange(-1, e.shiftKey); return; }
         if (e.key === 'ArrowRight') { e.preventDefault(); moveAndMaybeRange(1, e.shiftKey); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); moveAndMaybeRange(-3, e.shiftKey); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); moveAndMaybeRange(3, e.shiftKey); return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); moveAndMaybeRange(-currentColumns(), e.shiftKey); return; }
+        if (e.key === 'ArrowDown') { e.preventDefault(); moveAndMaybeRange(currentColumns(), e.shiftKey); return; }
         return;
       }
 
       if (e.key === 'Enter') { e.preventDefault(); goTo(window.__photoQueue.ids[selectedIndex]); return; }
       if (e.key === 'ArrowLeft') { e.preventDefault(); moveSelection(-1); return; }
       if (e.key === 'ArrowRight') { e.preventDefault(); moveSelection(1); return; }
-      if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-3); return; }
-      if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(3); return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-currentColumns()); return; }
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(currentColumns()); return; }
     });
   })();
 

@@ -143,6 +143,12 @@ class SearchPaletteBody(BaseModel):
     sort: str = ''      # '', 'added', 'modified', 'filename', 'age', 'favorites'
     order: str = 'desc'
 
+class FileMetaBody(BaseModel):
+    """Body for POST /api/files/meta — a list of file ids the client wants
+    display metadata (name + set names) for. Used by the Space photo-grid
+    overlay, which only carries file ids and fetches captions in one batch."""
+    ids: List[int] = []
+
 class SwipeExcludeBody(BaseModel):
     """Shared body for every swipe stack's buffer-refill endpoint. Sent as a
     POST body rather than a query-string `exclude` param because the client's
@@ -3069,6 +3075,32 @@ def create_app(data_root: str) -> FastAPI:
         effective = _effective_checksums(chip_cs, tag_cs, file_cs)
         rows = _ordered_rows(effective, body.sort, body.order)
         return {'ids': [r['id'] for r in rows]}
+
+    @app.post('/api/files/meta')
+    def api_files_meta(body: FileMetaBody):
+        """Lightweight per-file display metadata (name + set names) for a list of
+        file ids — the Space photo-grid overlay only carries ids and fetches
+        captions in one batch. Reuses the same batched accessors as _enrich_rows
+        (titles + sets keyed by checksum); no tags/people/categories/thumbnails.
+        `name` is the file's title if it has one, else its basename. Returns only
+        the ids that still resolve to a file (order not guaranteed — the client
+        keys by id)."""
+        if not body.ids:
+            return []
+        rows = db.get_files_by_ids(body.ids)
+        checksums = [r['checksum'] for r in rows]
+        title_map = manual.get_titles_for_checksums(checksums)
+        sets_map = manual.get_sets_for_checksums(checksums)
+        result = []
+        for r in rows:
+            checksum = r['checksum']
+            result.append({
+                'id': r['id'],
+                'name': title_map.get(checksum) or os.path.basename(r['path']),
+                'sets': [{'id': s['id'], 'name': s['name']}
+                         for s in sets_map.get(checksum, [])],
+            })
+        return result
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):
