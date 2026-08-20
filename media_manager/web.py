@@ -2958,7 +2958,7 @@ def create_app(data_root: str) -> FastAPI:
                 for fid, score, bbox in scored[:count]
             ])
 
-        from media_manager.clip_tag_classifier import score_all
+        from media_manager.clip_tag_classifier import load_probe, score_all
 
         all_embeddings = [
             row for row in db.get_all_embeddings()
@@ -2971,10 +2971,23 @@ def create_app(data_root: str) -> FastAPI:
             ((checksum_to_file_id[c], s) for c, s in scores.items() if c in checksum_to_file_id),
             key=lambda x: -x[1],
         )
-        return _attach_file_meta([
-            {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
-            for fid, score in ranked[:count]
-        ])
+        # A whole-image CLIP score has no inherent "where". Localize each match to
+        # the sub-tile that most activates the learned probe weight `w` (argmax of
+        # tile·w — the bias is constant across tiles, so it doesn't affect which
+        # tile wins), so the swipe fullview highlights CLIP matches the same way
+        # the YOLO/centroid paths do. Falls back to no box when the tile index
+        # isn't built for a file (_best_tile_bbox returns None).
+        probe = load_probe(data_root, label)
+        probe_w = probe[0] if probe is not None else None
+        cards = []
+        for fid, score in ranked[:count]:
+            card = {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+            if probe_w is not None:
+                bbox = _best_tile_bbox(fid, probe_w)
+                if bbox is not None:
+                    card['bbox'] = bbox
+            cards.append(card)
+        return _attach_file_meta(cards)
 
     @app.post('/api/tags/{label}/suggestions/next-by-model')
     def api_next_tag_suggestions_by_model(label: str, body: SwipeExcludeBody, model: str = 'clip', count: int = 10):

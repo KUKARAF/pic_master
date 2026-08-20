@@ -263,6 +263,19 @@ def score_all(data_root, tag_label, embeddings):
     return result
 
 
+def load_probe(data_root, tag_label):
+    """This tag's trained linear-probe weight vector `w` (512-dim, np.float32)
+    and bias `b`, or None if the tag has no done CLIP model yet. `w` is the
+    direction CLIP learned for the concept — dotting a (whole-image OR sub-tile)
+    embedding against it is the concept's activation, so it's what web.py uses to
+    localize a CLIP match to its best-matching sub-tile for the swipe highlight."""
+    weights_path = os.path.join(classifier_dir(data_root, tag_label, 'clip_model'), 'weights.npz')
+    if not os.path.isfile(weights_path):
+        return None
+    data = np.load(weights_path)
+    return data['w'].astype(np.float32), float(data['b'])
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train a per-tag CLIP linear classifier.')
     parser.add_argument('--data-root', required=True)
