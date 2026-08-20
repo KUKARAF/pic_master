@@ -11,6 +11,7 @@
 {% if studios %}
 <div class="grid">
   {% for s in studios %}
+  {% set sid = s.id if s.id is defined and s.id is not none else s.name %}
   <div class="card">
     <a class="card-img-link" href="/sets?studio={{ s.name | urlencode }}">
       <div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2.5rem;">🏢</div>
@@ -22,6 +23,19 @@
                 title="Rename this studio everywhere (renaming to an existing studio merges them)" style="font-size:0.8em;">✏️</button>
       </div>
       <div class="sub" style="font-size:0.78rem;">{{ s.set_count }} set(s) &nbsp;·&nbsp; {{ s.image_count }} image(s)</div>
+      <div class="studio-location-section" style="margin-top:6px;">
+        <div class="studio-location-list" data-studio-id="{{ sid | urlencode }}"
+             style="display:flex;flex-wrap:wrap;gap:6px;">
+          {% for l in s.locations %}
+          <span class="tag-removable" data-location-id="{{ l.id }}" style="display:inline-flex;font-size:0.75em;">
+            <a href="/locations/{{ l.id }}">{{ l.name }}</a>
+            <button class="rm studio-location-remove-btn" type="button" title="Remove this location">×</button>
+          </span>
+          {% endfor %}
+        </div>
+        <button type="button" class="btn-similar studio-location-add-btn" data-studio-id="{{ sid | urlencode }}"
+                style="font-size:0.7em;padding:2px 8px;margin-top:4px;">📍 + Location</button>
+      </div>
     </div>
   </div>
   {% endfor %}
@@ -53,5 +67,64 @@ document.querySelectorAll('.studio-rename-btn').forEach(function(btn) {
       .catch(function(err) { showToast('Failed to rename: ' + err.message); });
   });
 });
+
+/* Locations per studio — assign/remove named places, POSTing to
+   /api/studios/{id}/locations (the studio identifier comes from data-studio-id,
+   which is the studio's id when the backend provides one, else its name). */
+(function() {
+  function wireRemove(span, studioId) {
+    const rm = span.querySelector('.studio-location-remove-btn');
+    if (rm) rm.addEventListener('click', function() {
+      fetch('/api/studios/' + studioId + '/locations/' + span.dataset.locationId, { method: 'DELETE' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { span.remove(); })
+        .catch(function(err) { showToast('Failed to remove location: ' + err.message); });
+    });
+  }
+
+  document.querySelectorAll('.studio-location-list').forEach(function(list) {
+    const studioId = list.dataset.studioId;
+    list.querySelectorAll('[data-location-id]').forEach(function(span) { wireRemove(span, studioId); });
+  });
+
+  document.querySelectorAll('.studio-location-add-btn').forEach(function(btn) {
+    const studioId = btn.dataset.studioId;
+    const list = btn.parentElement.querySelector('.studio-location-list');
+    btn.addEventListener('click', function() {
+      window.openEntitySearchModal({
+        type: 'location',
+        onResolved: function(entity) {
+          fetch('/api/studios/' + studioId + '/locations', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ location_id: entity.id }),
+          })
+            .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+            .then(function() {
+              if (list.querySelector('[data-location-id="' + entity.id + '"]')) return;
+              const span = document.createElement('span');
+              span.className = 'tag-removable';
+              span.style.display = 'inline-flex';
+              span.style.fontSize = '0.75em';
+              span.dataset.locationId = entity.id;
+              const a = document.createElement('a');
+              a.href = '/locations/' + entity.id;
+              a.textContent = entity.name;
+              span.appendChild(a);
+              const rm = document.createElement('button');
+              rm.className = 'rm studio-location-remove-btn';
+              rm.type = 'button';
+              rm.title = 'Remove this location';
+              rm.textContent = '×';
+              span.appendChild(rm);
+              wireRemove(span, studioId);
+              list.appendChild(span);
+            })
+            .catch(function(err) { showToast('Failed to add location: ' + err.message); });
+        },
+      });
+    });
+  });
+})();
 </script>
 {% endblock %}

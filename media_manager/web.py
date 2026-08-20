@@ -120,6 +120,16 @@ class CategoryBody(BaseModel):
     temperature: Optional[float] = None
     category_id: Optional[int] = None
 
+class LocationBody(BaseModel):
+    # Mirrors CategoryBody. gps_lat/gps_lon are optional and may be explicitly
+    # null to CLEAR a location's stored coordinates on PUT — see api_update_location.
+    name: Optional[str] = None
+    gps_lat: Optional[float] = None
+    gps_lon: Optional[float] = None
+
+class LocationAssignBody(BaseModel):
+    location_id: int
+
 class CaptureFrameIndexBody(BaseModel):
     frame_index: int
 
@@ -378,6 +388,20 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
             return True
     except Exception:
         return False
+
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in kilometres between two (lat, lon) points
+    (standard haversine formula). Used by the /search distance sort to rank
+    photos by how close their EXIF GPS is to a target point."""
+    import math
+    r = 6371.0  # Earth mean radius, km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +871,13 @@ def create_app(data_root: str) -> FastAPI:
             if set_map is not None:
                 return set(set_map.get(int(v), ()))
             return set(manual.get_files_by_set(int(v), limit=1000))
+        if t == 'location':
+            # value 'any' == "has any location metadata": EXIF-geotagged files
+            # unioned with files that carry at least one manual location
+            # assignment; otherwise a specific location id's assigned files.
+            if v == 'any':
+                return db.get_geotagged_checksums() | manual.get_checksums_with_any_location()
+            return set(manual.get_checksums_for_location(int(v)))
         if t == 'file':
             return {row[2] for row in db.search_by_path_substring(v, limit=200)}
         return set()
@@ -937,12 +968,25 @@ def create_app(data_root: str) -> FastAPI:
         with_age.sort(key=lambda c: age_map[c['checksum']], reverse=(order != 'asc'))
         return with_age + without_age
 
-    def _sort_file_rows(file_rows, sort, order):
+    def _sort_file_rows(file_rows, sort, order, target_lat=None, target_lon=None):
         """Sort raw files_with_path rows (has first_seen/modified_time/checksum) by
         the 'added'/'modified' timestamp columns — used by the checksum-driven views
         (search by tag/person, set detail) which don't paginate via SQL. 'age' isn't
-        handled here since it needs manual.db and enriched cards; see _sort_cards_by_age."""
+        handled here since it needs manual.db and enriched cards; see _sort_cards_by_age.
+
+        'distance' ranks by haversine distance from (target_lat, target_lon) —
+        always nearest-first (ascending distance) regardless of `order`; rows with
+        no EXIF GPS (gps_lat is None) always sort LAST (mirrors the 'age'-with-no-
+        estimate 'sort to end' pattern). If a distance sort is requested without a
+        target point, it falls back to the default 'added' sort."""
         reverse = (order != 'asc')
+        if sort == 'distance':
+            if target_lat is None or target_lon is None:
+                return sorted(file_rows, key=lambda r: r['first_seen'], reverse=True)
+            with_gps = [r for r in file_rows if r['gps_lat'] is not None and r['gps_lon'] is not None]
+            without_gps = [r for r in file_rows if r['gps_lat'] is None or r['gps_lon'] is None]
+            with_gps.sort(key=lambda r: _haversine(r['gps_lat'], r['gps_lon'], target_lat, target_lon))
+            return with_gps + without_gps
         if sort == 'filename':
             return sorted(file_rows, key=lambda r: os.path.basename(r['path']).lower(), reverse=reverse)
         if sort == 'modified':
@@ -952,7 +996,7 @@ def create_app(data_root: str) -> FastAPI:
             return sorted(file_rows, key=lambda r: counts.get(r['checksum'], 0), reverse=reverse)
         return sorted(file_rows, key=lambda r: r['first_seen'], reverse=reverse)
 
-    def _ordered_rows(checksums, sort, order):
+    def _ordered_rows(checksums, sort, order, target_lat=None, target_lon=None):
         """Resolve a checksum set to files_with_path rows ordered by sort/order.
         Shared by the search palette (preview + open-as-queue). 'age' ranks by the
         checksum age map at the row level (no enrichment needed); everything else
@@ -966,7 +1010,7 @@ def create_app(data_root: str) -> FastAPI:
             without_age = [r for r in rows if r['checksum'] not in age_map]
             with_age.sort(key=lambda r: age_map[r['checksum']], reverse=(order != 'asc'))
             return with_age + without_age
-        return _sort_file_rows(rows, sort or 'added', order)
+        return _sort_file_rows(rows, sort or 'added', order, target_lat=target_lat, target_lon=target_lon)
 
     def _palette_media(checksums, sort, order, cap=16):
         """Top `cap` of `checksums` as enriched cards, ordered by sort/order."""
@@ -1165,6 +1209,7 @@ def create_app(data_root: str) -> FastAPI:
         ]
         _attach_set_people([current_sets])
         file_info['categories'] = resolve_categories_for_file(manual, db, file_id, checksum)
+        file_info['locations'] = manual.get_locations_for_checksum(checksum)
         all_categories = _all_categories_for_nav()
         # Age/gender estimates (experimental — see age_estimator.py) are shown inline
         # next to each face's name, not as a separate section, so merge them directly
@@ -1275,7 +1320,11 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/search', response_class=HTMLResponse)
     def search_page(request: Request, q: str = '', tag: str = '', start: str = '',
                      face_ref: str = '', category: str = '', sort: str = 'added', order: str = 'desc',
+                     lat: float = None, lon: float = None,
                      f: List[str] = Query([])):
+        # Distance sort needs a target point; without one, fall back to the default.
+        if sort == 'distance' and (lat is None or lon is None):
+            sort = 'added'
         files = []
         message = ''
         all_tags = manual.list_all_tags()
@@ -1298,7 +1347,8 @@ def create_app(data_root: str) -> FastAPI:
             if not checksums:
                 message = 'No files match this combination of filters.'
             else:
-                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order)
+                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order,
+                                            target_lat=lat, target_lon=lon)
                 rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
                 files = _enrich_rows(rows)
                 if sort == 'age':
@@ -1309,7 +1359,8 @@ def create_app(data_root: str) -> FastAPI:
             pass
         elif tag:
             checksums = manual.get_files_by_tag(tag, limit=200)
-            file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
+            file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order,
+                                        target_lat=lat, target_lon=lon)
             rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
             files = _enrich_rows(rows)
             if sort == 'age':
@@ -1326,7 +1377,8 @@ def create_app(data_root: str) -> FastAPI:
                 if not checksums:
                     message = f'No files resolved to category "{category}" yet.'
                 else:
-                    file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order)
+                    file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order,
+                                                target_lat=lat, target_lon=lon)
                     rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
                     files = _enrich_rows(rows)
                     if sort == 'age':
@@ -1814,6 +1866,10 @@ def create_app(data_root: str) -> FastAPI:
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
+    # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
+    # MediaManager.extract_metadata but with progress (see api_metadata_start).
+    metadata_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2103,6 +2159,53 @@ def create_app(data_root: str) -> FastAPI:
             'total': index_job['total'],
             'error': index_job['error'],
             'pending': len(db.get_unindexed_files()),
+        }
+
+    @app.post('/api/metadata/start')
+    def api_metadata_start():
+        """Bulk-extract EXIF capture time + GPS for every file whose metadata has
+        never been checked. Mirrors MediaManager.extract_metadata but with progress:
+        non-image files are still stamped checked (update_file_metadata(fid, None,
+        None, None)) so they don't resurface on every future run; image files get
+        their real EXIF read via exif_reader.extract_exif_metadata."""
+        import threading
+        from media_manager import exif_reader
+
+        if metadata_job['running']:
+            return {'started': False, 'message': 'Metadata extraction already running.'}
+        candidates = db.get_files_without_metadata()  # [(id, path), ...]
+        metadata_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                done = 0
+                for fid, rel_path in candidates:
+                    ext = os.path.splitext(rel_path)[1].lower()
+                    if ext not in IMAGE_EXTENSIONS:
+                        # Not an image — nothing to extract, but stamp it checked.
+                        db.update_file_metadata(fid, None, None, None)
+                    else:
+                        taken_at, gps_lat, gps_lon = exif_reader.extract_exif_metadata(
+                            os.path.join(data_root, rel_path))
+                        db.update_file_metadata(fid, taken_at, gps_lat, gps_lon)
+                    done += 1
+                    metadata_job['done'] = done
+            except Exception as exc:
+                metadata_job['error'] = str(exc)
+            finally:
+                metadata_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': metadata_job['total']}
+
+    @app.get('/api/metadata/status')
+    def api_metadata_status():
+        return {
+            'running': metadata_job['running'],
+            'done': metadata_job['done'],
+            'total': metadata_job['total'],
+            'error': metadata_job['error'],
+            'pending': len(db.get_files_without_metadata()),
         }
 
     @app.post('/api/match-faces/start')
@@ -3052,7 +3155,8 @@ def create_app(data_root: str) -> FastAPI:
     def studios_page(request: Request):
         all_tags = manual.list_all_tags()
         studios = [
-            {'name': r['studio'], 'set_count': r['set_count'], 'image_count': r['image_count']}
+            {'id': r['id'], 'name': r['studio'], 'set_count': r['set_count'],
+             'image_count': r['image_count'], 'locations': manual.get_locations_for_studio(r['id'])}
             for r in manual.list_studios()
         ]
         return templates.TemplateResponse(request, 'studios.html', {
@@ -3801,6 +3905,137 @@ def create_app(data_root: str) -> FastAPI:
         exclude_refs = set(body.exclude)
         cards = _next_category_suggestions(category_id, count, exclude_refs)
         return {'cards': cards}
+
+    # ------------------------------------------------------------------
+    # Locations
+    # ------------------------------------------------------------------
+    # Endpoint contract (for the templates/app.js agent):
+    #   GET/POST  /api/locations
+    #   PUT/DELETE /api/locations/{id}
+    #   POST /api/files/{id}/locations         body {location_id}
+    #   DELETE /api/files/{id}/locations/{loc}
+    #   POST /api/sets/{id}/locations          body {location_id}
+    #   DELETE /api/sets/{id}/locations/{loc}
+    #   POST /api/studios/{id}/locations       body {location_id}   (id = studios.id integer)
+    #   DELETE /api/studios/{id}/locations/{loc}
+    #   POST /api/metadata/start ; GET /api/metadata/status
+    #   search chip type "location" (value = location id, or "any" for "has any location metadata")
+    #   sort=distance&lat=<f>&lon=<f>  (nearest-first; rows without GPS sort last)
+
+    @app.get('/locations', response_class=HTMLResponse)
+    def locations_page(request: Request):
+        locations = [
+            {'id': r['id'], 'name': r['name'], 'gps_lat': r['gps_lat'], 'gps_lon': r['gps_lon'],
+             'file_count': r['file_count']}
+            for r in manual.list_locations()
+        ]
+        return templates.TemplateResponse(request, 'locations.html', {
+            'locations': locations,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/locations/{location_id}', response_class=HTMLResponse)
+    def location_detail_page(request: Request, location_id: int, sort: str = 'added', order: str = 'desc',
+                             lat: float = None, lon: float = None):
+        loc = manual.get_location(location_id)
+        if loc is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        if sort == 'distance' and (lat is None or lon is None):
+            sort = 'added'
+        checksums = manual.get_checksums_for_location(location_id)
+        file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order,
+                                    target_lat=lat, target_lon=lon)
+        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+        files = _enrich_rows(rows)
+        if sort == 'age':
+            files = _sort_cards_by_age(files, order)
+        return templates.TemplateResponse(request, 'location_detail.html', {
+            'location': {'id': loc['id'], 'name': loc['name'],
+                         'gps_lat': loc['gps_lat'], 'gps_lon': loc['gps_lon']},
+            'files': files,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+            'sort': sort,
+            'order': order,
+        })
+
+    @app.get('/api/locations')
+    def api_list_locations():
+        return [
+            {'id': r['id'], 'name': r['name'], 'gps_lat': r['gps_lat'], 'gps_lon': r['gps_lon'],
+             'file_count': r['file_count']}
+            for r in manual.list_locations()
+        ]
+
+    @app.post('/api/locations')
+    def api_create_location(body: LocationBody):
+        name = (body.name or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='Location name must not be empty')
+        location_id = manual.create_location(name, body.gps_lat, body.gps_lon)
+        loc = manual.get_location(location_id)
+        return {'id': loc['id'], 'name': loc['name'], 'gps_lat': loc['gps_lat'], 'gps_lon': loc['gps_lon']}
+
+    @app.put('/api/locations/{location_id}')
+    def api_update_location(location_id: int, body: LocationBody):
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        if body.name is not None:
+            name = body.name.strip()
+            if not name:
+                raise HTTPException(status_code=400, detail='Location name must not be empty')
+            manual.rename_location(location_id, name)
+        # Coordinates: a PUT that carries either coord key sets them (either may be
+        # null to clear). A name-only PUT (both keys omitted -> both None) leaves
+        # coords untouched, so renaming never silently wipes a location's pin.
+        fields = body.model_fields_set if hasattr(body, 'model_fields_set') else set()
+        if 'gps_lat' in fields or 'gps_lon' in fields:
+            manual.set_location_coords(location_id, body.gps_lat, body.gps_lon)
+        return {'ok': True}
+
+    @app.delete('/api/locations/{location_id}')
+    def api_delete_location(location_id: int):
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        manual.delete_location(location_id)
+        return {'ok': True}
+
+    @app.post('/api/files/{file_id}/locations')
+    def api_add_file_location(file_id: int, body: LocationAssignBody):
+        """Adds a location to a file — a file can carry any number of locations, so
+        this never replaces an existing one (mirrors api_add_file_category)."""
+        row = _file_or_404(file_id)
+        manual.add_file_location(row['checksum'], body.location_id)
+        return {'ok': True}
+
+    @app.delete('/api/files/{file_id}/locations/{location_id}')
+    def api_remove_file_location(file_id: int, location_id: int):
+        row = _file_or_404(file_id)
+        manual.remove_file_location(row['checksum'], location_id)
+        return {'ok': True}
+
+    @app.post('/api/sets/{set_id}/locations')
+    def api_add_set_location(set_id: int, body: LocationAssignBody):
+        manual.add_set_location(set_id, body.location_id)
+        return {'ok': True}
+
+    @app.delete('/api/sets/{set_id}/locations/{location_id}')
+    def api_remove_set_location(set_id: int, location_id: int):
+        manual.remove_set_location(set_id, location_id)
+        return {'ok': True}
+
+    @app.post('/api/studios/{studio_id}/locations')
+    def api_add_studio_location(studio_id: int, body: LocationAssignBody):
+        """studio_id is the integer studios.id (studio_locations FKs studios(id)) —
+        not the free-text studio name the /api/studios/{studio} rename route keys on."""
+        manual.add_studio_location(studio_id, body.location_id)
+        return {'ok': True}
+
+    @app.delete('/api/studios/{studio_id}/locations/{location_id}')
+    def api_remove_studio_location(studio_id: int, location_id: int):
+        manual.remove_studio_location(studio_id, location_id)
+        return {'ok': True}
 
     @app.post('/api/files/{file_id}/sets')
     def api_assign_set(file_id: int, body: SetBody):

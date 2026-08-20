@@ -58,6 +58,22 @@
   {% endif %}
 </div>
 
+<div class="section-title" style="margin-bottom:10px;display:flex;align-items:center;gap:10px;">
+  Locations
+  <button type="button" id="set-location-add-btn" class="btn-similar" style="font-size:0.75em;padding:2px 8px;">+ Add location</button>
+</div>
+<div id="set-location-list" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:20px;">
+  {% for l in set.locations %}
+  <span class="tag-removable" data-location-id="{{ l.id }}" style="display:inline-flex;">
+    <a href="/locations/{{ l.id }}">{{ l.name }}</a>
+    <button class="rm set-location-remove-btn" type="button" title="Remove this location">×</button>
+  </span>
+  {% endfor %}
+  {% if not set.locations %}
+  <span class="sub" id="set-location-empty">No location assigned to this set.</span>
+  {% endif %}
+</div>
+
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
   <p class="sub">{{ files | length }} image(s)</p>
   {{ macros.sort_controls(sort, order, show_filename=True, show_manual=True) }}
@@ -110,6 +126,65 @@
 
 {% block scripts %}
 <script src="/static/swipe-core.js"></script>
+<script>
+/* Locations for this set — assign/remove named places, mirroring the photo
+   page's location pod but scoped to the whole set (/api/sets/{id}/locations). */
+(function() {
+  const setId = {{ set.id }};
+  const listEl = document.getElementById('set-location-list');
+  const addBtn = document.getElementById('set-location-add-btn');
+  if (!listEl || !addBtn) return;
+
+  function wireRemove(span) {
+    const rm = span.querySelector('.set-location-remove-btn');
+    if (rm) rm.addEventListener('click', function() {
+      fetch('/api/sets/' + setId + '/locations/' + span.dataset.locationId, { method: 'DELETE' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { span.remove(); })
+        .catch(function(err) { showToast('Failed to remove location: ' + err.message); });
+    });
+  }
+  listEl.querySelectorAll('[data-location-id]').forEach(wireRemove);
+
+  function appendChip(loc) {
+    const empty = document.getElementById('set-location-empty');
+    if (empty) empty.remove();
+    if (listEl.querySelector('[data-location-id="' + loc.id + '"]')) return;
+    const span = document.createElement('span');
+    span.className = 'tag-removable';
+    span.style.display = 'inline-flex';
+    span.dataset.locationId = loc.id;
+    const a = document.createElement('a');
+    a.href = '/locations/' + loc.id;
+    a.textContent = loc.name;
+    span.appendChild(a);
+    const rm = document.createElement('button');
+    rm.className = 'rm set-location-remove-btn';
+    rm.type = 'button';
+    rm.title = 'Remove this location';
+    rm.textContent = '×';
+    span.appendChild(rm);
+    wireRemove(span);
+    listEl.appendChild(span);
+  }
+
+  addBtn.addEventListener('click', function() {
+    window.openEntitySearchModal({
+      type: 'location',
+      onResolved: function(entity) {
+        fetch('/api/sets/' + setId + '/locations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ location_id: entity.id }),
+        })
+          .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function() { appendChip({ id: entity.id, name: entity.name }); })
+          .catch(function(err) { showToast('Failed to add location: ' + err.message); });
+      },
+    });
+  });
+})();
+</script>
 <script>
 (function() {
   const setId = {{ set.id }};

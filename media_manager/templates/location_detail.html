@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}{{ location.name }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>
+    {{ location.name }}
+    <button type="button" id="location-edit-btn" class="heart-btn-inline" title="Rename location">✏️</button>
+    <button type="button" id="location-delete-btn" class="heart-btn-inline" title="Delete location">🗑️</button>
+  </h1>
+  <a href="/locations" class="sub">← Back to locations</a>
+</div>
+
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:20px;">
+  <p class="sub">{{ files | length }} photo(s)</p>
+  {{ macros.sort_controls(sort, order) }}
+</div>
+
+<div class="sidebar-panel" style="max-width:420px;margin-bottom:20px;">
+  <div class="section-title">Coordinates</div>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;">
+    <label class="sub" style="display:flex;align-items:center;gap:4px;">Lat
+      <input type="number" id="location-lat-input" step="any" style="width:120px;"
+             value="{% if location.gps_lat is not none %}{{ location.gps_lat }}{% endif %}">
+    </label>
+    <label class="sub" style="display:flex;align-items:center;gap:4px;">Lon
+      <input type="number" id="location-lon-input" step="any" style="width:120px;"
+             value="{% if location.gps_lon is not none %}{{ location.gps_lon }}{% endif %}">
+    </label>
+    <button type="button" id="location-coords-save-btn" class="btn-similar">Save</button>
+    <span id="location-coords-msg" class="sub"></span>
+  </div>
+  {% if location.gps_lat is not none %}
+  <a href="/search?sort=distance&lat={{ location.gps_lat }}&lon={{ location.gps_lon }}"
+     class="btn-similar" style="display:inline-block;margin-top:10px;">📍 Find photos near here</a>
+  {% endif %}
+</div>
+
+{% if files %}
+<div class="grid" data-queue-source="Location: {{ location.name }}">
+  {% for f in files %}
+  {{ macros.card(f) }}
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="icon">📍</div>
+  <p>No photos assigned to this location yet. Assign one from a photo's detail page.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  const locationId = {{ location.id }};
+  const locationName = {{ location.name | tojson }};
+
+  const editBtn = document.getElementById('location-edit-btn');
+  if (editBtn) {
+    editBtn.addEventListener('click', function() {
+      openModal('Rename location', function(box) {
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.value = locationName;
+        nameInput.style.width = '100%';
+        nameInput.style.marginBottom = '8px';
+        box.appendChild(nameInput);
+
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button';
+        saveBtn.textContent = 'Save';
+        saveBtn.addEventListener('click', function() {
+          const name = nameInput.value.trim();
+          if (!name) return;
+          fetch('/api/locations/' + locationId, {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name}),
+          })
+            .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+            .then(function() { closeModal(); location.reload(); })
+            .catch(function(err) { showToast('Failed to rename location: ' + err.message); });
+        });
+        box.appendChild(saveBtn);
+      });
+    });
+  }
+
+  const deleteBtn = document.getElementById('location-delete-btn');
+  if (deleteBtn) {
+    deleteBtn.addEventListener('click', function() {
+      if (!confirm('Delete this location? Photos assigned to it lose the assignment.')) return;
+      fetch('/api/locations/' + locationId, { method: 'DELETE' })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { window.location.href = '/locations'; })
+        .catch(function(err) { showToast('Failed to delete location: ' + err.message); });
+    });
+  }
+
+  const saveCoordsBtn = document.getElementById('location-coords-save-btn');
+  if (saveCoordsBtn) {
+    saveCoordsBtn.addEventListener('click', function() {
+      const latRaw = document.getElementById('location-lat-input').value.trim();
+      const lonRaw = document.getElementById('location-lon-input').value.trim();
+      const msg = document.getElementById('location-coords-msg');
+      const body = {
+        gps_lat: latRaw === '' ? null : parseFloat(latRaw),
+        gps_lon: lonRaw === '' ? null : parseFloat(lonRaw),
+      };
+      fetch('/api/locations/' + locationId, {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      })
+        .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+        .then(function() { location.reload(); })
+        .catch(function(err) { msg.textContent = 'Failed: ' + err.message; });
+    });
+  }
+})();
+</script>
+{% endblock %}

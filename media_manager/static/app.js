@@ -971,6 +971,28 @@
         });
       },
     },
+    location: {
+      title: 'Set location',
+      placeholder: 'Search or create a location…',
+      fetchAll: function () { return cachedGetJson('/api/locations'); },
+      label: function (l) { return l.name; },
+      secondary: function (l) {
+        return l.gps_lat != null
+          ? l.gps_lat.toFixed(4) + ', ' + l.gps_lon.toFixed(4)
+          : (l.file_count || 0) + ' photo(s)';
+      },
+      image: null,
+      createFn: function (typedName) {
+        return fetch('/api/locations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: typedName }),
+        }).then(function (r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        });
+      },
+    },
     tag: {
       title: 'Search or create a tag',
       placeholder: 'Search or type a tag…',
@@ -1550,6 +1572,7 @@
   var paletteCandidatesPromise = (function () {
     var sources = [
       { type: 'category', url: '/api/categories', label: function (c) { return c.name; }, value: function (c) { return c.name; }, count: function (c) { return c.image_count || 0; } },
+      { type: 'location', url: '/api/locations', label: function (l) { return l.name; }, value: function (l) { return String(l.id); }, count: function (l) { return l.file_count || 0; } },
       { type: 'tag', url: '/api/tags', label: function (t) { return t.tag; }, value: function (t) { return t.tag; }, count: function (t) { return t.count || 0; } },
       { type: 'face', url: '/api/identities', label: function (i) { return i.name; }, value: function (i) { return i.name; }, count: function (i) { return i.count || 0; } },
       { type: 'set', url: '/api/sets', label: function (s) {
@@ -1590,10 +1613,10 @@
     var highlighted = 0;
     var requestSeq = 0;   // guards against an in-flight grid request resolving out of order
 
-    var FACET_LABELS = { category: 'CAT', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
+    var FACET_LABELS = { category: 'CAT', location: 'LOC', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
     // Section headers for the grouped left-pane suggestions.
-    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', set: 'SETS', file: 'FILES' };
-    var TYPE_ORDER = ['face', 'tag', 'category', 'set', 'file'];
+    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', location: 'LOCATIONS', set: 'SETS', file: 'FILES' };
+    var TYPE_ORDER = ['face', 'tag', 'category', 'location', 'set', 'file'];
 
     // Text sort syntax: "field:asc|desc" anywhere in the input is parsed out into a
     // sort chip. Aliases map onto the backend's sort keys.
@@ -2013,6 +2036,21 @@
       });
     }
 
+    // "📍 Has location" toggles a `location:any` chip — the sentinel the backend
+    // reads as "has any location metadata" (see the location facet in web.py).
+    // Same chip-add code path as a suggestion click, just with a fixed value.
+    var hasLocBtn = document.getElementById('palette-hasloc-btn');
+    if (hasLocBtn) {
+      hasLocBtn.addEventListener('click', function () {
+        var idx = -1;
+        chips.forEach(function (c, i) { if (c.type === 'location' && c.value === 'any') idx = i; });
+        if (idx === -1) chips.push({ type: 'location', value: 'any' });
+        else chips.splice(idx, 1);
+        updateSuggestions();
+        updateGrid();
+      });
+    }
+
     // paletteCandidates may still be loading the first time the palette opens
     // (a handful of small GETs, normally done well before that) — refresh
     // suggestions once they land so an early keystroke isn't stuck empty.
@@ -2073,6 +2111,13 @@
       open();
     });
   })();
+
+  // File-info "Taken" cell holds a raw unix timestamp — render it as a locale
+  // date/time client-side (no server-side date filter exists).
+  document.querySelectorAll('.taken-at-ts').forEach(function (el) {
+    var ts = parseFloat(el.dataset.ts);
+    if (!isNaN(ts)) el.textContent = new Date(ts * 1000).toLocaleString();
+  });
 
   const fileId = window.MEDIA_FILE_ID;
   if (!fileId) return;
@@ -3575,6 +3620,133 @@
   if (categoryPickerBtn) categoryPickerBtn.addEventListener('click', openCategoryPickerModal);
   if (categoryCurrent) categoryCurrent.querySelectorAll('[data-category-id]').forEach(wireCategoryChip);
 
+  /* Location assignment — a photo can be assigned to any number of named
+     places, mirroring the category flow above. When the photo carries EXIF GPS
+     (window.MEDIA_FILE_GPS) and a just-assigned location has no coordinates of
+     its own, offer to seed it with this photo's GPS. */
+  const locationCurrent = document.getElementById('location-current');
+  const locationPickerBtn = document.getElementById('location-picker-btn');
+
+  function wireLocationChip(span) {
+    const removeBtn = span.querySelector('.location-remove-btn');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', function () {
+        removeFileLocation(span.dataset.locationId);
+      });
+    }
+  }
+
+  function buildLocationChip(location) {
+    const span = document.createElement('span');
+    span.className = 'tag-removable';
+    span.style.marginBottom = '4px';
+    span.style.display = 'inline-flex';
+    span.dataset.locationId = location.id;
+
+    const link = document.createElement('a');
+    link.href = '/locations/' + location.id;
+    link.style.color = '#fff';
+    link.textContent = location.name;
+    span.appendChild(link);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'rm location-remove-btn';
+    removeBtn.type = 'button';
+    removeBtn.title = 'Remove this location';
+    removeBtn.textContent = '×';
+    span.appendChild(removeBtn);
+
+    wireLocationChip(span);
+    return span;
+  }
+
+  function renderLocations(locations) {
+    if (!locationCurrent) return;
+    locationCurrent.innerHTML = '';
+    if (!locations || !locations.length) {
+      const span = document.createElement('span');
+      span.className = 'sub';
+      span.textContent = 'No location.';
+      locationCurrent.appendChild(span);
+      return;
+    }
+    locations.forEach(function (location) {
+      locationCurrent.appendChild(buildLocationChip(location));
+    });
+  }
+
+  function appendLocationChip(location) {
+    // Drop the "No location." placeholder if it's the only thing there.
+    if (locationCurrent.children.length === 1 && locationCurrent.firstElementChild.tagName === 'SPAN'
+        && !locationCurrent.firstElementChild.dataset.locationId) {
+      locationCurrent.innerHTML = '';
+    }
+    if (locationCurrent.querySelector('[data-location-id="' + location.id + '"]')) return;
+    locationCurrent.appendChild(buildLocationChip(location));
+  }
+
+  function addFileLocation(locationId) {
+    return fetch('/api/files/' + fileId + '/locations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ location_id: locationId }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    });
+  }
+
+  function removeFileLocation(locationId) {
+    fetch('/api/files/' + fileId + '/locations/' + locationId, { method: 'DELETE' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('Request failed: ' + r.status);
+        return r.json();
+      })
+      .then(function () {
+        const chip = locationCurrent.querySelector('[data-location-id="' + locationId + '"]');
+        if (chip) chip.remove();
+        if (!locationCurrent.children.length) renderLocations([]);
+      })
+      .catch(function (err) {
+        showToast('Failed to remove location: ' + err.message);
+      });
+  }
+
+  // If this photo has EXIF GPS and the just-assigned location has none, offer to
+  // seed the location's coordinates from the photo (PUT /api/locations/{id}).
+  function maybeOfferPhotoGps(location) {
+    const gps = window.MEDIA_FILE_GPS;
+    if (!gps || location.gps_lat != null) return;
+    if (!confirm('Use this photo\'s GPS (' + gps.lat.toFixed(5) + ', ' + gps.lon.toFixed(5) +
+                 ') as the coordinates for "' + location.name + '"?')) return;
+    fetch('/api/locations/' + location.id, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gps_lat: gps.lat, gps_lon: gps.lon }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function () { showToast('Saved GPS for "' + location.name + '".'); })
+      .catch(function (err) { showToast('Failed to save GPS: ' + err.message); });
+  }
+
+  function openLocationPickerModal() {
+    openEntitySearchModal({
+      type: 'location',
+      onResolved: function (entity) {
+        addFileLocation(entity.id)
+          .then(function () {
+            appendLocationChip({ id: entity.id, name: entity.name });
+            maybeOfferPhotoGps(entity);
+          })
+          .catch(function (err) { showToast('Failed to add location: ' + err.message); });
+      },
+    });
+  }
+
+  if (locationPickerBtn) locationPickerBtn.addEventListener('click', openLocationPickerModal);
+  if (locationCurrent) locationCurrent.querySelectorAll('[data-location-id]').forEach(wireLocationChip);
+  window.openLocationPickerModal = openLocationPickerModal;
+
   /* Set assignment — a photo can belong to any number of sets */
   const setCurrent = document.getElementById('set-current');
   const setPickerBtn = document.getElementById('set-picker-btn');
@@ -4100,7 +4272,8 @@
       // set link (same screen spot), so hovering replaces the button with the
       // clickable set. Faces and the rest (info/frames/tags) keep hover-open.
       const isSetWithSets = pod.dataset.podKind === 'set' && pod.classList.contains('has-sets');
-      const clickOnly = (pod.dataset.podKind === 'set' || pod.dataset.podKind === 'category')
+      const clickOnly = (pod.dataset.podKind === 'set' || pod.dataset.podKind === 'category'
+                         || pod.dataset.podKind === 'location')
                         && !isSetWithSets;
       let hideTimer = null;
       function openPod() { if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; } pod.classList.add('is-open'); }
@@ -4120,6 +4293,7 @@
           // the picker modal straight away instead of toggling the (near-empty) menu.
           const action = trigger.dataset.podAction;
           if (action === 'add-category') { closeAllPods(null); openCategoryPickerModal(); return; }
+          if (action === 'add-location') { closeAllPods(null); openLocationPickerModal(); return; }
           if (action === 'add-set') { closeAllPods(null); openSetPickerModal(); return; }
           pod.__pinned = !pod.__pinned;
           if (pod.__pinned) { closeAllPods(pod); openPod(); }

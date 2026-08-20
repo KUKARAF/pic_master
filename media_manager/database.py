@@ -488,6 +488,13 @@ class Database(ThreadLocalDB):
             cursor.execute(sql + ' LIMIT ?', (limit,))
         return cursor.fetchall()
 
+    def get_geotagged_checksums(self):
+        """Checksums of files with EXIF GPS coordinates — the 'has location
+        metadata' search filter unions this with manual location assignments."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT checksum FROM files WHERE gps_lat IS NOT NULL')
+        return {row[0] for row in cursor.fetchall()}
+
     def count_broken_files(self):
         cur = self.conn.cursor()
         cur.execute('SELECT COUNT(*) FROM files WHERE broken IS NOT NULL')

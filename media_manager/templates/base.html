@@ -17,6 +17,7 @@
     <a class="nav-link" href="/faces">Faces</a>
     <a class="nav-link" href="/tags">Tags</a>
     <a class="nav-link" href="/categories">Categories</a>
+    <a class="nav-link" href="/locations">Locations</a>
     <a class="nav-link" href="/sets">Sets</a>
     <a class="nav-link" href="/studios">Studios</a>
     <a class="nav-link" href="/duplicates">Duplicates</a>
@@ -52,6 +53,10 @@
       </div>
       <div class="bulk-action-row">
         <button type="button" class="bulk-action-btn" data-start="/api/tile-index/start" data-status="/api/tile-index/status">▦ Index regions</button>
+        <span class="bulk-action-status" data-role="status"></span>
+      </div>
+      <div class="bulk-action-row">
+        <button type="button" class="bulk-action-btn" data-start="/api/metadata/start" data-status="/api/metadata/status">📍 Extract locations</button>
         <span class="bulk-action-status" data-role="status"></span>
       </div>
     </div>
@@ -97,6 +102,8 @@
     </div>
     <div class="palette-footer">
       <a href="#" id="palette-viewall" class="sub" style="display:none;">Browse results →</a>
+      <button type="button" id="palette-hasloc-btn" class="sub" style="background:none;border:none;cursor:pointer;padding:0;"
+              title="Filter to photos that have location metadata">📍 Has location</button>
       <span class="sub palette-hint">↑↓ select · Enter apply filter / open results · Esc close</span>
     </div>
   </div>

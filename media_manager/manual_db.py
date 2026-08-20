@@ -520,6 +520,50 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_category_exclusions_category ON file_category_exclusions (category_id)')
+
+        # Locations — a named place (optional physical coordinates) assignable to
+        # a photo, a set, and a studio (a studio may have many). Multi-valued, same
+        # shape as categories: the entity lives in `locations`, with a link table
+        # per target keyed the way manual.db keys each of those (checksum for files,
+        # the entity id for sets/studios). EXIF-derived per-photo coordinates live
+        # separately in media.db (files.gps_lat/gps_lon) — these are the user's
+        # curated named places.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS locations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                gps_lat REAL,
+                gps_lon REAL,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_locations (
+                checksum TEXT NOT NULL,
+                location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, location_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_locations_location ON file_locations (location_id)')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS set_locations (
+                set_id INTEGER NOT NULL REFERENCES sets(id) ON DELETE CASCADE,
+                location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (set_id, location_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_set_locations_location ON set_locations (location_id)')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS studio_locations (
+                studio_id INTEGER NOT NULL REFERENCES studios(id) ON DELETE CASCADE,
+                location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (studio_id, location_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_studio_locations_location ON studio_locations (location_id)')
         if old_overrides_exists:
             cur.execute('''
                 INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
@@ -1253,7 +1297,7 @@ class ManualDB(ThreadLocalDB):
         not a GROUP BY over a free-text sets.studio column."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT st.name as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
+            SELECT st.id as id, st.name as studio, COUNT(DISTINCT s.id) as set_count, COUNT(fs.checksum) as image_count
             FROM studios st
             JOIN sets s ON s.studio_id = st.id
             LEFT JOIN file_sets fs ON fs.set_id = s.id
@@ -1755,6 +1799,149 @@ class ManualDB(ThreadLocalDB):
             (category_id, limit)
         )
         return [row[0] for row in cur.fetchall()]
+
+    # ---- Locations (named places; mirror the category accessors) --------------
+
+    def create_location(self, name, gps_lat=None, gps_lon=None):
+        """Find-or-create by name (mirrors create_category). If it already exists,
+        its stored coordinates are NOT overwritten — call set_location_coords."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT OR IGNORE INTO locations (name, gps_lat, gps_lon, created_at) VALUES (?, ?, ?, ?)',
+            (name.strip(), gps_lat, gps_lon, int(time.time()))
+        )
+        self.conn.commit()
+        cur.execute('SELECT id FROM locations WHERE name = ?', (name.strip(),))
+        return cur.fetchone()[0]
+
+    def get_location(self, location_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM locations WHERE id = ?', (location_id,))
+        return cur.fetchone()
+
+    def list_locations(self):
+        """Location rows + a file_count (manual file assignments only), mirroring
+        list_categories' image_count."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT l.id, l.name, l.gps_lat, l.gps_lon, l.created_at,
+                   COUNT(fl.checksum) as file_count
+            FROM locations l
+            LEFT JOIN file_locations fl ON fl.location_id = l.id
+            GROUP BY l.id
+            ORDER BY l.name
+        ''')
+        return cur.fetchall()
+
+    def rename_location(self, location_id, name):
+        cur = self.conn.cursor()
+        cur.execute('UPDATE locations SET name = ? WHERE id = ?', (name.strip(), location_id))
+        self.conn.commit()
+
+    def set_location_coords(self, location_id, gps_lat, gps_lon):
+        cur = self.conn.cursor()
+        cur.execute('UPDATE locations SET gps_lat = ?, gps_lon = ? WHERE id = ?',
+                    (gps_lat, gps_lon, location_id))
+        self.conn.commit()
+
+    def delete_location(self, location_id):
+        """Delete the location entity; ON DELETE CASCADE removes every
+        file/set/studio link to it (mirrors delete_category)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM locations WHERE id = ?', (location_id,))
+        self.conn.commit()
+
+    def add_file_location(self, checksum, location_id):
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO file_locations (checksum, location_id, created_at) VALUES (?, ?, ?)',
+                    (checksum, location_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_file_location(self, checksum, location_id):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_locations WHERE checksum = ? AND location_id = ?', (checksum, location_id))
+        self.conn.commit()
+
+    def get_locations_for_checksum(self, checksum):
+        """Every location assigned to this file — [{'id','name','gps_lat','gps_lon'}]."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT l.id, l.name, l.gps_lat, l.gps_lon
+            FROM file_locations fl JOIN locations l ON l.id = fl.location_id
+            WHERE fl.checksum = ? ORDER BY l.name
+        ''', (checksum,))
+        return [{'id': r[0], 'name': r[1], 'gps_lat': r[2], 'gps_lon': r[3]} for r in cur.fetchall()]
+
+    def get_locations_for_checksums(self, checksums):
+        """Batched: {checksum: [{'id','name','gps_lat','gps_lon'}, ...]} (mirrors
+        get_categories_for_checksums; chunked for library-wide lists)."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'''
+                SELECT fl.checksum, l.id, l.name, l.gps_lat, l.gps_lon
+                FROM file_locations fl JOIN locations l ON l.id = fl.location_id
+                WHERE fl.checksum IN ({placeholders}) ORDER BY l.name
+            ''', tuple(chunk))
+            for checksum, lid, name, lat, lon in cur.fetchall():
+                result.setdefault(checksum, []).append(
+                    {'id': lid, 'name': name, 'gps_lat': lat, 'gps_lon': lon})
+        return result
+
+    def get_checksums_for_location(self, location_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_locations WHERE location_id = ?', (location_id,))
+        return {row[0] for row in cur.fetchall()}
+
+    def get_checksums_with_any_location(self):
+        """Every checksum that has at least one assigned location (for the
+        'has location metadata' search filter, unioned with EXIF-geotagged files)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM file_locations')
+        return {row[0] for row in cur.fetchall()}
+
+    def add_set_location(self, set_id, location_id):
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO set_locations (set_id, location_id, created_at) VALUES (?, ?, ?)',
+                    (set_id, location_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_set_location(self, set_id, location_id):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM set_locations WHERE set_id = ? AND location_id = ?', (set_id, location_id))
+        self.conn.commit()
+
+    def get_locations_for_set(self, set_id):
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT l.id, l.name, l.gps_lat, l.gps_lon
+            FROM set_locations sl JOIN locations l ON l.id = sl.location_id
+            WHERE sl.set_id = ? ORDER BY l.name
+        ''', (set_id,))
+        return [{'id': r[0], 'name': r[1], 'gps_lat': r[2], 'gps_lon': r[3]} for r in cur.fetchall()]
+
+    def add_studio_location(self, studio_id, location_id):
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO studio_locations (studio_id, location_id, created_at) VALUES (?, ?, ?)',
+                    (studio_id, location_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_studio_location(self, studio_id, location_id):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM studio_locations WHERE studio_id = ? AND location_id = ?', (studio_id, location_id))
+        self.conn.commit()
+
+    def get_locations_for_studio(self, studio_id):
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT l.id, l.name, l.gps_lat, l.gps_lon
+            FROM studio_locations sl JOIN locations l ON l.id = sl.location_id
+            WHERE sl.studio_id = ? ORDER BY l.name
+        ''', (studio_id,))
+        return [{'id': r[0], 'name': r[1], 'gps_lat': r[2], 'gps_lon': r[3]} for r in cur.fetchall()]
 
     def get_all_category_checksums(self):
         """{category_id: set(checksum), ...} for every manual category assignment,

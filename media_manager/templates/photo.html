@@ -9,6 +9,7 @@
 <script>
   window.MEDIA_FILE_ID = {{ file.id }};
   window.MEDIA_FRAME_COUNT = {{ file.frame_count or 1 }};
+  window.MEDIA_FILE_GPS = {% if file.gps_lat is not none %}{lat: {{ file.gps_lat }}, lon: {{ file.gps_lon }}}{% else %}null{% endif %};
   window.DETECTED_CLASSES = {{ detected_classes | tojson }};
   window.DETECTED_BBOXES = {{ detection_bboxes | tojson }};
 </script>
@@ -108,6 +109,27 @@
           <td>Hash</td>
           <td>{{ file.checksum or '—' }}</td>
         </tr>
+        {% if file.locations or file.gps_lat is not none %}
+        <tr>
+          <td>Location</td>
+          <td>
+            {% for l in file.locations %}
+            <a href="/locations/{{ l.id }}">{{ l.name }}</a>{% if not loop.last %}, {% endif %}
+            {% endfor %}
+            {% if file.gps_lat is not none %}
+            {% if file.locations %}<br>{% endif %}
+            GPS {{ '%.5f'|format(file.gps_lat) }}, {{ '%.5f'|format(file.gps_lon) }}
+            · <a href="/search?sort=distance&lat={{ file.gps_lat }}&lon={{ file.gps_lon }}">find nearby</a>
+            {% endif %}
+          </td>
+        </tr>
+        {% endif %}
+        {% if file.taken_at %}
+        <tr>
+          <td>Taken</td>
+          <td><span class="taken-at-ts" data-ts="{{ file.taken_at }}">{{ file.taken_at }}</span></td>
+        </tr>
+        {% endif %}
       </table>
       </div>
       <button type="button" id="fileinfo-add-set-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add to set</button>
@@ -231,6 +253,30 @@
         {% endif %}
       </div>
       <button type="button" id="category-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add category</button>
+    </div>
+    </div>
+  </div>
+
+  <div class="stage-pod" data-pod data-pod-kind="location">
+    <button type="button" class="stage-pod-btn" id="location-pod-trigger"{% if not file.locations %} data-pod-action="add-location" title="Add a location"{% endif %}>{% if file.locations %}<span class="pod-collapsed-label">📍 {{ file.locations | map(attribute='name') | join(', ') }}</span>{% else %}＋ Add location{% endif %}</button>
+    <div class="stage-pod-menu">
+    <!-- Locations — a photo can be assigned to any number of named places, each
+         optionally carrying GPS coordinates (see locations.html). -->
+    <div class="sidebar-panel">
+      <div class="section-title">Locations</div>
+      <div id="location-current">
+        {% if file.locations %}
+        {% for l in file.locations %}
+        <span class="tag-removable" data-location-id="{{ l.id }}" style="margin-bottom:4px;display:inline-flex;">
+          <a href="/locations/{{ l.id }}">{{ l.name }}</a>
+          <button class="rm location-remove-btn" type="button" title="Remove this location">×</button>
+        </span>
+        {% endfor %}
+        {% else %}
+        <span class="sub">No location.</span>
+        {% endif %}
+      </div>
+      <button type="button" id="location-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add location</button>
     </div>
     </div>
   </div>
