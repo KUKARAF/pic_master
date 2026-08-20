@@ -495,6 +495,15 @@ class Database(ThreadLocalDB):
         cursor.execute('SELECT checksum FROM files WHERE gps_lat IS NOT NULL')
         return {row[0] for row in cursor.fetchall()}
 
+    def get_geotagged_points(self):
+        """(file_id, gps_lat, gps_lon) for every non-hidden EXIF-geotagged file —
+        the points plotted on the offline locations map."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, gps_lat, gps_lon FROM files '
+            'WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL AND COALESCE(hidden, 0) = 0')
+        return cursor.fetchall()
+
     def count_broken_files(self):
         cur = self.conn.cursor()
         cur.execute('SELECT COUNT(*) FROM files WHERE broken IS NOT NULL')

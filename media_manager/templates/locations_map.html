@@ -1,0 +1,331 @@
+{% extends "base.html" %}
+
+{% block title %}Map — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Map</h1>
+  <span class="sub" id="map-count">…</span>
+  <a href="/locations" class="btn-similar" style="text-decoration:none;">← Locations</a>
+  <button type="button" id="map-reset-btn" class="btn-similar" style="margin-left:auto;">Reset view</button>
+</div>
+
+<div id="map-wrap" style="position:relative;width:100%;border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;background:var(--input-bg);">
+  <canvas id="map-canvas" style="display:block;width:100%;height:70vh;cursor:grab;touch-action:none;"></canvas>
+
+  <div id="map-tooltip" style="position:absolute;pointer-events:none;display:none;padding:3px 7px;
+       font-family:var(--font-pixel);font-size:8px;letter-spacing:.06em;text-transform:uppercase;
+       background:var(--surface);color:var(--accent);border:1px solid var(--border-accent);
+       border-radius:var(--radius);white-space:nowrap;z-index:5;"></div>
+
+  <div id="map-empty" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+       text-align:center;padding:24px;pointer-events:none;">
+    <div class="empty-state" style="pointer-events:auto;">
+      <div class="icon">📍</div>
+      <p>No geotagged photos yet — run ⚡ → 📍 Extract locations</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  'use strict';
+
+  // ---- Equirectangular (Plate Carrée) base projection ---------------------
+  // Base world coordinate space is BW x BH (2:1). Every geographic point is
+  // first projected into this fixed space, then a single scale/panX/panY
+  // affine turns base coords into on-screen pixels, so zoom/pan is nothing but
+  // mutating those three numbers.
+  var BW = 2000, BH = 1000;
+  function projLon(lon) { return (lon + 180) / 360 * BW; }
+  function projLat(lat) { return (90 - lat) / 180 * BH; }
+
+  var canvas = document.getElementById('map-canvas');
+  var ctx = canvas.getContext('2d');
+  var tooltipEl = document.getElementById('map-tooltip');
+  var emptyEl = document.getElementById('map-empty');
+  var countEl = document.getElementById('map-count');
+
+  // Resolve theme colors once from CSS variables (same-origin stylesheet).
+  var css = getComputedStyle(document.documentElement);
+  function v(name, fallback) { var x = css.getPropertyValue(name).trim(); return x || fallback; }
+  var COL_LAND   = v('--surface-2', '#0F160F');
+  var COL_BORDER = v('--border', '#243024');
+  var COL_GRAT   = v('--divider', '#141a14');
+  var COL_ACCENT = v('--accent', '#79F279');
+  var COL_INK    = v('--accent-ink', '#06210A');
+
+  // View transform: screen = base * scale + pan.
+  var scale = 1, panX = 0, panY = 0;
+  var MIN_SCALE = 0.1, MAX_SCALE = 40;
+  var cssW = 0, cssH = 0, dpr = 1;
+
+  var world = null;   // GeoJSON features
+  var points = [];    // [file_id, lat, lon]
+  // Projected point cache in base space: {x, y, id} — recomputed only on load.
+  var projPts = [];
+  // Clusters from the most recent render, in screen space, for hit-testing.
+  var clusters = [];
+
+  function base2screenX(bx) { return bx * scale + panX; }
+  function base2screenY(by) { return by * scale + panY; }
+
+  // ---- Sizing / DPR -------------------------------------------------------
+  function resize() {
+    var rect = canvas.getBoundingClientRect();
+    cssW = rect.width;
+    cssH = rect.height;
+    dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // draw in CSS px, crisp on HiDPI
+    render();
+  }
+
+  // Fit the whole world into the viewport (used on first load + reset).
+  function fitView() {
+    var s = Math.min(cssW / BW, cssH / BH);
+    scale = s;
+    panX = (cssW - BW * s) / 2;
+    panY = (cssH - BH * s) / 2;
+  }
+
+  function clampScale(s) { return Math.max(MIN_SCALE, Math.min(MAX_SCALE, s)); }
+
+  // ---- Rendering ----------------------------------------------------------
+  function drawGraticule() {
+    ctx.strokeStyle = COL_GRAT;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (var lon = -180; lon <= 180; lon += 30) {
+      var x = base2screenX(projLon(lon));
+      ctx.moveTo(x, base2screenY(projLat(90)));
+      ctx.lineTo(x, base2screenY(projLat(-90)));
+    }
+    for (var lat = -90; lat <= 90; lat += 30) {
+      var y = base2screenY(projLat(lat));
+      ctx.moveTo(base2screenX(projLon(-180)), y);
+      ctx.lineTo(base2screenX(projLon(180)), y);
+    }
+    ctx.stroke();
+  }
+
+  function drawRing(ring) {
+    for (var i = 0; i < ring.length; i++) {
+      var x = base2screenX(projLon(ring[i][0]));
+      var y = base2screenY(projLat(ring[i][1]));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.closePath();
+  }
+
+  function drawWorld() {
+    if (!world) return;
+    ctx.fillStyle = COL_LAND;
+    ctx.strokeStyle = COL_BORDER;
+    ctx.lineWidth = 1;
+    for (var f = 0; f < world.length; f++) {
+      var g = world[f].geometry;
+      if (!g) continue;
+      var polys = g.type === 'Polygon' ? [g.coordinates]
+                : g.type === 'MultiPolygon' ? g.coordinates : [];
+      for (var p = 0; p < polys.length; p++) {
+        ctx.beginPath();
+        for (var r = 0; r < polys[p].length; r++) drawRing(polys[p][r]);
+        ctx.fill('evenodd'); // holes (lakes) subtract via even-odd
+        ctx.stroke();
+      }
+    }
+  }
+
+  // Cluster projected points by a fixed screen-pixel grid, recomputed every
+  // render so bins merge/split with zoom. Returns [{x,y,count,ids}] in screen
+  // space (only bins that intersect the viewport, for hit-testing + drawing).
+  var CELL = 34;
+  function buildClusters() {
+    var bins = {};
+    for (var i = 0; i < projPts.length; i++) {
+      var sx = base2screenX(projPts[i].x);
+      var sy = base2screenY(projPts[i].y);
+      // Skip far-offscreen points (cheap viewport cull).
+      if (sx < -CELL || sy < -CELL || sx > cssW + CELL || sy > cssH + CELL) continue;
+      var gx = Math.floor(sx / CELL), gy = Math.floor(sy / CELL);
+      var key = gx + ',' + gy;
+      var b = bins[key];
+      if (!b) { b = bins[key] = { sx: 0, sy: 0, count: 0, ids: [] }; }
+      b.sx += sx; b.sy += sy; b.count++;
+      b.ids.push(projPts[i].id);
+    }
+    var out = [];
+    for (var k in bins) {
+      var bb = bins[k];
+      out.push({ x: bb.sx / bb.count, y: bb.sy / bb.count, count: bb.count, ids: bb.ids });
+    }
+    return out;
+  }
+
+  function drawClusters() {
+    clusters = buildClusters();
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = '10px monospace';
+    for (var i = 0; i < clusters.length; i++) {
+      var c = clusters[i];
+      if (c.count === 1) {
+        // Single photo — small constant-size accent dot.
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = COL_ACCENT;
+        ctx.fill();
+      } else {
+        // Cluster — radius grows with log(N); constant pixel size (screen space).
+        var rad = 8 + Math.log(c.count) * 4;
+        ctx.beginPath();
+        ctx.arc(c.x, c.y, rad, 0, Math.PI * 2);
+        ctx.fillStyle = COL_ACCENT;
+        ctx.globalAlpha = 0.85;
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = COL_INK;
+        ctx.fillText(String(c.count), c.x, c.y);
+      }
+    }
+  }
+
+  function render() {
+    if (!ctx) return;
+    ctx.clearRect(0, 0, cssW, cssH);
+    drawGraticule();
+    drawWorld();
+    drawClusters();
+  }
+
+  // ---- Hit testing --------------------------------------------------------
+  function hitCluster(mx, my) {
+    // Topmost (last drawn) first.
+    for (var i = clusters.length - 1; i >= 0; i--) {
+      var c = clusters[i];
+      var rad = c.count === 1 ? 6 : (8 + Math.log(c.count) * 4);
+      var dx = mx - c.x, dy = my - c.y;
+      if (dx * dx + dy * dy <= rad * rad) return c;
+    }
+    return null;
+  }
+
+  function openCluster(c) {
+    if (!c) return;
+    if (c.count === 1) {
+      window.setPhotoQueue([c.ids[0]], 'Map', 0);
+    } else {
+      window.setPhotoQueue(c.ids, 'Map · ' + c.count + ' photos', 0);
+    }
+    window.location.href = '/photo/' + c.ids[0];
+  }
+
+  // ---- Interaction: wheel zoom toward cursor ------------------------------
+  canvas.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var rect = canvas.getBoundingClientRect();
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var factor = Math.pow(1.0015, -e.deltaY); // smooth, direction-correct
+    var newScale = clampScale(scale * factor);
+    if (newScale === scale) return;
+    // Keep the base point under the cursor fixed: solve pan for new scale.
+    var bx = (mx - panX) / scale, by = (my - panY) / scale;
+    scale = newScale;
+    panX = mx - bx * scale;
+    panY = my - by * scale;
+    render();
+  }, { passive: false });
+
+  // ---- Interaction: drag to pan, small move = click -----------------------
+  var dragging = false, moved = false, startX = 0, startY = 0, startPanX = 0, startPanY = 0;
+  var DRAG_THRESHOLD = 4; // px before a press counts as a drag not a click
+
+  canvas.addEventListener('mousedown', function (e) {
+    dragging = true; moved = false;
+    startX = e.clientX; startY = e.clientY;
+    startPanX = panX; startPanY = panY;
+    canvas.style.cursor = 'grabbing';
+  });
+
+  window.addEventListener('mousemove', function (e) {
+    if (dragging) {
+      var dx = e.clientX - startX, dy = e.clientY - startY;
+      if (!moved && (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD)) moved = true;
+      if (moved) {
+        panX = startPanX + dx;
+        panY = startPanY + dy;
+        render();
+      }
+      return;
+    }
+    // Hover: show cluster count + accent cursor.
+    var rect = canvas.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right ||
+        e.clientY < rect.top || e.clientY > rect.bottom) { tooltipEl.style.display = 'none'; return; }
+    var mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    var c = hitCluster(mx, my);
+    if (c) {
+      canvas.style.cursor = 'pointer';
+      tooltipEl.textContent = c.count === 1 ? '1 photo' : (c.count + ' photos');
+      tooltipEl.style.left = (mx + 12) + 'px';
+      tooltipEl.style.top = (my + 12) + 'px';
+      tooltipEl.style.display = 'block';
+    } else {
+      canvas.style.cursor = 'grab';
+      tooltipEl.style.display = 'none';
+    }
+  });
+
+  window.addEventListener('mouseup', function (e) {
+    if (!dragging) return;
+    dragging = false;
+    canvas.style.cursor = 'grab';
+    if (moved) return; // was a pan, not a click
+    var rect = canvas.getBoundingClientRect();
+    if (e.clientX < rect.left || e.clientX > rect.right ||
+        e.clientY < rect.top || e.clientY > rect.bottom) return;
+    openCluster(hitCluster(e.clientX - rect.left, e.clientY - rect.top));
+  });
+
+  document.getElementById('map-reset-btn').addEventListener('click', function () {
+    fitView();
+    render();
+  });
+
+  window.addEventListener('resize', resize);
+
+  // ---- Load data (all same-origin) ----------------------------------------
+  function projectPoints() {
+    projPts = points.map(function (p) {
+      return { id: p[0], x: projLon(p[2]), y: projLat(p[1]) }; // p = [id, lat, lon]
+    });
+  }
+
+  Promise.all([
+    fetch('/static/world-110m.geojson').then(function (r) { return r.json(); }),
+    fetch('/api/locations/map-points').then(function (r) { return r.json(); })
+  ]).then(function (res) {
+    world = res[0].features || [];
+    points = (res[1] && res[1].points) || [];
+    projectPoints();
+    countEl.textContent = points.length + ' geotagged photo' + (points.length === 1 ? '' : 's');
+    if (points.length === 0) emptyEl.style.display = 'flex';
+    resize(); // sizes + fits + renders
+    fitView();
+    render();
+  }).catch(function (err) {
+    // Surface loudly rather than a blank canvas.
+    countEl.textContent = 'Failed to load map: ' + err;
+    console.error('locations map load failed', err);
+  });
+
+  // Initial size before data arrives (shows land quickly once world resolves).
+  resize();
+  fitView();
+})();
+</script>
+{% endblock %}

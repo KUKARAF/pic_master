@@ -3967,6 +3967,21 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    # NOTE: this static route must precede /locations/{location_id} so "map"
+    # isn't parsed as an int location id.
+    @app.get('/locations/map', response_class=HTMLResponse)
+    def locations_map_page(request: Request):
+        return templates.TemplateResponse(request, 'locations_map.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/api/locations/map-points')
+    def api_locations_map_points():
+        """Every non-hidden EXIF-geotagged photo as [file_id, lat, lon] — plotted
+        on the offline locations map (see locations_map.html)."""
+        return {'points': [[r[0], r[1], r[2]] for r in db.get_geotagged_points()]}
+
     @app.get('/locations/{location_id}', response_class=HTMLResponse)
     def location_detail_page(request: Request, location_id: int, sort: str = 'added', order: str = 'desc',
                              lat: float = None, lon: float = None):
