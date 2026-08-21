@@ -1595,6 +1595,17 @@ class ManualDB(ThreadLocalDB):
         row = cur.fetchone()
         return row[0] if row else 0
 
+    def count_named_faces(self):
+        """Count of named face INSTANCES (not distinct people) — every confirmed
+        identity-bearing face row (promoted from a detection or hand-drawn). The
+        counterpart to media.db's count_unidentified_faces: naming lives here, not on
+        media.db's faces.identity (which stays NULL), so this is the real 'identified
+        faces' number for /stats."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        row = cur.fetchone()
+        return row[0] if row else 0
+
     def storage_stats(self):
         """Entity counts + on-disk size for the /stats page — the user-labeled side of
         the library (manual.db)."""

@@ -3953,6 +3953,7 @@ def create_app(data_root: str) -> FastAPI:
                 'broken': db.count_broken_files(),
                 'tiled_files': db.count_tiled_files(),
                 'unidentified_faces': db.count_unidentified_faces(),
+                'identified_faces': manual.count_named_faces(),
                 'cities': db.count_cities(),
             },
             'embeddings': emb,
