@@ -539,14 +539,16 @@ def create_app(data_root: str) -> FastAPI:
             'title': manual.get_file_title(row['checksum']),
         }
 
-    def _enrich_rows(rows, scores=None):
+    def _enrich_rows(rows, scores=None, distances=None):
         """Add tags + favorite state + title + sets + recognized people to a list of
         (id, path, has_embedding, checksum) rows — the single shared card-building
         path for every photo-grid view (gallery, search results, set detail), so
         those views don't each duplicate the same batch of lookups.
 
         `scores` is an optional {file_id: score} map for search results ranked by
-        similarity/relevance; when given, each card gets a 'score' key."""
+        similarity/relevance; when given, each card gets a 'score' key. `distances` is
+        an optional {file_id: km} map for the distance sort; each card gets a
+        'distance_km' key so the card can show how far it is from the search point."""
         checksums = [row[3] for row in rows]
         tag_map = manual.list_tags_for_checksums(checksums)
         favorite_counts = manual.get_favorite_counts(checksums)
@@ -578,8 +580,19 @@ def create_app(data_root: str) -> FastAPI:
             }
             if scores is not None and file_id in scores:
                 card['score'] = scores[file_id]
+            if distances is not None and file_id in distances:
+                card['distance_km'] = distances[file_id]
             result.append(card)
         return result
+
+    def _distance_map(file_rows, sort, target_lat, target_lon):
+        """{file_id: km} for a distance-sorted result set so each card can show its
+        distance from the search point; None for any non-distance sort (so _enrich_rows
+        adds no badge). Rows without EXIF GPS are simply omitted."""
+        if sort != 'distance' or target_lat is None or target_lon is None:
+            return None
+        return {r['id']: round(_haversine(r['gps_lat'], r['gps_lon'], target_lat, target_lon), 1)
+                for r in file_rows if r['gps_lat'] is not None and r['gps_lon'] is not None}
 
     def _people_not_in_sets(people, card_sets):
         """Drop anyone from a card's own 'recognized in this photo' people list
@@ -1380,7 +1393,7 @@ def create_app(data_root: str) -> FastAPI:
                 file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order,
                                             target_lat=lat, target_lon=lon)
                 rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-                files = _enrich_rows(rows)
+                files = _enrich_rows(rows, distances=_distance_map(file_rows, sort, lat, lon))
                 if sort == 'age':
                     files = _sort_cards_by_age(files, order)
             queue_label = 'Search: ' + ' + '.join(f'{c["type"]}:{c["value"]}' for c in chips)
@@ -1392,7 +1405,7 @@ def create_app(data_root: str) -> FastAPI:
             file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order,
                                         target_lat=lat, target_lon=lon)
             rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-            files = _enrich_rows(rows)
+            files = _enrich_rows(rows, distances=_distance_map(file_rows, sort, lat, lon))
             if sort == 'age':
                 files = _sort_cards_by_age(files, order)
             queue_label = f'Tag: {tag}'
@@ -1410,7 +1423,7 @@ def create_app(data_root: str) -> FastAPI:
                     file_rows = _sort_file_rows(db.get_files_by_checksums(checksums), sort, order,
                                                 target_lat=lat, target_lon=lon)
                     rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-                    files = _enrich_rows(rows)
+                    files = _enrich_rows(rows, distances=_distance_map(file_rows, sort, lat, lon))
                     if sort == 'age':
                         files = _sort_cards_by_age(files, order)
 
@@ -1459,7 +1472,7 @@ def create_app(data_root: str) -> FastAPI:
                 file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order,
                                             target_lat=lat, target_lon=lon)
                 rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-                files = _enrich_rows(rows)
+                files = _enrich_rows(rows, distances=_distance_map(file_rows, sort, lat, lon))
             queue_label = 'Near here'
 
         return templates.TemplateResponse(request, 'search.html', {

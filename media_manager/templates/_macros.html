@@ -81,6 +81,10 @@
   <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
   {% endif %}
 
+  {% if f.distance_km is defined %}
+  <span class="score-badge distance-badge" title="Distance from search point">📍 {{ f.distance_km }} km</span>
+  {% endif %}
+
   <div class="card-body">
     <a class="card-name" href="/photo/{{ f.id }}" title="{{ f.path }}">{{ f.title or f.filename }}</a>
     {{ card_chips(f) }}

@@ -915,6 +915,18 @@
     };
   })();
 
+  // Great-circle distance in km between two lat/lon points — mirrors the server's
+  // _haversine (web.py). Used by the location picker to show how far each named
+  // location is from the current photo's EXIF GPS (window.MEDIA_FILE_GPS).
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    var toRad = function (d) { return d * Math.PI / 180; };
+    var r = 6371;
+    var dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+    var a = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+      + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    return 2 * r * Math.asin(Math.sqrt(a));
+  }
+
   // Per-type behavior for openEntitySearchModal — the one place that knows how
   // to list/label/create each kind of entity. `image` is only set for
   // 'identity' (a face-crop thumbnail); every other type renders text-only.
@@ -977,9 +989,18 @@
       fetchAll: function () { return cachedGetJson('/api/locations'); },
       label: function (l) { return l.name; },
       secondary: function (l) {
-        return l.gps_lat != null
-          ? l.gps_lat.toFixed(4) + ', ' + l.gps_lon.toFixed(4)
-          : (l.file_count || 0) + ' photo(s)';
+        if (l.gps_lat == null) {
+          return (l.file_count || 0) + ' photo(s)';
+        }
+        var coords = l.gps_lat.toFixed(4) + ', ' + l.gps_lon.toFixed(4);
+        // On the photo page, if this photo has EXIF GPS, lead with how far this
+        // location is from it — so you can pick the nearest named place at a glance.
+        var g = window.MEDIA_FILE_GPS;
+        if (g) {
+          var km = haversineKm(g.lat, g.lon, l.gps_lat, l.gps_lon);
+          return '📍 ' + (km < 10 ? km.toFixed(1) : Math.round(km)) + ' km · ' + coords;
+        }
+        return coords;
       },
       image: null,
       createFn: function (typedName) {
