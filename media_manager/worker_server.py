@@ -727,6 +727,112 @@ def handle_tag_detect(path, data, request_id, link_id, remote_identity, requeste
             _cleanup(tmp)
 
 
+# --- imdb: resident in-memory search index --------------------------------------
+class ImdbIndex:
+    """The worker's resident CLIP + face embedding matrices for search offload, plus
+    a receive buffer used WHILE a build streams in from the host. The host ships the
+    matrix in bounded chunks (imdb_build_begin → many imdb_build_chunk → imdb_build_end)
+    so neither side ever holds the whole ~1 GB blob in one message; only the final
+    stacked matrix is kept resident. All state guarded by `lock`."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.matrices = {}   # kind -> {'ids': int64[N], 'matrix': float32[N,D], 'built_at': int}
+        self._buf = {}       # kind -> {'dim', 'ids': [int], 'chunks': [bytes], 'rows'} while building
+
+    def begin(self, kind, dim):
+        with self.lock:
+            self._buf[kind] = {'dim': int(dim), 'ids': [], 'chunks': [], 'rows': 0}
+
+    def add_chunk(self, kind, ids, vecs):
+        with self.lock:
+            buf = self._buf.get(kind)
+            if buf is None:
+                raise ValueError(f'no imdb build in progress for {kind!r} (call begin first)')
+            buf['ids'].extend(ids)
+            buf['chunks'].append(vecs)
+            buf['rows'] += len(ids)
+            return buf['rows']
+
+    def end(self, kind, now):
+        with self.lock:
+            buf = self._buf.pop(kind, None)
+            if buf is None:
+                raise ValueError(f'no imdb build in progress for {kind!r}')
+            dim = buf['dim']
+            # One contiguous copy: join the chunk bytes, view as float32, own it, then
+            # let the transient join-buffer go. ~2x the matrix size for a moment (fine
+            # on the big worker box), vs never materializing it on the low-RAM host.
+            matrix = np.frombuffer(b''.join(buf['chunks']), dtype=np.float32).reshape(-1, dim).copy()
+            ids = np.array(buf['ids'], dtype=np.int64)
+            if matrix.shape[0] != ids.shape[0]:
+                raise ValueError(f'{kind}: {matrix.shape[0]} vectors but {ids.shape[0]} ids')
+            self.matrices[kind] = {'ids': ids, 'matrix': matrix, 'built_at': now}
+            return matrix.shape[0], dim, int(matrix.nbytes)
+
+    def status(self):
+        with self.lock:
+            out = {}
+            for kind in ('clip', 'face'):
+                m = self.matrices.get(kind)
+                building = kind in self._buf
+                if m is not None:
+                    out[kind] = {'rows': int(m['matrix'].shape[0]), 'dim': int(m['matrix'].shape[1]),
+                                 'bytes': int(m['matrix'].nbytes), 'built_at': m['built_at'],
+                                 'building': building}
+                else:
+                    out[kind] = {'rows': 0, 'dim': 0, 'bytes': 0, 'built_at': None, 'building': building}
+            return out
+
+
+imdb_index = ImdbIndex()
+
+
+def handle_imdb_build_begin(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        kind = req['kind']
+        imdb_index.begin(kind, req['dim'])
+        print(f"[worker] imdb build begin kind={kind} dim={req['dim']} total={req.get('total_rows')}",
+              flush=True)
+        return worker_protocol.pack({'ok': True, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'ok': False, 'error': str(e)})
+
+
+def handle_imdb_build_chunk(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        received = imdb_index.add_chunk(req['kind'], req['ids'], req['vecs'])
+        return worker_protocol.pack({'received': received, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'received': 0, 'error': str(e)})
+
+
+def handle_imdb_build_end(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        rows, dim, nbytes = imdb_index.end(req['kind'], int(time.time()))
+        print(f"[worker] imdb build end kind={req['kind']} rows={rows} dim={dim} "
+              f"bytes={nbytes} ({nbytes / 1048576:.1f} MB)", flush=True)
+        return worker_protocol.pack({'rows': rows, 'dim': dim, 'bytes': nbytes, 'error': None})
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'rows': 0, 'dim': 0, 'bytes': 0, 'error': str(e)})
+
+
+def handle_imdb_status(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        resp = imdb_index.status()
+        resp['error'] = None
+        return worker_protocol.pack(resp)
+    except Exception as e:
+        traceback.print_exc()
+        return worker_protocol.pack({'clip': {}, 'face': {}, 'error': str(e)})
+
+
 # Map of request path -> handler, used both by run() and the loopback test.
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
@@ -742,6 +848,10 @@ HANDLERS = {
     worker_protocol.PATH_TRAIN_STATUS: handle_train_status,
     worker_protocol.PATH_TRAIN_CANCEL: handle_train_cancel,
     worker_protocol.PATH_TAG_DETECT: handle_tag_detect,
+    worker_protocol.PATH_IMDB_BUILD_BEGIN: handle_imdb_build_begin,
+    worker_protocol.PATH_IMDB_BUILD_CHUNK: handle_imdb_build_chunk,
+    worker_protocol.PATH_IMDB_BUILD_END: handle_imdb_build_end,
+    worker_protocol.PATH_IMDB_STATUS: handle_imdb_status,
 }
 
 

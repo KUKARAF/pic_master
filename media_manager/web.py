@@ -1951,6 +1951,11 @@ def create_app(data_root: str) -> FastAPI:
     # A single download has no per-row progress, so total is a placeholder (1) that
     # becomes the loaded city count on completion.
     fetch_cities_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Manual rebuild of the worker's in-memory search index ("imdb"): streams the
+    # CLIP+face matrices to the worker over RNS (see remote_index_builder). Tracks the
+    # live rows-sent + per-kind timings so /stats-style UI can show the ~1 GB transfer.
+    imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'seconds': 0.0,
+                      'results': None, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2380,6 +2385,56 @@ def create_app(data_root: str) -> FastAPI:
             'total': fetch_cities_job['total'],
             'error': fetch_cities_job['error'],
             'pending': 0,
+        }
+
+    @app.post('/api/imdb/rebuild')
+    def api_imdb_rebuild():
+        """Manually (re)build the worker's in-memory search index: stream the CLIP+face
+        matrices to the worker over RNS. Runs in a background thread; the host side
+        streams from media.db chunk-by-chunk so this process never materializes the full
+        matrix. Requires a configured worker (imdb lives ON the worker)."""
+        import threading
+        from media_manager import remote_index_builder
+
+        if imdb_build_job['running']:
+            return {'started': False, 'message': 'imdb rebuild already running.'}
+        if _worker_client is None or not _worker_client.is_configured():
+            return {'started': False,
+                    'message': 'No worker configured — the imdb index lives on the worker.'}
+        imdb_build_job.update(running=True, kind=None, rows_sent=0, seconds=0.0,
+                              results=None, error=None)
+
+        def _progress(kind, sent, secs):
+            imdb_build_job['kind'] = kind
+            imdb_build_job['rows_sent'] = sent
+            imdb_build_job['seconds'] = round(secs, 1)
+
+        def _run():
+            try:
+                imdb_build_job['results'] = remote_index_builder.build_index(
+                    data_root, progress=_progress)
+            except Exception as exc:
+                imdb_build_job['error'] = str(exc)
+            finally:
+                imdb_build_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True}
+
+    @app.get('/api/imdb/status')
+    def api_imdb_status():
+        """Rebuild-job state + the worker's live imdb matrix status (rows/MB/built_at
+        per kind). `worker` is None when no worker is configured."""
+        worker = None
+        if _worker_client is not None and _worker_client.is_configured():
+            try:
+                worker = _worker_client.imdb_status()
+            except Exception as exc:
+                worker = {'error': str(exc)}
+        return {
+            'configured': _worker_client is not None and _worker_client.is_configured(),
+            'job': dict(imdb_build_job),
+            'worker': worker,
         }
 
     @app.post('/api/match-faces/start')

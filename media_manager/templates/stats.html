@@ -27,6 +27,16 @@
   <div id="ram-report" class="stats-report" style="display:none;"></div>
 </div>
 
+{# ---- imdb: worker search index (build/rebuild + timing) ---- #}
+<div class="stats-card">
+  <div class="stats-card-head">
+    <h2>Search index (imdb)</h2>
+    <button type="button" id="imdb-rebuild-btn" class="btn-similar">↻ Rebuild index</button>
+  </div>
+  <div id="imdb-status" class="stats-report" style="display:none;"></div>
+  <p class="sub">Rebuilds the worker's in-memory CLIP + face matrices (streamed over RNS). Manual only — after new photos are indexed, rebuild to make them searchable via the worker. Times the transfer.</p>
+</div>
+
 {# ---- Embedding matrices (the imdb-sizing table) ---- #}
 <div class="stats-card">
   <h2>Embedding matrices</h2>
@@ -111,6 +121,51 @@
       .catch(function (err) { out.textContent = 'failed: ' + err.message; out.style.display = 'block'; })
       .finally(function () { btn.disabled = false; btn.textContent = '🔬 Analyze RAM'; });
   });
+})();
+
+(function () {
+  var btn = document.getElementById('imdb-rebuild-btn');
+  var out = document.getElementById('imdb-status');
+  if (!btn) return;
+  function mb(b) { return ((b || 0) / 1048576).toFixed(1) + ' MB'; }
+  function when(ts) { return ts ? new Date(ts * 1000).toLocaleString() : 'never built'; }
+  function render(d) {
+    var lines = [];
+    if (!d.configured) { out.textContent = 'No worker configured — the imdb index lives on the worker.'; out.style.display = 'block'; return; }
+    var w = d.worker || {};
+    if (w.error) { lines.push('worker status error: ' + w.error); }
+    ['clip', 'face'].forEach(function (k) {
+      var m = (w && w[k]) || {};
+      lines.push(k.padEnd(5) + ' resident: ' + (m.rows ? m.rows.toLocaleString() + ' rows / ' + mb(m.bytes) + ' · built ' + when(m.built_at) : 'not built'));
+    });
+    var j = d.job || {};
+    if (j.running) lines.push('', 'rebuilding ' + (j.kind || '') + ': ' + (j.rows_sent || 0).toLocaleString() + ' rows sent · ' + (j.seconds || 0) + 's');
+    else if (j.error) lines.push('', 'last rebuild FAILED: ' + j.error);
+    else if (j.results) {
+      lines.push('', 'last rebuild:');
+      Object.keys(j.results).forEach(function (k) {
+        var r = j.results[k];
+        lines.push('  ' + k.padEnd(5) + r.rows.toLocaleString() + ' rows / ' + r.mb + ' MB in ' + r.seconds + 's (' + r.mbps + ' MB/s)');
+      });
+    }
+    out.textContent = lines.join('\n');
+    out.style.display = 'block';
+  }
+  function poll() {
+    fetch('/api/imdb/status').then(function (r) { return r.json(); }).then(function (d) {
+      render(d);
+      if (d.job && d.job.running) { setTimeout(poll, 1500); btn.disabled = true; }
+      else { btn.disabled = false; }
+    }).catch(function (err) { out.textContent = 'status failed: ' + err.message; out.style.display = 'block'; });
+  }
+  btn.addEventListener('click', function () {
+    btn.disabled = true;
+    fetch('/api/imdb/rebuild', { method: 'POST' }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.started === false) { out.textContent = d.message || 'could not start'; out.style.display = 'block'; btn.disabled = false; return; }
+      poll();
+    }).catch(function (err) { out.textContent = 'failed: ' + err.message; out.style.display = 'block'; btn.disabled = false; });
+  });
+  poll();  // show current worker index state on load
 })();
 </script>
 

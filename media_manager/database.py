@@ -719,6 +719,34 @@ class Database(ThreadLocalDB):
         """Size of this database file on disk, or 0 if missing."""
         return os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
 
+    def iter_clip_embeddings(self, chunk=10000):
+        """Stream (file_ids: list[int], vecs: bytes) chunks of whole-image CLIP
+        embeddings via fetchmany — used to SHIP the CLIP matrix to the imdb worker
+        without ever materializing all ~478 MB on this (low-RAM) host. `vecs` is the
+        concatenated little-endian float32 blobs for the chunk's rows, in id order."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT file_id, embedding FROM embeddings '
+                    'WHERE frame_index = 0 AND embedding IS NOT NULL ORDER BY file_id')
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows:
+                break
+            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
+
+    def iter_face_embeddings(self, chunk=10000):
+        """Stream (file_ids: list[int], vecs: bytes) chunks of face (ArcFace)
+        embeddings — one row per detected face, `id` is its file_id so a face-search
+        result maps straight to the photo. Streams like iter_clip_embeddings so the
+        ~444 MB face matrix is never fully resident on the host."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT file_id, embedding FROM faces "
+                    "WHERE embedding != x'' ORDER BY id")
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows:
+                break
+            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
+
     def get_geotagged_points(self):
         """(file_id, gps_lat, gps_lon) for every non-hidden EXIF-geotagged file —
         the points plotted on the offline locations map."""

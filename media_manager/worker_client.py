@@ -355,6 +355,34 @@ class WorkerClient:
             out.append((d[0], float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])))
         return out
 
+    # -- imdb: resident search index ---------------------------------------
+    # The host (remote_index_builder.py) streams a matrix to the worker in bounded
+    # chunks so neither side ever holds the whole ~1 GB blob. Control messages are
+    # small; each chunk is a few tens of MB (RNS ships it as a segmented Resource),
+    # so allow a generous per-chunk timeout.
+
+    def imdb_build_begin(self, kind: str, dim: int, total_rows=None) -> None:
+        resp = self.request(worker_protocol.PATH_IMDB_BUILD_BEGIN,
+                            {"kind": kind, "dim": dim, "total_rows": total_rows}, timeout=60)
+        if resp.get("error") or not resp.get("ok"):
+            raise WorkerError(resp.get("error") or "imdb_build_begin failed")
+
+    def imdb_build_chunk(self, kind: str, ids: list, vecs: bytes) -> int:
+        resp = self.request(worker_protocol.PATH_IMDB_BUILD_CHUNK,
+                            {"kind": kind, "ids": ids, "vecs": vecs}, timeout=600)
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        return resp.get("received", 0)
+
+    def imdb_build_end(self, kind: str) -> dict:
+        resp = self.request(worker_protocol.PATH_IMDB_BUILD_END, {"kind": kind}, timeout=300)
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        return resp
+
+    def imdb_status(self) -> dict:
+        return self.request(worker_protocol.PATH_IMDB_STATUS, {}, timeout=30, retries=0)
+
     # -- Activity / introspection ------------------------------------------
 
     def record(self, op: str, name: str) -> None:

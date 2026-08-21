@@ -32,6 +32,16 @@ PATH_TRAIN_RUN = "train_run"
 PATH_TRAIN_STATUS = "train_status"
 PATH_TRAIN_CANCEL = "train_cancel"
 PATH_TAG_DETECT = "tag_detect"
+# In-memory search index ("imdb"): the worker holds the big CLIP + face embedding
+# matrices resident in RAM and answers ranking queries, so the low-RAM host never
+# loads them (the OOM this exists to prevent). The host STREAMS the matrix in
+# bounded chunks (imdb_build_*) so neither side ever materializes the whole ~1 GB
+# blob; imdb_search ranks a query vector (optionally within a host-supplied id set).
+PATH_IMDB_BUILD_BEGIN = "imdb_build_begin"
+PATH_IMDB_BUILD_CHUNK = "imdb_build_chunk"
+PATH_IMDB_BUILD_END = "imdb_build_end"
+PATH_IMDB_STATUS = "imdb_status"
+PATH_IMDB_SEARCH = "imdb_search"
 
 ALL_PATHS = [
     PATH_PING,
@@ -47,6 +57,11 @@ ALL_PATHS = [
     PATH_TRAIN_STATUS,
     PATH_TRAIN_CANCEL,
     PATH_TAG_DETECT,
+    PATH_IMDB_BUILD_BEGIN,
+    PATH_IMDB_BUILD_CHUNK,
+    PATH_IMDB_BUILD_END,
+    PATH_IMDB_STATUS,
+    PATH_IMDB_SEARCH,
 ]
 
 # ---------------------------------------------------------------------------
@@ -137,6 +152,37 @@ ALL_PATHS = [
 #            "image": <bytes: <=640px JPEG>, "conf": <float|None>}
 #     resp: {"detections": [[class_name, conf, x1, y1, x2, y2], ...],
 #            "error": <None|str>}   # error set (e.g. "no model") when untrained
+#
+# --- In-memory search index ("imdb") --------------------------------------
+# The host (remote_index_builder.py) rebuilds a matrix by streaming it in chunks:
+# begin (reset the receive buffer), many chunk (append rows), end (finalize the
+# buffer into one resident (N,D) float32 matrix + parallel id array). "kind" is
+# "clip" or "face". ids are the row's file_id (for face: the file_id per face row,
+# so a search maps to photos). Vectors are contiguous little-endian float32,
+# count*D of them per chunk.
+#
+#   PATH_IMDB_BUILD_BEGIN
+#     req:  {"kind": "clip"|"face", "dim": <int>, "total_rows": <int|None>}
+#     resp: {"ok": <bool>, "error": <None|str>}
+#
+#   PATH_IMDB_BUILD_CHUNK   (append one block of rows; call repeatedly)
+#     req:  {"kind": <str>, "ids": [<int>, ...], "vecs": <bytes: float32 count*D>}
+#     resp: {"received": <int total rows buffered>, "error": <None|str>}
+#
+#   PATH_IMDB_BUILD_END   (finalize the buffer into the resident matrix)
+#     req:  {"kind": <str>}
+#     resp: {"rows": <int>, "dim": <int>, "bytes": <int>, "error": <None|str>}
+#
+#   PATH_IMDB_STATUS
+#     req:  {}
+#     resp: {"clip": {"rows": <int>, "dim": <int>, "bytes": <int>,
+#                     "built_at": <int|None>, "building": <bool>},
+#            "face": {...}, "error": <None|str>}
+#
+#   PATH_IMDB_SEARCH   (M2 — rank a query vector against a resident matrix)
+#     req:  {"kind": <str>, "query": <bytes: float32 (D,)>, "k": <int>,
+#            "allowed_ids": [<int>, ...]|None}   # None = rank all
+#     resp: {"results": [[id(int), score(float)], ...], "error": <None|str>}
 # ---------------------------------------------------------------------------
 
 
