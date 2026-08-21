@@ -77,8 +77,13 @@
   (function () {
     function fmt(d, countKey) {
       if (d.error) return 'error: ' + d.error;
-      var s = (d.done || 0) + '/' + (d.total || 0);
+      var s = (d.done || 0).toLocaleString() + '/' + (d.total || 0).toLocaleString();
       if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' matched';
+      // Optional server-provided time-left estimate (e.g. the imdb index load).
+      if (d.eta_seconds != null) {
+        var e = Math.round(d.eta_seconds);
+        s += ' · ~' + (e < 90 ? e + 's' : Math.floor(e / 60) + 'm ' + (e % 60) + 's') + ' left';
+      }
       return s;
     }
     document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {

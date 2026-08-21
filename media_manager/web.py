@@ -1957,8 +1957,8 @@ def create_app(data_root: str) -> FastAPI:
     # Manual rebuild of the worker's in-memory search index ("imdb"): streams the
     # CLIP+face matrices to the worker over RNS (see remote_index_builder). Tracks the
     # live rows-sent + per-kind timings so /stats-style UI can show the ~1 GB transfer.
-    imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'seconds': 0.0,
-                      'results': None, 'error': None}
+    imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'total': 0,
+                      'seconds': 0.0, 'results': None, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2404,12 +2404,18 @@ def create_app(data_root: str) -> FastAPI:
         if _worker_client is None or not _worker_client.is_configured():
             return {'started': False,
                     'message': 'No worker configured — the imdb index lives on the worker.'}
-        imdb_build_job.update(running=True, kind=None, rows_sent=0, seconds=0.0,
-                              results=None, error=None)
+        emb = db.embedding_stats()
+        total_rows = emb['clip']['rows'] + emb['face']['rows']
+        imdb_build_job.update(running=True, kind=None, rows_sent=0, total=total_rows,
+                              seconds=0.0, results=None, error=None)
+        sent_by_kind = {}
 
         def _progress(kind, sent, secs):
+            # `sent` is cumulative within a kind (resets each begin); sum across kinds
+            # for a monotonic overall done/total the ⚡ bulk runner can show.
+            sent_by_kind[kind] = sent
             imdb_build_job['kind'] = kind
-            imdb_build_job['rows_sent'] = sent
+            imdb_build_job['rows_sent'] = sum(sent_by_kind.values())
             imdb_build_job['seconds'] = round(secs, 1)
 
         def _run():
@@ -2422,22 +2428,39 @@ def create_app(data_root: str) -> FastAPI:
                 imdb_build_job['running'] = False
 
         threading.Thread(target=_run, daemon=True).start()
-        return {'started': True}
+        return {'started': True, 'total': total_rows}
 
     @app.get('/api/imdb/status')
     def api_imdb_status():
         """Rebuild-job state + the worker's live imdb matrix status (rows/MB/built_at
-        per kind). `worker` is None when no worker is configured."""
+        per kind). Also exposes the generic ⚡ bulk-action fields (running/done/total/
+        error/pending) so the "Load index into memory" menu button can drive it. `worker`
+        is None when no worker is configured."""
         worker = None
         if _worker_client is not None and _worker_client.is_configured():
             try:
                 worker = _worker_client.imdb_status()
             except Exception as exc:
                 worker = {'error': str(exc)}
+        # Time-left estimate: remaining rows ÷ the average shipping rate so far. Only
+        # while running with real progress; None otherwise so the UI hides it.
+        done = imdb_build_job['rows_sent']
+        total = imdb_build_job['total']
+        secs = imdb_build_job['seconds']
+        eta = None
+        if imdb_build_job['running'] and done > 0 and secs > 0 and total > done:
+            eta = round((total - done) / (done / secs))
         return {
             'configured': _worker_client is not None and _worker_client.is_configured(),
             'job': dict(imdb_build_job),
             'worker': worker,
+            # ⚡ bulk-action-runner contract:
+            'running': imdb_build_job['running'],
+            'done': done,
+            'total': total,
+            'error': imdb_build_job['error'],
+            'eta_seconds': eta,
+            'pending': 0,
         }
 
     @app.post('/api/match-faces/start')
