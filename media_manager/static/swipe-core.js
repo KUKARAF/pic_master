@@ -125,6 +125,10 @@ window.initSwipeStack = function (config) {
   // all once one of them is clicked, so there's no need to also show this
   // engine's OWN internal Start button afterward).
   let started = queue.length > 0 || !!config.autoStart;
+  // When false, this stack ignores keyboard + drag decisions — used so a paused
+  // stack (e.g. the main review while a calibration stack is on top) doesn't also
+  // react to arrow keys (every instance registers its own document keydown listener).
+  let active = true;
   let dragging = null; // {ref, startX, startY, dx, dy, el}
   const history = []; // [{card, action}, ...] — most recent decision last
 
@@ -343,6 +347,7 @@ window.initSwipeStack = function (config) {
     }
 
     function pointerDown(e) {
+      if (!active) return;
       const point = e.touches ? e.touches[0] : e;
       dragging = { ref: card.ref, startX: point.clientX, startY: point.clientY, dx: 0, dy: 0, el };
       el.classList.add('dragging');
@@ -399,6 +404,7 @@ window.initSwipeStack = function (config) {
   if (rejectBtn) rejectBtn.addEventListener('click', () => decide('reject'));
 
   document.addEventListener('keydown', (e) => {
+    if (!active) return;
     if (_isEditableTarget(e.target)) return;
 
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
@@ -450,5 +456,13 @@ window.initSwipeStack = function (config) {
     getTopCard: () => topCard(),
     decide: (action) => decide(action),
     setBufferSize: (n) => { BUFFER_SIZE = Math.max(1, n); maybeFetchMore(); },
+    // pause()/resume() gate this stack's keyboard + drag decisions without tearing it
+    // down, so a second stack (e.g. calibration) can take over input while this one
+    // stays rendered underneath. reset() empties the queue/seen/history and refetches
+    // from scratch — used to reopen a reused calibration stack cleanly.
+    pause: () => { active = false; },
+    resume: () => { active = true; },
+    isActive: () => active,
+    reset: () => { queue = []; known.clear(); history.length = 0; started = true; render(); maybeFetchMore(); },
   };
 };

@@ -28,6 +28,19 @@
 </label>
 <div id="find-person-auto-approve-timer" class="sub" style="display:none;margin-bottom:10px;"></div>
 
+<!-- Auto-labeling actions, grouped with the settings above the swipe stack. -->
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
+  <button type="button" id="auto-calibrate-btn" class="btn-similar"
+          title="Swipe through the riskiest matches (lowest score first) to set a confidence threshold, then add everyone at/above it to {{ name }} in one go.">
+    🎯 Calibrate &amp; auto-add
+  </button>
+  <button type="button" id="auto-add-top-match-btn" class="btn-similar"
+          title="Sweeps every unnamed face and adds to {{ name }} exactly those where {{ name }} is the closest known person — i.e. no one else matches that face more strongly. Runs in the background; safe to leave the page.">
+    🪄 Auto-add all where {{ name }} is the top match
+  </button>
+  <span id="auto-add-top-match-status" class="sub"></span>
+</div>
+
 <div class="swipe-page">
   <div class="swipe-stack-wrap" id="find-person-swipe-stack"></div>
   <div class="swipe-controls">
@@ -37,21 +50,8 @@
   <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
 </div>
 
-<div style="margin-top:14px;">
-  <button type="button" id="auto-calibrate-btn" class="btn-similar"
-          title="Finds the lowest match threshold that doesn't turn up false positives (doubling up, then narrowing in), then offers to bulk-confirm everything above it. Restart if you navigate away mid-run — nothing is saved between runs.">
-    🔍 Auto-calibrate threshold
-  </button>
-  <div id="calibrate-panel" style="display:none;margin-top:10px;"></div>
-</div>
-
-<div style="margin-top:14px;">
-  <button type="button" id="auto-add-top-match-btn" class="btn-similar"
-          title="Sweeps every unnamed face and adds to {{ name }} exactly those where {{ name }} is the closest known person — i.e. no one else matches that face more strongly. Runs in the background; safe to leave the page.">
-    🪄 Auto-add all where {{ name }} is the top match
-  </button>
-  <span id="auto-add-top-match-status" class="sub" style="margin-left:8px;"></span>
-</div>
+<!-- Calibration swipe UI mounts here (shown while calibrating; main stack hidden). -->
+<div id="calibrate-panel" style="display:none;margin-top:14px;"></div>
 {% endblock %}
 
 {% block scripts %}
@@ -213,189 +213,147 @@
 
   wireBufferSizeSlider(stack, 'find-person-buffer-size-slider', 'find-person-buffer-size-value');
 
-  /* Auto-calibrate threshold: exponential-search-then-bisect for the lowest
-     match threshold that doesn't turn up a false positive, using the user's
-     own confirm/reject decisions on each round's batch as the ground truth,
-     then offers to bulk-confirm everything above the discovered threshold.
-     Entirely page-scoped JS state — nothing persists across a reload, so
-     navigating away mid-run just means clicking the button again to restart
-     (any confirm/reject decisions already made during the abandoned run are
-     real and stay put, same as if they'd been made in the normal stream). */
+  /* Calibrate & auto-add: swipe through the riskiest (lowest-score) candidate
+     matches — same Tinder cards as the main review — to establish a confidence
+     threshold, then bulk-confirm everyone at/above the lowest card you swiped
+     'same'. The main review stack is paused (its keyboard/drag gated via the new
+     pause/resume) and hidden while calibrating, so only the calibration stack
+     reacts to input. Reuses /calibration-batch (riskiest-first) and
+     /confirm-above-threshold; nothing persists across a reload. */
   function wireAutoCalibrate() {
     const btn = document.getElementById('auto-calibrate-btn');
     const panel = document.getElementById('calibrate-panel');
+    const swipePage = document.querySelector('.swipe-page');  // the MAIN stack's page
     if (!btn || !panel) return;
 
-    const LO = 0.10, HI = 0.95, EPSILON = 0.02, MAX_ITER = 8, BATCH_SIZE = 8;
-    let test, badBound, goodBound, phase, iter;
+    const SAMPLE = 40;   // riskiest candidates to seed the calibration swipe
+    const FLOOR = 0.10;  // include the risky low-score tail
+    let calStack = null;
+    let lowestSame = null;   // min score among cards swiped 'same' this session
+    let previewTimer = null;
 
-    function setStatus(html) {
-      panel.innerHTML = '<p class="sub" id="calibrate-status">' + html + '</p><div class="grid" id="calibration-grid"></div>';
-    }
+    function idBase() { return '/api/identities/' + encodeURIComponent(personName); }
 
-    function runRound() {
-      const ceiling = goodBound !== undefined ? goodBound : 1.0;
-      setStatus('Testing threshold ' + test.toFixed(3) + ' (band ' + test.toFixed(3) + '–' + ceiling.toFixed(3) + ')…');
-      const url = '/api/identities/' + encodeURIComponent(personName) + '/calibration-batch?floor=' + test +
-        '&ceiling=' + ceiling + '&count=' + BATCH_SIZE;
-      fetch(url)
-        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-        .then(function(data) {
-          // Empty band — nothing left to review here, vacuously clean.
-          if (!data.results.length) { handleRoundResult(true); return; }
-          renderBatch(data.results, data.total);
-        })
-        .catch(function(err) {
-          panel.innerHTML = '<p class="alert">Calibration failed: ' + err.message + '</p>';
-          btn.disabled = false;
-        });
-    }
-
-    function renderBatch(results, total) {
-      document.getElementById('calibrate-status').textContent =
-        'Threshold ' + test.toFixed(3) + ' — reviewing the ' + results.length + ' riskiest of ' +
-        total + ' candidate(s) in this band. Confirm or reject each.';
-      const grid = document.getElementById('calibration-grid');
-      grid.innerHTML = '';
-      const pending = new Set(results.map(function(f) { return f.ref; }));
-      let anyReject = false;
-
-      results.forEach(function(f) {
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.dataset.faceRef = f.ref;
-        card.innerHTML =
-          '<a class="card-img-link" href="/photo/' + f.file_id + '" target="_blank" rel="noopener">' +
-            '<img src="/face-crop/' + f.ref + '" alt="candidate face" loading="lazy">' +
-          '</a>' +
-          '<span class="score-badge">' + f.score.toFixed(3) + '</span>' +
-          '<div class="card-body">' +
-            '<button type="button" class="btn-similar cal-confirm-btn" style="font-size:0.8em;padding:4px 10px;margin-right:4px;">✓ Same</button>' +
-            '<button type="button" class="btn-similar cal-reject-btn" style="font-size:0.8em;padding:4px 10px;">✕ Not them</button>' +
-          '</div>';
-        grid.appendChild(card);
-
-        function decide(action, url, body) {
-          const confirmBtn = card.querySelector('.cal-confirm-btn');
-          const rejectBtn = card.querySelector('.cal-reject-btn');
-          confirmBtn.disabled = true;
-          rejectBtn.disabled = true;
-          fetch(url, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: body ? JSON.stringify(body) : undefined,
-          })
-            .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-            .then(function() {
-              card.style.opacity = '0.4';
-              if (action === 'reject') anyReject = true;
-              pending.delete(f.ref);
-              if (pending.size === 0) {
-                grid.innerHTML = '';
-                handleRoundResult(!anyReject);
-              }
-            })
-            .catch(function(err) {
-              confirmBtn.disabled = false;
-              rejectBtn.disabled = false;
-              showToast('Failed to decide: ' + err.message);
-            });
-        }
-
-        card.querySelector('.cal-confirm-btn').addEventListener('click', function() {
-          decide('confirm', '/api/faces/' + encodeURIComponent(f.ref) + '/identity', {name: personName});
-        });
-        card.querySelector('.cal-reject-btn').addEventListener('click', function() {
-          decide('reject', '/api/faces/' + encodeURIComponent(f.ref) + '/reject', null);
-        });
-      });
-    }
-
-    function handleRoundResult(clean) {
-      if (phase === 'expand') {
-        if (!clean) {
-          badBound = test;
-          if (goodBound === undefined) {
-            if (test >= HI) { showAbort(); return; }
-            test = Math.min(test * 2, HI);
-            runRound();
-            return;
-          }
-          phase = 'bisect';
-          test = (badBound + goodBound) / 2;
-          iter = 0;
-          runRound();
-          return;
-        }
-        goodBound = test;
-        if (badBound === undefined) { showDone(goodBound); return; } // lo itself was already clean
-        phase = 'bisect';
-        test = (badBound + goodBound) / 2;
-        iter = 0;
-        runRound();
-        return;
-      }
-      // bisect phase
-      if (clean) goodBound = test; else badBound = test;
-      iter++;
-      if ((goodBound - badBound) < EPSILON || iter >= MAX_ITER) { showDone(goodBound); return; }
-      test = (badBound + goodBound) / 2;
-      runRound();
-    }
-
-    function showAbort() {
-      panel.innerHTML = '<p class="alert">Even the strictest threshold tested (' + HI.toFixed(2) +
-        ') still turned up a false positive — this person may need reviewing manually via the ' +
-        'expand-similar-search slider below instead.</p>';
+    function exit() {
+      if (calStack) calStack.pause();
+      clearTimeout(previewTimer);
+      panel.style.display = 'none';
+      panel.innerHTML = '';
+      if (swipePage) swipePage.style.display = '';
+      stack.resume();
+      stack.refill();
       btn.disabled = false;
     }
 
-    function showDone(threshold) {
-      const url = '/api/identities/' + encodeURIComponent(personName) +
-        '/calibration-batch?floor=' + threshold + '&ceiling=1.0&count=1';
-      fetch(url)
-        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-        .then(function(data) {
-          panel.innerHTML =
-            '<p>Lowest safe threshold: <strong>' + threshold.toFixed(3) + '</strong> — ' + data.total +
-            ' more candidate(s) qualify and haven\'t been reviewed.</p>' +
-            (data.total
-              ? '<button type="button" id="calibrate-bulk-add-btn" class="btn-similar">Add all ' +
-                data.total + ' to "' + escapeHtml(personName) + '"</button>'
-              : '');
-          btn.disabled = false;
-          const bulkBtn = document.getElementById('calibrate-bulk-add-btn');
-          if (bulkBtn) {
-            bulkBtn.addEventListener('click', function() {
-              bulkBtn.disabled = true;
-              fetch('/api/identities/' + encodeURIComponent(personName) + '/confirm-above-threshold', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({threshold: threshold}),
-              })
-                .then(function(r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-                .then(function(res) {
-                  panel.innerHTML = '<p>Confirmed ' + res.confirmed + ' photo(s) as "' + escapeHtml(personName) + '".</p>';
-                })
-                .catch(function(err) {
-                  bulkBtn.disabled = false;
-                  showToast('Failed to bulk-confirm: ' + err.message);
-                });
-            });
-          }
-        })
-        .catch(function(err) {
-          panel.innerHTML = '<p class="alert">Failed to fetch final count: ' + err.message + '</p>';
-          btn.disabled = false;
-        });
+    function updatePreview() {
+      const line = document.getElementById('calib-threshold-line');
+      const addBtn = document.getElementById('calib-add-all-btn');
+      if (!line) return;
+      if (lowestSame == null) {
+        line.textContent = 'Swipe a match up (same) to set the threshold.';
+        if (addBtn) addBtn.disabled = true;
+        return;
+      }
+      if (addBtn) addBtn.disabled = false;
+      line.textContent = 'Threshold ≈ ' + lowestSame.toFixed(3) + ' — counting…';
+      clearTimeout(previewTimer);
+      previewTimer = setTimeout(function () {
+        fetch(idBase() + '/calibration-batch?floor=' + lowestSame + '&ceiling=1.0&count=1')
+          .then(function (r) { return r.json(); })
+          .then(function (d) { line.textContent = 'Threshold ≈ ' + lowestSame.toFixed(3) + ' · will add ~' + d.total + ' above it'; })
+          .catch(function () {});
+      }, 400);
     }
 
-    btn.addEventListener('click', function() {
-      test = LO; phase = 'expand'; iter = 0;
-      badBound = undefined; goodBound = undefined;
+    function startCalibration(results) {
+      lowestSame = null;
+      cancelAutoApprove();  // don't let a pending main-stack auto-approve fire while calibrating
+      panel.innerHTML =
+        '<div class="sub" style="margin-bottom:8px;">Swipe the riskiest matches (lowest score first). Up = <strong>' + escapeHtml(personName) + '</strong>, down = not them.</div>' +
+        '<div class="swipe-page">' +
+          '<div class="swipe-stack-wrap" id="calib-swipe-stack"></div>' +
+          '<div class="swipe-controls">' +
+            '<button type="button" class="swipe-btn swipe-btn-reject" id="calib-reject-btn" title="Not them (↓)">✕</button>' +
+            '<button type="button" class="swipe-btn swipe-btn-confirm" id="calib-confirm-btn" title="Same (↑)">✓</button>' +
+          '</div>' +
+          '<div class="swipe-hint">Swipe up = same, down = not them (or ↑ / ↓)</div>' +
+        '</div>' +
+        '<div id="calib-threshold-line" class="sub" style="margin-top:8px;"></div>' +
+        '<div style="display:flex;gap:10px;margin-top:10px;">' +
+          '<button type="button" id="calib-add-all-btn" class="btn-similar" disabled>✅ Add all now</button>' +
+          '<button type="button" id="calib-done-btn" class="btn-similar">Done</button>' +
+        '</div>';
       panel.style.display = 'block';
+      if (swipePage) swipePage.style.display = 'none';
+      stack.pause();
+
+      if (calStack) calStack.pause();  // retire any previous session's stack (keeps its keys inert)
+      calStack = window.initSwipeStack({
+        stackElId: 'calib-swipe-stack',
+        confirmBtnId: 'calib-confirm-btn',
+        rejectBtnId: 'calib-reject-btn',
+        initialCards: results,
+        bufferSize: results.length,  // keep the whole riskiest sample (initialCards is sliced to bufferSize)
+        fetchMoreUrl: function () { return null; },  // fixed riskiest sample, no refill
+        renderCard: function (card) {
+          return {
+            imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+            questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
+            scoreText: 'score ' + card.score.toFixed(3),
+            metaHtml: '',
+            originalUrl: '/photo/' + card.file_id,
+          };
+        },
+        onConfirm: function (card) {
+          if (lowestSame == null || card.score < lowestSame) lowestSame = card.score;
+          updatePreview();
+          return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
+        },
+        onReject: function (card) {
+          return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+        },
+        onUndo: function (card) {
+          return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+        },
+        emptyStateHtml: '<div class="swipe-empty">That\'s the riskiest sample reviewed — press “Add all now”, or Done.</div>',
+      });
+      updatePreview();
+
+      document.getElementById('calib-done-btn').addEventListener('click', exit);
+      document.getElementById('calib-add-all-btn').addEventListener('click', function () {
+        if (lowestSame == null) return;
+        const addBtn = document.getElementById('calib-add-all-btn');
+        addBtn.disabled = true;
+        addBtn.textContent = 'Adding…';
+        fetch(idBase() + '/confirm-above-threshold', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ threshold: lowestSame }),
+        })
+          .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
+          .then(function (res) { showToast('Added ' + res.confirmed + ' photo(s) as "' + personName + '".'); exit(); })
+          .catch(function (err) { addBtn.disabled = false; addBtn.textContent = '✅ Add all now'; showToast('Failed: ' + err.message); });
+      });
+    }
+
+    btn.addEventListener('click', function () {
       btn.disabled = true;
-      runRound();
+      panel.style.display = 'block';
+      panel.innerHTML = '<p class="sub">Loading riskiest candidates…</p>';
+      fetch(idBase() + '/calibration-batch?floor=' + FLOOR + '&ceiling=1.0&count=' + SAMPLE)
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) {
+          if (!data.results.length) {
+            panel.innerHTML = '<p class="sub">No unreviewed candidates found to calibrate on.</p>';
+            btn.disabled = false;
+            return;
+          }
+          startCalibration(data.results);
+        })
+        .catch(function (err) {
+          panel.innerHTML = '<p class="alert">Calibration failed: ' + err.message + '</p>';
+          btn.disabled = false;
+        });
     });
   }
 
