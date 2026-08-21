@@ -203,14 +203,22 @@
   var initialized = false;
 
   btn.addEventListener('click', function() {
-    section.style.display = section.style.display === 'none' ? 'block' : 'none';
-    if (section.style.display === 'none' || initialized) return;
+    var showing = section.style.display === 'none';
+    section.style.display = showing ? 'block' : 'none';
+    if (!showing) return;
+    // The section sits below the (potentially long) people grid, so scroll it into
+    // view — otherwise clicking the top button looks like nothing happened.
+    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    if (initialized) return;
     initialized = true;
     initSwipeStack({
       stackElId: 'faces-swipe-stack',
       confirmBtnId: 'faces-swipe-confirm-btn',
       rejectBtnId: 'faces-swipe-reject-btn',
       initialCards: [],
+      // Clicking "Find new faces" is itself the explicit opt-in, so fetch faces
+      // straight away instead of showing a second "▶ Start reviewing" button.
+      autoStart: true,
       biasKeyFor: function(card) { return card.identity; },
       fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
         var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
