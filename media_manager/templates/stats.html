@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+
+{% block title %}Stats — media{% endblock %}
+
+{% macro mb(b) %}{{ '%.1f' | format((b or 0) / 1048576) }} MB{% endmacro %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Service stats</h1>
+  <span class="sub">live numbers from this running process</span>
+</div>
+
+{# ---- Process RAM + Analyze button ---- #}
+<div class="stats-card">
+  <div class="stats-card-head">
+    <h2>Memory</h2>
+    <button type="button" id="analyze-ram-btn" class="btn-similar">🔬 Analyze RAM</button>
+  </div>
+  <table class="stats-table">
+    <tr><td>Process RSS (resident)</td>
+        <td class="num">{% if stats.rss_bytes %}{{ mb(stats.rss_bytes) }}{% else %}n/a{% endif %}</td></tr>
+    <tr><td>Embedding matrices if all resident (est.)</td>
+        <td class="num">{{ mb(stats.embeddings_total_bytes) }}</td></tr>
+    <tr><td>Embedding matrices currently loaded</td>
+        <td class="num">{{ mb(stats.embeddings_loaded.values() | sum) }}</td></tr>
+  </table>
+  <div id="ram-report" class="stats-report" style="display:none;"></div>
+</div>
+
+{# ---- Embedding matrices (the imdb-sizing table) ---- #}
+<div class="stats-card">
+  <h2>Embedding matrices</h2>
+  <table class="stats-table">
+    <tr class="head"><th>Kind</th><th class="num">Rows</th><th class="num">Dim</th>
+        <th class="num">Est. matrix</th><th class="num">Loaded now</th></tr>
+    {% for key in ['clip', 'face', 'body', 'tile'] %}
+    {% set e = stats.embeddings[key] %}
+    <tr>
+      <td>{{ key }}</td>
+      <td class="num">{{ '{:,}'.format(e.rows) }}</td>
+      <td class="num">{{ e.dim or '—' }}</td>
+      <td class="num">{{ mb(e.bytes) }}</td>
+      <td class="num">{% if key in stats.embeddings_loaded and stats.embeddings_loaded[key] %}{{ mb(stats.embeddings_loaded[key]) }}{% else %}—{% endif %}</td>
+    </tr>
+    {% endfor %}
+    <tr class="total">
+      <td>total</td><td class="num"></td><td class="num"></td>
+      <td class="num">{{ mb(stats.embeddings_total_bytes) }}</td>
+      <td class="num">{{ mb(stats.embeddings_loaded.values() | sum) }}</td>
+    </tr>
+  </table>
+  <p class="sub">Est. matrix = rows × dim × 4 bytes (float32) — the RAM a stacked search matrix needs. Tile is not held as one matrix (chunked at query time).</p>
+</div>
+
+{# ---- Library + manual counts + db files, side by side ---- #}
+<div class="stats-cols">
+  <div class="stats-card">
+    <h2>Library (media.db)</h2>
+    <table class="stats-table">
+      <tr><td>Photos (non-hidden)</td><td class="num">{{ '{:,}'.format(stats.library.total_photos) }}</td></tr>
+      <tr><td>CLIP-indexed</td><td class="num">{{ '{:,}'.format(stats.library.indexed_clip) }}</td></tr>
+      <tr><td>Region-tiled files</td><td class="num">{{ '{:,}'.format(stats.library.tiled_files) }}</td></tr>
+      <tr><td>Unidentified faces</td><td class="num">{{ '{:,}'.format(stats.library.unidentified_faces) }}</td></tr>
+      <tr><td>Cities loaded</td><td class="num">{{ '{:,}'.format(stats.library.cities) }}</td></tr>
+      <tr><td>Broken files</td><td class="num">{{ '{:,}'.format(stats.library.broken) }}</td></tr>
+      <tr><td>media.db on disk</td><td class="num">{{ mb(stats.db_files.media_db_bytes) }}</td></tr>
+    </table>
+  </div>
+  <div class="stats-card">
+    <h2>Labels (manual.db)</h2>
+    <table class="stats-table">
+      <tr><td>Tags</td><td class="num">{{ '{:,}'.format(stats.manual.tags) }}</td></tr>
+      <tr><td>Categories</td><td class="num">{{ '{:,}'.format(stats.manual.categories) }}</td></tr>
+      <tr><td>Sets</td><td class="num">{{ '{:,}'.format(stats.manual.sets) }}</td></tr>
+      <tr><td>Studios</td><td class="num">{{ '{:,}'.format(stats.manual.studios) }}</td></tr>
+      <tr><td>Named people</td><td class="num">{{ '{:,}'.format(stats.manual.identities) }}</td></tr>
+      <tr><td>Locations</td><td class="num">{{ '{:,}'.format(stats.manual.locations) }}</td></tr>
+      <tr><td>Favorites</td><td class="num">{{ '{:,}'.format(stats.manual.favorites) }}</td></tr>
+      <tr><td>manual.db on disk</td><td class="num">{{ mb(stats.db_files.manual_db_bytes) }}</td></tr>
+    </table>
+  </div>
+</div>
+
+<script>
+(function () {
+  var btn = document.getElementById('analyze-ram-btn');
+  var out = document.getElementById('ram-report');
+  if (!btn) return;
+  function mb(b) { return ((b || 0) / 1048576).toFixed(1) + ' MB'; }
+  btn.addEventListener('click', function () {
+    btn.disabled = true; btn.textContent = 'Analyzing…';
+    fetch('/api/stats/ram', { method: 'POST' })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var lines = [
+          'RSS (resident):        ' + (d.rss_bytes ? mb(d.rss_bytes) : 'n/a'),
+          'Matrices if resident:  ' + mb(d.embeddings_total_bytes),
+          'Matrices loaded now:   ' + mb(d.embeddings_loaded_bytes),
+          '',
+        ];
+        ['clip', 'face', 'body', 'tile'].forEach(function (k) {
+          var e = d.embeddings[k];
+          lines.push('  ' + k.padEnd(6) + e.rows.toLocaleString() + ' × ' + (e.dim || '—') +
+                     '  →  ' + mb(e.bytes) +
+                     (d.embeddings_loaded[k] ? '  (loaded ' + mb(d.embeddings_loaded[k]) + ')' : ''));
+        });
+        out.textContent = lines.join('\n');
+        out.style.display = 'block';
+      })
+      .catch(function (err) { out.textContent = 'failed: ' + err.message; out.style.display = 'block'; })
+      .finally(function () { btn.disabled = false; btn.textContent = '🔬 Analyze RAM'; });
+  });
+})();
+</script>
+
+<style>
+  .stats-card { background: var(--input-bg); border: 1px solid rgba(121,242,121,.18);
+    border-radius: var(--radius); padding: 14px 16px; margin-bottom: 16px; }
+  .stats-card h2 { font-size: 1.05em; margin: 0 0 10px; }
+  .stats-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .stats-card-head h2 { margin: 0; }
+  .stats-table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+  .stats-table td, .stats-table th { padding: 4px 8px; border-bottom: 1px solid rgba(121,242,121,.08); text-align: left; }
+  .stats-table th { color: var(--text-muted); font-weight: normal; }
+  .stats-table .num { text-align: right; font-family: var(--font-term); }
+  .stats-table tr.total td { border-top: 1px solid rgba(121,242,121,.3); font-weight: bold; }
+  .stats-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .stats-report { margin-top: 12px; padding: 10px; background: rgba(6,33,10,.6);
+    border-radius: var(--radius); font-family: var(--font-term); font-size: 0.85em;
+    white-space: pre; overflow-x: auto; color: var(--accent); }
+</style>
+{% endblock %}

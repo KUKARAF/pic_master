@@ -1,6 +1,7 @@
 """
 Database schema and operations for media management.
 """
+import os
 import sqlite3
 import threading
 import time
@@ -664,6 +665,59 @@ class Database(ThreadLocalDB):
         ''')
         return [{'id': r[0], 'name': r[1], 'country': r[2], 'admin1': r[3], 'file_count': r[4]}
                 for r in cursor.fetchall()]
+
+    # --- Service stats (for /stats + imdb sizing) ---------------------------------
+
+    def embedding_stats(self):
+        """Row count, vector dimension, and stacked-matrix byte size for each kind of
+        embedding — the numbers that decide whether search needs to be offloaded (imdb)
+        or an mmap'd index. `dim` is read from a real blob (len//4) so it's exact;
+        `bytes` = rows × dim × 4 is the RAM the (N,D) float32 matrix would occupy."""
+        cur = self.conn.cursor()
+
+        def stat(count_sql, dim_sql):
+            rows = cur.execute(count_sql).fetchone()[0]
+            blob = cur.execute(dim_sql).fetchone()
+            dim = (blob[0] // 4) if blob and blob[0] else 0
+            return {'rows': rows, 'dim': dim, 'bytes': rows * dim * 4}
+
+        return {
+            'clip': stat("SELECT COUNT(*) FROM embeddings WHERE frame_index=0",
+                         "SELECT length(embedding) FROM embeddings WHERE frame_index=0 "
+                         "AND embedding IS NOT NULL LIMIT 1"),
+            'face': stat("SELECT COUNT(*) FROM faces WHERE embedding != x''",
+                         "SELECT length(embedding) FROM faces WHERE embedding != x'' LIMIT 1"),
+            'body': stat("SELECT COUNT(*) FROM body_embeddings WHERE bbox != '[]'",
+                         "SELECT length(embedding) FROM body_embeddings "
+                         "WHERE bbox != '[]' AND embedding != x'' LIMIT 1"),
+            'tile': stat("SELECT COUNT(*) FROM tile_embeddings",
+                         "SELECT length(embedding) FROM tile_embeddings LIMIT 1"),
+        }
+
+    def loaded_matrix_bytes(self):
+        """Actual RAM (bytes) of each embedding matrix currently resident in the
+        write-invalidated caches, 0 if not yet built. Best-effort: reaches into the
+        cache slots (each `(version, result)`, result a tuple whose last-or-known
+        element is the numpy matrix), guarded so a cache-shape change can never break
+        /stats."""
+        out = {}
+        # (label, cache attribute, index of the matrix within the cached result tuple)
+        for label, attr, idx in (('clip', '_emb_cache', 2),
+                                  ('face', '_face_cache', 2),
+                                  ('body', '_body_cache', 3)):
+            out[label] = 0
+            try:
+                slot = getattr(self, attr, None)
+                result = slot[1] if slot else None
+                if result is not None:
+                    out[label] = int(result[idx].nbytes)
+            except Exception:
+                pass
+        return out
+
+    def db_file_bytes(self):
+        """Size of this database file on disk, or 0 if missing."""
+        return os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
 
     def get_geotagged_points(self):
         """(file_id, gps_lat, gps_lon) for every non-hidden EXIF-geotagged file —

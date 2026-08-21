@@ -1595,6 +1595,25 @@ class ManualDB(ThreadLocalDB):
         row = cur.fetchone()
         return row[0] if row else 0
 
+    def storage_stats(self):
+        """Entity counts + on-disk size for the /stats page — the user-labeled side of
+        the library (manual.db)."""
+        cur = self.conn.cursor()
+
+        def count(sql):
+            return cur.execute(sql).fetchone()[0]
+
+        return {
+            'tags': len(self.list_all_tags()),
+            'categories': count('SELECT COUNT(*) FROM categories'),
+            'sets': self.count_sets(),
+            'studios': count('SELECT COUNT(*) FROM studios'),
+            'identities': self.count_identities(),
+            'locations': count('SELECT COUNT(*) FROM locations'),
+            'favorites': count('SELECT COUNT(*) FROM file_favorites'),
+            'db_bytes': os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0,
+        }
+
     def get_all_set_member_checksums(self):
         """Every checksum that belongs to at least one set, as a plain set() —
         one cheap query independent of any candidate list size, unlike

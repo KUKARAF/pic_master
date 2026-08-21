@@ -414,6 +414,20 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # App factory
 # ---------------------------------------------------------------------------
 
+def _read_rss_bytes():
+    """Resident set size of THIS process in bytes, from Linux /proc/self/status
+    (VmRSS). None on non-Linux / when unavailable. No psutil dependency — prod is
+    Linux and single-process, so this reflects the actual served process."""
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) * 1024  # value is in kB
+    except Exception:
+        return None
+    return None
+
+
 def create_app(data_root: str) -> FastAPI:
     """Create and return the FastAPI application rooted at data_root."""
     data_root = os.path.abspath(data_root)
@@ -3911,6 +3925,63 @@ def create_app(data_root: str) -> FastAPI:
             'total_videos': None,
             'total_manual_tags': len(manual.list_all_tags()),
             'total_auto_tags': db.count_detected_classes(),
+        }
+
+    def _service_stats():
+        """Everything the /stats page shows: embedding-matrix sizes (the imdb-sizing
+        numbers), library + manual counts, DB file sizes, and current process RSS. All
+        cheap COUNT/size queries — never materializes a matrix."""
+        emb = db.embedding_stats()
+        manual_stats = manual.storage_stats()
+        return {
+            'library': {
+                'total_photos': db.count_files(),
+                'indexed_clip': db.count_indexed(),
+                'broken': db.count_broken_files(),
+                'tiled_files': db.count_tiled_files(),
+                'unidentified_faces': db.count_unidentified_faces(),
+                'cities': db.count_cities(),
+            },
+            'embeddings': emb,
+            'embeddings_loaded': db.loaded_matrix_bytes(),
+            'embeddings_total_bytes': sum(e['bytes'] for e in emb.values()),
+            'manual': manual_stats,
+            'db_files': {
+                'media_db_bytes': db.db_file_bytes(),
+                'manual_db_bytes': manual_stats['db_bytes'],
+            },
+            'rss_bytes': _read_rss_bytes(),
+        }
+
+    @app.get('/stats', response_class=HTMLResponse)
+    def stats_page(request: Request):
+        return templates.TemplateResponse(request, 'stats.html', {
+            'stats': _service_stats(),
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/api/stats')
+    def api_stats():
+        return _service_stats()
+
+    @app.post('/api/stats/ram')
+    def api_stats_ram():
+        """The 'Analyze RAM' button. Runs a gc pass, then reports current process RSS
+        alongside the embedding-matrix sizes — the estimated RAM if every matrix were
+        stacked resident (rows×dim×4) vs what's actually loaded in the caches right now.
+        This is the number that decides imdb vs an mmap'd index; it never materializes a
+        matrix, so it can't itself OOM the box."""
+        import gc
+        gc.collect()
+        emb = db.embedding_stats()
+        loaded = db.loaded_matrix_bytes()
+        return {
+            'rss_bytes': _read_rss_bytes(),
+            'embeddings': emb,
+            'embeddings_loaded': loaded,
+            'embeddings_total_bytes': sum(e['bytes'] for e in emb.values()),
+            'embeddings_loaded_bytes': sum(loaded.values()),
         }
 
     @app.get('/categories', response_class=HTMLResponse)
