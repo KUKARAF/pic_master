@@ -258,7 +258,7 @@
       fetch(idBase() + '/calibration-batch?floor=' + safeFloor + '&ceiling=1.0&count=1')
         .then(function (r) { return r.json(); })
         .then(function (d) {
-          addBtn.textContent = '✅ Add all ≥ ' + safeFloor.toFixed(2) + ' now (' + d.total + ')';
+          addBtn.textContent = '✅ Add ' + d.total + ' to ' + personName;
           addBtn.disabled = !d.total;
         })
         .catch(function () {});
