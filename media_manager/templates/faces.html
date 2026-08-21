@@ -13,7 +13,7 @@
   <a href="/faces" class="sub">← All faces</a>
   {% else %}
   <a href="/faces?favorite=1" class="sub">♥ Favorites only</a>
-  <button type="button" id="find-new-faces-btn" class="btn-similar">🔍 Find new faces</button>
+  <a href="/find_all_faces" class="btn-similar" style="text-decoration:none;">🔍 Find new faces</a>
   <button type="button" id="cleanup-low-confidence-btn" class="btn-similar">🧹 Cleanup low confidence matches</button>
   {% endif %}
 </div>
@@ -68,22 +68,6 @@
 </p>
 <p id="people-no-match" class="sub" style="text-align:center;margin-top:16px;display:none;">No people match "<span id="people-no-match-query"></span>".</p>
 
-<!-- "Find new faces" swipe stream — hidden until requested, unchanged behavior -->
-<div id="find-new-faces-section" style="display:none;margin-top:28px;">
-  <div class="section-title" style="margin-bottom:12px;">Unidentified faces</div>
-  <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
-    <input type="checkbox" id="faces-avoid-existing-toggle" checked>
-    Deprioritize photos that already have an identified face
-  </label>
-  <div class="swipe-page">
-    <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
-    <div class="swipe-controls">
-      <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not same face (↓)">✕</button>
-      <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Same face (↑)">✓</button>
-    </div>
-    <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
-  </div>
-</div>
 {% endif %}
 {% endblock %}
 
@@ -191,68 +175,6 @@
   searchInput.addEventListener('input', render);
   sortSelect.addEventListener('change', render);
   render();
-})();
-
-/* "Find new faces" — reveals the existing unidentified-faces swipe stream
-   (unchanged), lazily initialized on first reveal so a plain /faces visit
-   never fires its stream request. */
-(function() {
-  var btn = document.getElementById('find-new-faces-btn');
-  var section = document.getElementById('find-new-faces-section');
-  if (!btn || !section) return;
-  var initialized = false;
-
-  btn.addEventListener('click', function() {
-    var showing = section.style.display === 'none';
-    section.style.display = showing ? 'block' : 'none';
-    if (!showing) return;
-    // The section sits below the (potentially long) people grid, so scroll it into
-    // view — otherwise clicking the top button looks like nothing happened.
-    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    if (initialized) return;
-    initialized = true;
-    initSwipeStack({
-      stackElId: 'faces-swipe-stack',
-      confirmBtnId: 'faces-swipe-confirm-btn',
-      rejectBtnId: 'faces-swipe-reject-btn',
-      initialCards: [],
-      // Clicking "Find new faces" is itself the explicit opt-in, so fetch faces
-      // straight away instead of showing a second "▶ Start reviewing" button.
-      autoStart: true,
-      biasKeyFor: function(card) { return card.identity; },
-      fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
-        var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
-        var params = new URLSearchParams({
-          count: String(need),
-          avoid_existing: String(!avoidToggle || avoidToggle.checked),
-        });
-        if (biasKey) {
-          params.set('bias_identity', biasKey);
-          params.set('bias', biasAction);
-        }
-        return '/api/face-suggestions/next?' + params.toString();
-      },
-      renderCard: function(card) {
-        return {
-          imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
-          questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
-          scoreText: 'match score ' + card.score.toFixed(2),
-          metaHtml: swipeCardMeta(card),
-          originalUrl: '/photo/' + card.file_id,
-        };
-      },
-      onConfirm: function(card) {
-        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
-      },
-      onReject: function(card) {
-        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
-      },
-      onUndo: function(card) {
-        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
-      },
-      emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces or come back later.</div>',
-    });
-  });
 })();
 
 /* "Cleanup low confidence matches" — reviews already-confirmed faces one at

@@ -1725,6 +1725,16 @@ def create_app(data_root: str) -> FastAPI:
             c['has_age_estimate'] = c['checksum'] in estimated
         return {'cards': page_cards, 'total': len(instances), 'offset': offset, 'limit': limit}
 
+    @app.get('/find_all_faces', response_class=HTMLResponse)
+    def find_all_faces_page(request: Request):
+        """Global unidentified-faces swipe stream (was an inline section on /faces):
+        each unnamed face matched to its closest known person via the same
+        /api/face-suggestions/next stream in global mode."""
+        return templates.TemplateResponse(request, 'find_all_faces.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
     @app.get('/find-person/{name}', response_class=HTMLResponse)
     def find_person_page(request: Request, name: str):
         """Person-scoped face-suggestion swipe stream — 'is this <name>?' cards

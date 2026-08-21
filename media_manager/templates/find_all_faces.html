@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}Find new faces — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Find new faces</h1>
+  <a href="/faces" class="sub">← Back to Faces</a>
+</div>
+
+<p class="sub" style="margin-bottom:12px;">Unidentified faces, each matched to its closest known person — confirm or reject each.</p>
+
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:12px;">
+  <input type="checkbox" id="faces-avoid-existing-toggle" checked>
+  Deprioritize photos that already have an identified face
+</label>
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="faces-swipe-reject-btn" title="Not this person (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="faces-swipe-confirm-btn" title="Yes, same person (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/swipe-core.js"></script>
+<script>
+/* Global unidentified-faces stream (same /api/face-suggestions/next stream as the
+   old inline "Find new faces" section on /faces, now its own page): each card is an
+   unnamed face matched to its closest known person — "Is this X?". */
+(function() {
+  if (!window.initSwipeStack || !document.getElementById('faces-swipe-stack')) return;
+  initSwipeStack({
+    stackElId: 'faces-swipe-stack',
+    confirmBtnId: 'faces-swipe-confirm-btn',
+    rejectBtnId: 'faces-swipe-reject-btn',
+    initialCards: [],
+    autoStart: true,
+    biasKeyFor: function(card) { return card.identity; },
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
+      var params = new URLSearchParams({
+        count: String(need),
+        avoid_existing: String(!avoidToggle || avoidToggle.checked),
+      });
+      if (biasKey) {
+        params.set('bias_identity', biasKey);
+        params.set('bias', biasAction);
+      }
+      return '/api/face-suggestions/next?' + params.toString();
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+        questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
+        scoreText: 'match score ' + card.score.toFixed(2),
+        metaHtml: swipeCardMeta(card),
+        originalUrl: '/photo/' + card.file_id,
+      };
+    },
+    onConfirm: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
+    },
+    onReject: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+    },
+    onUndo: function(card) {
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+    },
+    emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces (or name a few people first so there\'s someone to match against), then come back.</div>',
+  });
+})();
+</script>
+{% endblock %}
