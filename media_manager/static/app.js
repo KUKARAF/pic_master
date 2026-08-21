@@ -1610,6 +1610,7 @@
     var sources = [
       { type: 'category', url: '/api/categories', label: function (c) { return c.name; }, value: function (c) { return c.name; }, count: function (c) { return c.image_count || 0; } },
       { type: 'location', url: '/api/locations', label: function (l) { return l.name; }, value: function (l) { return String(l.id); }, count: function (l) { return l.file_count || 0; } },
+      { type: 'city', url: '/api/cities', label: function (c) { return c.name + (c.country ? ', ' + c.country : ''); }, value: function (c) { return String(c.id); }, count: function (c) { return c.file_count || 0; } },
       { type: 'tag', url: '/api/tags', label: function (t) { return t.tag; }, value: function (t) { return t.tag; }, count: function (t) { return t.count || 0; } },
       { type: 'face', url: '/api/identities', label: function (i) { return i.name; }, value: function (i) { return i.name; }, count: function (i) { return i.count || 0; } },
       { type: 'set', url: '/api/sets', label: function (s) {
@@ -1650,10 +1651,10 @@
     var highlighted = 0;
     var requestSeq = 0;   // guards against an in-flight grid request resolving out of order
 
-    var FACET_LABELS = { category: 'CAT', location: 'LOC', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
+    var FACET_LABELS = { category: 'CAT', location: 'LOC', city: 'CITY', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
     // Section headers for the grouped left-pane suggestions.
-    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', location: 'LOCATIONS', set: 'SETS', file: 'FILES' };
-    var TYPE_ORDER = ['face', 'tag', 'category', 'location', 'set', 'file'];
+    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', location: 'LOCATIONS', city: 'CITIES', set: 'SETS', file: 'FILES' };
+    var TYPE_ORDER = ['face', 'tag', 'category', 'location', 'city', 'set', 'file'];
 
     // Text sort syntax: "field:asc|desc" anywhere in the input is parsed out into a
     // sort chip. Aliases map onto the backend's sort keys.

@@ -41,7 +41,7 @@
         {{ l.file_count or 0 }} photo(s)
         {% if l.gps_lat is not none %}
         · <span title="GPS coordinates">{{ '%.5f'|format(l.gps_lat) }}, {{ '%.5f'|format(l.gps_lon) }}</span>
-        · <a href="/search?sort=distance&lat={{ l.gps_lat }}&lon={{ l.gps_lon }}">📍 nearby</a>
+        · <a href="/search?sort=distance&order=asc&lat={{ l.gps_lat }}&lon={{ l.gps_lon }}">📍 nearby</a>
         {% endif %}
       </div>
     </div>

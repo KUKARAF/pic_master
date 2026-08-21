@@ -129,6 +129,18 @@ class Database(ThreadLocalDB):
         # a first-class file everywhere else (photo view, thumbnails, face search).
         if 'hidden' not in files_cols:
             cursor.execute('ALTER TABLE files ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
+        # view_count / last_viewed_at: how many times /photo/{id} has been opened, and
+        # when last. Drives the home "Needs attention" section's least-viewed-first
+        # ordering (see get_least_viewed_files + web.py increment_view_count hook).
+        if 'view_count' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN view_count INTEGER NOT NULL DEFAULT 0')
+        if 'last_viewed_at' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN last_viewed_at INTEGER')
+        # city_id: nearest known GeoNames city to this photo's EXIF GPS (see geonames.py
+        # + nearest_city). Lets the UI show a place NAME instead of raw coordinates and
+        # lets search filter by city. NULL until the "Match cities" job resolves it.
+        if 'city_id' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN city_id INTEGER')
         # file_paths: every location this content has been seen at. One-to-many — this
         # is where duplicates (same checksum, multiple paths) live. last_seen_at is
         # bumped on every scan that still finds the path on disk, so a path whose
@@ -266,6 +278,26 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tile_file ON tile_embeddings(file_id)')
+        # Cities: offline GeoNames reference data (cities15000, CC-BY 4.0) for
+        # reverse-geocoding a photo's EXIF GPS to the nearest known city NAME
+        # (files.city_id → cities.id). Optional/rebuildable — stays empty until
+        # `media geo fetch-cities` populates it (see geonames.py). Created here (empty)
+        # so nearest_city/find_cities never hit "no such table"; lat/lon are indexed
+        # for the bounding-box prefilter nearest_city uses.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS cities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                lat REAL NOT NULL,
+                lon REAL NOT NULL,
+                country TEXT,
+                admin1 TEXT,
+                population INTEGER
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_lat ON cities(lat)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_lon ON cities(lon)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_cities_name ON cities(name)')
         # Categories: single-value ML auto-match result per file, keyed by file_id
         # like detections/faces (derived, rebuildable data). Stores the category as
         # a name string rather than manual.db's numeric category id, since a cross-
@@ -396,6 +428,17 @@ class Database(ThreadLocalDB):
         cursor.execute('UPDATE files SET hidden = ? WHERE id = ?', (1 if hidden else 0, file_id))
         self.conn.commit()
 
+    def increment_view_count(self, file_id):
+        """Record one more open of this photo's /photo page — bumps view_count and
+        stamps last_viewed_at. Checksum-scoped (one files row per content), so all
+        duplicate paths of the same photo share the count. Drives the home
+        'Needs attention' least-viewed-first ordering."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'UPDATE files SET view_count = view_count + 1, last_viewed_at = ? WHERE id = ?',
+            (int(time.time()), file_id))
+        self.conn.commit()
+
     def find_file_id_by_checksum(self, checksum):
         """Return the existing files.id for this checksum, or None. Used at scan time
         to detect a duplicate *before* writing anything — see fast_scan.py."""
@@ -469,7 +512,10 @@ class Database(ThreadLocalDB):
 
     def update_file_metadata(self, file_id, taken_at=None, gps_lat=None, gps_lon=None):
         """Store EXIF-derived capture time / GPS coordinates for a file, when present.
-        Always stamps metadata_checked_at so a file with no EXIF isn't retried forever."""
+        Always stamps metadata_checked_at so a file with no EXIF isn't retried forever.
+        When GPS is present and the offline cities table is loaded, also labels the file
+        with its nearest city (no-op when cities were never fetched — nearest_city
+        returns None)."""
         cursor = self.conn.cursor()
         cursor.execute('''
             UPDATE files
@@ -477,6 +523,10 @@ class Database(ThreadLocalDB):
             WHERE id = ?
         ''', (taken_at, gps_lat, gps_lon, int(time.time()), file_id))
         self.conn.commit()
+        if gps_lat is not None and gps_lon is not None:
+            city = self.nearest_city(gps_lat, gps_lon)
+            if city is not None:
+                self.set_file_city(file_id, city['id'])
 
     def get_files_without_metadata(self, limit=None):
         """Return (id, path) for files whose EXIF metadata has never been checked."""
@@ -494,6 +544,126 @@ class Database(ThreadLocalDB):
         cursor = self.conn.cursor()
         cursor.execute('SELECT checksum FROM files WHERE gps_lat IS NOT NULL')
         return {row[0] for row in cursor.fetchall()}
+
+    # --- Cities (offline GeoNames reverse-geocode; see geonames.py) ---------------
+
+    def replace_cities(self, rows):
+        """Wholesale-replace the `cities` table with (name, lat, lon, country, admin1,
+        population) tuples — the atomic rebuild step for `media geo fetch-cities`.
+        A rebuild changes ids, so any files.city_id is cleared too (it would otherwise
+        point at a now-different city); re-run the 'Match cities' job afterwards."""
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM cities')
+        cursor.execute('UPDATE files SET city_id = NULL WHERE city_id IS NOT NULL')
+        cursor.executemany(
+            'INSERT INTO cities (name, lat, lon, country, admin1, population) '
+            'VALUES (?, ?, ?, ?, ?, ?)', rows)
+        self.conn.commit()
+
+    def count_cities(self):
+        """How many cities are loaded — 0 means the table was never fetched (callers
+        surface a 'run media geo fetch-cities' hint)."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM cities')
+        return cursor.fetchone()[0]
+
+    def nearest_city(self, lat, lon, max_km=None):
+        """The `cities` row nearest to (lat, lon) as a dict, or None if the table is
+        empty or nothing is within max_km. A bounding-box prefilter (±0.75°) keeps the
+        haversine scan to a handful of candidates instead of the whole table."""
+        if lat is None or lon is None:
+            return None
+        from media_manager.geonames import haversine
+        cursor = self.conn.cursor()
+        margin = 0.75
+        cursor.execute(
+            'SELECT id, name, lat, lon, country, admin1, population FROM cities '
+            'WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?',
+            (lat - margin, lat + margin, lon - margin, lon + margin))
+        rows = cursor.fetchall()
+        if not rows:
+            # Sparse region (e.g. mid-ocean / remote) — fall back to a full scan so a
+            # far-but-real nearest city is still found rather than silently returning None.
+            cursor.execute('SELECT id, name, lat, lon, country, admin1, population FROM cities')
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+        best, best_km = None, None
+        for r in rows:
+            km = haversine(lat, lon, r[2], r[3])
+            if best_km is None or km < best_km:
+                best, best_km = r, km
+        if max_km is not None and best_km > max_km:
+            return None
+        return {'id': best[0], 'name': best[1], 'lat': best[2], 'lon': best[3],
+                'country': best[4], 'admin1': best[5], 'population': best[6],
+                'distance_km': round(best_km, 1)}
+
+    def get_city(self, city_id):
+        """One city row as a dict, or None. Used to render a photo's labeled place."""
+        if city_id is None:
+            return None
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, name, lat, lon, country, admin1, population '
+                       'FROM cities WHERE id = ?', (city_id,))
+        r = cursor.fetchone()
+        if not r:
+            return None
+        return {'id': r[0], 'name': r[1], 'lat': r[2], 'lon': r[3],
+                'country': r[4], 'admin1': r[5], 'population': r[6]}
+
+    def find_cities(self, prefix, limit=20):
+        """Cities whose name starts with `prefix` (case-insensitive), biggest first —
+        backs the /api/cities search-palette autocomplete."""
+        if not prefix or not prefix.strip():
+            return []
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT id, name, lat, lon, country, admin1, population FROM cities '
+            'WHERE name LIKE ? ORDER BY population DESC LIMIT ?',
+            (prefix.strip() + '%', limit))
+        return [{'id': r[0], 'name': r[1], 'lat': r[2], 'lon': r[3],
+                 'country': r[4], 'admin1': r[5], 'population': r[6]}
+                for r in cursor.fetchall()]
+
+    def set_file_city(self, file_id, city_id):
+        """Store this photo's nearest-city match (files.city_id → cities.id)."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE files SET city_id = ? WHERE id = ?', (city_id, file_id))
+        self.conn.commit()
+
+    def get_geotagged_files_without_city(self, limit=None):
+        """(id, gps_lat, gps_lon) for geotagged files not yet matched to a city — the
+        'Match cities' bulk-job's work list."""
+        cursor = self.conn.cursor()
+        sql = ('SELECT id, gps_lat, gps_lon FROM files '
+               'WHERE gps_lat IS NOT NULL AND gps_lon IS NOT NULL AND city_id IS NULL')
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def get_checksums_for_city(self, city_id):
+        """Checksums of every photo labeled with this city — backs the `city:` search
+        chip."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT checksum FROM files WHERE city_id = ?', (city_id,))
+        return {row[0] for row in cursor.fetchall()}
+
+    def get_used_cities(self):
+        """Only the cities that actually label at least one photo, with photo counts —
+        [{id, name, country, admin1, file_count}], biggest first. Bounded by the
+        library's real diversity (not the whole ~26k table), so it's safe to preload
+        into the search palette's `city` facet (mirrors how locations are listed)."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT c.id, c.name, c.country, c.admin1, COUNT(f.id) AS file_count
+            FROM cities c JOIN files f ON f.city_id = c.id
+            GROUP BY c.id ORDER BY file_count DESC
+        ''')
+        return [{'id': r[0], 'name': r[1], 'country': r[2], 'admin1': r[3], 'file_count': r[4]}
+                for r in cursor.fetchall()]
 
     def get_geotagged_points(self):
         """(file_id, gps_lat, gps_lon) for every non-hidden EXIF-geotagged file —
@@ -803,6 +973,22 @@ class Database(ThreadLocalDB):
                   WHERE fa.file_id = f.id AND (fa.identity IS NULL OR fa.identity != '__indexed__')
               )
             ORDER BY RANDOM() LIMIT ?
+        ''', (limit,))
+        return cur.fetchall()
+
+    def get_least_viewed_files(self, limit=400):
+        """Least-viewed (non-hidden) files first, as (id, checksum) rows — the home
+        'Needs attention' candidate pool. Unlike get_random_faceless_files this does
+        NOT exclude photos that have a face: an UNNAMED face still needs attention, so
+        eligibility (no name/set/tag/category) is applied by the caller against the
+        manual.db exclusion sets. RANDOM() tie-break keeps variety while the whole
+        library is still at view_count 0, and photos get viewed as they're worked on,
+        so handled ones naturally sink out of the top."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT id, checksum FROM files
+            WHERE hidden = 0 AND noface = 0
+            ORDER BY view_count ASC, RANDOM() LIMIT ?
         ''', (limit,))
         return cur.fetchall()
 

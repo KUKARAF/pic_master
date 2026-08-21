@@ -163,6 +163,14 @@ def main():
     metadata_cmd.add_argument('path', nargs='?', default='.',
                               help='Directory to check (relative to repo root, default: .)')
 
+    # media geo fetch-cities - download the offline GeoNames city database (CC-BY 4.0)
+    # into media.db, so photos can be reverse-geocoded to a nearest-city NAME instead
+    # of raw coordinates (see geonames.py). One-time setup; no runtime network calls.
+    geo_cmd = sub.add_parser('geo', help='Offline city database (GeoNames) for reverse-geocoding photos to city names')
+    geo_sub = geo_cmd.add_subparsers(dest='geo_cmd', required=True)
+    geo_sub.add_parser('fetch-cities',
+                       help='Download the GeoNames cities15000 dump (~26k cities, CC-BY 4.0) into media.db')
+
 
     # media who <image> - find who appears in an image
     who_cmd = sub.add_parser('who', help='Find which people appear in an image')
@@ -669,6 +677,18 @@ def main():
         checked, found = m.extract_metadata(args.path)
         print(f"Done: checked {checked} images, found EXIF data in {found}")
         m.close()
+        return 0
+
+    elif args.cmd == 'geo':
+        if args.geo_cmd == 'fetch-cities':
+            from media_manager import geonames
+            m = MediaManager()
+            try:
+                count = geonames.fetch_cities(m.db)
+                print(f"Loaded {count} cities. Now run the '🏙 Match cities' bulk action "
+                      "(⚡ menu) or `media metadata` to label photos with their nearest city.")
+            finally:
+                m.close()
         return 0
 
     elif args.cmd == 'who':

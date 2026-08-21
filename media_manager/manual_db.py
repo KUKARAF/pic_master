@@ -1610,6 +1610,16 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT DISTINCT checksum FROM file_sets')
         return {row[0] for row in cur.fetchall()}
 
+    def get_all_photo_identity_checksums(self):
+        """Every checksum with at least one whole-photo name assignment
+        (identity_photo_assignments), as a plain set() — one cheap query, mirrors
+        get_all_set_member_checksums. Complements get_all_checksums_with_named_face
+        so the home 'Needs attention' filter can exclude photos named either via a
+        detected face or via a faceless whole-photo assignment."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM identity_photo_assignments')
+        return {row[0] for row in cur.fetchall()}
+
     def get_sets_for_checksums(self, checksums):
         """Batched lookup: {checksum: [{'id', 'name', 'studio'}, ...]} — avoids N+1
         queries on list pages (mirrors list_tags_for_checksums). Chunked (see

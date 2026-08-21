@@ -55,10 +55,19 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media bodies [path]` | Crop + embed person boxes for find-by-body search |
 | `media who <image>` | Find which known people appear in an image |
 | `media metadata [path]` | Read EXIF capture time + GPS |
+| `media geo fetch-cities` | Download the offline GeoNames city database for reverse-geocoding |
 | `media set create/ls/assign/files` | Manage named sets (e.g. a studio shoot) |
 | `media web` | Launch the FastAPI gallery UI |
 | `media worker` | Run the remote ML-offload worker on a beefy machine (see below) |
 | `media worker-connect <hash>` | Point this host at a worker to offload heavy ML |
+
+## Optional: offline city names (reverse-geocoding)
+
+Run `media geo fetch-cities` once to download the [GeoNames](https://www.geonames.org/)
+`cities15000` dataset (~26k cities, licensed CC-BY 4.0) into a local `cities` table — no
+runtime network calls. Then the `🏙 Match cities` bulk action (⚡ menu) labels each
+geotagged photo with its nearest city, so photos show a place **name** (and are searchable
+by the `city:` facet) instead of raw coordinates. City data © GeoNames, CC-BY 4.0.
 
 ## Optional: age/gender estimation (MiVOLO)
 

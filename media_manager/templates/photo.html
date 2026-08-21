@@ -109,17 +109,20 @@
           <td>Hash</td>
           <td>{{ file.checksum or '—' }}</td>
         </tr>
-        {% if file.locations or file.gps_lat is not none %}
+        {% if file.locations or file.gps_lat is not none or city %}
         <tr>
           <td>Location</td>
           <td>
+            {% if city %}
+            <a href="/search?f=city:{{ city.id }}">📍 {{ city.name }}{% if city.country %}, {{ city.country }}{% endif %}</a><br>
+            {% endif %}
             {% for l in file.locations %}
             <a href="/locations/{{ l.id }}">{{ l.name }}</a>{% if not loop.last %}, {% endif %}
             {% endfor %}
             {% if file.gps_lat is not none %}
-            {% if file.locations %}<br>{% endif %}
+            {% if file.locations or city %}<br>{% endif %}
             GPS {{ '%.5f'|format(file.gps_lat) }}, {{ '%.5f'|format(file.gps_lon) }}
-            · <a href="/search?sort=distance&lat={{ file.gps_lat }}&lon={{ file.gps_lon }}">find nearby</a>
+            · <a href="/search?sort=distance&order=asc&lat={{ file.gps_lat }}&lon={{ file.gps_lon }}">find nearby</a>
             {% endif %}
           </td>
         </tr>

@@ -33,7 +33,7 @@
     <span id="location-coords-msg" class="sub"></span>
   </div>
   {% if location.gps_lat is not none %}
-  <a href="/search?sort=distance&lat={{ location.gps_lat }}&lon={{ location.gps_lon }}"
+  <a href="/search?sort=distance&order=asc&lat={{ location.gps_lat }}&lon={{ location.gps_lon }}"
      class="btn-similar" style="display:inline-block;margin-top:10px;">📍 Find photos near here</a>
   {% endif %}
 </div>

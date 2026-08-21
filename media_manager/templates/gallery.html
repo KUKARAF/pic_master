@@ -32,7 +32,7 @@
 
 {% if needs_attention %}
 <div class="section-title" style="margin-bottom:4px;">Needs attention</div>
-<div class="sub" style="margin-bottom:10px;">Random items with no face, no set, and no manual tags yet.</div>
+<div class="sub" style="margin-bottom:10px;">Least-viewed photos with no name, set, tag, or category yet.</div>
 <div class="grid" style="margin-bottom:28px;" data-queue-source="Needs attention">
   {% for f in needs_attention %}
   {{ macros.card(f) }}

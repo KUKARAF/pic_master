@@ -884,6 +884,10 @@ def create_app(data_root: str) -> FastAPI:
             if v == 'any':
                 return db.get_geotagged_checksums() | manual.get_checksums_with_any_location()
             return set(manual.get_checksums_for_location(int(v)))
+        if t == 'city':
+            # value = a GeoNames city id; photos reverse-geocoded to that city (see
+            # the 'Match cities' job). Lets you filter by place NAME, not coordinates.
+            return db.get_checksums_for_city(int(v))
         if t == 'file':
             return {row[2] for row in db.search_by_path_substring(v, limit=200)}
         return set()
@@ -980,18 +984,19 @@ def create_app(data_root: str) -> FastAPI:
         (search by tag/person, set detail) which don't paginate via SQL. 'age' isn't
         handled here since it needs manual.db and enriched cards; see _sort_cards_by_age.
 
-        'distance' ranks by haversine distance from (target_lat, target_lon) —
-        always nearest-first (ascending distance) regardless of `order`; rows with
-        no EXIF GPS (gps_lat is None) always sort LAST (mirrors the 'age'-with-no-
-        estimate 'sort to end' pattern). If a distance sort is requested without a
-        target point, it falls back to the default 'added' sort."""
+        'distance' ranks by haversine distance from (target_lat, target_lon):
+        `order='asc'` is nearest-first, `order='desc'` (the default) is farthest-first.
+        Rows with no EXIF GPS (gps_lat is None) always sort LAST in either direction
+        (mirrors the 'age'-with-no-estimate 'sort to end' pattern). If a distance sort
+        is requested without a target point, it falls back to the default 'added' sort."""
         reverse = (order != 'asc')
         if sort == 'distance':
             if target_lat is None or target_lon is None:
                 return sorted(file_rows, key=lambda r: r['first_seen'], reverse=True)
             with_gps = [r for r in file_rows if r['gps_lat'] is not None and r['gps_lon'] is not None]
             without_gps = [r for r in file_rows if r['gps_lat'] is None or r['gps_lon'] is None]
-            with_gps.sort(key=lambda r: _haversine(r['gps_lat'], r['gps_lon'], target_lat, target_lon))
+            with_gps.sort(key=lambda r: _haversine(r['gps_lat'], r['gps_lon'], target_lat, target_lon),
+                          reverse=(order == 'desc'))
             return with_gps + without_gps
         if sort == 'filename':
             return sorted(file_rows, key=lambda r: os.path.basename(r['path']).lower(), reverse=reverse)
@@ -1118,21 +1123,31 @@ def create_app(data_root: str) -> FastAPI:
     def gallery_page(request: Request):
         """A fast, curated landing page — three small sections, each enriching only a
         few dozen cards (never the whole library): favorites (most-favorited first),
-        a random 'needs attention' sample (no face / no set / no manual tag), and a
-        random sample. Browsing everything lives on Search / Files now."""
+        a 'needs attention' sample (least-viewed photos with no name / set / tag /
+        category yet), and a random sample. Browsing everything lives on Search / Files
+        now."""
         # 1. Favorites, most-favorited first.
         fav = manual.get_top_favorite_checksums(limit=60)
         fav_rank = {cs: i for i, (cs, _c) in enumerate(fav)}
         favorites = _cards_for_checksums(fav_rank.keys())
         favorites.sort(key=lambda c: fav_rank.get(c['checksum'], 1 << 30))
 
-        # 2. Needs attention: no face (SQL) ∩ no set ∩ no manual tag (Python).
-        set_ex = manual.get_all_set_member_checksums()
-        tag_ex = manual.get_checksums_with_manual_tags()
+        # 2. Needs attention: least-viewed photos that are still untouched — no NAME
+        # (neither a named face nor a whole-photo assignment), no set, no positive tag,
+        # no category. A photo with an UNNAMED face IS shown (it needs a name). The
+        # candidate pool is least-viewed-first (get_least_viewed_files); eligibility is
+        # the union of manual.db exclusion sets (checksum-keyed) filtered in Python,
+        # since view_count is media.db id-keyed — no single cross-DB join.
+        excluded = (
+            manual.get_all_checksums_with_named_face()
+            | manual.get_all_photo_identity_checksums()
+            | manual.get_all_set_member_checksums()
+            | manual.get_checksums_with_manual_tags()
+            | set().union(*manual.get_all_category_checksums().values() or [set()])
+        )
         needs = []
-        for r in db.get_random_faceless_files(limit=200):
-            cs = r['checksum']
-            if cs in set_ex or cs in tag_ex:
+        for _fid, cs in db.get_least_viewed_files(limit=400):
+            if cs in excluded:
                 continue
             needs.append(cs)
             if len(needs) >= 6:
@@ -1175,6 +1190,10 @@ def create_app(data_root: str) -> FastAPI:
     def photo_page(request: Request, file_id: int):
         row = _file_or_404(file_id)
         checksum = row['checksum']
+        # Count this as a view — the true "user opened this photo" signal (thumbs/grid
+        # loads and cache-served /image requests don't reach here). Feeds the home
+        # "Needs attention" least-viewed-first ordering.
+        db.increment_view_count(file_id)
         tag_rows = manual.get_tags(checksum)
         whole_tags = [
             {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': t['favorite']}
@@ -1240,6 +1259,10 @@ def create_app(data_root: str) -> FastAPI:
             if prows:
                 parent_capture = {'id': prows[0]['id'], 'time_ms': pc['time_ms'],
                                   'filename': os.path.basename(prows[0]['path'])}
+        # Nearest offline city for this photo's EXIF GPS (labeled by the 'Match cities'
+        # job / metadata extraction) — shown as a place NAME in File-info. None when
+        # untagged or the cities table was never fetched.
+        city = db.get_city(row['city_id']) if 'city_id' in row.keys() else None
         return templates.TemplateResponse(request, 'photo.html', {
             'file': file_info,
             'detected_classes': detected_classes,
@@ -1252,6 +1275,7 @@ def create_app(data_root: str) -> FastAPI:
             'current_sets': current_sets,
             'captured_frames': captured_frames,
             'parent_capture': parent_capture,
+            'city': city,
         })
 
     def _identity_instances(name):
@@ -1420,6 +1444,23 @@ def create_app(data_root: str) -> FastAPI:
                     files = _enrich_rows(rows, scores=scores)
             except Exception as exc:
                 message = f'Search error: {exc}'
+
+        elif sort == 'distance':
+            # A bare distance search (?sort=distance&lat=&lon= with no chip/tag/etc.)
+            # has no base set to rank, so it used to render empty. Seed it with every
+            # geotagged photo (pure EXIF GPS, so every row is distance-rankable —
+            # unlike location:any, which would drag in manual-location files that have
+            # no coords) and let _sort_file_rows order them by distance. The top guard
+            # guarantees lat/lon are present here.
+            checksums = db.get_geotagged_checksums()
+            if not checksums:
+                message = 'No geotagged photos found — run <code>media metadata</code> to read EXIF GPS first.'
+            else:
+                file_rows = _sort_file_rows(db.get_files_by_checksums(list(checksums)), sort, order,
+                                            target_lat=lat, target_lon=lon)
+                rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
+                files = _enrich_rows(rows)
+            queue_label = 'Near here'
 
         return templates.TemplateResponse(request, 'search.html', {
             'files': files,
@@ -1876,6 +1917,9 @@ def create_app(data_root: str) -> FastAPI:
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
     metadata_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Reverse-geocode geotagged photos to their nearest offline GeoNames city; same
+    # {running,done,total,error} job shape, surfaced in the ⚡ menu as "Match cities".
+    cities_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2213,6 +2257,59 @@ def create_app(data_root: str) -> FastAPI:
             'error': metadata_job['error'],
             'pending': len(db.get_files_without_metadata()),
         }
+
+    @app.post('/api/match-cities/start')
+    def api_match_cities_start():
+        """Reverse-geocode every geotagged photo not yet labeled to its nearest offline
+        GeoNames city (files.city_id). Requires the cities table to be loaded first
+        (`media geo fetch-cities`) — fails loud with a hint otherwise, rather than
+        silently doing nothing."""
+        import threading
+
+        if cities_job['running']:
+            return {'started': False, 'message': 'City matching already running.'}
+        if db.count_cities() == 0:
+            return {'started': False,
+                    'message': 'No cities loaded — run `media geo fetch-cities` first.'}
+        candidates = db.get_geotagged_files_without_city()  # [(id, lat, lon), ...]
+        cities_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                done = 0
+                for fid, lat, lon in candidates:
+                    city = db.nearest_city(lat, lon)
+                    if city is not None:
+                        db.set_file_city(fid, city['id'])
+                    done += 1
+                    cities_job['done'] = done
+            except Exception as exc:
+                cities_job['error'] = str(exc)
+            finally:
+                cities_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': cities_job['total']}
+
+    @app.get('/api/match-cities/status')
+    def api_match_cities_status():
+        return {
+            'running': cities_job['running'],
+            'done': cities_job['done'],
+            'total': cities_job['total'],
+            'error': cities_job['error'],
+            'pending': len(db.get_geotagged_files_without_city()),
+        }
+
+    @app.get('/api/cities')
+    def api_cities(q: str = ''):
+        """Backs the search palette's `city` facet. With no `q`: the cities that
+        actually label photos (bounded, with counts) — what the palette preloads. With
+        `q`: a name-prefix autocomplete over the whole table. Returns a bare list either
+        way (the palette maps over it like the other facet endpoints)."""
+        if q.strip():
+            return db.find_cities(q, limit=20)
+        return db.get_used_cities()
 
     @app.post('/api/match-faces/start')
     def api_match_faces_start():
