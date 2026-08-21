@@ -1936,6 +1936,9 @@ def create_app(data_root: str) -> FastAPI:
     # 'matched' count).
     index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
+    # Person-scoped "auto-add all where P is the top match" sweep (find-person page).
+    auto_add_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None,
+                    'identity': None}
     # Tile (region) index: per-image CLIP crops of an overlapping grid, so region
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
@@ -2489,6 +2492,64 @@ def create_app(data_root: str) -> FastAPI:
             'total': match_faces_job['total'],
             'matched': match_faces_job['matched'],
             'error': match_faces_job['error'],
+        }
+
+    @app.post('/api/identities/{name}/auto-add-until-other-match')
+    def api_auto_add_until_other_match(name: str, threshold: float = None):
+        """Sweep every not-yet-named auto face and confirm as `name` exactly those whose
+        TOP identity match (across ALL known people) is `name` — i.e. no other known
+        person matches that face more strongly ("not exceeded by someone else"). A
+        person-scoped variant of the library-wide match-faces job: same candidate pool
+        and promote path, but find_matching_identity must return THIS person for the face
+        to be added. Runs in a background thread; `threshold` (default AUTO_MATCH) is the
+        minimum winning similarity so a face where `name` only barely wins isn't added."""
+        import threading
+
+        if auto_add_job['running']:
+            return {'started': False, 'message': 'Auto-add already running.'}
+        canonical = manual.resolve_identity_name(name)
+        pool = _unpromoted_auto_faces(limit=None)
+        auto_add_job.update(running=True, done=0, total=len(pool), matched=0, error=None,
+                            identity=canonical)
+
+        def _run():
+            try:
+                done = matched = 0
+                for face_id, file_id, _path, bbox, emb_bytes in pool:
+                    done += 1
+                    auto_add_job['done'] = done
+                    if not emb_bytes:
+                        continue
+                    top, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
+                    # Only add when THIS person is the winner — a face better matched by
+                    # someone else is left for that person / manual review.
+                    if top is None or top.strip().lower() != canonical.strip().lower():
+                        continue
+                    file_row = db.get_file_by_id(file_id)
+                    if file_row is None:
+                        continue
+                    manual.promote_auto_face(
+                        face_id, file_row['checksum'], json.loads(bbox), emb_bytes,
+                        canonical, None, None)
+                    matched += 1
+                    auto_add_job['matched'] = matched
+            except Exception as exc:
+                auto_add_job['error'] = str(exc)
+            finally:
+                auto_add_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': auto_add_job['total'], 'identity': canonical}
+
+    @app.get('/api/identities/{name}/auto-add-status')
+    def api_auto_add_status(name: str):
+        return {
+            'running': auto_add_job['running'],
+            'done': auto_add_job['done'],
+            'total': auto_add_job['total'],
+            'matched': auto_add_job['matched'],
+            'error': auto_add_job['error'],
+            'identity': auto_add_job['identity'],
         }
 
     @app.post('/api/tile-index/start')
