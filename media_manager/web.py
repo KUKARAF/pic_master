@@ -3518,6 +3518,19 @@ def create_app(data_root: str) -> FastAPI:
             candidates = [s for s in manual.list_sets() if s['id'] in set_ids and s['id'] not in member_of]
         else:
             candidates = [s for s in manual.list_sets() if s['id'] not in member_of]
+            # When this photo has a recognized person, only suggest sets that person is
+            # already in — a matching face is a far stronger "belongs here" signal than
+            # CLIP scene similarity (mirrors _find_similar_files_for_set's
+            # exclude_non_matching_faces, the reverse direction). Applied only to the
+            # auto-suggestion path (not the explicit set_ids quick-access ranking) and
+            # only when the photo has a recognized person; an empty result is correct
+            # here (no existing set contains this person). Runs before the centroid loop
+            # below, so it also shrinks the work.
+            photo_people = (set(manual.get_identities_for_checksums([checksum]).get(checksum, []))
+                            | set(manual.get_identities_assigned_to_photo(checksum)))
+            if photo_people:
+                rosters = manual.get_all_people_for_sets([c['id'] for c in candidates])
+                candidates = [c for c in candidates if photo_people & set(rosters.get(c['id'], []))]
         if not candidates:
             return []
 
