@@ -463,6 +463,16 @@ window.initSwipeStack = function (config) {
     pause: () => { active = false; },
     resume: () => { active = true; },
     isActive: () => active,
-    reset: () => { queue = []; known.clear(); history.length = 0; started = true; render(); maybeFetchMore(); },
+    // Replace the queue with an explicit set of cards and re-render — lets a caller
+    // drive the stack in discrete batches (e.g. calibration feeding one bisect round
+    // at a time) instead of via fetchMoreUrl.
+    load: (cards) => {
+      queue = (cards || []).slice();
+      known.clear();
+      queue.forEach((c) => known.add(c.ref));
+      history.length = 0;
+      started = true;
+      render();
+    },
   };
 };

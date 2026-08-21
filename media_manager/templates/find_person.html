@@ -213,30 +213,29 @@
 
   wireBufferSizeSlider(stack, 'find-person-buffer-size-slider', 'find-person-buffer-size-value');
 
-  /* Calibrate & auto-add: swipe through the riskiest (lowest-score) candidate
-     matches — same Tinder cards as the main review — to establish a confidence
-     threshold, then bulk-confirm everyone at/above the lowest card you swiped
-     'same'. The main review stack is paused (its keyboard/drag gated via the new
-     pause/resume) and hidden while calibrating, so only the calibration stack
-     reacts to input. Reuses /calibration-batch (riskiest-first) and
-     /confirm-above-threshold; nothing persists across a reload. */
+  /* Calibrate & auto-add: binary-search the safe confidence threshold by reviewing
+     a small batch (5) of borderline faces per round — the SAME Tinder cards as the
+     main review — starting from the MIDDLE of the score range and narrowing. Each
+     round shows the weakest faces at the current threshold band: swipe them all
+     'same' and the threshold can go lower; any 'not them' and it must go higher.
+     "Add all now" is always available and confirms everyone at/above the best safe
+     threshold found so far (conservative — it only gets more inclusive as you swipe).
+     The main review stack is paused + hidden while calibrating. Reuses
+     /calibration-batch + /confirm-above-threshold. */
   function wireAutoCalibrate() {
     const btn = document.getElementById('auto-calibrate-btn');
     const panel = document.getElementById('calibrate-panel');
     const swipePage = document.querySelector('.swipe-page');  // the MAIN stack's page
     if (!btn || !panel) return;
 
-    const SAMPLE = 40;   // riskiest candidates to seed the calibration swipe
-    const FLOOR = 0.10;  // include the risky low-score tail
+    const LO = 0.10, HI = 0.95, EPSILON = 0.03, MAX_ITER = 8, BATCH = 5;
     let calStack = null;
-    let lowestSame = null;   // min score among cards swiped 'same' this session
-    let previewTimer = null;
+    let riskyFloor, safeFloor, test, iter, roundRejects, roundActive, converged;
 
     function idBase() { return '/api/identities/' + encodeURIComponent(personName); }
 
     function exit() {
       if (calStack) calStack.pause();
-      clearTimeout(previewTimer);
       panel.style.display = 'none';
       panel.innerHTML = '';
       if (swipePage) swipePage.style.display = '';
@@ -245,31 +244,62 @@
       btn.disabled = false;
     }
 
-    function updatePreview() {
+    function updateLine(msg) {
       const line = document.getElementById('calib-threshold-line');
-      const addBtn = document.getElementById('calib-add-all-btn');
-      if (!line) return;
-      if (lowestSame == null) {
-        line.textContent = 'Swipe a match up (same) to set the threshold.';
-        if (addBtn) addBtn.disabled = true;
-        return;
-      }
-      if (addBtn) addBtn.disabled = false;
-      line.textContent = 'Threshold ≈ ' + lowestSame.toFixed(3) + ' — counting…';
-      clearTimeout(previewTimer);
-      previewTimer = setTimeout(function () {
-        fetch(idBase() + '/calibration-batch?floor=' + lowestSame + '&ceiling=1.0&count=1')
-          .then(function (r) { return r.json(); })
-          .then(function (d) { line.textContent = 'Threshold ≈ ' + lowestSame.toFixed(3) + ' · will add ~' + d.total + ' above it'; })
-          .catch(function () {});
-      }, 400);
+      if (line) line.textContent = msg;
     }
 
-    function startCalibration(results) {
-      lowestSame = null;
+    // "Add all now" always targets the best-known-safe threshold (safeFloor): safe/
+    // conservative, and more inclusive as rounds push safeFloor down.
+    function refreshAddButton() {
+      const addBtn = document.getElementById('calib-add-all-btn');
+      if (!addBtn) return;
+      addBtn.dataset.threshold = String(safeFloor);
+      fetch(idBase() + '/calibration-batch?floor=' + safeFloor + '&ceiling=1.0&count=1')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          addBtn.textContent = '✅ Add all ≥ ' + safeFloor.toFixed(2) + ' now (' + d.total + ')';
+          addBtn.disabled = !d.total;
+        })
+        .catch(function () {});
+    }
+
+    function runRound() {
+      if (converged || iter >= MAX_ITER || (safeFloor - riskyFloor) < EPSILON) {
+        converged = true;
+        if (calStack) calStack.pause();
+        const wrap = document.getElementById('calib-swipe-stack');
+        if (wrap) wrap.innerHTML = '<div class="swipe-empty">Calibrated — press “Add all now”, or keep the main review.</div>';
+        updateLine('Safe threshold ≈ ' + safeFloor.toFixed(3) + '.');
+        refreshAddButton();
+        return;
+      }
+      test = (riskyFloor + safeFloor) / 2;
+      iter++;
+      updateLine('Round ' + iter + ': testing threshold ' + test.toFixed(3) + ' — swipe these borderline faces.');
+      fetch(idBase() + '/calibration-batch?floor=' + test + '&ceiling=' + safeFloor + '&count=' + BATCH)
+        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function (data) {
+          if (!data.results.length) { handleRound(true); return; }  // empty band → vacuously clean
+          roundRejects = 0;
+          roundActive = true;
+          calStack.load(data.results);
+        })
+        .catch(function (err) { updateLine('Calibration failed: ' + err.message); });
+    }
+
+    function handleRound(clean) {
+      if (clean) safeFloor = test; else riskyFloor = test;  // clean → lower is OK; dirty → must go higher
+      refreshAddButton();
+      runRound();
+    }
+
+    function startCalibration() {
       cancelAutoApprove();  // don't let a pending main-stack auto-approve fire while calibrating
+      riskyFloor = LO; safeFloor = HI; iter = 0; converged = false;
+      roundRejects = 0; roundActive = false;
       panel.innerHTML =
-        '<div class="sub" style="margin-bottom:8px;">Swipe the riskiest matches (lowest score first). Up = <strong>' + escapeHtml(personName) + '</strong>, down = not them.</div>' +
+        '<div class="sub" style="margin-bottom:8px;">Swipe each borderline face: up = <strong>' + escapeHtml(personName) + '</strong>, down = not them. It narrows in on the safe threshold.</div>' +
         '<div class="swipe-page">' +
           '<div class="swipe-stack-wrap" id="calib-swipe-stack"></div>' +
           '<div class="swipe-controls">' +
@@ -292,9 +322,10 @@
         stackElId: 'calib-swipe-stack',
         confirmBtnId: 'calib-confirm-btn',
         rejectBtnId: 'calib-reject-btn',
-        initialCards: results,
-        bufferSize: results.length,  // keep the whole riskiest sample (initialCards is sliced to bufferSize)
-        fetchMoreUrl: function () { return null; },  // fixed riskiest sample, no refill
+        initialCards: [],
+        bufferSize: BATCH,
+        autoStart: true,                          // no "Start reviewing" button; rounds load via load()
+        fetchMoreUrl: function () { return null; },
         renderCard: function (card) {
           return {
             imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
@@ -305,55 +336,51 @@
           };
         },
         onConfirm: function (card) {
-          if (lowestSame == null || card.score < lowestSame) lowestSame = card.score;
-          updatePreview();
           return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
         },
         onReject: function (card) {
+          roundRejects++;
           return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
         },
         onUndo: function (card) {
           return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
         },
-        emptyStateHtml: '<div class="swipe-empty">That\'s the riskiest sample reviewed — press “Add all now”, or Done.</div>',
+        onTopCardChange: function (card) {
+          // A round ends when its batch drains — clean iff no 'not them' swipes.
+          if (card === null && roundActive) {
+            roundActive = false;
+            handleRound(roundRejects === 0);
+          }
+        },
+        emptyStateHtml: '<div class="swipe-empty">Loading next round…</div>',
       });
-      updatePreview();
 
       document.getElementById('calib-done-btn').addEventListener('click', exit);
       document.getElementById('calib-add-all-btn').addEventListener('click', function () {
-        if (lowestSame == null) return;
         const addBtn = document.getElementById('calib-add-all-btn');
+        const threshold = parseFloat(addBtn.dataset.threshold);
+        if (!isFinite(threshold)) return;
         addBtn.disabled = true;
         addBtn.textContent = 'Adding…';
         fetch(idBase() + '/confirm-above-threshold', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ threshold: lowestSame }),
+          body: JSON.stringify({ threshold: threshold }),
         })
           .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
           .then(function (res) { showToast('Added ' + res.confirmed + ' photo(s) as "' + personName + '".'); exit(); })
-          .catch(function (err) { addBtn.disabled = false; addBtn.textContent = '✅ Add all now'; showToast('Failed: ' + err.message); });
+          .catch(function (err) { addBtn.disabled = false; showToast('Failed: ' + err.message); });
       });
+
+      refreshAddButton();
+      runRound();
     }
 
     btn.addEventListener('click', function () {
       btn.disabled = true;
       panel.style.display = 'block';
-      panel.innerHTML = '<p class="sub">Loading riskiest candidates…</p>';
-      fetch(idBase() + '/calibration-batch?floor=' + FLOOR + '&ceiling=1.0&count=' + SAMPLE)
-        .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
-        .then(function (data) {
-          if (!data.results.length) {
-            panel.innerHTML = '<p class="sub">No unreviewed candidates found to calibrate on.</p>';
-            btn.disabled = false;
-            return;
-          }
-          startCalibration(data.results);
-        })
-        .catch(function (err) {
-          panel.innerHTML = '<p class="alert">Calibration failed: ' + err.message + '</p>';
-          btn.disabled = false;
-        });
+      panel.innerHTML = '<p class="sub">Starting calibration…</p>';
+      startCalibration();
     });
   }
 
