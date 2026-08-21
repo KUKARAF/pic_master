@@ -39,35 +39,40 @@ def build_index(data_root, kinds=('clip', 'face'), log=print, progress=None):
         raise RuntimeError('Worker unavailable — start/configure the media worker '
                            'before rebuilding the imdb index.')
 
+    # Fresh Database on this background thread — close it in finally so the thread's
+    # own SQLite connection is released deterministically, not left for GC.
     db = Database(os.path.join(os.path.abspath(data_root), '.media', 'media.db'))
-    stats = db.embedding_stats()
-    iters = {'clip': db.iter_clip_embeddings, 'face': db.iter_face_embeddings}
+    try:
+        stats = db.embedding_stats()
+        iters = {'clip': db.iter_clip_embeddings, 'face': db.iter_face_embeddings}
 
-    results = {}
-    for kind in kinds:
-        if kind not in iters:
-            raise ValueError(f'unknown imdb kind {kind!r}')
-        dim = stats.get(kind, {}).get('dim', 0)
-        rows_total = stats.get(kind, {}).get('rows', 0)
-        if not dim or not rows_total:
-            log(f'[imdb] {kind}: no embeddings to ship, skipping')
-            results[kind] = {'rows': 0, 'seconds': 0.0, 'mb': 0.0, 'mbps': 0.0}
-            continue
+        results = {}
+        for kind in kinds:
+            if kind not in iters:
+                raise ValueError(f'unknown imdb kind {kind!r}')
+            dim = stats.get(kind, {}).get('dim', 0)
+            rows_total = stats.get(kind, {}).get('rows', 0)
+            if not dim or not rows_total:
+                log(f'[imdb] {kind}: no embeddings to ship, skipping')
+                results[kind] = {'rows': 0, 'seconds': 0.0, 'mb': 0.0, 'mbps': 0.0}
+                continue
 
-        log(f'[imdb] building {kind} matrix ({rows_total:,} rows × {dim}) ...')
-        t0 = time.time()
-        client.imdb_build_begin(kind, dim, total_rows=rows_total)
-        sent = 0
-        for ids, vecs in iters[kind](chunk=_CHUNK_ROWS):
-            sent = client.imdb_build_chunk(kind, ids, vecs)
-            if progress:
-                progress(kind, sent, time.time() - t0)
-        end = client.imdb_build_end(kind)
-        secs = time.time() - t0
-        mb = end.get('bytes', 0) / 1048576
-        results[kind] = {'rows': end.get('rows', 0), 'seconds': round(secs, 1),
-                         'mb': round(mb, 1), 'mbps': round(mb / secs, 2) if secs else 0.0}
-        log(f'[imdb] {kind}: {end.get("rows", 0):,} rows / {mb:.1f} MB in {secs:.1f}s '
-            f'({results[kind]["mbps"]} MB/s)')
+            log(f'[imdb] building {kind} matrix ({rows_total:,} rows × {dim}) ...')
+            t0 = time.time()
+            client.imdb_build_begin(kind, dim, total_rows=rows_total)
+            sent = 0
+            for ids, vecs in iters[kind](chunk=_CHUNK_ROWS):
+                sent = client.imdb_build_chunk(kind, ids, vecs)
+                if progress:
+                    progress(kind, sent, time.time() - t0)
+            end = client.imdb_build_end(kind)
+            secs = time.time() - t0
+            mb = end.get('bytes', 0) / 1048576
+            results[kind] = {'rows': end.get('rows', 0), 'seconds': round(secs, 1),
+                             'mb': round(mb, 1), 'mbps': round(mb / secs, 2) if secs else 0.0}
+            log(f'[imdb] {kind}: {end.get("rows", 0):,} rows / {mb:.1f} MB in {secs:.1f}s '
+                f'({results[kind]["mbps"]} MB/s)')
 
-    return results
+        return results
+    finally:
+        db.close()

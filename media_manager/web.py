@@ -428,6 +428,34 @@ def _read_rss_bytes():
     return None
 
 
+def _start_malloc_trimmer(interval=60.0):
+    """Periodically hand freed heap memory back to the OS via glibc malloc_trim.
+
+    The search / suggestion / index paths allocate large transient numpy matrices
+    (a whole-library embedding matrix is hundreds of MB). glibc's per-thread malloc
+    arenas cache the freed pages instead of returning them, so with the request
+    threadpool RSS ratchets upward and 'never comes back down' even though nothing
+    is actually leaked. A low-frequency background trim keeps RSS tracking live
+    memory. No-op on non-glibc platforms (malloc_trim absent)."""
+    import ctypes
+    import ctypes.util
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6')
+        trim = libc.malloc_trim
+    except Exception:
+        return  # not glibc / no malloc_trim — nothing to do
+
+    def _loop():
+        while True:
+            time.sleep(interval)
+            try:
+                trim(0)
+            except Exception:
+                return
+
+    threading.Thread(target=_loop, daemon=True, name='malloc-trim').start()
+
+
 def create_app(data_root: str) -> FastAPI:
     """Create and return the FastAPI application rooted at data_root."""
     data_root = os.path.abspath(data_root)
@@ -439,6 +467,10 @@ def create_app(data_root: str) -> FastAPI:
     # nothing when no worker is configured).
     global _worker_client
     _worker_client = worker_client.get_client(data_root)
+
+    # Return freed heap back to the OS periodically (see _start_malloc_trimmer):
+    # the big transient embedding matrices otherwise ratchet RSS upward.
+    _start_malloc_trimmer()
 
     if not os.path.isdir(media_dir):
         raise RuntimeError(
@@ -1792,32 +1824,34 @@ def create_app(data_root: str) -> FastAPI:
         else:
             try:
                 import numpy as np
+                from media_manager.similarity import top_k_indices
                 query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-                dim = query_emb.shape[0]
-                all_embs = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
-                if all_embs:
-                    # One contiguous (N,D) matrix + a single BLAS matmul (GIL released),
-                    # then a C-level top-K select via argpartition — NOT a Python
-                    # sorted(zip(...)) over the whole embeddings table plus four full
-                    # list comprehensions, which held the GIL long enough to stall the
-                    # entire server on a large library.
-                    matrix = np.frombuffer(
-                        b''.join(r[2] for r in all_embs), dtype=np.float32
-                    ).reshape(len(all_embs), dim)
-                    scores = matrix @ query_emb
-                    k = min(len(all_embs), 21)  # 20 results + room to drop self
-                    top = np.argpartition(scores, -k)[-k:]
-                    top = top[np.argsort(scores[top])[::-1]]
-                    ranked = []
-                    for i in top:
-                        r = all_embs[int(i)]
-                        if r[0] == file_id:
+                # Cached, write-invalidated matrix shared library-wide — NOT a
+                # per-request get_all_embeddings() rebuild, which allocated a fresh
+                # ~478 MB matrix on every "find similar" click and, under the request
+                # threadpool, ratcheted RSS via glibc arena retention (the "leak").
+                file_ids, checksums, matrix = db.get_embeddings_matrix()
+                if matrix.shape[0]:
+                    scores = matrix.dot(query_emb)
+                    k = min(matrix.shape[0], 21)  # 20 results + room to drop self
+                    ranked = []  # (file_id, checksum, score)
+                    for i in top_k_indices(scores, k):
+                        fid = int(file_ids[i])
+                        if fid == file_id:
                             continue
-                        ranked.append((r[0], r[1], float(scores[i]), r[3]))
+                        ranked.append((fid, checksums[i], float(scores[i])))
                         if len(ranked) >= 20:
                             break
-                    rows = [(fid, path, True, cs) for fid, path, _score, cs in ranked]
-                    scoremap = {fid: round(score, 4) for fid, _path, score, _cs in ranked}
+                    # Resolve paths for just the top matches (not the whole library).
+                    row_by_cs = {r['checksum']: r for r in
+                                 db.get_files_by_checksums([cs for _f, cs, _s in ranked])}
+                    rows, scoremap = [], {}
+                    for fid, cs, score in ranked:
+                        fr = row_by_cs.get(cs)
+                        if fr is None:
+                            continue
+                        rows.append((fr['id'], fr['path'], True, cs))
+                        scoremap[fr['id']] = round(score, 4)
                     files = _enrich_rows(rows, scores=scoremap)
             except Exception as exc:
                 message = f'Similarity search error: {exc}'
@@ -5414,6 +5448,12 @@ def create_app(data_root: str) -> FastAPI:
                 detail=f'{frame_count} frames exceeds the {MAX_SCAN_FRAMES}-frame safety cap',
             )
 
+        # Evict old finished jobs so this dict can't grow unbounded over the process
+        # lifetime (one entry per distinct file ever scanned).
+        if len(_frame_scan_jobs) > 40:
+            for fid in [k for k, v in _frame_scan_jobs.items()
+                        if v.get('done') and k != file_id][:20]:
+                _frame_scan_jobs.pop(fid, None)
         _frame_scan_jobs[file_id] = {
             'frame_count': frame_count,
             'frames_processed': 0,
