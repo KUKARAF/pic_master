@@ -1920,6 +1920,10 @@ def create_app(data_root: str) -> FastAPI:
     # Reverse-geocode geotagged photos to their nearest offline GeoNames city; same
     # {running,done,total,error} job shape, surfaced in the ⚡ menu as "Match cities".
     cities_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # One-off download+build of the offline GeoNames city table (⚡ "Download cities").
+    # A single download has no per-row progress, so total is a placeholder (1) that
+    # becomes the loaded city count on completion.
+    fetch_cities_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2310,6 +2314,46 @@ def create_app(data_root: str) -> FastAPI:
         if q.strip():
             return db.find_cities(q, limit=20)
         return db.get_used_cities()
+
+    @app.post('/api/fetch-cities/start')
+    def api_fetch_cities_start():
+        """Download the offline GeoNames city database (cities15000, CC-BY 4.0) into
+        media.db — the ⚡-menu equivalent of `media geo fetch-cities`. A single download
+        has no per-row progress, so total starts at 1 (so the generic bulk runner polls
+        instead of treating it as 'nothing to do') and becomes the loaded city count on
+        completion. Rebuilding clears every files.city_id (see replace_cities), so run
+        'Match cities' afterwards."""
+        import threading
+        from media_manager import geonames
+
+        if fetch_cities_job['running']:
+            return {'started': False, 'message': 'City download already running.'}
+        fetch_cities_job.update(running=True, done=0, total=1, error=None)
+
+        def _run():
+            try:
+                count = geonames.fetch_cities(db)
+                fetch_cities_job['total'] = count
+                fetch_cities_job['done'] = count
+            except Exception as exc:
+                fetch_cities_job['error'] = str(exc)
+            finally:
+                fetch_cities_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': 1}
+
+    @app.get('/api/fetch-cities/status')
+    def api_fetch_cities_status():
+        # pending stays 0 (a download isn't a per-item backlog); the loaded count is
+        # surfaced as done/total once it finishes.
+        return {
+            'running': fetch_cities_job['running'],
+            'done': fetch_cities_job['done'],
+            'total': fetch_cities_job['total'],
+            'error': fetch_cities_job['error'],
+            'pending': 0,
+        }
 
     @app.post('/api/match-faces/start')
     def api_match_faces_start():
