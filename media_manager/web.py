@@ -2000,6 +2000,8 @@ def create_app(data_root: str) -> FastAPI:
     # live rows-sent + per-kind timings so /stats-style UI can show the ~1 GB transfer.
     imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'total': 0,
                       'seconds': 0.0, 'results': None, 'error': None}
+    # Precompute each unidentified face's closest known person (for /find_all_faces).
+    face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -5103,6 +5105,33 @@ def create_app(data_root: str) -> FastAPI:
     # Tinder-style face-suggestion card stack (swipe to confirm/reject)
     # ------------------------------------------------------------------
 
+    def compute_face_suggestions(progress=None):
+        """Precompute each still-unidentified face's closest known person + score into
+        faces.suggested_identity/suggested_score — chunked + vectorized (one matmul per
+        chunk against the named-face matrix), so /find_all_faces reads the top matches
+        instantly instead of re-scanning ~227k faces on every buffer refill. Only touches
+        faces with a NULL score (new ones); db.clear_face_suggestions() first for a full
+        refresh after the named set changes. Returns how many were scored; 0 if there are
+        no named faces to match against."""
+        import numpy as np
+        named = manual.get_named_face_embeddings()
+        if not named:
+            return 0
+        names = [n for n, _ in named]
+        named_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])  # K×D
+        done = 0
+        for face_ids, vecs in db.iter_unsuggested_faces(chunk=5000):
+            cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)  # N×D
+            scores = cand @ named_matrix.T  # N×K — one BLAS matmul, not a Python loop
+            best = scores.argmax(axis=1)
+            best_scores = scores[np.arange(len(face_ids)), best]
+            db.set_face_suggestions([(names[int(best[i])], float(best_scores[i]), face_ids[i])
+                                     for i in range(len(face_ids))])
+            done += len(face_ids)
+            if progress:
+                progress(done)
+        return done
+
     def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None, identity_filter=None, avoid_existing=True):
         """Rank unpromoted auto-detected faces against every known identity (same
         embedding math as _suggest_names) and return up to `count` candidates that
@@ -5153,27 +5182,22 @@ def create_app(data_root: str) -> FastAPI:
                 for score, ref, file_id_, identity in candidates[:count]
             ])
 
-        named = manual.get_named_face_embeddings()
-        if not named:
-            return []
-        import numpy as np
-        names = [n for n, _ in named]
-        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
-
+        # Read the PRECOMPUTED closest-known-person per unidentified face (see
+        # compute_face_suggestions), ordered by score — instant, vs the old per-refill
+        # scan of every ~227k unidentified face against the named matrix. Fetch a
+        # generous slice, drop promoted / already-buffered refs, take `count`.
+        promoted = manual.get_promoted_source_ids()
+        fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
+        rows = db.get_suggested_unidentified_faces(SUGGEST_THRESHOLD, fetch)
         candidates = []  # (score, ref, file_id, identity)
-        for face_id_, file_id_, _path, _bbox, emb_bytes in _unpromoted_auto_faces(limit=None):
+        for face_id_, file_id_, _path, _bbox, sug_identity, sug_score in rows:
             ref = f"auto:{face_id_}"
-            if ref in exclude_refs or not emb_bytes:
+            if ref in exclude_refs or face_id_ in promoted or not sug_identity:
                 continue
-            vec = np.frombuffer(emb_bytes, dtype=np.float32)
-            scores = matrix.dot(vec)
-            best_idx = int(scores.argmax())
-            best_score = float(scores[best_idx])
-            if best_score >= SUGGEST_THRESHOLD:
-                candidates.append((best_score, ref, file_id_, names[best_idx]))
+            candidates.append((float(sug_score), ref, file_id_, sug_identity))
 
         from media_manager.swipe_support import bias_reorder
-        candidates.sort(key=lambda c: -c[0])
+        # already score-desc from SQL; keep the deprioritize + confirm/reject bias behavior
         if avoid_existing:
             candidates = _deprioritize_files_with_named_face(candidates, 2)
         candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
@@ -5200,6 +5224,40 @@ def create_app(data_root: str) -> FastAPI:
         cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
                                         identity_filter=identity or None, avoid_existing=avoid_existing)
         return {'cards': cards}
+
+    @app.post('/api/face-suggestions/compute/start')
+    def api_face_suggest_compute_start(full: bool = False):
+        """Precompute the closest known person for every not-yet-scored unidentified
+        face (populates faces.suggested_*), so /find_all_faces can serve instantly.
+        Background job. `full=1` clears + recomputes everyone (use after naming new
+        people); default only scores faces that have no suggestion yet."""
+        import threading
+        if face_suggest_job['running']:
+            return {'started': True}
+        face_suggest_job.update(running=True, done=0, total=0, error=None)
+
+        def _run():
+            try:
+                if full:
+                    db.clear_face_suggestions()
+                face_suggest_job['total'] = db.count_unsuggested_faces()
+                compute_face_suggestions(progress=lambda d: face_suggest_job.__setitem__('done', d))
+            except Exception as exc:
+                face_suggest_job['error'] = str(exc)
+            finally:
+                face_suggest_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True}
+
+    @app.get('/api/face-suggestions/compute/status')
+    def api_face_suggest_compute_status():
+        return {
+            'running': face_suggest_job['running'],
+            'done': face_suggest_job['done'],
+            'total': face_suggest_job['total'],
+            'error': face_suggest_job['error'],
+        }
 
     def _confirm_auto_face(raw_id, name):
         """Core of confirming an auto-detected (media.db) face as `name`: looks up

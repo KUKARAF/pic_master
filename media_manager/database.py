@@ -349,6 +349,16 @@ class Database(ThreadLocalDB):
         faces_cols = {row[1] for row in cursor.execute('PRAGMA table_info(faces)')}
         if 'frame_index' not in faces_cols:
             cursor.execute('ALTER TABLE faces ADD COLUMN frame_index INTEGER')
+        # Precomputed "closest known person" for an unidentified face (identity IS NULL):
+        # the /find_all_faces review reads the top-scoring ones instead of re-scanning
+        # every unidentified face against the named-face matrix on each buffer refill
+        # (see compute_face_suggestions). NULL score = not computed yet.
+        if 'suggested_identity' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN suggested_identity TEXT')
+        if 'suggested_score' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN suggested_score REAL')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_suggested '
+                           'ON faces(suggested_score) WHERE identity IS NULL')
 
         # embeddings' PK changed shape (file_id -> (file_id, frame_index)), which SQLite
         # can't ALTER in place — rebuild the table if it's still the old single-column-PK
@@ -1602,6 +1612,60 @@ class Database(ThreadLocalDB):
             WHERE identity IS NOT NULL AND identity != '__indexed__' AND embedding != x''
         ''')
         return cursor.fetchall()
+
+    # --- Precomputed face suggestions (see web.py compute_face_suggestions) --------
+
+    def count_unsuggested_faces(self):
+        """How many unidentified faces still need a suggestion computed (NULL score)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM faces WHERE identity IS NULL "
+                    "AND suggested_score IS NULL AND embedding != x''")
+        return cur.fetchone()[0]
+
+    def iter_unsuggested_faces(self, chunk=5000):
+        """Stream (face_ids: list[int], vecs: bytes) chunks of unidentified faces whose
+        suggestion hasn't been computed yet — for the chunked, vectorized
+        compute_face_suggestions (never materializes all ~227k face embeddings at once)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, embedding FROM faces WHERE identity IS NULL "
+                    "AND suggested_score IS NULL AND embedding != x'' ORDER BY id")
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows:
+                break
+            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
+
+    def set_face_suggestions(self, updates):
+        """Batch-write precomputed (suggested_identity, suggested_score) — updates is a
+        list of (identity, score, face_id) tuples."""
+        cur = self.conn.cursor()
+        cur.executemany('UPDATE faces SET suggested_identity = ?, suggested_score = ? WHERE id = ?',
+                        updates)
+        self.conn.commit()
+
+    def clear_face_suggestions(self):
+        """Reset all unidentified faces' suggestions (NULL) so the next compute recomputes
+        everyone — used after the named-people set changes."""
+        cur = self.conn.cursor()
+        cur.execute('UPDATE faces SET suggested_identity = NULL, suggested_score = NULL '
+                    'WHERE identity IS NULL')
+        self.conn.commit()
+
+    def get_suggested_unidentified_faces(self, threshold, limit):
+        """Top unidentified faces by precomputed suggested_score (>= threshold), best
+        first — the /find_all_faces review pool. Returns (face_id, file_id, path, bbox,
+        suggested_identity, suggested_score). Caller drops promoted / already-buffered
+        refs. Instant vs the old per-refill full-library scan."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.suggested_identity, fa.suggested_score
+            FROM faces fa
+            JOIN files_with_path f ON f.id = fa.file_id
+            WHERE fa.identity IS NULL AND fa.suggested_score >= ?
+            ORDER BY fa.suggested_score DESC
+            LIMIT ?
+        ''', (threshold, limit))
+        return cur.fetchall()
 
     def get_all_identities(self) -> list:
         """Return [(identity, count)] ordered by count DESC, excluding sentinels and NULL."""

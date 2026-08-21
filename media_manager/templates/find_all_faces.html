@@ -8,12 +8,16 @@
   <a href="/faces" class="sub">← Back to Faces</a>
 </div>
 
-<p class="sub" style="margin-bottom:12px;">Unidentified faces, each matched to its closest known person — confirm or reject each.</p>
+<p class="sub" style="margin-bottom:10px;">Unidentified faces, each matched to its closest known person — confirm or reject each.</p>
 
-<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:12px;">
-  <input type="checkbox" id="faces-avoid-existing-toggle" checked>
-  Deprioritize photos that already have an identified face
-</label>
+<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
+  <label class="sub" style="display:flex;align-items:center;gap:6px;">
+    <input type="checkbox" id="faces-avoid-existing-toggle" checked>
+    Deprioritize photos that already have an identified face
+  </label>
+  <a href="#" id="recompute-all-link" class="sub" title="Recompute every face's closest match — use after naming new people">↻ Recompute all</a>
+  <span id="compute-status" class="sub"></span>
+</div>
 
 <div class="swipe-page">
   <div class="swipe-stack-wrap" id="faces-swipe-stack"></div>
@@ -28,50 +32,90 @@
 {% block scripts %}
 <script src="/static/swipe-core.js"></script>
 <script>
-/* Global unidentified-faces stream (same /api/face-suggestions/next stream as the
-   old inline "Find new faces" section on /faces, now its own page): each card is an
-   unnamed face matched to its closest known person — "Is this X?". */
+/* Global unidentified-faces review. On load (and on "Recompute all") we first
+   precompute each unidentified face's closest known person server-side
+   (/api/face-suggestions/compute), showing progress; once that's done the swipe
+   stream (/api/face-suggestions/next, now reading those precomputed scores) is
+   instant on every refill. */
 (function() {
   if (!window.initSwipeStack || !document.getElementById('faces-swipe-stack')) return;
-  initSwipeStack({
-    stackElId: 'faces-swipe-stack',
-    confirmBtnId: 'faces-swipe-confirm-btn',
-    rejectBtnId: 'faces-swipe-reject-btn',
-    initialCards: [],
-    autoStart: true,
-    biasKeyFor: function(card) { return card.identity; },
-    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
-      var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
-      var params = new URLSearchParams({
-        count: String(need),
-        avoid_existing: String(!avoidToggle || avoidToggle.checked),
-      });
-      if (biasKey) {
-        params.set('bias_identity', biasKey);
-        params.set('bias', biasAction);
+  var status = document.getElementById('compute-status');
+  var stackEl = document.getElementById('faces-swipe-stack');
+  var recomputeLink = document.getElementById('recompute-all-link');
+  var swipeStarted = false;
+
+  function startSwipe() {
+    if (swipeStarted) { return; }
+    swipeStarted = true;
+    initSwipeStack({
+      stackElId: 'faces-swipe-stack',
+      confirmBtnId: 'faces-swipe-confirm-btn',
+      rejectBtnId: 'faces-swipe-reject-btn',
+      initialCards: [],
+      autoStart: true,
+      biasKeyFor: function(card) { return card.identity; },
+      fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+        var avoidToggle = document.getElementById('faces-avoid-existing-toggle');
+        var params = new URLSearchParams({
+          count: String(need),
+          avoid_existing: String(!avoidToggle || avoidToggle.checked),
+        });
+        if (biasKey) { params.set('bias_identity', biasKey); params.set('bias', biasAction); }
+        return '/api/face-suggestions/next?' + params.toString();
+      },
+      renderCard: function(card) {
+        return {
+          imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
+          questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
+          scoreText: 'match score ' + card.score.toFixed(2),
+          metaHtml: swipeCardMeta(card),
+          originalUrl: '/photo/' + card.file_id,
+        };
+      },
+      onConfirm: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
+      },
+      onReject: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
+      },
+      onUndo: function(card) {
+        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
+      },
+      emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces (or name a few people first so there\'s someone to match against), then come back.</div>',
+    });
+  }
+
+  function poll() {
+    fetch('/api/face-suggestions/compute/status').then(function(r){ return r.json(); }).then(function(d) {
+      if (d.error) { status.textContent = 'Compute failed: ' + d.error; return; }
+      if (d.running) {
+        status.textContent = 'Computing suggestions… ' + (d.done || 0).toLocaleString() +
+                             (d.total ? ' / ' + d.total.toLocaleString() : '');
+        setTimeout(poll, 800);
+      } else {
+        status.textContent = '';
+        startSwipe();
       }
-      return '/api/face-suggestions/next?' + params.toString();
-    },
-    renderCard: function(card) {
-      return {
-        imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
-        questionHtml: 'Is this <strong>' + escapeHtml(card.identity) + '</strong>?',
-        scoreText: 'match score ' + card.score.toFixed(2),
-        metaHtml: swipeCardMeta(card),
-        originalUrl: '/photo/' + card.file_id,
-      };
-    },
-    onConfirm: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: card.identity } };
-    },
-    onReject: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
-    },
-    onUndo: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
-    },
-    emptyStateHtml: '<div class="swipe-empty">No more suggestions right now.<br>Detect more faces (or name a few people first so there\'s someone to match against), then come back.</div>',
+    }).catch(function(e){ status.textContent = 'Status failed: ' + e.message; });
+  }
+
+  function runCompute(full) {
+    stackEl.innerHTML = '<div class="swipe-empty">Computing suggestions…</div>';
+    status.textContent = 'Computing suggestions…';
+    fetch('/api/face-suggestions/compute/start' + (full ? '?full=1' : ''), { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(){ poll(); })
+      .catch(function(e){ status.textContent = 'Failed to start: ' + e.message; });
+  }
+
+  recomputeLink.addEventListener('click', function(e) {
+    e.preventDefault();
+    if (!confirm('Recompute the closest known person for every unidentified face? (Use this after naming new people.)')) return;
+    // Reload with the full-recompute flag — cleanest way to get a fresh stack afterward.
+    location.href = '/find_all_faces?recompute=1';
   });
+  var doFull = new URLSearchParams(location.search).get('recompute') === '1';
+  runCompute(doFull);
 })();
 </script>
 {% endblock %}
