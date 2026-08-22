@@ -43,8 +43,13 @@
   .feed-heart.is-fav { color:#ff5b7f; }
   .feed-open { text-decoration:none; font-size:0.85em; border:1px solid rgba(255,255,255,.5);
     border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
-  .feed-muted { position:absolute; top:10px; right:12px; z-index:3; background:rgba(0,0,0,.5);
+  .feed-muted { position:absolute; top:52px; right:12px; z-index:3; background:rgba(0,0,0,.5);
     color:#fff; border:none; border-radius:50%; width:34px; height:34px; font-size:1em; cursor:pointer; }
+  /* Floating transparent "add the rest of this set" button (top-right). */
+  .feed-setbtn { position:absolute; top:10px; right:12px; z-index:3; background:rgba(0,0,0,.35);
+    color:#fff; border:1px solid rgba(255,255,255,.4); border-radius:16px; padding:5px 12px;
+    font-size:0.82em; cursor:pointer; max-width:55%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .feed-setbtn:active { background:rgba(121,242,121,.45); }
   /* Tappable known-face chips (interactive /random feed) */
   .feed-chips { position:absolute; top:10px; left:12px; right:56px; z-index:3;
     display:flex; gap:6px; flex-wrap:wrap; }
@@ -104,23 +109,6 @@
     }).catch(function () {});
   }
 
-  // Set membership → a tappable toast to pull in the rest of that set.
-  function maybeSetToast(item) {
-    if (source !== 'random' || item.dataset.toastShown === '1' || !window.showToast) return;
-    var sets = item._sets || [];
-    if (!sets.length) return;
-    item.dataset.toastShown = '1';
-    var s = sets[0];
-    var toast = showToast('In set "' + s.name + '"');
-    var msg = toast && toast.querySelector('.toast-msg');
-    if (msg) {
-      var a = document.createElement('a');
-      a.href = '#'; a.textContent = '  + add more';
-      a.style.cssText = 'color:inherit;text-decoration:underline;white-space:nowrap;';
-      a.addEventListener('click', function (e) { e.preventDefault(); injectFrom('set', s.id); });
-      msg.appendChild(a);
-    }
-  }
 
   function sizeFeed() {
     var top = feed.getBoundingClientRect().top;
@@ -196,7 +184,6 @@
       if (e.isIntersecting) {
         activeItem = e.target;
         if (source === 'queue') onActive(e.target);
-        else if (source === 'random') maybeSetToast(e.target);
       }
       var v = e.target.querySelector('video');
       if (!v) return;
@@ -236,6 +223,17 @@
           chipsEl.appendChild(chip);
         });
       }
+      // Floating transparent set button (top-right) → inject the rest of the set.
+      var oldBtn = item.querySelector('.feed-setbtn');
+      if (oldBtn) oldBtn.remove();
+      if (item._sets.length) {
+        var s = item._sets[0];
+        var sb = document.createElement('button');
+        sb.type = 'button'; sb.className = 'feed-setbtn'; sb.textContent = '🗂 ' + s.name + '  ＋';
+        sb.title = 'Add more from set "' + s.name + '"';
+        sb.addEventListener('click', function (e) { e.stopPropagation(); injectFrom('set', s.id); });
+        item.appendChild(sb);
+      }
     }
   }
 
@@ -254,7 +252,7 @@
       // Double-tap the media → favorite + inject visually-similar into the mix.
       var lastTap = 0;
       section.addEventListener('click', function (e) {
-        if (e.target.closest('.feed-chips, .feed-caption, .feed-muted, .feed-progress')) return;
+        if (e.target.closest('.feed-chips, .feed-caption, .feed-muted, .feed-progress, .feed-setbtn')) return;
         var now = Date.now();
         if (now - lastTap < 300) { lastTap = 0; doFavorite(section); injectFrom('similar', section.dataset.fileId); }
         else lastTap = now;
