@@ -2251,6 +2251,22 @@
       goTo(queue.ids[queue.cursor]);
     }
 
+    // Warm the browser cache with the neighbouring full-res images (±2) so a
+    // Left/Right/swipe step shows instantly instead of downloading /image on
+    // navigation. /image is served with immutable cache headers, so these stay
+    // cached. Deferred so the CURRENT photo's image gets bandwidth priority first.
+    if (queue && queue.ids.length > 1) {
+      setTimeout(function () {
+        [1, -1, 2, -2].forEach(function (d) {
+          var i = queue.cursor + d;
+          if (i >= 0 && i < queue.ids.length) {
+            var im = new Image();
+            im.src = '/image/' + queue.ids[i];
+          }
+        });
+      }, 350);
+    }
+
     function isTypingTarget(el) {
       if (!el) return false;
       const tag = el.tagName;
