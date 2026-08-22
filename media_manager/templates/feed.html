@@ -16,7 +16,7 @@
 </div>
 
 <div class="feed" id="feed"></div>
-<div id="feed-status" class="sub" style="text-align:center;padding:12px;"></div>
+<div id="feed-status" class="sub" style="text-align:center;padding:10px;"></div>
 
 <style>
   :root { --feed-h: calc(100dvh - 118px); }
@@ -25,12 +25,16 @@
   .feed-filters { display:flex; gap:14px; flex-wrap:wrap; }
   .feed-filters label { display:flex; align-items:center; gap:5px; cursor:pointer; }
   .feed { height: var(--feed-h); overflow-y:auto; scroll-snap-type:y mandatory;
-    -webkit-overflow-scrolling:touch; border-radius:var(--radius); background:#000; }
-  .feed-item { height: var(--feed-h); scroll-snap-align:start; position:relative;
-    display:flex; align-items:center; justify-content:center; background:#000; }
+    -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
+    border-radius:var(--radius); background:#000; }
+  /* No scrollbars — TikTok-style bare scroll surface. */
+  .feed { scrollbar-width:none; -ms-overflow-style:none; }
+  .feed::-webkit-scrollbar { display:none; }
+  .feed-item { height: var(--feed-h); scroll-snap-align:start; scroll-snap-stop:always;
+    position:relative; display:flex; align-items:center; justify-content:center; background:#000; }
   .feed-item img, .feed-item video { max-width:100%; max-height:100%; object-fit:contain; display:block; }
   .feed-caption { position:absolute; left:0; right:0; bottom:0; display:flex; align-items:center;
-    gap:14px; padding:12px 16px 16px; color:#fff;
+    gap:14px; padding:12px 16px 16px; color:#fff; z-index:2;
     background:linear-gradient(transparent, rgba(0,0,0,.75)); }
   .feed-caption a { color:#fff; }
   .feed-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.9em; }
@@ -38,6 +42,8 @@
   .feed-heart.is-fav { color:#ff5b7f; }
   .feed-open { text-decoration:none; font-size:0.85em; border:1px solid rgba(255,255,255,.5);
     border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
+  .feed-muted { position:absolute; top:10px; right:12px; z-index:2; background:rgba(0,0,0,.5);
+    color:#fff; border:none; border-radius:50%; width:34px; height:34px; font-size:1em; cursor:pointer; }
 </style>
 {% endblock %}
 
@@ -50,7 +56,8 @@
   if (!feed) return;
 
   var offset = 0, loading = false, hasMore = true;
-  var seen = {};  // dedupe (mainly for random, which ignores offset)
+  var seen = {};
+  var soundOn = false;  // shared: once you unmute one, later videos stay unmuted
 
   function unlovedParams() {
     var p = {};
@@ -58,29 +65,89 @@
     return p;
   }
 
+  // --- media mount/unmount: only items near the viewport hold an <img>/<video>;
+  //     scrolling one away removes its media element and stops playback (TikTok-style).
+  function mountMedia(item) {
+    if (item.dataset.mounted === '1') return;
+    item.dataset.mounted = '1';
+    var id = item.dataset.fileId;
+    var media;
+    if (item.dataset.isVideo === '1') {
+      media = document.createElement('video');
+      media.src = '/image/' + id;
+      media.loop = true; media.playsInline = true; media.muted = !soundOn;
+      media.preload = 'auto';
+      media.addEventListener('click', function () {
+        soundOn = media.muted;  // toggle
+        media.muted = !soundOn;
+        var b = item.querySelector('.feed-muted'); if (b) b.textContent = media.muted ? '🔇' : '🔊';
+      });
+      var mbtn = document.createElement('button');
+      mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = media.muted ? '🔇' : '🔊';
+      mbtn.addEventListener('click', function (e) { e.stopPropagation(); media.click(); });
+      item.insertBefore(mbtn, item.firstChild);
+    } else {
+      media = document.createElement('img');
+      media.src = '/image/' + id;
+      media.loading = 'eager';
+      media.alt = '';
+    }
+    item.insertBefore(media, item.firstChild);
+  }
+
+  function unmountMedia(item) {
+    if (item.dataset.mounted !== '1') return;
+    item.dataset.mounted = '0';
+    var v = item.querySelector('video');
+    if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
+    var media = item.querySelector('video, img');
+    if (media) media.remove();
+    var mbtn = item.querySelector('.feed-muted');
+    if (mbtn) mbtn.remove();
+  }
+
+  // Mount media for items within ~1 viewport of the visible area, unmount beyond.
+  var mountObs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) mountMedia(e.target); else unmountMedia(e.target);
+    });
+  }, { root: feed, rootMargin: '120% 0px', threshold: 0 });
+
+  // Autoplay the item that's mostly on screen; pause + rewind the rest.
+  var playObs = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      var v = e.target.querySelector('video');
+      if (!v) return;
+      if (e.isIntersecting) { v.muted = !soundOn; v.currentTime = 0; v.play().catch(function () {}); }
+      else { v.pause(); }
+    });
+  }, { root: feed, threshold: 0.7 });
+
   function itemNode(it) {
     var section = document.createElement('div');
     section.className = 'feed-item';
-    var media = it.is_video
-      ? '<video src="/image/' + it.file_id + '" controls playsinline preload="metadata"></video>'
-      : '<img src="/image/' + it.file_id + '" alt="" loading="lazy">';
-    section.innerHTML = media +
-      '<div class="feed-caption">' +
-        '<button type="button" class="feed-heart' + (it.favorite ? ' is-fav' : '') + '" title="Favorite">' +
-          (it.favorite ? '♥ ' + it.favorite : '♡') + '</button>' +
-        '<span class="feed-name">' + escapeHtml(it.filename) + '</span>' +
-        '<a class="feed-open" href="/photo/' + it.file_id + '">Open</a>' +
-      '</div>';
-    var heart = section.querySelector('.feed-heart');
-    heart.addEventListener('click', function () {
+    section.dataset.fileId = it.file_id;
+    section.dataset.isVideo = it.is_video ? '1' : '0';
+    section.dataset.mounted = '0';
+    // Caption is built upfront (lightweight); media is mounted lazily by the observers.
+    var cap = document.createElement('div');
+    cap.className = 'feed-caption';
+    cap.innerHTML =
+      '<button type="button" class="feed-heart' + (it.favorite ? ' is-fav' : '') + '" title="Favorite">' +
+        (it.favorite ? '♥ ' + it.favorite : '♡') + '</button>' +
+      '<span class="feed-name">' + escapeHtml(it.filename) + '</span>' +
+      '<a class="feed-open" href="/photo/' + it.file_id + '">Open</a>';
+    cap.querySelector('.feed-heart').addEventListener('click', function () {
+      var h = cap.querySelector('.feed-heart');
       fetch('/api/files/' + it.file_id + '/favorite', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ delta: 1 }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ delta: 1 }),
       }).then(function (r) { return r.json(); }).then(function (d) {
-        heart.classList.add('is-fav');
-        heart.textContent = '♥ ' + d.count;
+        h.classList.add('is-fav'); h.textContent = '♥ ' + d.count;
       }).catch(function () {});
     });
+    section.appendChild(cap);
+    mountObs.observe(section);
+    playObs.observe(section);
     return section;
   }
 
@@ -102,30 +169,29 @@
         });
         offset += (d.items || []).length;
         hasMore = d.has_more && (source !== 'random' || added > 0);
-        statusEl.textContent = feed.children.length ? (hasMore ? '' : '— end —')
+        statusEl.textContent = feed.children.length
+          ? (hasMore ? '' : '— end —')
           : 'Nothing here' + (source === 'unloved' ? ' — everything ticked has been handled.' : '.');
         loading = false;
-        // If the viewport isn't filled yet, keep loading.
         if (hasMore && feed.scrollHeight <= feed.clientHeight + 10) loadMore();
       })
       .catch(function (e) { statusEl.textContent = 'Failed: ' + e.message; loading = false; });
   }
 
-  // Load the next page as the last item scrolls into view.
   feed.addEventListener('scroll', function () {
     if (feed.scrollTop + feed.clientHeight >= feed.scrollHeight - feed.clientHeight * 1.5) loadMore();
   });
 
   function reset() {
+    feed.querySelectorAll('.feed-item').forEach(function (it) {
+      mountObs.unobserve(it); playObs.unobserve(it); unmountMedia(it);
+    });
     feed.innerHTML = '';
     offset = 0; loading = false; hasMore = true; seen = {};
     loadMore();
   }
 
-  document.querySelectorAll('.unloved-filter').forEach(function (cb) {
-    cb.addEventListener('change', reset);
-  });
-
+  document.querySelectorAll('.unloved-filter').forEach(function (cb) { cb.addEventListener('change', reset); });
   loadMore();
 })();
 </script>
