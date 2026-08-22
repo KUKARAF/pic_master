@@ -184,6 +184,7 @@
     } else {
       var img = document.createElement('img');
       img.src = '/image/' + id; img.loading = 'eager'; img.alt = '';
+      img.draggable = false;  // else a horizontal mouse-drag starts a native image-drag and eats the swipe
       if (source === 'random') img.addEventListener('load', function () { positionFaceBoxes(item); });
       item.insertBefore(img, item.firstChild);
     }
@@ -300,12 +301,14 @@
     setTimeout(function () { el.classList.remove('flash'); }, 350);
   }
   function triggerSet(item) {
-    if (!item || !item._sets || !item._sets.length) return;
+    if (!item) return;
+    if (!item._sets || !item._sets.length) { if (window.showToast) showToast('No set on this photo'); return; }
     flashSwipe(item.querySelector('.feed-swipe.right'));
     injectFrom('set', item._sets[0].id);
   }
   function triggerCategory(item) {
-    if (!item || !item._cats || !item._cats.length) return;
+    if (!item) return;
+    if (!item._cats || !item._cats.length) { if (window.showToast) showToast('No category on this photo'); return; }
     flashSwipe(item.querySelector('.feed-swipe.left'));
     injectFrom('category', item._cats[0].name);
   }
@@ -313,6 +316,12 @@
   // Reveal the helper overlays (face squares + swipe arrows/labels) for one tap;
   // they auto-hide again so the image stays clean by default.
   function showHelpers(item) {
+    var nFaces = (item.querySelector('.feed-face-layer') || {}).childElementCount || 0;
+    var hasSet = item._sets && item._sets.length, hasCat = item._cats && item._cats.length;
+    if (!nFaces && !hasSet && !hasCat) {
+      if (window.showToast) showToast('No named face, set, or category on this one');
+      return;
+    }
     item.classList.add('helpers-on');
     if (item._hideTimer) clearTimeout(item._hideTimer);
     item._hideTimer = setTimeout(function () { item.classList.remove('helpers-on'); }, 4000);
@@ -341,28 +350,29 @@
     }
     section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-caption' }));
     if (source === 'random') {
-      // Pointer-based gesture (mouse + touch, so it also works on desktop):
-      //  - horizontal swipe right → set, left → category (coexists with vertical
-      //    scroll-snap: only horizontal-dominant drags act, and we never preventDefault).
-      //  - one tap → reveal the helpers (face squares + swipe arrows).
-      //  - fast double tap → favorite + inject visually-similar.
-      var downX = 0, downY = 0, isDown = false, swiped = false, tapTimer = null;
+      // One pointer handler for the whole gesture set (mouse + touch, so it works on
+      // desktop too — the earlier touch-only version was dead under a mouse). We never
+      // preventDefault, so vertical scroll-snap is untouched. Taps on the interactive
+      // overlays (face squares / swipe strips / caption controls) are left to their own
+      // click handlers.
+      //   horizontal drag → set (right) / category (left)
+      //   single tap      → reveal helpers (face squares + swipe arrows)
+      //   fast double tap → favorite + inject visually-similar
+      var downX = 0, downY = 0, downT = 0, isDown = false, tapTimer = null;
       section.addEventListener('pointerdown', function (e) {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
-        downX = e.clientX; downY = e.clientY; isDown = true; swiped = false;
+        downX = e.clientX; downY = e.clientY; downT = e.timeStamp; isDown = true;
       });
       section.addEventListener('pointerup', function (e) {
         if (!isDown) return; isDown = false;
-        var dx = e.clientX - downX, dy = e.clientY - downY;
-        if (Math.abs(dx) >= 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
-          swiped = true;  // suppress the click that follows this drag
-          if (dx > 0) triggerSet(section); else triggerCategory(section);
-        }
-      });
-      section.addEventListener('click', function (e) {
-        if (swiped) { swiped = false; return; }  // this "click" was really a swipe
         if (e.target.closest('.feed-caption, .feed-muted, .feed-progress, .feed-face-box, .feed-swipe')) return;
-        if (tapTimer) {  // second tap within the window → double tap
+        var dx = e.clientX - downX, dy = e.clientY - downY, dt = e.timeStamp - downT;
+        if (Math.abs(dx) >= 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {   // horizontal swipe
+          if (dx > 0) triggerSet(section); else triggerCategory(section);
+          return;
+        }
+        if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || dt > 600) return;  // a scroll / long-press, not a tap
+        if (tapTimer) {  // second tap inside the window → double tap
           clearTimeout(tapTimer); tapTimer = null;
           doFavorite(section); injectFrom('similar', section.dataset.fileId);
         } else {
