@@ -305,14 +305,12 @@
     setTimeout(function () { el.classList.remove('flash'); }, 350);
   }
   function triggerSet(item) {
-    if (!item) return;
-    if (!item._sets || !item._sets.length) { if (window.showToast) showToast('No set on this photo'); return; }
+    if (!item || !item._sets || !item._sets.length) return;  // nothing to add — just ignore
     flashSwipe(item.querySelector('.feed-swipe.right'));
     injectFrom('set', item._sets[0].id);
   }
   function triggerCategory(item) {
-    if (!item) return;
-    if (!item._cats || !item._cats.length) { if (window.showToast) showToast('No category on this photo'); return; }
+    if (!item || !item._cats || !item._cats.length) return;
     flashSwipe(item.querySelector('.feed-swipe.left'));
     injectFrom('category', item._cats[0].name);
   }
