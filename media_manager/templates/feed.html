@@ -1,12 +1,12 @@
 {% extends "base.html" %}
 
-{% block title %}{{ feed_title }} — media{% endblock %}
+{% block title %}{{ feed_title or 'Queue' }} — media{% endblock %}
 
 {% block container_class %}feed-page{% endblock %}
 
 {% block content %}
 <div class="feed-header">
-  <h1 class="feed-title">{{ feed_title }}</h1>
+  <h1 class="feed-title">{{ feed_title or '▚ Queue' }}</h1>
   {% if source == 'unloved' %}
   <div class="feed-filters sub">
     <label><input type="checkbox" class="unloved-filter" data-key="no_name" checked> no name</label>
@@ -21,9 +21,7 @@
 <div id="feed-status"></div>
 
 <style>
-  :root { --feed-h: 80vh; }  /* JS sets the exact px height so nothing overflows */
-  /* Full-bleed on feed pages: kill the .container padding/max-width that otherwise
-     leaves a navbar-height scroll below the feed. */
+  :root { --feed-h: 80vh; }
   .container.feed-page { max-width:none; padding:0; }
   .feed-header { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin:0; padding:10px 14px 6px; }
   .feed-title { margin:0; }
@@ -47,7 +45,6 @@
     border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
   .feed-muted { position:absolute; top:10px; right:12px; z-index:3; background:rgba(0,0,0,.5);
     color:#fff; border:none; border-radius:50%; width:34px; height:34px; font-size:1em; cursor:pointer; }
-  /* Slim seekable progress bar at the very bottom edge (native controls would cover the caption). */
   .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
     background:rgba(255,255,255,.22); cursor:pointer; }
   .feed-progress:hover { height:8px; }
@@ -69,11 +66,7 @@
   var seen = {};
   var soundOn = false;
 
-  // Size the feed to exactly fill from its top to the viewport bottom — measured, so
-  // it works regardless of navbar/header height and never leaves a stray scroll.
   function sizeFeed() {
-    // Fill from the feed's top edge to the bottom of the viewport — exact, so nothing
-    // below it (padding/status) creates a stray scroll.
     var top = feed.getBoundingClientRect().top;
     document.documentElement.style.setProperty('--feed-h', Math.max(200, window.innerHeight - top) + 'px');
   }
@@ -86,8 +79,9 @@
     return p;
   }
 
+  // --- media mount/unmount (shared by every source) --------------------------------
   function mountMedia(item) {
-    if (item.dataset.mounted === '1') return;
+    if (item.dataset.mounted === '1' || item.dataset.metaLoaded === '0') return;
     item.dataset.mounted = '1';
     var id = item.dataset.fileId;
     if (item.dataset.isVideo === '1') {
@@ -99,12 +93,10 @@
         var b = item.querySelector('.feed-muted'); if (b) b.textContent = video.muted ? '🔇' : '🔊';
       });
       item.insertBefore(video, item.firstChild);
-
       var mbtn = document.createElement('button');
       mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = video.muted ? '🔇' : '🔊';
       mbtn.addEventListener('click', function (e) { e.stopPropagation(); video.click(); });
       item.appendChild(mbtn);
-
       var prog = document.createElement('div');
       prog.className = 'feed-progress';
       var fill = document.createElement('div');
@@ -135,11 +127,17 @@
   }
 
   var mountObs = new IntersectionObserver(function (entries) {
-    entries.forEach(function (e) { if (e.isIntersecting) mountMedia(e.target); else unmountMedia(e.target); });
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        if (source === 'queue') ensureMeta(e.target).then(function () { mountMedia(e.target); });
+        else mountMedia(e.target);
+      } else unmountMedia(e.target);
+    });
   }, { root: feed, rootMargin: '120% 0px', threshold: 0 });
 
   var playObs = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
+      if (e.isIntersecting && source === 'queue') onActive(e.target);
       var v = e.target.querySelector('video');
       if (!v) return;
       if (e.isIntersecting) { v.muted = !soundOn; v.currentTime = 0; v.play().catch(function () {}); }
@@ -147,14 +145,11 @@
     });
   }, { root: feed, threshold: 0.7 });
 
-  function itemNode(it) {
-    var section = document.createElement('div');
-    section.className = 'feed-item';
-    section.dataset.fileId = it.file_id;
-    section.dataset.isVideo = it.is_video ? '1' : '0';
-    section.dataset.mounted = '0';
-    var cap = document.createElement('div');
-    cap.className = 'feed-caption';
+  // --- caption ---------------------------------------------------------------------
+  function fillMeta(item, it) {
+    item.dataset.isVideo = it.is_video ? '1' : '0';
+    item.dataset.metaLoaded = '1';
+    var cap = item.querySelector('.feed-caption');
     cap.innerHTML =
       '<button type="button" class="feed-heart' + (it.favorite ? ' is-fav' : '') + '" title="Favorite">' +
         (it.favorite ? '♥ ' + it.favorite : '♡') + '</button>' +
@@ -168,12 +163,76 @@
         h.classList.add('is-fav'); h.textContent = '♥ ' + d.count;
       }).catch(function () {});
     });
-    section.appendChild(cap);
+  }
+
+  function makeItem(id, idx) {
+    var section = document.createElement('div');
+    section.className = 'feed-item';
+    section.dataset.fileId = id;
+    if (idx != null) section.dataset.idx = idx;
+    section.dataset.mounted = '0';
+    section.dataset.metaLoaded = '0';
+    section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-caption' }));
     mountObs.observe(section);
     playObs.observe(section);
     return section;
   }
 
+  // --- source: watch queue (ids from sessionStorage; captions fetched lazily) ------
+  var queueTotal = 0;
+  function ensureMeta(item) {
+    if (item.dataset.metaLoaded === '1') return Promise.resolve();
+    var batch = [], nodes = [], el = item;
+    while (el && batch.length < 16) {
+      if (el.classList && el.classList.contains('feed-item') &&
+          el.dataset.metaLoaded === '0' && el.dataset.fetching !== '1') {
+        el.dataset.fetching = '1'; batch.push(parseInt(el.dataset.fileId, 10)); nodes.push(el);
+      }
+      el = el.nextElementSibling;
+    }
+    if (!batch.length) return Promise.resolve();
+    return fetch('/api/feed/queue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids: batch }),
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      var byId = {};
+      (d.items || []).forEach(function (it) { byId[it.file_id] = it; });
+      nodes.forEach(function (n) {
+        n.dataset.fetching = '0';
+        var it = byId[parseInt(n.dataset.fileId, 10)];
+        if (it) fillMeta(n, it); else n.dataset.metaLoaded = '1';  // deleted → mark done, leave blank
+      });
+    }).catch(function () { nodes.forEach(function (n) { n.dataset.fetching = '0'; }); });
+  }
+
+  function onActive(item) {
+    var idx = parseInt(item.dataset.idx, 10);
+    if (isNaN(idx)) return;
+    statusEl.textContent = (idx + 1) + ' / ' + queueTotal;
+    try {
+      var q = JSON.parse(sessionStorage.getItem('photoQueue') || '{}');
+      if (q && q.ids) { q.cursor = idx; sessionStorage.setItem('photoQueue', JSON.stringify(q)); }
+    } catch (e) {}
+  }
+
+  function buildQueue() {
+    var q = {};
+    try { q = JSON.parse(sessionStorage.getItem('photoQueue') || '{}'); } catch (e) {}
+    var ids = q.ids || [];
+    queueTotal = ids.length;
+    if (!ids.length) {
+      feed.innerHTML = '<div class="feed-item"><div class="swipe-empty">No queue — open photos from a grid or search.<br>' +
+        '<a href="/files" style="color:#fff">Browse files</a></div></div>';
+      return;
+    }
+    var frag = document.createDocumentFragment();
+    ids.forEach(function (id, idx) { frag.appendChild(makeItem(id, idx)); });
+    feed.appendChild(frag);
+    var cursor = Math.max(0, Math.min(ids.length - 1, q.cursor || 0));
+    var target = feed.children[cursor];
+    if (target) { target.scrollIntoView(); statusEl.textContent = (cursor + 1) + ' / ' + queueTotal; }
+  }
+
+  // --- source: browse feeds (biggest/random/favorites/unloved), forward paging -----
   function loadMore() {
     if (loading || !hasMore) return;
     loading = true;
@@ -187,7 +246,9 @@
         (d.items || []).forEach(function (it) {
           if (seen[it.file_id]) return;
           seen[it.file_id] = true;
-          feed.appendChild(itemNode(it));
+          var section = makeItem(it.file_id, null);
+          fillMeta(section, it);
+          feed.appendChild(section);
           added++;
         });
         offset += (d.items || []).length;
@@ -202,7 +263,16 @@
   }
 
   feed.addEventListener('scroll', function () {
+    if (source === 'queue') return;
     if (feed.scrollTop + feed.clientHeight >= feed.scrollHeight - feed.clientHeight * 1.5) loadMore();
+  });
+
+  // Up/Down (and k/j) step one item — scroll-snap containers don't move on arrow keys.
+  function isTyping(el) { return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable); }
+  document.addEventListener('keydown', function (e) {
+    if (isTyping(document.activeElement) || e.altKey || e.ctrlKey || e.metaKey) return;
+    if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); feed.scrollBy({ top: feed.clientHeight, behavior: 'smooth' }); }
+    else if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); feed.scrollBy({ top: -feed.clientHeight, behavior: 'smooth' }); }
   });
 
   function reset() {
@@ -213,9 +283,10 @@
     offset = 0; loading = false; hasMore = true; seen = {};
     loadMore();
   }
-
   document.querySelectorAll('.unloved-filter').forEach(function (cb) { cb.addEventListener('change', reset); });
-  loadMore();
+
+  if (source === 'queue') buildQueue();
+  else loadMore();
 })();
 </script>
 {% endblock %}

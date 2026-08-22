@@ -1968,8 +1968,7 @@
           if (cursor < 0) cursor = 0;
           var label = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (q || 'search');
           sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor, label: 'Search: ' + label }));
-          sessionStorage.setItem('photoQueueNavigating', '1');
-          window.location.href = '/photo/' + ids[cursor];
+          window.location.href = '/queue';  // open the vertical queue feed at the cursor
         })
         .catch(function (err) { showToast('Failed to open results: ' + err.message); });
     }
@@ -3289,8 +3288,7 @@
           return;
         }
         setPhotoQueue(ids, opts.label, 0);
-        sessionStorage.setItem('photoQueueNavigating', '1');
-        window.location.href = '/photo/' + ids[0];
+        window.location.href = '/queue';  // open the vertical queue feed
       })
       .catch(function (err) {
         el.textContent = glyph; delete el.dataset.busy;

@@ -138,6 +138,11 @@ document.addEventListener('click', function (e) {
     cursor: cursor,
     label: container.dataset.queueSource || document.title,
   }));
+  // Open the TikTok-style vertical queue feed instead of the full photo page; the
+  // feed reads this sessionStorage queue and starts at the clicked item. ("Open" in
+  // the feed jumps to the full /photo/{id} editor.)
+  e.preventDefault();
+  window.location.href = '/queue';
 });
 </script>
 <script src="/static/app.js"></script>

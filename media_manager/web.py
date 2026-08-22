@@ -90,6 +90,10 @@ class FavoriteBody(BaseModel):
     # left-click, -1 on right-click) and the endpoint returns the new count.
     delta: int = 1
 
+class FeedQueueBody(BaseModel):
+    # Ordered file ids for the watch-queue feed (/api/feed/queue).
+    ids: List[int] = []
+
 class TagLabelBody(BaseModel):
     label: str
 
@@ -1269,6 +1273,33 @@ def create_app(data_root: str) -> FastAPI:
     def favorites_page(request: Request):
         return _feed_page(request, 'favorites', '⭐ Favorites')
 
+    @app.get('/queue', response_class=HTMLResponse)
+    def queue_feed_page(request: Request):
+        """The watch-queue as a vertical TikTok feed. The id list + cursor come from
+        sessionStorage (set by whatever grid/search opened it); feed.html reads them and
+        pages captions via /api/feed/queue."""
+        return _feed_page(request, 'queue', '')
+
+    def _feed_items(rows):
+        """(file_id, path, checksum) rows → feed item dicts (favorite + is_video)."""
+        fav_counts = manual.get_favorite_counts([cs for _i, _p, cs in rows])
+        return [{
+            'file_id': fid, 'filename': os.path.basename(path), 'checksum': cs,
+            'favorite': fav_counts.get(cs, 0),
+            'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
+        } for fid, path, cs in rows]
+
+    @app.post('/api/feed/queue')
+    def api_feed_queue(body: FeedQueueBody):
+        """Feed items for an explicit ordered list of file ids (the watch queue).
+        Order is preserved; ids that no longer exist are skipped."""
+        rows = []
+        for fid in body.ids:
+            r = db.get_file_by_id(fid)
+            if r is not None:
+                rows.append((r['id'], r['path'], r['checksum']))
+        return {'items': _feed_items(rows)}
+
     @app.get('/api/feed')
     def api_feed(source: str, offset: int = 0, limit: int = 8,
                  no_name: bool = True, no_set: bool = True, no_tag: bool = True,
@@ -1309,13 +1340,7 @@ def create_app(data_root: str) -> FastAPI:
         else:
             raise HTTPException(status_code=400, detail=f'unknown feed source {source!r}')
 
-        fav_counts = manual.get_favorite_counts([cs for _i, _p, cs in rows])
-        items = [{
-            'file_id': fid, 'filename': os.path.basename(path), 'checksum': cs,
-            'favorite': fav_counts.get(cs, 0),
-            'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
-        } for fid, path, cs in rows]
-        return {'items': items, 'has_more': len(rows) >= limit}
+        return {'items': _feed_items(rows), 'has_more': len(rows) >= limit}
 
     @app.get('/photo/{file_id}', response_class=HTMLResponse)
     def photo_page(request: Request, file_id: int):
