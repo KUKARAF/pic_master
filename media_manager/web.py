@@ -1288,25 +1288,33 @@ def create_app(data_root: str) -> FastAPI:
 
     def _feed_items(rows):
         """(file_id, path, checksum) rows → feed item dicts. Carries the photo's named
-        people + sets too, so the interactive /random feed can offer 'more like this
-        person / set'."""
+        people (with face bounding boxes), sets, and categories too, so the interactive
+        /random feed can offer 'more like this person / set / category': tappable
+        transparent squares over each face, swipe-right for the set, swipe-left for the
+        category."""
         checksums = [cs for _i, _p, cs in rows]
         fav_counts = manual.get_favorite_counts(checksums)
         people_map = manual.get_identities_for_checksums(checksums)  # {cs: [name, ...]}
+        faces_map = manual.get_named_faces_with_bbox_for_checksums(checksums)  # {cs: [{identity,x1..y2}]}
         sets_map = manual.get_sets_for_checksums(checksums)          # {cs: [{id,name,studio}]}
+        cats_map = resolve_categories_for_checksums(               # {cs: [{name,source,score}]}
+            manual, db, [(fid, cs) for fid, _p, cs in rows])
         return [{
             'file_id': fid, 'filename': os.path.basename(path), 'checksum': cs,
             'favorite': fav_counts.get(cs, 0),
             'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
             'people': people_map.get(cs, []),
+            'faces': faces_map.get(cs, []),
             'sets': [{'id': s['id'], 'name': s['name']} for s in sets_map.get(cs, [])],
+            'categories': [{'name': c['name']} for c in cats_map.get(cs, [])],
         } for fid, path, cs in rows]
 
     @app.post('/api/feed/more')
     def api_feed_more(body: FeedMoreBody):
         """Inject more photos 'into the mix' for the interactive /random feed:
         kind='identity' (value=name) → that person's photos; kind='set' (value=set id)
-        → the set's members; kind='similar' (value=file id) → visually-similar via the
+        → the set's members; kind='category' (value=category name) → the category's
+        resolved members; kind='similar' (value=file id) → visually-similar via the
         cached embeddings matrix. Excludes ids already in the feed; capped at 20."""
         exclude = set(body.exclude)
         rows = []
@@ -1319,6 +1327,11 @@ def create_app(data_root: str) -> FastAPI:
             cs = manual.get_files_by_set(int(body.value), limit=500, manual_order=True)
             by = {r['checksum']: r for r in db.get_files_by_checksums(cs)}
             rows = [(by[c]['id'], by[c]['path'], c) for c in cs if c in by]
+        elif body.kind == 'category':
+            cat = manual.find_category(body.value)
+            if cat is not None:
+                cs = get_resolved_checksums_for_category(manual, db, cat['id'], cat['name'])
+                rows = [(r['id'], r['path'], r['checksum']) for r in db.get_files_by_checksums(cs)]
         elif body.kind == 'similar':
             import numpy as np
             from media_manager.similarity import top_k_indices

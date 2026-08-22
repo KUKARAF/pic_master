@@ -2240,6 +2240,34 @@ class ManualDB(ThreadLocalDB):
                 result.setdefault(checksum, []).append(identity)
         return result
 
+    def get_named_faces_with_bbox_for_checksums(self, checksums):
+        """Batched lookup: {checksum: [{identity, x1, y1, x2, y2, frame_index}, ...]}
+        of *named* (identified, non-rejected) faces with their bounding boxes — feeds
+        the interactive /random feed's tappable transparent face squares. Bboxes are
+        in ORIGINAL image pixels (same coordinate system as the photo page); the client
+        normalizes against img.naturalWidth/naturalHeight. Chunked like
+        get_identities_for_checksums since the caller list can be library-wide."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'''SELECT checksum, identity, x1, y1, x2, y2, frame_index FROM faces
+                    WHERE checksum IN ({placeholders}) AND identity IS NOT NULL AND rejected = 0
+                    ORDER BY id''',
+                tuple(chunk)
+            )
+            for checksum, identity, x1, y1, x2, y2, frame_index in cur.fetchall():
+                if None in (x1, y1, x2, y2):
+                    continue
+                result.setdefault(checksum, []).append({
+                    'identity': identity, 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
+                    'frame_index': frame_index,
+                })
+        return result
+
     def get_all_checksums_with_named_face(self):
         """Every checksum with at least one identified (named, non-rejected)
         face, as a plain set() — same one-cheap-query-instead-of-chunked-
