@@ -37,6 +37,10 @@
   .feed-caption { position:absolute; left:0; right:0; bottom:0; display:flex; align-items:center;
     gap:14px; padding:12px 16px 18px; color:#fff; z-index:6;
     background:linear-gradient(transparent, rgba(0,0,0,.75)); }
+  /* /random: caption (heart / filename / Open) is hidden until one tap, like the
+     other helpers. Other feeds keep it always visible. */
+  .feed-item.is-random .feed-caption { opacity:0; pointer-events:none; transition:opacity .15s ease; }
+  .feed-item.is-random.helpers-on .feed-caption { opacity:1; pointer-events:auto; }
   .feed-caption a { color:#fff; }
   .feed-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.9em; }
   .feed-heart { background:none; border:none; color:#fff; font-size:1.4em; cursor:pointer; padding:4px 6px; }
@@ -313,15 +317,9 @@
     injectFrom('category', item._cats[0].name);
   }
 
-  // Reveal the helper overlays (face squares + swipe arrows/labels) for one tap;
-  // they auto-hide again so the image stays clean by default.
+  // Reveal the helper chrome for one tap — the caption (heart / filename / Open) plus
+  // the face squares and swipe arrows/labels. Auto-hides so the image stays clean.
   function showHelpers(item) {
-    var nFaces = (item.querySelector('.feed-face-layer') || {}).childElementCount || 0;
-    var hasSet = item._sets && item._sets.length, hasCat = item._cats && item._cats.length;
-    if (!nFaces && !hasSet && !hasCat) {
-      if (window.showToast) showToast('No named face, set, or category on this one');
-      return;
-    }
     item.classList.add('helpers-on');
     if (item._hideTimer) clearTimeout(item._hideTimer);
     item._hideTimer = setTimeout(function () { item.classList.remove('helpers-on'); }, 4000);
@@ -329,7 +327,7 @@
 
   function makeItem(id, idx) {
     var section = document.createElement('div');
-    section.className = 'feed-item';
+    section.className = 'feed-item' + (source === 'random' ? ' is-random' : '');
     section.dataset.fileId = id;
     if (idx != null) section.dataset.idx = idx;
     section.dataset.mounted = '0';
