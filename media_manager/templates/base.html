@@ -24,16 +24,12 @@
     <a class="nav-link" href="/stats">Stats</a>
   </div>
 
-  <form class="nav-search" action="/search" method="get">
-    <input type="text" id="nav-search-input" name="q" placeholder="search photos, tags, people… ( / )" value="{{ request.query_params.get('q', '') }}">
-    <button type="submit">Search</button>
-  </form>
-
   <!-- Media worker status: green ✓ when a worker is reachable, red when
        configured-but-offline, hidden when no worker is enabled. Populated by
-       app.js polling /api/worker/status. -->
+       app.js polling /api/worker/status. Label is a wrench (🔧); the dot + title
+       carry the status. -->
   <span id="worker-badge" class="worker-badge" style="display:none;" title="">
-    <span class="worker-dot"></span><span class="worker-label">Worker</span>
+    <span class="worker-dot"></span><span class="worker-label">🔧</span>
   </span>
 
   <div style="position:relative;">

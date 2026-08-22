@@ -530,10 +530,12 @@
         return;
       }
       var addr = data.address ? String(data.address).slice(0, 8) : '';
+      // Label is just a wrench to keep the navbar narrow; the dot colour + title tooltip
+      // convey connected/offline.
       if (data.connected) {
-        setBadge('is-online', 'Worker ✓', addr ? 'Worker ' + addr : 'Worker connected');
+        setBadge('is-online', '🔧', addr ? 'Worker ' + addr + ' connected' : 'Worker connected');
       } else {
-        setBadge('is-offline', 'Worker offline',
+        setBadge('is-offline', '🔧',
                  addr ? 'Worker ' + addr + ' (unreachable)' : 'Worker unreachable');
       }
     }
