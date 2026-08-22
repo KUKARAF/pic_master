@@ -2,6 +2,8 @@
 
 {% block title %}{{ feed_title }} — media{% endblock %}
 
+{% block container_class %}feed-page{% endblock %}
+
 {% block content %}
 <div class="feed-header">
   <h1 class="feed-title">{{ feed_title }}</h1>
@@ -16,25 +18,26 @@
 </div>
 
 <div class="feed" id="feed"></div>
-<div id="feed-status" class="sub" style="text-align:center;padding:10px;"></div>
+<div id="feed-status"></div>
 
 <style>
-  :root { --feed-h: calc(100dvh - 118px); }
-  .feed-header { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:8px; }
+  :root { --feed-h: 80vh; }  /* JS sets the exact px height so nothing overflows */
+  /* Full-bleed on feed pages: kill the .container padding/max-width that otherwise
+     leaves a navbar-height scroll below the feed. */
+  .container.feed-page { max-width:none; padding:0; }
+  .feed-header { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin:0; padding:10px 14px 6px; }
   .feed-title { margin:0; }
   .feed-filters { display:flex; gap:14px; flex-wrap:wrap; }
   .feed-filters label { display:flex; align-items:center; gap:5px; cursor:pointer; }
   .feed { height: var(--feed-h); overflow-y:auto; scroll-snap-type:y mandatory;
-    -webkit-overflow-scrolling:touch; overscroll-behavior:contain;
-    border-radius:var(--radius); background:#000; }
-  /* No scrollbars — TikTok-style bare scroll surface. */
+    -webkit-overflow-scrolling:touch; overscroll-behavior:contain; background:#000; }
   .feed { scrollbar-width:none; -ms-overflow-style:none; }
   .feed::-webkit-scrollbar { display:none; }
   .feed-item { height: var(--feed-h); scroll-snap-align:start; scroll-snap-stop:always;
     position:relative; display:flex; align-items:center; justify-content:center; background:#000; }
   .feed-item img, .feed-item video { max-width:100%; max-height:100%; object-fit:contain; display:block; }
   .feed-caption { position:absolute; left:0; right:0; bottom:0; display:flex; align-items:center;
-    gap:14px; padding:12px 16px 16px; color:#fff; z-index:2;
+    gap:14px; padding:12px 16px 18px; color:#fff; z-index:2;
     background:linear-gradient(transparent, rgba(0,0,0,.75)); }
   .feed-caption a { color:#fff; }
   .feed-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.9em; }
@@ -42,8 +45,15 @@
   .feed-heart.is-fav { color:#ff5b7f; }
   .feed-open { text-decoration:none; font-size:0.85em; border:1px solid rgba(255,255,255,.5);
     border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
-  .feed-muted { position:absolute; top:10px; right:12px; z-index:2; background:rgba(0,0,0,.5);
+  .feed-muted { position:absolute; top:10px; right:12px; z-index:3; background:rgba(0,0,0,.5);
     color:#fff; border:none; border-radius:50%; width:34px; height:34px; font-size:1em; cursor:pointer; }
+  /* Slim seekable progress bar at the very bottom edge (native controls would cover the caption). */
+  .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
+    background:rgba(255,255,255,.22); cursor:pointer; }
+  .feed-progress:hover { height:8px; }
+  .feed-progress-fill { height:100%; width:0; background:#fff; }
+  #feed-status { position:fixed; left:0; right:0; bottom:6px; text-align:center; z-index:5;
+    pointer-events:none; color:#fff; font-size:0.85em; text-shadow:0 1px 3px #000; }
 </style>
 {% endblock %}
 
@@ -57,7 +67,18 @@
 
   var offset = 0, loading = false, hasMore = true;
   var seen = {};
-  var soundOn = false;  // shared: once you unmute one, later videos stay unmuted
+  var soundOn = false;
+
+  // Size the feed to exactly fill from its top to the viewport bottom — measured, so
+  // it works regardless of navbar/header height and never leaves a stray scroll.
+  function sizeFeed() {
+    // Fill from the feed's top edge to the bottom of the viewport — exact, so nothing
+    // below it (padding/status) creates a stray scroll.
+    var top = feed.getBoundingClientRect().top;
+    document.documentElement.style.setProperty('--feed-h', Math.max(200, window.innerHeight - top) + 'px');
+  }
+  window.addEventListener('resize', sizeFeed);
+  sizeFeed();
 
   function unlovedParams() {
     var p = {};
@@ -65,34 +86,44 @@
     return p;
   }
 
-  // --- media mount/unmount: only items near the viewport hold an <img>/<video>;
-  //     scrolling one away removes its media element and stops playback (TikTok-style).
   function mountMedia(item) {
     if (item.dataset.mounted === '1') return;
     item.dataset.mounted = '1';
     var id = item.dataset.fileId;
-    var media;
     if (item.dataset.isVideo === '1') {
-      media = document.createElement('video');
-      media.src = '/image/' + id;
-      media.loop = true; media.playsInline = true; media.muted = !soundOn;
-      media.preload = 'auto';
-      media.addEventListener('click', function () {
-        soundOn = media.muted;  // toggle
-        media.muted = !soundOn;
-        var b = item.querySelector('.feed-muted'); if (b) b.textContent = media.muted ? '🔇' : '🔊';
+      var video = document.createElement('video');
+      video.src = '/image/' + id;
+      video.loop = true; video.playsInline = true; video.muted = !soundOn; video.preload = 'auto';
+      video.addEventListener('click', function () {
+        soundOn = video.muted; video.muted = !soundOn;
+        var b = item.querySelector('.feed-muted'); if (b) b.textContent = video.muted ? '🔇' : '🔊';
       });
+      item.insertBefore(video, item.firstChild);
+
       var mbtn = document.createElement('button');
-      mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = media.muted ? '🔇' : '🔊';
-      mbtn.addEventListener('click', function (e) { e.stopPropagation(); media.click(); });
-      item.insertBefore(mbtn, item.firstChild);
+      mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = video.muted ? '🔇' : '🔊';
+      mbtn.addEventListener('click', function (e) { e.stopPropagation(); video.click(); });
+      item.appendChild(mbtn);
+
+      var prog = document.createElement('div');
+      prog.className = 'feed-progress';
+      var fill = document.createElement('div');
+      fill.className = 'feed-progress-fill';
+      prog.appendChild(fill);
+      video.addEventListener('timeupdate', function () {
+        if (video.duration) fill.style.width = (video.currentTime / video.duration * 100) + '%';
+      });
+      prog.addEventListener('click', function (e) {
+        if (!video.duration) return;
+        var r = prog.getBoundingClientRect();
+        video.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * video.duration;
+      });
+      item.appendChild(prog);
     } else {
-      media = document.createElement('img');
-      media.src = '/image/' + id;
-      media.loading = 'eager';
-      media.alt = '';
+      var img = document.createElement('img');
+      img.src = '/image/' + id; img.loading = 'eager'; img.alt = '';
+      item.insertBefore(img, item.firstChild);
     }
-    item.insertBefore(media, item.firstChild);
   }
 
   function unmountMedia(item) {
@@ -100,20 +131,13 @@
     item.dataset.mounted = '0';
     var v = item.querySelector('video');
     if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
-    var media = item.querySelector('video, img');
-    if (media) media.remove();
-    var mbtn = item.querySelector('.feed-muted');
-    if (mbtn) mbtn.remove();
+    item.querySelectorAll('video, img, .feed-muted, .feed-progress').forEach(function (el) { el.remove(); });
   }
 
-  // Mount media for items within ~1 viewport of the visible area, unmount beyond.
   var mountObs = new IntersectionObserver(function (entries) {
-    entries.forEach(function (e) {
-      if (e.isIntersecting) mountMedia(e.target); else unmountMedia(e.target);
-    });
+    entries.forEach(function (e) { if (e.isIntersecting) mountMedia(e.target); else unmountMedia(e.target); });
   }, { root: feed, rootMargin: '120% 0px', threshold: 0 });
 
-  // Autoplay the item that's mostly on screen; pause + rewind the rest.
   var playObs = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
       var v = e.target.querySelector('video');
@@ -129,7 +153,6 @@
     section.dataset.fileId = it.file_id;
     section.dataset.isVideo = it.is_video ? '1' : '0';
     section.dataset.mounted = '0';
-    // Caption is built upfront (lightweight); media is mounted lazily by the observers.
     var cap = document.createElement('div');
     cap.className = 'feed-caption';
     cap.innerHTML =
