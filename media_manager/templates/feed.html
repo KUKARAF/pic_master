@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+
+{% block title %}{{ feed_title }} — media{% endblock %}
+
+{% block content %}
+<div class="feed-header">
+  <h1 class="feed-title">{{ feed_title }}</h1>
+  {% if source == 'unloved' %}
+  <div class="feed-filters sub">
+    <label><input type="checkbox" class="unloved-filter" data-key="no_name" checked> no name</label>
+    <label><input type="checkbox" class="unloved-filter" data-key="no_set" checked> no set</label>
+    <label><input type="checkbox" class="unloved-filter" data-key="no_tag" checked> no tag</label>
+    <label><input type="checkbox" class="unloved-filter" data-key="no_category" checked> no category</label>
+  </div>
+  {% endif %}
+</div>
+
+<div class="feed" id="feed"></div>
+<div id="feed-status" class="sub" style="text-align:center;padding:12px;"></div>
+
+<style>
+  :root { --feed-h: calc(100dvh - 118px); }
+  .feed-header { display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:8px; }
+  .feed-title { margin:0; }
+  .feed-filters { display:flex; gap:14px; flex-wrap:wrap; }
+  .feed-filters label { display:flex; align-items:center; gap:5px; cursor:pointer; }
+  .feed { height: var(--feed-h); overflow-y:auto; scroll-snap-type:y mandatory;
+    -webkit-overflow-scrolling:touch; border-radius:var(--radius); background:#000; }
+  .feed-item { height: var(--feed-h); scroll-snap-align:start; position:relative;
+    display:flex; align-items:center; justify-content:center; background:#000; }
+  .feed-item img, .feed-item video { max-width:100%; max-height:100%; object-fit:contain; display:block; }
+  .feed-caption { position:absolute; left:0; right:0; bottom:0; display:flex; align-items:center;
+    gap:14px; padding:12px 16px 16px; color:#fff;
+    background:linear-gradient(transparent, rgba(0,0,0,.75)); }
+  .feed-caption a { color:#fff; }
+  .feed-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.9em; }
+  .feed-heart { background:none; border:none; color:#fff; font-size:1.4em; cursor:pointer; padding:4px 6px; }
+  .feed-heart.is-fav { color:#ff5b7f; }
+  .feed-open { text-decoration:none; font-size:0.85em; border:1px solid rgba(255,255,255,.5);
+    border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var source = {{ source | tojson }};
+  var feed = document.getElementById('feed');
+  var statusEl = document.getElementById('feed-status');
+  if (!feed) return;
+
+  var offset = 0, loading = false, hasMore = true;
+  var seen = {};  // dedupe (mainly for random, which ignores offset)
+
+  function unlovedParams() {
+    var p = {};
+    document.querySelectorAll('.unloved-filter').forEach(function (cb) { p[cb.dataset.key] = cb.checked; });
+    return p;
+  }
+
+  function itemNode(it) {
+    var section = document.createElement('div');
+    section.className = 'feed-item';
+    var media = it.is_video
+      ? '<video src="/image/' + it.file_id + '" controls playsinline preload="metadata"></video>'
+      : '<img src="/image/' + it.file_id + '" alt="" loading="lazy">';
+    section.innerHTML = media +
+      '<div class="feed-caption">' +
+        '<button type="button" class="feed-heart' + (it.favorite ? ' is-fav' : '') + '" title="Favorite">' +
+          (it.favorite ? '♥ ' + it.favorite : '♡') + '</button>' +
+        '<span class="feed-name">' + escapeHtml(it.filename) + '</span>' +
+        '<a class="feed-open" href="/photo/' + it.file_id + '">Open</a>' +
+      '</div>';
+    var heart = section.querySelector('.feed-heart');
+    heart.addEventListener('click', function () {
+      fetch('/api/files/' + it.file_id + '/favorite', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ delta: 1 }),
+      }).then(function (r) { return r.json(); }).then(function (d) {
+        heart.classList.add('is-fav');
+        heart.textContent = '♥ ' + d.count;
+      }).catch(function () {});
+    });
+    return section;
+  }
+
+  function loadMore() {
+    if (loading || !hasMore) return;
+    loading = true;
+    statusEl.textContent = 'Loading…';
+    var params = new URLSearchParams(Object.assign({ source: source, offset: offset, limit: 8 },
+      source === 'unloved' ? unlovedParams() : {}));
+    fetch('/api/feed?' + params.toString())
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var added = 0;
+        (d.items || []).forEach(function (it) {
+          if (seen[it.file_id]) return;
+          seen[it.file_id] = true;
+          feed.appendChild(itemNode(it));
+          added++;
+        });
+        offset += (d.items || []).length;
+        hasMore = d.has_more && (source !== 'random' || added > 0);
+        statusEl.textContent = feed.children.length ? (hasMore ? '' : '— end —')
+          : 'Nothing here' + (source === 'unloved' ? ' — everything ticked has been handled.' : '.');
+        loading = false;
+        // If the viewport isn't filled yet, keep loading.
+        if (hasMore && feed.scrollHeight <= feed.clientHeight + 10) loadMore();
+      })
+      .catch(function (e) { statusEl.textContent = 'Failed: ' + e.message; loading = false; });
+  }
+
+  // Load the next page as the last item scrolls into view.
+  feed.addEventListener('scroll', function () {
+    if (feed.scrollTop + feed.clientHeight >= feed.scrollHeight - feed.clientHeight * 1.5) loadMore();
+  });
+
+  function reset() {
+    feed.innerHTML = '';
+    offset = 0; loading = false; hasMore = true; seen = {};
+    loadMore();
+  }
+
+  document.querySelectorAll('.unloved-filter').forEach(function (cb) {
+    cb.addEventListener('change', reset);
+  });
+
+  loadMore();
+})();
+</script>
+{% endblock %}

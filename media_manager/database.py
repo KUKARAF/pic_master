@@ -1090,6 +1090,14 @@ class Database(ThreadLocalDB):
         cur.execute('SELECT checksum FROM files WHERE hidden = 0 ORDER BY RANDOM() LIMIT ?', (limit,))
         return [r[0] for r in cur.fetchall()]
 
+    def get_files_by_size(self, limit, offset=0):
+        """(id, path, checksum, size) for non-hidden files, largest first — the
+        'biggest' browse feed. SQL LIMIT/OFFSET paginates it exactly."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT id, path, checksum, size FROM files_with_path '
+                    'WHERE hidden = 0 ORDER BY size DESC LIMIT ? OFFSET ?', (limit, offset))
+        return cur.fetchall()
+
     def count_unidentified_faces(self):
         """Cheap count of unidentified real faces (identity IS NULL) — a stat-tile
         approximation of 'unknown faces' that avoids the full row scan + join."""

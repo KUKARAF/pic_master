@@ -1245,6 +1245,77 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    # --- Phone-first swipe-down browse feeds (Unloved / Biggest / Random / Favorites) --
+    def _feed_page(request, source, title):
+        return templates.TemplateResponse(request, 'feed.html', {
+            'source': source, 'feed_title': title,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/unloved', response_class=HTMLResponse)
+    def unloved_page(request: Request):
+        return _feed_page(request, 'unloved', '🤍 Unloved')
+
+    @app.get('/biggest', response_class=HTMLResponse)
+    def biggest_page(request: Request):
+        return _feed_page(request, 'biggest', '📏 Biggest')
+
+    @app.get('/random', response_class=HTMLResponse)
+    def random_feed_page(request: Request):
+        return _feed_page(request, 'random', '🎲 Random')
+
+    @app.get('/favorites', response_class=HTMLResponse)
+    def favorites_page(request: Request):
+        return _feed_page(request, 'favorites', '⭐ Favorites')
+
+    @app.get('/api/feed')
+    def api_feed(source: str, offset: int = 0, limit: int = 8,
+                 no_name: bool = True, no_set: bool = True, no_tag: bool = True,
+                 no_category: bool = True):
+        """One page of items for a swipe-down browse feed. Each source has its own
+        ordering; `offset` paginates. Returns {items:[{file_id, filename, checksum,
+        favorite, is_video}], has_more}. 'unloved' = files missing whichever of
+        name/set/tag/category are ticked (least-viewed first)."""
+        limit = max(1, min(limit, 30))
+        rows = []  # (id, path, checksum)
+        if source == 'biggest':
+            rows = [(r['id'], r['path'], r['checksum']) for r in db.get_files_by_size(limit, offset)]
+        elif source == 'random':
+            found = db.get_files_by_checksums(db.get_random_file_checksums(limit))
+            rows = [(r['id'], r['path'], r['checksum']) for r in found]
+        elif source == 'favorites':
+            favs = manual.get_top_favorite_checksums(limit=100000)  # [(checksum, count)] desc
+            page_cs = [cs for cs, _c in favs[offset:offset + limit]]
+            by = {r['checksum']: r for r in db.get_files_by_checksums(page_cs)}
+            rows = [(by[cs]['id'], by[cs]['path'], cs) for cs in page_cs if cs in by]
+        elif source == 'unloved':
+            excluded = set()
+            if no_name:
+                excluded |= manual.get_all_checksums_with_named_face()
+                excluded |= manual.get_all_photo_identity_checksums()
+            if no_set:
+                excluded |= manual.get_all_set_member_checksums()
+            if no_tag:
+                excluded |= manual.get_checksums_with_manual_tags()
+            if no_category:
+                excluded |= set().union(*manual.get_all_category_checksums().values() or [set()])
+            eligible = [(fid, cs) for fid, cs in db.get_least_viewed_files(limit=5000)
+                        if cs not in excluded]
+            page = eligible[offset:offset + limit]
+            by = {r['checksum']: r for r in db.get_files_by_checksums([cs for _f, cs in page])}
+            rows = [(by[cs]['id'], by[cs]['path'], cs) for _f, cs in page if cs in by]
+        else:
+            raise HTTPException(status_code=400, detail=f'unknown feed source {source!r}')
+
+        fav_counts = manual.get_favorite_counts([cs for _i, _p, cs in rows])
+        items = [{
+            'file_id': fid, 'filename': os.path.basename(path), 'checksum': cs,
+            'favorite': fav_counts.get(cs, 0),
+            'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
+        } for fid, path, cs in rows]
+        return {'items': items, 'has_more': len(rows) >= limit}
+
     @app.get('/photo/{file_id}', response_class=HTMLResponse)
     def photo_page(request: Request, file_id: int):
         row = _file_or_404(file_id)
