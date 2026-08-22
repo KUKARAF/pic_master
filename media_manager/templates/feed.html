@@ -48,19 +48,24 @@
   /* Interactive /random: a thin transparent square drawn ON each named face.
      Tapping it injects more photos of that person into the mix. Positioned in JS
      (contain-fit math) once the image loads. */
-  .feed-face-layer { position:absolute; inset:0; z-index:3; pointer-events:none; }
+  /* Overlays stay hidden until one tap reveals them (see showHelpers()). */
+  .feed-face-layer { position:absolute; inset:0; z-index:3; pointer-events:none;
+    opacity:0; transition:opacity .15s ease; }
+  .feed-item.helpers-on .feed-face-layer { opacity:1; }
   .feed-face-box { position:absolute; box-sizing:border-box; background:transparent;
     border:1.5px solid rgba(255,255,255,.75); border-radius:3px; padding:0; margin:0;
-    cursor:pointer; pointer-events:auto; box-shadow:0 0 0 1px rgba(0,0,0,.35);
+    cursor:pointer; pointer-events:none; box-shadow:0 0 0 1px rgba(0,0,0,.35);
     transition:border-color .12s, background .12s; }
+  .feed-item.helpers-on .feed-face-box { pointer-events:auto; }
   .feed-face-box:hover, .feed-face-box:active { border-color:#79f279; background:rgba(121,242,121,.18); }
   /* Interactive /random: swipe-right (set) on the right edge, swipe-left (category)
      on the left edge. Each shows an arrow hinting the swipe + the name turned 90° and
      transparent. Tapping the strip works too (desktop). */
   .feed-swipe { position:absolute; top:0; bottom:64px; width:46px; z-index:4;
     display:flex; flex-direction:column; align-items:center; justify-content:center; gap:12px;
-    color:rgba(255,255,255,.6); pointer-events:auto; cursor:pointer;
-    -webkit-user-select:none; user-select:none; }
+    color:rgba(255,255,255,.6); pointer-events:none; cursor:pointer;
+    opacity:0; transition:opacity .15s ease; -webkit-user-select:none; user-select:none; }
+  .feed-item.helpers-on .feed-swipe { opacity:1; pointer-events:auto; }
   .feed-swipe.right { right:0; }
   .feed-swipe.left { left:0; }
   .feed-swipe[hidden] { display:none; }
@@ -305,6 +310,14 @@
     injectFrom('category', item._cats[0].name);
   }
 
+  // Reveal the helper overlays (face squares + swipe arrows/labels) for one tap;
+  // they auto-hide again so the image stays clean by default.
+  function showHelpers(item) {
+    item.classList.add('helpers-on');
+    if (item._hideTimer) clearTimeout(item._hideTimer);
+    item._hideTimer = setTimeout(function () { item.classList.remove('helpers-on'); }, 4000);
+  }
+
   function makeItem(id, idx) {
     var section = document.createElement('div');
     section.className = 'feed-item';
@@ -328,27 +341,34 @@
     }
     section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-caption' }));
     if (source === 'random') {
-      // Double-tap the media → favorite + inject visually-similar into the mix.
-      var lastTap = 0;
-      section.addEventListener('click', function (e) {
-        if (e.target.closest('.feed-caption, .feed-muted, .feed-progress, .feed-face-box, .feed-swipe')) return;
-        var now = Date.now();
-        if (now - lastTap < 300) { lastTap = 0; doFavorite(section); injectFrom('similar', section.dataset.fileId); }
-        else lastTap = now;
+      // Pointer-based gesture (mouse + touch, so it also works on desktop):
+      //  - horizontal swipe right → set, left → category (coexists with vertical
+      //    scroll-snap: only horizontal-dominant drags act, and we never preventDefault).
+      //  - one tap → reveal the helpers (face squares + swipe arrows).
+      //  - fast double tap → favorite + inject visually-similar.
+      var downX = 0, downY = 0, isDown = false, swiped = false, tapTimer = null;
+      section.addEventListener('pointerdown', function (e) {
+        if (e.pointerType === 'mouse' && e.button !== 0) return;
+        downX = e.clientX; downY = e.clientY; isDown = true; swiped = false;
       });
-      // Horizontal swipe: right → set, left → category. Coexists with vertical
-      // scroll-snap by only acting on horizontal-dominant flicks (passive listeners).
-      var sx = 0, sy = 0, tracking = false;
-      section.addEventListener('touchstart', function (e) {
-        if (e.touches.length !== 1) { tracking = false; return; }
-        sx = e.touches[0].clientX; sy = e.touches[0].clientY; tracking = true;
-      }, { passive: true });
-      section.addEventListener('touchend', function (e) {
-        if (!tracking) return; tracking = false;
-        var t = e.changedTouches[0], dx = t.clientX - sx, dy = t.clientY - sy;
-        if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.3) return;  // not a horizontal swipe
-        if (dx > 0) triggerSet(section); else triggerCategory(section);
-      }, { passive: true });
+      section.addEventListener('pointerup', function (e) {
+        if (!isDown) return; isDown = false;
+        var dx = e.clientX - downX, dy = e.clientY - downY;
+        if (Math.abs(dx) >= 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {
+          swiped = true;  // suppress the click that follows this drag
+          if (dx > 0) triggerSet(section); else triggerCategory(section);
+        }
+      });
+      section.addEventListener('click', function (e) {
+        if (swiped) { swiped = false; return; }  // this "click" was really a swipe
+        if (e.target.closest('.feed-caption, .feed-muted, .feed-progress, .feed-face-box, .feed-swipe')) return;
+        if (tapTimer) {  // second tap within the window → double tap
+          clearTimeout(tapTimer); tapTimer = null;
+          doFavorite(section); injectFrom('similar', section.dataset.fileId);
+        } else {
+          tapTimer = setTimeout(function () { tapTimer = null; showHelpers(section); }, 280);
+        }
+      });
     }
     mountObs.observe(section);
     playObs.observe(section);
