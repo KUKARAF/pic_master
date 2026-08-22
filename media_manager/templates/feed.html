@@ -45,6 +45,12 @@
     border-radius:var(--radius); padding:4px 10px; white-space:nowrap; }
   .feed-muted { position:absolute; top:10px; right:12px; z-index:3; background:rgba(0,0,0,.5);
     color:#fff; border:none; border-radius:50%; width:34px; height:34px; font-size:1em; cursor:pointer; }
+  /* Tappable known-face chips (interactive /random feed) */
+  .feed-chips { position:absolute; top:10px; left:12px; right:56px; z-index:3;
+    display:flex; gap:6px; flex-wrap:wrap; }
+  .feed-chip { background:rgba(0,0,0,.55); color:#fff; border:1px solid rgba(255,255,255,.4);
+    border-radius:14px; padding:3px 10px; font-size:0.82em; cursor:pointer; }
+  .feed-chip:active { background:rgba(121,242,121,.45); }
   .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
     background:rgba(255,255,255,.22); cursor:pointer; }
   .feed-progress:hover { height:8px; }
@@ -65,6 +71,56 @@
   var offset = 0, loading = false, hasMore = true;
   var seen = {};
   var soundOn = false;
+  var activeItem = null;   // the item most in view (set by playObs) — inject after it
+
+  // Inject "more like this" into the mix (identity / set / similar), right after the
+  // current item. /random only. Dedupes against `seen`.
+  function injectFrom(kind, value) {
+    var exclude = Object.keys(seen).map(Number);
+    fetch('/api/feed/more', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind: kind, value: String(value), exclude: exclude }),
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      var anchor = activeItem, added = 0;
+      (d.items || []).forEach(function (it) {
+        if (seen[it.file_id]) return;
+        seen[it.file_id] = true;
+        var node = makeItem(it.file_id, null);
+        fillMeta(node, it);
+        if (anchor && anchor.parentNode) { anchor.parentNode.insertBefore(node, anchor.nextSibling); anchor = node; }
+        else feed.appendChild(node);
+        added++;
+      });
+      if (window.showToast) showToast(added ? ('Added ' + added + ' to the mix') : 'Nothing new to add');
+    }).catch(function (e) { if (window.showToast) showToast('Failed: ' + e.message); });
+  }
+
+  function doFavorite(item) {
+    fetch('/api/files/' + item.dataset.fileId + '/favorite', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ delta: 1 }),
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      var h = item.querySelector('.feed-heart');
+      if (h) { h.classList.add('is-fav'); h.textContent = '♥ ' + d.count; }
+    }).catch(function () {});
+  }
+
+  // Set membership → a tappable toast to pull in the rest of that set.
+  function maybeSetToast(item) {
+    if (source !== 'random' || item.dataset.toastShown === '1' || !window.showToast) return;
+    var sets = item._sets || [];
+    if (!sets.length) return;
+    item.dataset.toastShown = '1';
+    var s = sets[0];
+    var toast = showToast('In set "' + s.name + '"');
+    var msg = toast && toast.querySelector('.toast-msg');
+    if (msg) {
+      var a = document.createElement('a');
+      a.href = '#'; a.textContent = '  + add more';
+      a.style.cssText = 'color:inherit;text-decoration:underline;white-space:nowrap;';
+      a.addEventListener('click', function (e) { e.preventDefault(); injectFrom('set', s.id); });
+      msg.appendChild(a);
+    }
+  }
 
   function sizeFeed() {
     var top = feed.getBoundingClientRect().top;
@@ -88,14 +144,14 @@
       var video = document.createElement('video');
       video.src = '/image/' + id;
       video.loop = true; video.playsInline = true; video.muted = !soundOn; video.preload = 'auto';
-      video.addEventListener('click', function () {
-        soundOn = video.muted; video.muted = !soundOn;
-        var b = item.querySelector('.feed-muted'); if (b) b.textContent = video.muted ? '🔇' : '🔊';
-      });
       item.insertBefore(video, item.firstChild);
       var mbtn = document.createElement('button');
       mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = video.muted ? '🔇' : '🔊';
-      mbtn.addEventListener('click', function (e) { e.stopPropagation(); video.click(); });
+      mbtn.addEventListener('click', function (e) {
+        e.stopPropagation();
+        soundOn = video.muted; video.muted = !soundOn;
+        mbtn.textContent = video.muted ? '🔇' : '🔊';
+      });
       item.appendChild(mbtn);
       var prog = document.createElement('div');
       prog.className = 'feed-progress';
@@ -137,7 +193,11 @@
 
   var playObs = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
-      if (e.isIntersecting && source === 'queue') onActive(e.target);
+      if (e.isIntersecting) {
+        activeItem = e.target;
+        if (source === 'queue') onActive(e.target);
+        else if (source === 'random') maybeSetToast(e.target);
+      }
       var v = e.target.querySelector('video');
       if (!v) return;
       if (e.isIntersecting) { v.muted = !soundOn; v.currentTime = 0; v.play().catch(function () {}); }
@@ -163,6 +223,20 @@
         h.classList.add('is-fav'); h.textContent = '♥ ' + d.count;
       }).catch(function () {});
     });
+    // /random experimentation: tappable known-face chips + remember sets for the toast.
+    item._sets = it.sets || [];
+    if (source === 'random') {
+      var chipsEl = item.querySelector('.feed-chips');
+      if (chipsEl) {
+        chipsEl.innerHTML = '';
+        (it.people || []).forEach(function (name) {
+          var chip = document.createElement('button');
+          chip.type = 'button'; chip.className = 'feed-chip'; chip.textContent = '👤 ' + name;
+          chip.addEventListener('click', function (e) { e.stopPropagation(); injectFrom('identity', name); });
+          chipsEl.appendChild(chip);
+        });
+      }
+    }
   }
 
   function makeItem(id, idx) {
@@ -172,7 +246,20 @@
     if (idx != null) section.dataset.idx = idx;
     section.dataset.mounted = '0';
     section.dataset.metaLoaded = '0';
+    if (source === 'random') {
+      section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-chips' }));
+    }
     section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-caption' }));
+    if (source === 'random') {
+      // Double-tap the media → favorite + inject visually-similar into the mix.
+      var lastTap = 0;
+      section.addEventListener('click', function (e) {
+        if (e.target.closest('.feed-chips, .feed-caption, .feed-muted, .feed-progress')) return;
+        var now = Date.now();
+        if (now - lastTap < 300) { lastTap = 0; doFavorite(section); injectFrom('similar', section.dataset.fileId); }
+        else lastTap = now;
+      });
+    }
     mountObs.observe(section);
     playObs.observe(section);
     return section;

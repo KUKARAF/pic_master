@@ -94,6 +94,12 @@ class FeedQueueBody(BaseModel):
     # Ordered file ids for the watch-queue feed (/api/feed/queue).
     ids: List[int] = []
 
+class FeedMoreBody(BaseModel):
+    # Inject "more like this" into the /random feed. kind: identity|set|similar.
+    kind: str
+    value: str
+    exclude: List[int] = []
+
 class TagLabelBody(BaseModel):
     label: str
 
@@ -1281,13 +1287,59 @@ def create_app(data_root: str) -> FastAPI:
         return _feed_page(request, 'queue', '')
 
     def _feed_items(rows):
-        """(file_id, path, checksum) rows → feed item dicts (favorite + is_video)."""
-        fav_counts = manual.get_favorite_counts([cs for _i, _p, cs in rows])
+        """(file_id, path, checksum) rows → feed item dicts. Carries the photo's named
+        people + sets too, so the interactive /random feed can offer 'more like this
+        person / set'."""
+        checksums = [cs for _i, _p, cs in rows]
+        fav_counts = manual.get_favorite_counts(checksums)
+        people_map = manual.get_identities_for_checksums(checksums)  # {cs: [name, ...]}
+        sets_map = manual.get_sets_for_checksums(checksums)          # {cs: [{id,name,studio}]}
         return [{
             'file_id': fid, 'filename': os.path.basename(path), 'checksum': cs,
             'favorite': fav_counts.get(cs, 0),
             'is_video': os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS,
+            'people': people_map.get(cs, []),
+            'sets': [{'id': s['id'], 'name': s['name']} for s in sets_map.get(cs, [])],
         } for fid, path, cs in rows]
+
+    @app.post('/api/feed/more')
+    def api_feed_more(body: FeedMoreBody):
+        """Inject more photos 'into the mix' for the interactive /random feed:
+        kind='identity' (value=name) → that person's photos; kind='set' (value=set id)
+        → the set's members; kind='similar' (value=file id) → visually-similar via the
+        cached embeddings matrix. Excludes ids already in the feed; capped at 20."""
+        exclude = set(body.exclude)
+        rows = []
+        if body.kind == 'identity':
+            name = manual.resolve_identity_name(body.value)
+            cs = {r[1] for r in manual.get_faces_for_identity(name)}
+            cs |= set(manual.get_photos_assigned_to_identity(name, limit=1000))
+            rows = [(r['id'], r['path'], r['checksum']) for r in db.get_files_by_checksums(list(cs))]
+        elif body.kind == 'set':
+            cs = manual.get_files_by_set(int(body.value), limit=500, manual_order=True)
+            by = {r['checksum']: r for r in db.get_files_by_checksums(cs)}
+            rows = [(by[c]['id'], by[c]['path'], c) for c in cs if c in by]
+        elif body.kind == 'similar':
+            import numpy as np
+            from media_manager.similarity import top_k_indices
+            emb = db.get_embedding(int(body.value))
+            if emb is not None:
+                query = np.frombuffer(emb, dtype=np.float32)
+                file_ids, _cksums, matrix = db.get_embeddings_matrix()  # cached
+                if matrix.shape[0]:
+                    scores = matrix.dot(query)
+                    for i in top_k_indices(scores, min(matrix.shape[0], 40)):
+                        fid = int(file_ids[i])
+                        if fid == int(body.value):
+                            continue
+                        r = db.get_file_by_id(fid)
+                        if r is not None:
+                            rows.append((r['id'], r['path'], r['checksum']))
+        else:
+            raise HTTPException(status_code=400, detail=f'unknown kind {body.kind!r}')
+
+        rows = [r for r in rows if r[0] not in exclude][:20]
+        return {'items': _feed_items(rows)}
 
     @app.post('/api/feed/queue')
     def api_feed_queue(body: FeedQueueBody):
