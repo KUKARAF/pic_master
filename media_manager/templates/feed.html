@@ -79,8 +79,8 @@
   .feed-swipe.left .feed-swipe-label { transform:rotate(180deg); }
   .feed-swipe-arrow { font-size:1.5em; opacity:.7; text-shadow:0 1px 3px #000;
     animation:feedSwipeHint 1.8s ease-in-out infinite; }
-  .feed-swipe.right .feed-swipe-arrow { animation-name:feedSwipeHintR; }
-  .feed-swipe.left  .feed-swipe-arrow { animation-name:feedSwipeHintL; }
+  .feed-swipe.right .feed-swipe-arrow { animation-name:feedSwipeHintL; }
+  .feed-swipe.left  .feed-swipe-arrow { animation-name:feedSwipeHintR; }
   @keyframes feedSwipeHintR { 0%,100%{transform:translateX(0);opacity:.5} 50%{transform:translateX(5px);opacity:.9} }
   @keyframes feedSwipeHintL { 0%,100%{transform:translateX(0);opacity:.5} 50%{transform:translateX(-5px);opacity:.9} }
   .feed-swipe.flash { color:#79f279; }
@@ -335,12 +335,12 @@
       // Right-edge swipe affordance → add more from the set; left-edge → add more from category.
       var right = document.createElement('div');
       right.className = 'feed-swipe right'; right.hidden = true;
-      right.innerHTML = '<span class="feed-swipe-label"></span><span class="feed-swipe-arrow">→</span>';
+      right.innerHTML = '<span class="feed-swipe-label"></span><span class="feed-swipe-arrow">←</span>';
       right.addEventListener('click', function (e) { e.stopPropagation(); triggerSet(section); });
       section.appendChild(right);
       var left = document.createElement('div');
       left.className = 'feed-swipe left'; left.hidden = true;
-      left.innerHTML = '<span class="feed-swipe-arrow">←</span><span class="feed-swipe-label"></span>';
+      left.innerHTML = '<span class="feed-swipe-arrow">→</span><span class="feed-swipe-label"></span>';
       left.addEventListener('click', function (e) { e.stopPropagation(); triggerCategory(section); });
       section.appendChild(left);
     }
@@ -364,7 +364,9 @@
         if (e.target.closest('.feed-caption, .feed-muted, .feed-progress, .feed-face-box, .feed-swipe')) return;
         var dx = e.clientX - downX, dy = e.clientY - downY, dt = e.timeStamp - downT;
         if (Math.abs(dx) >= 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {   // horizontal swipe
-          if (dx > 0) triggerSet(section); else triggerCategory(section);
+          // Swipe toward the edge you want to pull in: left → the right-edge set,
+          // right → the left-edge category.
+          if (dx < 0) triggerSet(section); else triggerCategory(section);
           return;
         }
         if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || dt > 600) return;  // a scroll / long-press, not a tap
@@ -476,9 +478,10 @@
     if (isTyping(document.activeElement) || e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); feed.scrollBy({ top: feed.clientHeight, behavior: 'smooth' }); }
     else if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); feed.scrollBy({ top: -feed.clientHeight, behavior: 'smooth' }); }
-    // /random: ← / → mirror the edge swipes (category / set) on the active item.
-    else if (source === 'random' && e.key === 'ArrowRight') { e.preventDefault(); triggerSet(activeItem); }
-    else if (source === 'random' && e.key === 'ArrowLeft') { e.preventDefault(); triggerCategory(activeItem); }
+    // /random: ← pulls in the right-edge set, → pulls in the left-edge category
+    // (mirrors the swipe direction).
+    else if (source === 'random' && e.key === 'ArrowLeft') { e.preventDefault(); triggerSet(activeItem); }
+    else if (source === 'random' && e.key === 'ArrowRight') { e.preventDefault(); triggerCategory(activeItem); }
   });
 
   function reset() {
