@@ -119,6 +119,7 @@
 <script>
 (function () {
   var source = {{ source | tojson }};
+  var startId = {{ start_id | tojson }};  // /mobile-photo/{id}: start the queue here
   var feed = document.getElementById('feed');
   var statusEl = document.getElementById('feed-status');
   if (!feed) return;
@@ -455,6 +456,14 @@
     var q = {};
     try { q = JSON.parse(sessionStorage.getItem('photoQueue') || '{}'); } catch (e) {}
     var ids = q.ids || [];
+    var cursor = Math.max(0, Math.min(Math.max(0, ids.length - 1), q.cursor || 0));
+    // /mobile-photo/{id}: prefer the sessionStorage queue and jump to that id; if there
+    // is no queue (or it doesn't contain the id), fall back to showing just this photo.
+    if (startId != null) {
+      var at = ids.indexOf(startId);
+      if (at >= 0) cursor = at;
+      else { ids = [startId]; cursor = 0; }
+    }
     queueTotal = ids.length;
     if (!ids.length) {
       feed.innerHTML = '<div class="feed-item"><div class="swipe-empty">No queue — open photos from a grid or search.<br>' +
@@ -464,7 +473,6 @@
     var frag = document.createDocumentFragment();
     ids.forEach(function (id, idx) { frag.appendChild(makeItem(id, idx)); });
     feed.appendChild(frag);
-    var cursor = Math.max(0, Math.min(ids.length - 1, q.cursor || 0));
     var target = feed.children[cursor];
     if (target) { target.scrollIntoView(); statusEl.textContent = (cursor + 1) + ' / ' + queueTotal; }
   }

@@ -138,11 +138,13 @@ document.addEventListener('click', function (e) {
     cursor: cursor,
     label: container.dataset.queueSource || document.title,
   }));
-  // Open the TikTok-style vertical queue feed instead of the full photo page; the
-  // feed reads this sessionStorage queue and starts at the clicked item. ("Open" in
-  // the feed jumps to the full /photo/{id} editor.)
+  // Open the right view for the screen: the TikTok-style swipe feed on mobile
+  // (/mobile-photo/{id}), the traditional editor on desktop (/photo/{id}). Both read
+  // the sessionStorage queue set just above; window.openPhoto (app.js) picks by width.
   e.preventDefault();
-  window.location.href = '/queue';
+  var fid = parseInt(cardEl.dataset.fileId, 10);
+  if (window.openPhoto) window.openPhoto(fid);
+  else window.location.href = '/photo/' + fid;  // app.js not loaded yet — safe fallback
 });
 </script>
 <script src="/static/app.js"></script>

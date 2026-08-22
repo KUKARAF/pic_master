@@ -196,6 +196,21 @@
     sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor || 0, label: label }));
   };
 
+  // Open a photo in the right view for the screen: the TikTok-style swipe feed
+  // (/mobile-photo/{id}) on narrow screens, the traditional editor (/photo/{id}) on
+  // wide ones. Both read the sessionStorage watch-queue (set it first if you want
+  // prev/next / up-down browsing). Single entry point so every grid/search/find flow
+  // stays consistent — change the breakpoint here only.
+  window.MOBILE_PHOTO_MQ = '(max-width: 820px)';
+  window.openPhoto = function (id) {
+    if (window.matchMedia(window.MOBILE_PHOTO_MQ).matches) {
+      window.location.href = '/mobile-photo/' + id;
+    } else {
+      sessionStorage.setItem('photoQueueNavigating', '1');
+      window.location.href = '/photo/' + id;
+    }
+  };
+
   // "Custom action" — a declarative, one-shot action shown as a button at the
   // very top of the photo page's sidebar (see the renderer IIFE further down).
   // Declarative (not a callback) because it has to survive a real page
@@ -1968,7 +1983,7 @@
           if (cursor < 0) cursor = 0;
           var label = chips.map(function (c) { return c.type + ':' + c.value; }).join(' + ') || (q || 'search');
           sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor, label: 'Search: ' + label }));
-          window.location.href = '/queue';  // open the vertical queue feed at the cursor
+          window.openPhoto(ids[cursor]);  // swipe feed on mobile, /photo editor on desktop
         })
         .catch(function (err) { showToast('Failed to open results: ' + err.message); });
     }
@@ -3288,7 +3303,7 @@
           return;
         }
         setPhotoQueue(ids, opts.label, 0);
-        window.location.href = '/queue';  // open the vertical queue feed
+        window.openPhoto(ids[0]);  // swipe feed on mobile, /photo editor on desktop
       })
       .catch(function (err) {
         el.textContent = glyph; delete el.dataset.busy;

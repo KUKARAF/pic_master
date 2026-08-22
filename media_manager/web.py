@@ -1256,9 +1256,9 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     # --- Phone-first swipe-down browse feeds (Unloved / Biggest / Random / Favorites) --
-    def _feed_page(request, source, title):
+    def _feed_page(request, source, title, start_id=None):
         return templates.TemplateResponse(request, 'feed.html', {
-            'source': source, 'feed_title': title,
+            'source': source, 'feed_title': title, 'start_id': start_id,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
@@ -1285,6 +1285,15 @@ def create_app(data_root: str) -> FastAPI:
         sessionStorage (set by whatever grid/search opened it); feed.html reads them and
         pages captions via /api/feed/queue."""
         return _feed_page(request, 'queue', '')
+
+    @app.get('/mobile-photo/{file_id}', response_class=HTMLResponse)
+    def mobile_photo_page(request: Request, file_id: int):
+        """The TikTok-style swipe view of a single photo, starting at file_id. This is
+        the narrow-screen counterpart to /photo/{file_id} (the traditional editor); the
+        grid/search entry points pick between them by screen width (see window.openPhoto
+        in app.js). Reuses the queue feed: the id list + cursor come from the
+        sessionStorage watch-queue when present, otherwise it shows just this photo."""
+        return _feed_page(request, 'queue', '', start_id=file_id)
 
     def _feed_items(rows):
         """(file_id, path, checksum) rows → feed item dicts. Carries the photo's named
