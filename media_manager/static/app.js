@@ -2240,6 +2240,17 @@
       window.location.href = '/photo/' + id;
     }
 
+    // Move `delta` (+1 next / -1 previous) within the watch queue — shared by the
+    // arrow keys and the touch swipe below.
+    function stepQueue(delta) {
+      if (!queue) return;
+      var next = queue.cursor + delta;
+      if (next < 0 || next >= queue.ids.length) return;
+      queue.cursor = next;
+      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
+      goTo(queue.ids[queue.cursor]);
+    }
+
     function isTypingTarget(el) {
       if (!el) return false;
       const tag = el.tagName;
@@ -2266,18 +2277,30 @@
       }
 
       if (!queue) return;
-      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-
-      if (e.key === 'ArrowLeft') {
-        if (queue.cursor <= 0) return;
-        queue.cursor -= 1;
-      } else {
-        if (queue.cursor >= queue.ids.length - 1) return;
-        queue.cursor += 1;
-      }
-      sessionStorage.setItem(STORAGE_KEY, JSON.stringify(queue));
-      goTo(queue.ids[queue.cursor]);
+      if (e.key === 'ArrowLeft') stepQueue(-1);
+      else if (e.key === 'ArrowRight') stepQueue(1);
     });
+
+    // Phone-first: swipe left = next photo, swipe right = previous — same queue
+    // navigation as the arrow keys. Only fires when the image isn't zoomed/pannable
+    // horizontally (FIT mode), so it doesn't fight panning in FILL / 1:1 modes.
+    var stage = document.getElementById('photo-stage');
+    if (stage && queue) {
+      var tsx = 0, tsy = 0, tracking = false;
+      stage.addEventListener('touchstart', function (e) {
+        if (e.touches.length !== 1) { tracking = false; return; }
+        tsx = e.touches[0].clientX; tsy = e.touches[0].clientY; tracking = true;
+      }, { passive: true });
+      stage.addEventListener('touchend', function (e) {
+        if (!tracking) return;
+        tracking = false;
+        var t = e.changedTouches[0];
+        var dx = t.clientX - tsx, dy = t.clientY - tsy;
+        if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.3) return;  // not a horizontal flick
+        if (stage.scrollWidth > stage.clientWidth + 4) return;  // zoomed/pannable — leave to native pan
+        stepQueue(dx < 0 ? 1 : -1);
+      }, { passive: true });
+    }
   })();
 
   /* Space — a 3-wide thumbnail grid of every photo in the current watch
