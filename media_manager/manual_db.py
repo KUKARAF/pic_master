@@ -1572,6 +1572,13 @@ class ManualDB(ThreadLocalDB):
                     'ORDER BY count DESC, checksum LIMIT ?', (limit,))
         return cur.fetchall()
 
+    def get_all_favorite_checksums(self):
+        """set() of every favorited checksum (count > 0) — one cheap query, for
+        excluding favorites from the 'unloved' feed."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_favorites WHERE count > 0')
+        return {row[0] for row in cur.fetchall()}
+
     def get_checksums_with_manual_tags(self):
         """Whole-library set() of checksums carrying at least one positive manual tag —
         one indexed DISTINCT scan (idx_file_tags_checksum). For the home 'needs

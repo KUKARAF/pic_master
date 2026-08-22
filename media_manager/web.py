@@ -1290,7 +1290,8 @@ def create_app(data_root: str) -> FastAPI:
             by = {r['checksum']: r for r in db.get_files_by_checksums(page_cs)}
             rows = [(by[cs]['id'], by[cs]['path'], cs) for cs in page_cs if cs in by]
         elif source == 'unloved':
-            excluded = set()
+            # Favorites are never "unloved" — always excluded, regardless of tickboxes.
+            excluded = manual.get_all_favorite_checksums()
             if no_name:
                 excluded |= manual.get_all_checksums_with_named_face()
                 excluded |= manual.get_all_photo_identity_checksums()
