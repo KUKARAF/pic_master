@@ -11,45 +11,57 @@
 
 <div class="section-title" style="margin-bottom:10px;">Library stats</div>
 <div style="display:flex;flex-wrap:wrap;gap:16px;margin-bottom:24px;">
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_photos }}</span><span class="sub">Photos</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_videos or '—' }}</span><span class="sub">Videos</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.known_people }}</span><span class="sub">Known people</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.unknown_faces }}</span><span class="sub">Unknown faces</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.num_sets }}</span><span class="sub">Sets</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.photos_without_set }}</span><span class="sub">Photos without a set</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_manual_tags }}</span><span class="sub">Manual tags</span></div>
-  <div class="stat-tile"><span class="stat-value">{{ homepage_stats.total_auto_tags }}</span><span class="sub">Auto-detected tags</span></div>
+  <a class="stat-tile" href="/browse/photos"><span class="stat-value">{{ homepage_stats.total_photos }}</span><span class="sub">Photos</span></a>
+  <a class="stat-tile" href="/browse/videos"><span class="stat-value">{{ homepage_stats.total_videos }}</span><span class="sub">Videos</span></a>
+  <a class="stat-tile" href="/faces"><span class="stat-value">{{ homepage_stats.known_people }}</span><span class="sub">Known people</span></a>
+  <a class="stat-tile" href="/find_all_faces"><span class="stat-value">{{ homepage_stats.unknown_faces }}</span><span class="sub">Unknown faces</span></a>
+  <a class="stat-tile" href="/sets"><span class="stat-value">{{ homepage_stats.num_sets }}</span><span class="sub">Sets</span></a>
+  <a class="stat-tile" href="/browse/without-set"><span class="stat-value">{{ homepage_stats.photos_without_set }}</span><span class="sub">Without a set</span></a>
+  <a class="stat-tile" href="/tags"><span class="stat-value">{{ homepage_stats.total_manual_tags }}</span><span class="sub">Manual tags</span></a>
+  <a class="stat-tile" href="/tags"><span class="stat-value">{{ homepage_stats.total_auto_tags }}</span><span class="sub">Auto-detected tags</span></a>
 </div>
 
-{% if favorites %}
-<div class="section-title" style="margin-bottom:10px;">Favorites</div>
-<div class="grid" style="margin-bottom:28px;" data-queue-source="Favorites">
-  {% for f in favorites %}
-  {{ macros.card(f) }}
+{% macro photo_section(title, cards, queue_source) %}
+{% if cards %}
+<div class="section-title" style="margin-bottom:10px;">{{ title }}</div>
+<div class="grid" style="margin-bottom:28px;" data-queue-source="{{ queue_source }}">
+  {% for f in cards %}{{ macros.card(f) }}{% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
+
+{{ photo_section('Random', random_cards, 'Random') }}
+{{ photo_section('New photos', new_photos, 'New photos') }}
+{{ photo_section('New videos', new_videos, 'New videos') }}
+{{ photo_section('Favorites', favorites, 'Favorites') }}
+
+{% if random_sets %}
+<div class="section-title" style="margin-bottom:10px;">Random sets</div>
+<div class="grid" style="margin-bottom:28px;">
+  {% for s in random_sets %}
+  <div class="card" data-set-id="{{ s.id }}">
+    <a class="card-img-link" href="/sets/{{ s.id }}">
+      {% if s.thumb_id %}<img src="/thumb/{{ s.thumb_id }}" alt="{{ s.name }}" loading="lazy">
+      {% else %}<div style="aspect-ratio:1;background:#070D07;display:flex;align-items:center;justify-content:center;font-size:2rem;">🗂️</div>{% endif %}
+    </a>
+    <div class="card-body">
+      <a class="card-name" href="/sets/{{ s.id }}" title="{{ s.name }}">{{ s.name }}</a>
+      <div class="sub" style="font-size:0.78rem;">{{ s.image_count }} image(s)</div>
+    </div>
+  </div>
   {% endfor %}
 </div>
 {% endif %}
 
 {% if needs_attention %}
-<div class="section-title" style="margin-bottom:4px;">Needs attention</div>
+<div class="section-title" style="margin-bottom:4px;">Needs love</div>
 <div class="sub" style="margin-bottom:10px;">Least-viewed photos with no name, set, tag, or category yet.</div>
-<div class="grid" style="margin-bottom:28px;" data-queue-source="Needs attention">
-  {% for f in needs_attention %}
-  {{ macros.card(f) }}
-  {% endfor %}
+<div class="grid" style="margin-bottom:28px;" data-queue-source="Needs love">
+  {% for f in needs_attention %}{{ macros.card(f) }}{% endfor %}
 </div>
 {% endif %}
 
-{% if random_cards %}
-<div class="section-title" style="margin-bottom:10px;">Random</div>
-<div class="grid" style="margin-bottom:24px;" data-queue-source="Random">
-  {% for f in random_cards %}
-  {{ macros.card(f) }}
-  {% endfor %}
-</div>
-{% endif %}
-
-{% if not favorites and not needs_attention and not random_cards %}
+{% if not random_cards and not new_photos and not new_videos and not favorites and not random_sets and not needs_attention %}
 <div class="empty-state">
   <div class="icon">📂</div>
   <p>No files tracked yet. Run <code>media add .</code> to scan your photos.</p>

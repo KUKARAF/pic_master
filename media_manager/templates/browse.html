@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}{{ title }} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>{{ title }}</h1>
+  <span class="sub">{{ files | length }} shown · <a href="/browse/{{ kind }}">shuffle</a></span>
+</div>
+
+{% if files %}
+<div class="grid" data-queue-source="{{ title }}">
+  {% for f in files %}
+  {{ macros.card(f) }}
+  {% endfor %}
+</div>
+{% else %}
+<div class="empty-state">
+  <div class="icon">📂</div>
+  <p>Nothing here yet.</p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
+  if (window.wireHeartButton) wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+</script>
+{% endblock %}

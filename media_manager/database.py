@@ -1226,7 +1226,8 @@ class Database(ThreadLocalDB):
     # Columns 'age' can sort by are handled entirely in Python (web.py) since ages
     # live in the separate manual.db — this SQL-level sort only ever sees 'added'/
     # 'modified'.
-    _GALLERY_SORT_COLUMNS = {'added': 'f.first_seen', 'modified': 'f.modified_time'}
+    # 'date' = EXIF capture date (taken_at); NULLs (no EXIF) sort last in DESC.
+    _GALLERY_SORT_COLUMNS = {'added': 'f.first_seen', 'modified': 'f.modified_time', 'date': 'f.taken_at'}
 
     def list_files_with_embedding_flag(self, limit=200, offset=0, sort='added', order='desc'):
         """Return (id, path, has_embedding, checksum) rows for gallery browsing.
@@ -1293,6 +1294,40 @@ class Database(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('SELECT checksum FROM files WHERE hidden = 0 ORDER BY RANDOM() LIMIT ?', (limit,))
         return [r[0] for r in cur.fetchall()]
+
+    @staticmethod
+    def _ext_like_clause(exts):
+        """('(lower(path) LIKE ... OR ...)', [ext,...]) for filtering files_with_path by
+        extension. Empty exts → a clause that matches nothing."""
+        exts = [e.lower() for e in exts]
+        if not exts:
+            return '0', []
+        return '(' + ' OR '.join("lower(path) LIKE '%' || ?" for _ in exts) + ')', exts
+
+    def count_files_by_ext(self, exts):
+        """Count non-hidden files whose path ends with one of `exts` (e.g. images vs videos)."""
+        clause, params = self._ext_like_clause(exts)
+        cur = self.conn.cursor()
+        cur.execute(f'SELECT COUNT(*) FROM files_with_path WHERE hidden = 0 AND {clause}', params)
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def get_recent_files(self, limit, exts):
+        """(id, path, checksum) most-recently-ADDED (first_seen DESC) files matching `exts`
+        — the home 'new photos'/'new videos' sections."""
+        clause, params = self._ext_like_clause(exts)
+        cur = self.conn.cursor()
+        cur.execute(f'SELECT id, path, checksum FROM files_with_path WHERE hidden = 0 AND {clause} '
+                    f'ORDER BY first_seen DESC, id DESC LIMIT ?', params + [limit])
+        return cur.fetchall()
+
+    def get_random_files_by_ext(self, exts, limit):
+        """(id, path, checksum) random non-hidden files matching `exts` — the /browse grids."""
+        clause, params = self._ext_like_clause(exts)
+        cur = self.conn.cursor()
+        cur.execute(f'SELECT id, path, checksum FROM files_with_path WHERE hidden = 0 AND {clause} '
+                    f'ORDER BY RANDOM() LIMIT ?', params + [limit])
+        return cur.fetchall()
 
     def get_files_by_size(self, limit, offset=0):
         """(id, path, checksum, size) for non-hidden files, largest first — the

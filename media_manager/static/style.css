@@ -1770,6 +1770,10 @@ input[type="range"] { accent-color: var(--accent); }
   background: var(--surface);
   min-width: 100px;
 }
+/* Home stat tiles are links (each drills into a filtered view). */
+a.stat-tile { text-decoration: none; color: inherit; transition: border-color .12s, background .12s; }
+a.stat-tile:hover { border-color: var(--accent); background: var(--panel, var(--surface)); }
+a.stat-tile .sub { text-decoration: none; }
 .stat-value {
   font-family: var(--font-term);
   font-size: 1.3rem;

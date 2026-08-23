@@ -1107,6 +1107,13 @@ def create_app(data_root: str) -> FastAPI:
             return sorted(file_rows, key=lambda r: os.path.basename(r['path']).lower(), reverse=reverse)
         if sort == 'modified':
             return sorted(file_rows, key=lambda r: r['modified_time'] or 0, reverse=reverse)
+        if sort == 'date':
+            # EXIF capture date; undated (no EXIF) rows always sort LAST, either direction
+            # (same 'sort to end' pattern as age/distance).
+            dated = [r for r in file_rows if r['taken_at'] is not None]
+            undated = [r for r in file_rows if r['taken_at'] is None]
+            dated.sort(key=lambda r: r['taken_at'], reverse=reverse)
+            return dated + undated
         if sort == 'favorites':
             counts = manual.get_favorite_counts([r['checksum'] for r in file_rows])
             return sorted(file_rows, key=lambda r: counts.get(r['checksum'], 0), reverse=reverse)
@@ -1224,20 +1231,41 @@ def create_app(data_root: str) -> FastAPI:
         rows = db.get_files_by_checksums(checksums)
         return _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
 
+    def _random_set_cards(limit=6):
+        """A random handful of sets as light cards {id, name, image_count, favorite,
+        thumb_id} for the home 'Random sets' section."""
+        import random
+        sets = manual.list_sets()
+        if not sets:
+            return []
+        cards = []
+        for s in random.sample(sets, min(limit, len(sets))):
+            member_cs = manual.get_files_by_set(s['id'], limit=1)
+            rows = db.get_files_by_checksums(member_cs) if member_cs else []
+            cards.append({'id': s['id'], 'name': s['name'], 'image_count': s['image_count'],
+                          'favorite': s['favorite'], 'thumb_id': rows[0]['id'] if rows else None})
+        return cards
+
     @app.get('/', response_class=HTMLResponse)
     def gallery_page(request: Request):
-        """A fast, curated landing page — three small sections, each enriching only a
-        few dozen cards (never the whole library): favorites (most-favorited first),
-        a 'needs attention' sample (least-viewed photos with no name / set / tag /
-        category yet), and a random sample. Browsing everything lives on Search / Files
-        now."""
-        # 1. Favorites, most-favorited first.
-        fav = manual.get_top_favorite_checksums(limit=60)
+        """A fast, curated landing page — small sections, each enriching only a few cards
+        (never the whole library): random, new photos, new videos, favorites (top 6),
+        random sets, and 'needs love' (least-viewed untouched photos)."""
+        def _cards(rows):   # ordered enriched cards from (id, path, checksum) rows
+            return _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
+
+        random_cards = _cards_for_checksums(db.get_random_file_checksums(6))
+        new_photos = _cards(db.get_recent_files(6, IMAGE_EXTENSIONS))
+        new_videos = _cards(db.get_recent_files(6, VIDEO_EXTENSIONS))
+        random_sets = _random_set_cards(6)
+
+        # Favorites — top 6, most-favorited first.
+        fav = manual.get_top_favorite_checksums(limit=6)
         fav_rank = {cs: i for i, (cs, _c) in enumerate(fav)}
         favorites = _cards_for_checksums(fav_rank.keys())
         favorites.sort(key=lambda c: fav_rank.get(c['checksum'], 1 << 30))
 
-        # 2. Needs attention: least-viewed photos that are still untouched — no NAME
+        # Needs love: least-viewed photos that are still untouched — no NAME
         # (neither a named face nor a whole-photo assignment), no set, no positive tag,
         # no category. A photo with an UNNAMED face IS shown (it needs a name). The
         # candidate pool is least-viewed-first (get_least_viewed_files); eligibility is
@@ -1259,16 +1287,39 @@ def create_app(data_root: str) -> FastAPI:
                 break
         needs_attention = _cards_for_checksums(needs)
 
-        # 3. Random.
-        random_cards = _cards_for_checksums(db.get_random_file_checksums(limit=6))
-
         return templates.TemplateResponse(request, 'gallery.html', {
-            'favorites': favorites,
-            'needs_attention': needs_attention,
             'random_cards': random_cards,
+            'new_photos': new_photos,
+            'new_videos': new_videos,
+            'favorites': favorites,
+            'random_sets': random_sets,
+            'needs_attention': needs_attention,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
             'homepage_stats': _homepage_stats(),
+        })
+
+    @app.get('/browse/{kind}', response_class=HTMLResponse)
+    def browse_page(request: Request, kind: str, limit: int = 120):
+        """A random grid of one library slice — the clickable home stat tiles land here.
+        kind: 'photos' | 'videos' | 'without-set'. (Known people → /faces, unknown faces
+        → /find_all_faces, sets → /sets, tags → /tags are their own pages.)"""
+        titles = {'photos': '📷 Photos', 'videos': '🎬 Videos', 'without-set': '🗂 Without a set'}
+        if kind not in titles:
+            raise HTTPException(status_code=404, detail='unknown browse kind')
+        if kind == 'photos':
+            rows = db.get_random_files_by_ext(list(IMAGE_EXTENSIONS), limit)
+        elif kind == 'videos':
+            rows = db.get_random_files_by_ext(list(VIDEO_EXTENSIONS), limit)
+        else:  # without-set: random files not in any set
+            members = manual.get_all_set_member_checksums()
+            rows = [r for r in db.get_random_files_by_ext(list(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS), limit * 5)
+                    if r['checksum'] not in members][:limit]
+        files = _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
+        return templates.TemplateResponse(request, 'browse.html', {
+            'title': titles[kind], 'files': files, 'kind': kind,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
         })
 
     @app.get('/files', response_class=HTMLResponse)
@@ -4895,6 +4946,7 @@ def create_app(data_root: str) -> FastAPI:
         before). Treating checksum count as a stand-in for file-row count is
         the same approximation already accepted for 'total_photos' above."""
         total_files = db.count_files()
+        total_videos = db.count_files_by_ext(VIDEO_EXTENSIONS)
         return {
             # Cheap counts only — no whole-library row scans/joins (this runs on the
             # home page): distinct-identity/set-member/unidentified-face COUNTs instead
@@ -4903,8 +4955,8 @@ def create_app(data_root: str) -> FastAPI:
             'unknown_faces': db.count_unidentified_faces(),
             'num_sets': manual.count_sets(),
             'photos_without_set': max(0, total_files - manual.count_set_member_checksums()),
-            'total_photos': total_files,
-            'total_videos': None,
+            'total_photos': max(0, total_files - total_videos),   # non-video files
+            'total_videos': total_videos,
             'total_manual_tags': len(manual.list_all_tags()),
             'total_auto_tags': db.count_detected_classes(),
         }
