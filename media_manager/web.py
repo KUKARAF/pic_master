@@ -5459,6 +5459,16 @@ def create_app(data_root: str) -> FastAPI:
             })
         return {'items': items, 'total': manual.count_trash()}
 
+    @app.get('/api/broken')
+    def api_broken_list(limit: int = 500):
+        """Damaged/broken files (files.broken set — e.g. a video whose frames wouldn't
+        decode in the capture-frames job). JSON so it's scriptable, e.g.:
+            curl http://HOST/api/broken"""
+        items = [{'file_id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path'],
+                  'is_video': os.path.splitext(r['path'])[1].lower() in VIDEO_EXTENSIONS}
+                 for r in db.get_broken_files(limit)]
+        return {'items': items, 'total': db.count_broken_files()}
+
     @app.get('/trash', response_class=HTMLResponse)
     def trash_page(request: Request):
         """Review the trash (soft-deleted content) and restore items. Deletion of the

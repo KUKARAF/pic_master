@@ -15,8 +15,19 @@
 <div class="trash-grid" id="trash-grid" data-queue-source="Trash"></div>
 <div id="trash-status" class="sub"></div>
 
+<div class="section-title" style="margin:28px 0 4px;">💥 Damaged <span class="sub" id="damaged-count"></span></div>
+<p class="sub" style="margin:0 0 10px;">
+  Files flagged damaged (e.g. a video whose frames won't decode). Fetch the list as JSON:
+</p>
+<pre class="curl-example" id="damaged-curl"></pre>
+<div class="trash-grid" id="damaged-grid" data-queue-source="Damaged"></div>
+<div id="damaged-status" class="sub"></div>
+
 <style>
   .trash-header { display:flex; align-items:baseline; gap:12px; }
+  .curl-example { background:var(--panel, #0d0d0d); border:1px solid var(--border, #333);
+    border-radius:var(--radius, 6px); padding:8px 12px; overflow-x:auto; font-family:var(--font-term, monospace);
+    font-size:0.85em; margin:0 0 12px; }
   .trash-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:12px; }
   .trash-card { position:relative; background:var(--panel, #111); border-radius:var(--radius, 8px);
     overflow:hidden; }
@@ -71,6 +82,40 @@
   fetch('/api/trash')
     .then(function (r) { return r.json(); })
     .then(function (d) { status.textContent = ''; render(d.items || [], d.total || 0); })
+    .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
+})();
+
+/* Damaged files section: a copyable curl example + a grid fetched from /api/broken. */
+(function () {
+  var grid = document.getElementById('damaged-grid');
+  var status = document.getElementById('damaged-status');
+  var countEl = document.getElementById('damaged-count');
+  var curlEl = document.getElementById('damaged-curl');
+  if (!grid) return;
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+
+  curlEl.textContent = 'curl ' + window.location.origin + '/api/broken';
+
+  status.textContent = 'Loading…';
+  fetch('/api/broken')
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      status.textContent = '';
+      var items = d.items || [];
+      countEl.textContent = d.total ? ('(' + d.total + ')') : '';
+      if (!items.length) { status.textContent = 'No damaged files. 🎉'; return; }
+      items.forEach(function (it) {
+        var card = document.createElement('div');
+        card.className = 'trash-card';
+        card.innerHTML =
+          '<a href="/photo/' + it.file_id + '"><img src="/thumb/' + it.file_id + '" alt="" loading="lazy"></a>' +
+          '<div class="trash-meta">' +
+            '<span class="trash-reason">' + (it.is_video ? '▶ video' : 'image') + '</span><br>' +
+            '<span class="trash-note" title="' + esc(it.path) + '">' + esc(it.filename) + '</span>' +
+          '</div>';
+        grid.appendChild(card);
+      });
+    })
     .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
 })();
 </script>
