@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+
+{% block title %}Trash — media{% endblock %}
+
+{% block content %}
+<div class="trash-header">
+  <h1 style="margin:0;">🗑 Trash</h1>
+  <span class="sub" id="trash-count"></span>
+</div>
+<p class="sub" style="margin:6px 0 14px;">
+  Soft-deleted content, kept fully reversible. Nothing here has been removed from disk —
+  restoring returns a file untouched. Actual deletion is a separate step and isn't offered yet.
+</p>
+
+<div class="trash-grid" id="trash-grid" data-queue-source="Trash"></div>
+<div id="trash-status" class="sub"></div>
+
+<style>
+  .trash-header { display:flex; align-items:baseline; gap:12px; }
+  .trash-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(160px, 1fr)); gap:12px; }
+  .trash-card { position:relative; background:var(--panel, #111); border-radius:var(--radius, 8px);
+    overflow:hidden; }
+  .trash-card img { width:100%; aspect-ratio:1/1; object-fit:cover; display:block; background:#000; }
+  .trash-meta { padding:6px 8px; font-size:0.8em; }
+  .trash-reason { display:inline-block; background:rgba(255,255,255,.12); border-radius:10px;
+    padding:1px 8px; margin-bottom:4px; }
+  .trash-note { color:var(--muted, #999); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .trash-restore { width:100%; margin-top:4px; cursor:pointer; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+  var grid = document.getElementById('trash-grid');
+  var status = document.getElementById('trash-status');
+  var countEl = document.getElementById('trash-count');
+  if (!grid) return;
+
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+
+  function render(items, total) {
+    countEl.textContent = total ? (total + ' item' + (total === 1 ? '' : 's')) : '';
+    if (!items.length) { status.textContent = 'Trash is empty.'; return; }
+    items.forEach(function (it) {
+      var card = document.createElement('div');
+      card.className = 'trash-card';
+      var base = (it.note || '').split('/').pop();
+      card.innerHTML =
+        (it.file_id ? '<img src="/thumb/' + it.file_id + '" alt="" loading="lazy">' : '') +
+        '<div class="trash-meta">' +
+          (it.reason ? '<span class="trash-reason">' + esc(it.reason) + '</span><br>' : '') +
+          '<span class="trash-note" title="' + esc(it.note) + '">' + esc(base) + '</span>' +
+          (it.kept_checksum ? '<div class="sub">merged into a kept copy</div>' : '') +
+          '<button type="button" class="trash-restore" data-file-id="' + it.file_id + '">Restore</button>' +
+        '</div>';
+      var btn = card.querySelector('.trash-restore');
+      if (btn) btn.addEventListener('click', function () {
+        if (!it.file_id) return;
+        btn.disabled = true;
+        fetch('/api/files/' + it.file_id + '/untrash', { method: 'POST' })
+          .then(function (r) { return r.json(); })
+          .then(function () { card.remove(); if (window.showToast) showToast('Restored'); })
+          .catch(function (e) { btn.disabled = false; if (window.showToast) showToast('Failed: ' + e.message); });
+      });
+      grid.appendChild(card);
+    });
+  }
+
+  status.textContent = 'Loading…';
+  fetch('/api/trash')
+    .then(function (r) { return r.json(); })
+    .then(function (d) { status.textContent = ''; render(d.items || [], d.total || 0); })
+    .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
+})();
+</script>
+{% endblock %}

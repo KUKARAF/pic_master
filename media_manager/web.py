@@ -90,6 +90,14 @@ class FavoriteBody(BaseModel):
     # left-click, -1 on right-click) and the endpoint returns the new count.
     delta: int = 1
 
+class TrashBody(BaseModel):
+    # Move a file's content into the trash (soft-delete). reason: why ('duplicate',
+    # 'low_quality','damaged','manual', ...); kept_checksum: the survivor it was merged
+    # into, for provenance. Nothing is deleted here — see ManualDB.add_to_trash.
+    reason: Optional[str] = None
+    kept_checksum: Optional[str] = None
+    note: Optional[str] = None
+
 class FeedQueueBody(BaseModel):
     # Ordered file ids for the watch-queue feed (/api/feed/queue).
     ids: List[int] = []
@@ -4696,6 +4704,48 @@ def create_app(data_root: str) -> FastAPI:
         row = _file_or_404(file_id)
         count = manual.bump_file_favorite(row['checksum'], body.delta)
         return {'id': file_id, 'count': count}
+
+    @app.post('/api/files/{file_id}/trash')
+    def api_trash_file(file_id: int, body: TrashBody):
+        """Move this file's content into the trash (reversible soft-delete). Records the
+        file's current path as provenance. NOTHING is deleted from disk and no labels are
+        touched — actual removal is a separate step that isn't implemented yet."""
+        row = _file_or_404(file_id)
+        manual.add_to_trash(row['checksum'], reason=body.reason,
+                            kept_checksum=body.kept_checksum, source_file_id=file_id,
+                            note=body.note or row['path'])
+        return {'id': file_id, 'trashed': True}
+
+    @app.post('/api/files/{file_id}/untrash')
+    def api_untrash_file(file_id: int):
+        """Restore a file from the trash."""
+        row = _file_or_404(file_id)
+        restored = manual.restore_from_trash(row['checksum'])
+        return {'id': file_id, 'trashed': False, 'restored': restored}
+
+    @app.get('/api/trash')
+    def api_trash_list(limit: int = 200, offset: int = 0):
+        """The trash contents, newest first, resolved back to current file ids/paths
+        where the content still exists in the library."""
+        items = []
+        for cs, reason, kept, src_id, note, created_at in manual.list_trash(limit, offset):
+            row = db.get_file_by_checksum(cs)
+            fid = row['id'] if row else src_id
+            items.append({
+                'checksum': cs, 'reason': reason, 'kept_checksum': kept,
+                'file_id': fid, 'note': note, 'created_at': created_at,
+                'is_video': os.path.splitext(note or '')[1].lower() in VIDEO_EXTENSIONS,
+            })
+        return {'items': items, 'total': manual.count_trash()}
+
+    @app.get('/trash', response_class=HTMLResponse)
+    def trash_page(request: Request):
+        """Review the trash (soft-deleted content) and restore items. Deletion of the
+        underlying bytes is intentionally not offered here yet."""
+        return templates.TemplateResponse(request, 'trash.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
 
     @app.patch('/api/files/{file_id}/title')
     def api_set_file_title(file_id: int, body: TitleBody):

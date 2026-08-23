@@ -232,6 +232,23 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
+        # Trash: a soft-delete holding area (checksum-keyed like everything here). Placing
+        # a file here marks it for eventual removal WITHOUT deleting any bytes or labels —
+        # it stays fully reversible (restore_from_trash). Actual on-disk deletion is a
+        # separate, deliberate step that is intentionally NOT implemented yet. `reason`
+        # records why ('duplicate','low_quality','damaged','manual', ...), `kept_checksum`
+        # records the survivor it was merged into (provenance), and `note` holds free-form
+        # context (e.g. the original path/folder) so nothing is lost when it's cleared.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS trash (
+                checksum TEXT PRIMARY KEY,
+                reason TEXT,
+                kept_checksum TEXT,
+                source_file_id INTEGER,
+                note TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
         # Manually-captured video frames: each still (child_checksum, a hidden file in
         # media.db) links back to the source video (parent_checksum) + the timestamp it
         # was grabbed at. Lets the video's page list its saved frames and a captured
@@ -952,6 +969,69 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('SELECT 1 FROM file_favorites WHERE checksum = ?', (checksum,))
         return cur.fetchone() is not None
+
+    # --- trash (soft-delete holding area; no bytes/labels are removed here) -----------
+    def add_to_trash(self, checksum, reason=None, kept_checksum=None,
+                     source_file_id=None, note=None):
+        """Place a file's content in the trash (reversible). Idempotent: re-trashing
+        updates the reason/provenance. Removes nothing on disk and touches no labels —
+        that stays intact so a restore is lossless and eventual deletion can migrate
+        labels first."""
+        cur = self.conn.cursor()
+        cur.execute(
+            '''INSERT INTO trash (checksum, reason, kept_checksum, source_file_id, note, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(checksum) DO UPDATE SET
+                   reason = excluded.reason,
+                   kept_checksum = excluded.kept_checksum,
+                   source_file_id = excluded.source_file_id,
+                   note = excluded.note''',
+            (checksum, reason, kept_checksum, source_file_id, note, int(time.time()))
+        )
+        self.conn.commit()
+
+    def restore_from_trash(self, checksum):
+        """Take a file back out of the trash. Returns True if it was trashed."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM trash WHERE checksum = ?', (checksum,))
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def is_trashed(self, checksum):
+        cur = self.conn.cursor()
+        cur.execute('SELECT 1 FROM trash WHERE checksum = ?', (checksum,))
+        return cur.fetchone() is not None
+
+    def get_trashed_checksums(self, checksums=None):
+        """Trashed checksums as a set(). With `checksums`, the trashed subset of that
+        list (chunked, for excluding trash from a page of results); without, the whole
+        trash set (for a library-wide filter)."""
+        cur = self.conn.cursor()
+        if checksums is None:
+            cur.execute('SELECT checksum FROM trash')
+            return {row[0] for row in cur.fetchall()}
+        result = set()
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'SELECT checksum FROM trash WHERE checksum IN ({placeholders})', tuple(chunk))
+            result.update(row[0] for row in cur.fetchall())
+        return result
+
+    def count_trash(self):
+        cur = self.conn.cursor()
+        cur.execute('SELECT COUNT(*) FROM trash')
+        row = cur.fetchone()
+        return row[0] if row else 0
+
+    def list_trash(self, limit=200, offset=0):
+        """Trash rows, newest first — backs the /trash review page."""
+        cur = self.conn.cursor()
+        cur.execute(
+            '''SELECT checksum, reason, kept_checksum, source_file_id, note, created_at
+               FROM trash ORDER BY created_at DESC LIMIT ? OFFSET ?''',
+            (limit, offset)
+        )
+        return cur.fetchall()
 
     def get_random_favorite_checksums(self, limit=6):
         """Random sample of favorited whole-photo checksums, bounded by `limit`
