@@ -25,7 +25,13 @@ H_DUP = 4        # <= this: the same pixels (re-encode/resize/damage)
 H_NEAR = 10      # <= this: near — same scene / burst / possible dup
 BURST_SECS = 3   # capture-time gap under which near frames read as a burst, not a copy
 RATIO_DIFF = 1.2 # resolution/size ratio above which two copies "differ" in quality
-CROSS_THRESH = 0.92  # CLIP cosine for the screenshot↔video-still wide net (Phase 3)
+CROSS_THRESH = 0.95  # CLIP cosine for the screenshot↔video-still wide net (Phase 3)
+# Grouping is single-linkage union-find, so a loose threshold CHAINS dissimilar photos
+# (A≈B≈C… drags in unrelated D) into big useless blobs. Group tight — near-identical
+# only — so a group is genuinely "the same shot"; and drop any runaway group (a
+# degenerate hub / over-linked cluster) rather than present a wall of unrelated photos.
+GROUP_HAMMING = 6
+MAX_GROUP = 12
 
 _BANDS = 4
 _BAND_BITS = 16

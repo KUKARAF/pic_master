@@ -2985,7 +2985,7 @@ def create_app(data_root: str) -> FastAPI:
                 uf = near_dup._UnionFind()
                 for it in items:
                     uf.find(it['file_id'])
-                for g in near_dup.group(items, blocked_pairs=blocked):
+                for g in near_dup.group(items, max_hamming=near_dup.GROUP_HAMMING, blocked_pairs=blocked):
                     for k in range(1, len(g)):
                         uf.union(g[0], g[k])
                 still_ids = [it['file_id'] for it in items if it['is_still']]
@@ -3019,8 +3019,12 @@ def create_app(data_root: str) -> FastAPI:
                 near_dup_job['done'] = len(items)
                 db.clear_dup_groups()
                 n = 0
+                oversized = 0
                 for g in uf.groups():
                     if len(g) < 2:
+                        continue
+                    if len(g) > near_dup.MAX_GROUP:
+                        oversized += 1   # a runaway/over-linked cluster — noise, don't present it
                         continue
                     gitems = [by_id[fid] for fid in g if fid in by_id]
                     if len(gitems) < 2:
@@ -3028,6 +3032,8 @@ def create_app(data_root: str) -> FastAPI:
                     c = near_dup.classify(gitems)
                     db.insert_dup_group(c['label'], c['action'], c['keeper'], c['reason'], g)
                     n += 1
+                if oversized:
+                    errors.log('near-dup', f'dropped {oversized} oversized (>{near_dup.MAX_GROUP}) cluster(s) as noise')
                 near_dup_job['groups'] = n
             except Exception as exc:
                 near_dup_job['error'] = str(exc)
