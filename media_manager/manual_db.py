@@ -1107,6 +1107,13 @@ class ManualDB(ThreadLocalDB):
         )
         return cur.fetchall()
 
+    def get_checksums_with_age_estimate(self):
+        """Every checksum that already has at least one age estimate, as a set() — lets
+        the bulk 'estimate ages' job skip photos it has already processed."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT checksum FROM face_age_estimates')
+        return {row[0] for row in cur.fetchall()}
+
     def get_age_estimate_for_face_ref(self, face_ref):
         """Single-face lookup — unlike get_age_estimates_for_checksum (every face on
         one photo), this is for callers that already know exactly which face they

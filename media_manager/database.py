@@ -987,6 +987,33 @@ class Database(ThreadLocalDB):
             cursor.execute(sql + ' LIMIT ?', (limit,))
         return cursor.fetchall()
 
+    def get_videos_needing_frames(self, video_exts, min_frames=3, limit=None):
+        """(id, path) for video files (by extension) that have fewer than `min_frames`
+        perceptual-hash frames yet — the "Capture frames" job's work list. A video with
+        min_frames already present is skipped. `video_exts` is an iterable like
+        ('.mp4', '.mov', ...)."""
+        exts = [e.lower() for e in video_exts]
+        if not exts:
+            return []
+        like = ' OR '.join("lower(f.path) LIKE '%' || ?" for _ in exts)
+        # broken IS NULL: a video already flagged damaged won't yield more frames on a
+        # retry, so don't keep re-attempting it (clear_broken to force a re-try).
+        sql = f'''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN phashes p ON p.file_id = f.id
+            WHERE f.hidden = 0 AND f.broken IS NULL AND ({like})
+            GROUP BY f.id
+            HAVING COUNT(p.file_id) < ?
+        '''
+        params = exts + [min_frames]
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(limit)
+        cursor = self.conn.cursor()
+        cursor.execute(sql, params)
+        return cursor.fetchall()
+
     def count_phashed(self):
         """Number of files with at least one perceptual hash (videos counted once)."""
         cursor = self.conn.cursor()

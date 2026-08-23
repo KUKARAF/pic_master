@@ -2182,6 +2182,8 @@ def create_app(data_root: str) -> FastAPI:
     # Precompute each unidentified face's closest known person (for /find_all_faces).
     face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2473,80 +2475,56 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(db.get_unindexed_files()),
         }
 
+    def _unphashed_images():
+        """(fid, rel_path) for IMAGES only — the phasher ignores videos (their frames
+        come from the separate Capture-frames job)."""
+        return [
+            (fid, rel_path) for fid, rel_path in db.get_unphashed_files(limit=None)
+            if os.path.splitext(rel_path)[1].lower() in IMAGE_EXTENSIONS
+        ]
+
     @app.post('/api/phash/start')
     def api_phash_start():
-        """Backfill perceptual hashes (near-duplicate detection, Phase 1) for every
-        image/video with none yet. Hashes the cached 400px thumbnail (cheap and plenty
-        for pHash) but records the ORIGINAL pixel dimensions so a later merge can keep
-        the highest-resolution copy. CPU-only; no worker or model needed."""
+        """Perceptual-hash every IMAGE with none yet (near-duplicate detection). Hashes
+        the cached 400px thumbnail (cheap, plenty for pHash) and records the ORIGINAL
+        pixel dimensions so a later merge can keep the highest-resolution copy. Ignores
+        videos entirely — those are handled by the Capture-frames job, which this job
+        then treats as already-present frames. CPU-only; no worker or model."""
         import threading
         from media_manager import phasher
 
         if phash_job['running']:
             return {'started': False, 'message': 'Perceptual hashing already running.'}
-        candidates = [
-            (fid, rel_path) for fid, rel_path in db.get_unphashed_files(limit=None)
-            if os.path.splitext(rel_path)[1].lower() in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS)
-        ]
+        candidates = _unphashed_images()
         phash_job.update(running=True, done=0, total=len(candidates), error=None)
-
-        def _original_dims(abs_path, is_video):
-            """Original (width, height) in pixels, or (None, None). Header-only for
-            images (no full decode); a cheap capture-props read for videos."""
-            try:
-                if is_video:
-                    import cv2
-                    cap = cv2.VideoCapture(abs_path)
-                    try:
-                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
-                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
-                    finally:
-                        cap.release()
-                    return w, h
-                from PIL import Image as PILImage
-                with PILImage.open(abs_path) as im:
-                    return im.width, im.height
-            except Exception:
-                return None, None
 
         def _run():
             from PIL import Image as PILImage
             try:
                 done = 0
                 for fid, rel_path in candidates:
-                    ext = os.path.splitext(rel_path)[1].lower()
-                    is_video = ext in VIDEO_EXTENSIONS
                     abs_path = _live_abs_path(fid, rel_path)
                     if abs_path is None:
                         errors.log(rel_path, 'phash: file not on disk')
                         done += 1; phash_job['done'] = done; continue
                     try:
-                        if is_video:
-                            # Sample 10/25/50/75/90% and hash each frame; a capture failure
-                            # at any position means the video is damaged (mark it broken).
-                            results, all_ok = phasher.hash_video_frames(abs_path)
-                            for idx, ph, dh, w, h in results:
-                                db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
-                                                w, h, phasher.ALGO_TAG, frame_index=idx)
-                            if not all_ok:
-                                db.mark_broken(fid)
-                                errors.log(rel_path, 'phash: video damaged — only '
-                                           f'{len(results)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
-                        else:
-                            # Hash the cached 400px thumbnail (generate it like serve_thumb
-                            # does if missing); take dimensions from the original.
-                            thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
-                            if not os.path.isfile(thumb_path):
-                                ok, msg = _make_thumbnail(abs_path, thumb_path)
-                                if msg:
-                                    errors.log(rel_path, msg)
-                                if not ok:
-                                    done += 1; phash_job['done'] = done; continue
-                            with PILImage.open(thumb_path) as im:
-                                ph, dh = phasher.compute_hashes(im)
-                            w, h = _original_dims(abs_path, False)
-                            db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
-                                            w, h, phasher.ALGO_TAG)
+                        thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
+                        if not os.path.isfile(thumb_path):
+                            ok, msg = _make_thumbnail(abs_path, thumb_path)
+                            if msg:
+                                errors.log(rel_path, msg)
+                            if not ok:
+                                done += 1; phash_job['done'] = done; continue
+                        with PILImage.open(thumb_path) as im:
+                            ph, dh = phasher.compute_hashes(im)
+                        w = h = None
+                        try:
+                            with PILImage.open(abs_path) as orig:  # header-only, true dims
+                                w, h = orig.width, orig.height
+                        except Exception:
+                            pass
+                        db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                                        w, h, phasher.ALGO_TAG)
                     except Exception as exc:
                         errors.log(rel_path, f'phash: {exc}')
                     done += 1
@@ -2566,7 +2544,117 @@ def create_app(data_root: str) -> FastAPI:
             'done': phash_job['done'],
             'total': phash_job['total'],
             'error': phash_job['error'],
-            'pending': len(db.get_unphashed_files()),
+            'pending': len(_unphashed_images()),
+        }
+
+    @app.post('/api/capture-frames/start')
+    def api_capture_frames_start():
+        """Capture + perceptually-hash frames from every video at 10/25/50/75/90% of
+        playback (stored as phash frames 0..4 with each frame's true dimensions). A video
+        that already has >=3 frames is skipped. If any of the five frames fails to decode
+        the video is flagged damaged (files.broken) — a failed capture is the damage
+        signal. CPU-only."""
+        import threading
+        from media_manager import phasher
+
+        if capture_frames_job['running']:
+            return {'started': False, 'message': 'Frame capture already running.'}
+        candidates = db.get_videos_needing_frames(list(VIDEO_EXTENSIONS), min_frames=3)
+        capture_frames_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                done = 0
+                for fid, rel_path in candidates:
+                    abs_path = _live_abs_path(fid, rel_path)
+                    if abs_path is None:
+                        errors.log(rel_path, 'capture-frames: file not on disk')
+                        done += 1; capture_frames_job['done'] = done; continue
+                    try:
+                        results, all_ok = phasher.hash_video_frames(abs_path)
+                        for idx, ph, dh, w, h in results:
+                            db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                                            w, h, phasher.ALGO_TAG, frame_index=idx)
+                        if not all_ok:
+                            db.mark_broken(fid)
+                            errors.log(rel_path, 'capture-frames: video damaged — only '
+                                       f'{len(results)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
+                    except Exception as exc:
+                        errors.log(rel_path, f'capture-frames: {exc}')
+                    done += 1
+                    capture_frames_job['done'] = done
+            except Exception as exc:
+                capture_frames_job['error'] = str(exc)
+            finally:
+                capture_frames_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': capture_frames_job['total']}
+
+    @app.get('/api/capture-frames/status')
+    def api_capture_frames_status():
+        return {
+            'running': capture_frames_job['running'],
+            'done': capture_frames_job['done'],
+            'total': capture_frames_job['total'],
+            'error': capture_frames_job['error'],
+            'pending': len(db.get_videos_needing_frames(list(VIDEO_EXTENSIONS), min_frames=3)),
+        }
+
+    def _faces_needing_age():
+        """Checksums with a named face but no age estimate yet — the bulk age job's
+        work list."""
+        return manual.get_all_checksums_with_named_face() - manual.get_checksums_with_age_estimate()
+
+    @app.post('/api/estimate-age/start')
+    def api_estimate_age_start():
+        """Estimate age/gender for every photo that has a named face but no estimate yet
+        (MiVOLO in its isolated venv, via subprocess — see age_estimator.py). One pass per
+        photo; skips photos already estimated."""
+        import threading
+        from media_manager.age_estimator import MODEL_ID
+
+        if estimate_age_job['running']:
+            return {'started': False, 'message': 'Age estimation already running.'}
+        candidates = list(_faces_needing_age())
+        estimate_age_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                estimator = _get_age_estimator()
+                done = 0
+                for checksum in candidates:
+                    row = db.get_file_by_checksum(checksum)
+                    if row is None:
+                        done += 1; estimate_age_job['done'] = done; continue
+                    file_id = row['id']
+                    abs_path = _live_abs_path(file_id, row['path'])
+                    faces = _combined_faces_for_file(file_id, checksum)
+                    if abs_path is None or not faces:
+                        done += 1; estimate_age_job['done'] = done; continue
+                    try:
+                        results = estimator.estimate(abs_path, faces)
+                        manual.save_age_estimates(checksum, results, MODEL_ID)
+                    except Exception as exc:
+                        errors.log(row['path'], f'estimate-age: {exc}')
+                    done += 1
+                    estimate_age_job['done'] = done
+            except Exception as exc:
+                estimate_age_job['error'] = str(exc)
+            finally:
+                estimate_age_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': estimate_age_job['total']}
+
+    @app.get('/api/estimate-age/status')
+    def api_estimate_age_status():
+        return {
+            'running': estimate_age_job['running'],
+            'done': estimate_age_job['done'],
+            'total': estimate_age_job['total'],
+            'error': estimate_age_job['error'],
+            'pending': len(_faces_needing_age()),
         }
 
     @app.post('/api/metadata/start')

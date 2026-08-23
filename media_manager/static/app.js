@@ -4558,7 +4558,8 @@
       });
     })();
 
-    // Capture the current frame → a hidden still image, then open it.
+    // Capture the current frame → a hidden still image. Stays on the video (a toast
+    // confirms) so you can keep watching instead of jumping into the captured still.
     //  • <video>: draw the currently-shown frame (currentTime) to a canvas + upload.
     //  • animated <img>: no canvas — ask the server to extract the frame the stepper
     //    is showing (selectedFrameIndex, or 0 if still autoplaying) by index.
@@ -4585,7 +4586,7 @@
             body: JSON.stringify({ frame_index: idx }),
           })
             .then(onCaptured)
-            .then(function (data) { window.location.href = '/photo/' + data.file_id; })
+            .then(function () { captureBtn.disabled = false; say(''); if (window.showToast) showToast('Frame captured'); })
             .catch(onError);
           return;
         }
@@ -4608,7 +4609,7 @@
           fd.append('time_ms', String(isVideo ? Math.round((captureSrc.currentTime || 0) * 1000) : 0));
           fetch('/api/files/' + fileId + '/capture-frame', { method: 'POST', body: fd })
             .then(onCaptured)
-            .then(function (data) { window.location.href = '/photo/' + data.file_id; })
+            .then(function () { captureBtn.disabled = false; say(''); if (window.showToast) showToast('Frame captured'); })
             .catch(onError);
         }, 'image/jpeg', 0.92);
       });
