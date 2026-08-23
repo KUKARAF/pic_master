@@ -2679,11 +2679,22 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     def _faceless_images():
-        """(fid, rel_path) for IMAGES with no faces detected yet (excludes .noface)."""
+        """(fid, rel_path) for IMAGES with no faces detected yet (excludes .noface).
+        Captured video stills are hidden .jpgs and are INCLUDED here on purpose, so face
+        detection runs on video frames too — get_unface_indexed_files doesn't filter
+        hidden."""
         return [
             (fid, rel_path) for fid, rel_path in db.get_unface_indexed_files(limit=None)
             if os.path.splitext(rel_path)[1].lower() in IMAGE_EXTENSIONS
         ]
+
+    def _link_face_match_to_video(child_checksum, name):
+        """If `child_checksum` is a captured video still, credit the match to the SOURCE
+        video too: a whole-photo identity assignment on the parent's checksum. So a face
+        matched in a frame labels the video itself, not just the hidden still."""
+        cap = manual.get_parent_capture(child_checksum)
+        if cap:
+            manual.assign_identity_to_photo(cap['parent_checksum'], name)
 
     @app.post('/api/detect-faces/start')
     def api_detect_faces_start(threshold: float = None):
@@ -2725,6 +2736,7 @@ def create_app(data_root: str) -> FastAPI:
                                 continue
                             manual.promote_auto_face(face_row['id'], row['checksum'],
                                                      json.loads(face_row['bbox']), emb, name, None, None)
+                            _link_face_match_to_video(row['checksum'], name)
                             matched += 1
                             detect_faces_job['matched'] = matched
             except Exception as exc:
@@ -3174,6 +3186,7 @@ def create_app(data_root: str) -> FastAPI:
                     manual.promote_auto_face(
                         face_id, file_row['checksum'], json.loads(bbox), emb_bytes,
                         name, None, None)
+                    _link_face_match_to_video(file_row['checksum'], name)
                     matched += 1
                     match_faces_job['matched'] = matched
             except Exception as exc:
@@ -6130,6 +6143,7 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             bbox = json.loads(face_row['bbox'])
             manual.promote_auto_face(face_db_id, row['checksum'], bbox, emb_bytes, name, None, None)
+            _link_face_match_to_video(row['checksum'], name)
             auto_matched.append({'name': name, 'score': round(score, 3)})
 
         return {'faces_found': len(faces), 'auto_matched': auto_matched}
