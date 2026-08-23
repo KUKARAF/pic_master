@@ -834,6 +834,15 @@ class Database(ThreadLocalDB):
         cur.execute('SELECT path, broken FROM files_with_path WHERE broken IS NOT NULL LIMIT ?', (limit,))
         return cur.fetchall()
 
+    def get_broken_files(self, limit=200):
+        """(id, path, checksum) for files flagged damaged (broken IS NOT NULL) — the
+        /browse/broken grid. Videos whose frames wouldn't decode (capture-frames job)
+        land here, most-recently-flagged first."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT id, path, checksum FROM files_with_path '
+                    'WHERE broken IS NOT NULL AND hidden = 0 ORDER BY broken DESC LIMIT ?', (limit,))
+        return cur.fetchall()
+
     def clear_broken(self, paths):
         cur = self.conn.cursor()
         cur.executemany('''

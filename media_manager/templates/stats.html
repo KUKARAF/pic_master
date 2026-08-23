@@ -70,7 +70,7 @@
       <tr><td>Unidentified faces</td><td class="num">{{ '{:,}'.format(stats.library.unidentified_faces) }}</td></tr>
       <tr><td>Identified faces (named)</td><td class="num">{{ '{:,}'.format(stats.library.identified_faces) }}</td></tr>
       <tr><td>Cities loaded</td><td class="num">{{ '{:,}'.format(stats.library.cities) }}</td></tr>
-      <tr><td>Broken files</td><td class="num">{{ '{:,}'.format(stats.library.broken) }}</td></tr>
+      <tr><td><a href="/browse/broken">Broken / damaged files</a></td><td class="num">{{ '{:,}'.format(stats.library.broken) }}</td></tr>
       <tr><td>media.db on disk</td><td class="num">{{ mb(stats.db_files.media_db_bytes) }}</td></tr>
     </table>
   </div>

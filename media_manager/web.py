@@ -1304,13 +1304,16 @@ def create_app(data_root: str) -> FastAPI:
         """A random grid of one library slice — the clickable home stat tiles land here.
         kind: 'photos' | 'videos' | 'without-set'. (Known people → /faces, unknown faces
         → /find_all_faces, sets → /sets, tags → /tags are their own pages.)"""
-        titles = {'photos': '📷 Photos', 'videos': '🎬 Videos', 'without-set': '🗂 Without a set'}
+        titles = {'photos': '📷 Photos', 'videos': '🎬 Videos', 'without-set': '🗂 Without a set',
+                  'broken': '💥 Damaged / broken'}
         if kind not in titles:
             raise HTTPException(status_code=404, detail='unknown browse kind')
         if kind == 'photos':
             rows = db.get_random_files_by_ext(list(IMAGE_EXTENSIONS), limit)
         elif kind == 'videos':
             rows = db.get_random_files_by_ext(list(VIDEO_EXTENSIONS), limit)
+        elif kind == 'broken':
+            rows = db.get_broken_files(limit)
         else:  # without-set: random files not in any set
             members = manual.get_all_set_member_checksums()
             rows = [r for r in db.get_random_files_by_ext(list(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS), limit * 5)
