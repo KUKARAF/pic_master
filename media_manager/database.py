@@ -962,14 +962,23 @@ class Database(ThreadLocalDB):
                        'WHERE file_id = ? AND frame_index = ?', (file_id, frame_index))
         return cursor.fetchone()
 
+    def mark_broken(self, file_id, when=None):
+        """Flag content as damaged (files.broken = unix ts). Same column broken_finder
+        uses; NULL means healthy. Cleared by clear_broken."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE files SET broken = ? WHERE id = ?',
+                       (when if when is not None else int(time.time()), file_id))
+        self.conn.commit()
+
     def get_unphashed_files(self, limit=None):
-        """(id, path) for files with no primary (frame_index=0) perceptual hash —
-        mirrors get_unindexed_files. The caller skips non-image/video extensions."""
+        """(id, path) for files with NO perceptual hash at all — mirrors
+        get_unindexed_files. A video counts as hashed once any sampled frame is stored;
+        an image has just its single frame-0 hash. The caller skips non-media extensions."""
         cursor = self.conn.cursor()
         sql = '''
             SELECT f.id, f.path
             FROM files_with_path f
-            LEFT JOIN phashes p ON p.file_id = f.id AND p.frame_index = 0
+            LEFT JOIN phashes p ON p.file_id = f.id
             WHERE p.file_id IS NULL AND f.hidden = 0
         '''
         if limit is None:
@@ -979,20 +988,22 @@ class Database(ThreadLocalDB):
         return cursor.fetchall()
 
     def count_phashed(self):
+        """Number of files with at least one perceptual hash (videos counted once)."""
         cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM phashes WHERE frame_index = 0')
+        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM phashes')
         row = cursor.fetchone()
         return row[0] if row else 0
 
     def get_all_phashes(self):
-        """(file_id, path, phash_bytes, dhash_bytes, width, height, checksum) for every
-        primary (frame_index=0) hash — the batch fetch the Phase 2 grouping consumes."""
+        """(file_id, frame_index, path, phash_bytes, dhash_bytes, width, height, checksum)
+        for every stored hash — the batch fetch the Phase 2 grouping consumes. Images have
+        one row (frame 0); videos have one row per sampled frame, so a file_id can repeat
+        and grouping matches on any frame-pair."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT p.file_id, f.path, p.phash, p.dhash, p.width, p.height, f.checksum
+            SELECT p.file_id, p.frame_index, f.path, p.phash, p.dhash, p.width, p.height, f.checksum
             FROM phashes p
             JOIN files_with_path f ON f.id = p.file_id
-            WHERE p.frame_index = 0
         ''')
         return cursor.fetchall()
 

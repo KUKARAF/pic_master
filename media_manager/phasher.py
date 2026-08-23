@@ -64,3 +64,45 @@ def compute_hashes(pil_image: Image.Image):
 def hamming(a: int, b: int) -> int:
     """Bit distance between two 64-bit hashes."""
     return bin(a ^ b).count('1')
+
+
+# Video is sampled at these fractions of playback and each frame is hashed. A capture
+# failure at any of them means the video won't decode cleanly end-to-end → damaged.
+VIDEO_FRACTIONS = (0.10, 0.25, 0.50, 0.75, 0.90)
+
+
+def hash_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
+    """Capture a frame at each fraction of the video and perceptually hash it.
+
+    Returns (results, all_ok):
+      results = [(frame_index, phash:int, dhash:int, width:int, height:int), ...] for the
+        captures that SUCCEEDED. frame_index is the position's index in `fractions`, and
+        width/height are that decoded frame's true pixel dimensions.
+      all_ok  = True only if every requested fraction decoded. Any failure (bad open,
+        unreadable frame count, or a frame that won't decode) means the video is damaged
+        and the caller should mark it so.
+    """
+    import cv2  # heavy; imported lazily like the thumbnail path does
+    results = []
+    cap = cv2.VideoCapture(abs_path)
+    try:
+        if not cap.isOpened():
+            return results, False
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        all_ok = total > 0
+        for i, frac in enumerate(fractions):
+            frame = None
+            if total > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, min(total - 1, int(total * frac)))
+                ok, frame = cap.read()
+                if not ok:
+                    frame = None
+            if frame is None:
+                all_ok = False
+                continue
+            im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            ph, dh = compute_hashes(im)
+            results.append((i, ph, dh, int(frame.shape[1]), int(frame.shape[0])))
+        return results, all_ok
+    finally:
+        cap.release()

@@ -2520,22 +2520,33 @@ def create_app(data_root: str) -> FastAPI:
                     if abs_path is None:
                         errors.log(rel_path, 'phash: file not on disk')
                         done += 1; phash_job['done'] = done; continue
-                    # Hash the thumbnail (generate it the same way serve_thumb does if
-                    # it isn't cached yet); take dimensions from the original.
-                    thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
-                    if not os.path.isfile(thumb_path):
-                        make_thumb = _make_video_thumbnail if is_video else _make_thumbnail
-                        ok, msg = make_thumb(abs_path, thumb_path)
-                        if msg:
-                            errors.log(rel_path, msg)
-                        if not ok:
-                            done += 1; phash_job['done'] = done; continue
                     try:
-                        with PILImage.open(thumb_path) as im:
-                            ph, dh = phasher.compute_hashes(im)
-                        w, h = _original_dims(abs_path, is_video)
-                        db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
-                                        w, h, phasher.ALGO_TAG)
+                        if is_video:
+                            # Sample 10/25/50/75/90% and hash each frame; a capture failure
+                            # at any position means the video is damaged (mark it broken).
+                            results, all_ok = phasher.hash_video_frames(abs_path)
+                            for idx, ph, dh, w, h in results:
+                                db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                                                w, h, phasher.ALGO_TAG, frame_index=idx)
+                            if not all_ok:
+                                db.mark_broken(fid)
+                                errors.log(rel_path, 'phash: video damaged — only '
+                                           f'{len(results)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
+                        else:
+                            # Hash the cached 400px thumbnail (generate it like serve_thumb
+                            # does if missing); take dimensions from the original.
+                            thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
+                            if not os.path.isfile(thumb_path):
+                                ok, msg = _make_thumbnail(abs_path, thumb_path)
+                                if msg:
+                                    errors.log(rel_path, msg)
+                                if not ok:
+                                    done += 1; phash_job['done'] = done; continue
+                            with PILImage.open(thumb_path) as im:
+                                ph, dh = phasher.compute_hashes(im)
+                            w, h = _original_dims(abs_path, False)
+                            db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                                            w, h, phasher.ALGO_TAG)
                     except Exception as exc:
                         errors.log(rel_path, f'phash: {exc}')
                     done += 1
