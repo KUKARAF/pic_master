@@ -2884,12 +2884,18 @@ def create_app(data_root: str) -> FastAPI:
         cs_by_id = {m['id']: m['checksum'] for m in members}
 
         if body.action == 'merge':
-            keeper_id = body.keeper_file_id or g['keeper_file_id'] or members[0]['id']
-            keeper_cs = cs_by_id.get(keeper_id)
+            # No arbitrary fallback: require an explicit keeper (or a classifier-picked one
+            # for copy/damaged groups). burst/screenshot groups have no stored keeper, so a
+            # forced merge there must name one rather than trash arbitrary members.
+            keeper_id = body.keeper_file_id or g['keeper_file_id']
+            keeper_cs = cs_by_id.get(keeper_id) if keeper_id else None
             if keeper_cs is None:
-                raise HTTPException(status_code=400, detail='keeper is not a member of this group')
-            # pixel-tied labels only migrate when it's genuinely the same image.
-            same_image = g['label'] in ('lower_quality_copy', 'damaged_twin', 'review')
+                raise HTTPException(status_code=400, detail='a keeper file id in this group is required to merge')
+            # Pixel-tied labels (spatial tags, faces+ages, frame-captures) migrate ONLY for
+            # groups asserted to be the same image. 'review' is ambiguous (grouped up to
+            # Hamming 10) so it is treated as different-pixels — otherwise a loser's face
+            # bboxes would land on a differently-framed keeper.
+            same_image = g['label'] in ('lower_quality_copy', 'damaged_twin')
             for m in members:
                 if m['id'] == keeper_id:
                     continue

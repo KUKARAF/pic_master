@@ -1083,14 +1083,16 @@ class ManualDB(ThreadLocalDB):
                             (keeper_checksum, ltitle[0], now))
                 summary['title'] = 'taken'
 
-            # Favorites — sum the counters.
+            # Favorites — keep the higher counter. MAX (not SUM) so a replayed merge (a
+            # retried partial resolve, or a double-submit) can't keep inflating the count;
+            # the loser's own row is left intact so a restore stays lossless.
             lfav = cur.execute('SELECT count FROM file_favorites WHERE checksum=?', (loser_checksum,)).fetchone()
             if lfav and lfav[0]:
                 cur.execute(
                     '''INSERT INTO file_favorites (checksum, created_at, count) VALUES (?, ?, ?)
-                       ON CONFLICT(checksum) DO UPDATE SET count = count + excluded.count''',
+                       ON CONFLICT(checksum) DO UPDATE SET count = MAX(count, excluded.count)''',
                     (keeper_checksum, now, lfav[0]))
-                summary['fav_added'] = lfav[0]
+                summary['fav'] = lfav[0]
 
             # Tags — copy loser rows with no matching keeper signature (NULL-safe via IS).
             # Spatial (bbox) tags are pixel-tied → same-image only.
