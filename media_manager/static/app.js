@@ -3376,7 +3376,15 @@
     var glyph = el.textContent;
     el.textContent = '⏳';
     fetch(opts.url, opts.fetchInit)
-      .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
+      .then(function (r) {
+        if (!r.ok) {
+          // Surface the server's detail (e.g. "No pattern index yet — run Index
+          // patterns on /bulk") instead of a bare "status 400".
+          return r.json().catch(function () { return {}; })
+            .then(function (d) { throw new Error(d.detail || ('status ' + r.status)); });
+        }
+        return r.json();
+      })
       .then(function (data) {
         var seen = {}, ids = [];
         (opts.extractIds(data) || []).forEach(function (id) {
