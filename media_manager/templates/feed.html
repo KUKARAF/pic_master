@@ -86,8 +86,10 @@
   .feed-swipe.flash { color:#79f279; }
   .feed-swipe.flash .feed-swipe-arrow, .feed-swipe.flash .feed-swipe-label { opacity:1; }
   /* Tinder card drag: horizontal drags are ours (pan-y keeps vertical scrolling with
-     the browser); the card transform is driven live in JS. */
-  .feed-item.is-random { touch-action:pan-y; }
+     the browser); the card transform is driven live in JS. user-select/touch-callout
+     off so a double tap favorites instead of selecting text or the image. */
+  .feed-item.is-random { touch-action:pan-y; -webkit-user-select:none; user-select:none;
+    -webkit-touch-callout:none; }
   .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
     background:rgba(255,255,255,.22); cursor:pointer; }
   .feed-progress:hover { height:8px; }
