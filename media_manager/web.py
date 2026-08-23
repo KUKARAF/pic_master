@@ -518,6 +518,23 @@ def create_app(data_root: str) -> FastAPI:
     errors = ErrorLog(os.path.join(media_dir, 'error.db'))
     manual = ManualDB(os.path.join(media_dir, 'manual.db'))
 
+    def _spawn_job(target):
+        """Run a bulk-job body in a daemon thread, then close that thread's per-thread
+        sqlite connections. db/manual/errors are ThreadLocalDB (one connection per
+        thread); a one-shot job thread would otherwise leave its connections open and
+        Python emits 'unclosed database' when the thread is collected. close() only
+        affects the calling (job) thread's connections."""
+        import threading
+
+        def _wrapped():
+            try:
+                target()
+            finally:
+                db.close()
+                manual.close()
+                errors.close()
+        threading.Thread(target=_wrapped, daemon=True).start()
+
     app = FastAPI(title='media gallery')
 
     # Every route on this app is hit by fetch()-based JS that always does
@@ -2232,7 +2249,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 pattern_index_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': pattern_index_job['total']}
 
     @app.get('/api/pattern-index/status')
@@ -2551,7 +2568,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 body_index_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': body_index_job['total']}
 
     @app.get('/api/body-index/status')
@@ -2605,7 +2622,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 index_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': index_job['total']}
 
     @app.get('/api/index/status')
@@ -2677,7 +2694,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 phash_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': phash_job['total']}
 
     @app.get('/api/phash/status')
@@ -2739,7 +2756,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 capture_frames_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': capture_frames_job['total']}
 
     @app.get('/api/capture-frames/status')
@@ -2798,7 +2815,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 estimate_age_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': estimate_age_job['total']}
 
     @app.get('/api/estimate-age/status')
@@ -2918,7 +2935,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 detect_faces_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': detect_faces_job['total']}
 
     @app.get('/api/detect-faces/status')
@@ -3017,7 +3034,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 near_dup_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': near_dup_job['total']}
 
     @app.get('/api/near-dup/compute/status')
@@ -3146,7 +3163,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 metadata_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': metadata_job['total']}
 
     @app.get('/api/metadata/status')
@@ -3189,7 +3206,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 cities_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': cities_job['total']}
 
     @app.get('/api/match-cities/status')
@@ -3237,7 +3254,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 fetch_cities_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': 1}
 
     @app.get('/api/fetch-cities/status')
@@ -3289,7 +3306,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 imdb_build_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': total_rows}
 
     @app.get('/api/imdb/status')
@@ -3368,7 +3385,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 match_faces_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': match_faces_job['total']}
 
     @app.get('/api/match-faces/status')
@@ -3408,7 +3425,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 tile_index_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True, 'total': tile_index_job['total']}
 
     @app.get('/api/tile-index/status')
@@ -6147,7 +6164,7 @@ def create_app(data_root: str) -> FastAPI:
             finally:
                 face_suggest_job['running'] = False
 
-        threading.Thread(target=_run, daemon=True).start()
+        _spawn_job(_run)
         return {'started': True}
 
     @app.get('/api/face-suggestions/compute/status')
@@ -6435,12 +6452,8 @@ def create_app(data_root: str) -> FastAPI:
             'done': False,
             'error': None,
         }
-        thread = threading.Thread(
-            target=_run_frame_scan_job,
-            args=(file_id, row['checksum'], abs_path, frame_count),
-            daemon=True,
-        )
-        thread.start()
+        cksum = row['checksum']
+        _spawn_job(lambda: _run_frame_scan_job(file_id, cksum, abs_path, frame_count))
         return {'started': True, 'frame_count': frame_count}
 
     @app.get('/api/files/{file_id}/scan-all-frames/progress')
