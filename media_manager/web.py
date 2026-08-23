@@ -2696,6 +2696,26 @@ def create_app(data_root: str) -> FastAPI:
         if cap:
             manual.assign_identity_to_photo(cap['parent_checksum'], name)
 
+    def _collapse_face_cards_to_video(cards):
+        """Repoint face-suggestion cards that live on a captured video still to their
+        SOURCE video (in place, by 'file_id') — the user reviews the frame's face crop
+        (still keyed by the card's `ref`) but sees/links to the video, never the hidden
+        still. Call BEFORE _attach_file_meta so filename/meta come from the video."""
+        for c in cards:
+            row = db.get_file_by_id(c['file_id'])
+            if row is None:
+                continue
+            cap = manual.get_parent_capture(row['checksum'])
+            if cap:
+                vid = db.get_file_by_checksum(cap['parent_checksum'])
+                if vid is not None:
+                    c['file_id'] = vid['id']
+                    if 'path' in c:
+                        c['path'] = vid['path']
+                    if 'filename' in c:
+                        c['filename'] = os.path.basename(vid['path'])
+        return cards
+
     @app.post('/api/detect-faces/start')
     def api_detect_faces_start(threshold: float = None):
         """Run face detection (InsightFace) on every image that has no faces yet, then
@@ -5417,7 +5437,7 @@ def create_app(data_root: str) -> FastAPI:
             }
             for score, face_id_, file_id_, path_ in sliced
         ]
-        return {'results': results, 'total': len(scored)}
+        return {'results': _collapse_face_cards_to_video(results), 'total': len(scored)}
 
     @app.get('/faces', response_class=HTMLResponse)
     def faces_page(request: Request, favorite: bool = False):
@@ -5902,10 +5922,10 @@ def create_app(data_root: str) -> FastAPI:
             if avoid_existing:
                 candidates = _deprioritize_files_with_named_face(candidates, 2)
             candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
-            return _attach_file_meta([
+            return _attach_file_meta(_collapse_face_cards_to_video([
                 {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
                 for score, ref, file_id_, identity in candidates[:count]
-            ])
+            ]))
 
         # Read the PRECOMPUTED closest-known-person per unidentified face (see
         # compute_face_suggestions), ordered by score — instant, vs the old per-refill
@@ -5926,10 +5946,10 @@ def create_app(data_root: str) -> FastAPI:
         if avoid_existing:
             candidates = _deprioritize_files_with_named_face(candidates, 2)
         candidates = bias_reorder(candidates, key_fn=lambda c: c[3], bias_key=bias_identity, bias_action=bias)
-        return _attach_file_meta([
+        return _attach_file_meta(_collapse_face_cards_to_video([
             {'ref': ref, 'file_id': file_id_, 'identity': identity, 'score': round(score, 3)}
             for score, ref, file_id_, identity in candidates[:count]
-        ])
+        ]))
 
     @app.get('/swipe')
     def swipe_page_redirect():
@@ -5999,7 +6019,9 @@ def create_app(data_root: str) -> FastAPI:
         if src_file is None:
             return None
         bbox = json.loads(src['bbox'])
-        return manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None)
+        new_id = manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None)
+        _link_face_match_to_video(src_file['checksum'], name)  # a frame confirm credits the video
+        return new_id
 
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):
@@ -6015,6 +6037,7 @@ def create_app(data_root: str) -> FastAPI:
             if row is None:
                 raise HTTPException(status_code=404, detail='Face not found')
             manual.assign_identity(raw_id, name)
+            _link_face_match_to_video(row['checksum'], name)  # a frame confirm credits the video
             return {'face_id': face_id, 'identity': name}
 
         new_id = _confirm_auto_face(raw_id, name)
