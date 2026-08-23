@@ -971,15 +971,16 @@ class Database(ThreadLocalDB):
         self.conn.commit()
 
     def get_unphashed_files(self, limit=None):
-        """(id, path) for files with NO perceptual hash at all — mirrors
-        get_unindexed_files. A video counts as hashed once any sampled frame is stored;
-        an image has just its single frame-0 hash. The caller skips non-media extensions."""
+        """(id, path) for files with no perceptual hash yet — mirrors get_unindexed_files.
+        Includes hidden files on purpose: captured video stills are hidden but must be
+        hashed (that's how videos participate in near-dup detection). The caller skips
+        non-image extensions (the raw video files themselves aren't hashed)."""
         cursor = self.conn.cursor()
         sql = '''
             SELECT f.id, f.path
             FROM files_with_path f
             LEFT JOIN phashes p ON p.file_id = f.id
-            WHERE p.file_id IS NULL AND f.hidden = 0
+            WHERE p.file_id IS NULL
         '''
         if limit is None:
             cursor.execute(sql)
@@ -987,31 +988,21 @@ class Database(ThreadLocalDB):
             cursor.execute(sql + ' LIMIT ?', (limit,))
         return cursor.fetchall()
 
-    def get_videos_needing_frames(self, video_exts, min_frames=3, limit=None):
-        """(id, path) for video files (by extension) that have fewer than `min_frames`
-        perceptual-hash frames yet — the "Capture frames" job's work list. A video with
-        min_frames already present is skipped. `video_exts` is an iterable like
-        ('.mp4', '.mov', ...)."""
+    def get_video_files(self, video_exts):
+        """(id, path, checksum) for every healthy, non-hidden video file (by extension).
+        broken IS NULL so a video already flagged damaged isn't re-attempted (clear_broken
+        to force a retry). The "Capture frames" job filters these by how many stills each
+        already has."""
         exts = [e.lower() for e in video_exts]
         if not exts:
             return []
         like = ' OR '.join("lower(f.path) LIKE '%' || ?" for _ in exts)
-        # broken IS NULL: a video already flagged damaged won't yield more frames on a
-        # retry, so don't keep re-attempting it (clear_broken to force a re-try).
-        sql = f'''
-            SELECT f.id, f.path
-            FROM files_with_path f
-            LEFT JOIN phashes p ON p.file_id = f.id
-            WHERE f.hidden = 0 AND f.broken IS NULL AND ({like})
-            GROUP BY f.id
-            HAVING COUNT(p.file_id) < ?
-        '''
-        params = exts + [min_frames]
-        if limit is not None:
-            sql += ' LIMIT ?'
-            params.append(limit)
         cursor = self.conn.cursor()
-        cursor.execute(sql, params)
+        cursor.execute(f'''
+            SELECT f.id, f.path, f.checksum
+            FROM files_with_path f
+            WHERE f.hidden = 0 AND f.broken IS NULL AND ({like})
+        ''', exts)
         return cursor.fetchall()
 
     def count_phashed(self):

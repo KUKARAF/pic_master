@@ -66,43 +66,49 @@ def hamming(a: int, b: int) -> int:
     return bin(a ^ b).count('1')
 
 
-# Video is sampled at these fractions of playback and each frame is hashed. A capture
-# failure at any of them means the video won't decode cleanly end-to-end → damaged.
+# Video is sampled at these fractions of playback. The "Capture frames" job saves each as
+# a real still (the existing frame-capture architecture); the image phasher then hashes
+# those stills like any other image. A capture failure at any fraction => the video won't
+# decode cleanly end-to-end => damaged.
 VIDEO_FRACTIONS = (0.10, 0.25, 0.50, 0.75, 0.90)
 
 
-def hash_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
-    """Capture a frame at each fraction of the video and perceptually hash it.
+def extract_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
+    """Decode a frame at each fraction of the video and JPEG-encode it.
 
-    Returns (results, all_ok):
-      results = [(frame_index, phash:int, dhash:int, width:int, height:int), ...] for the
-        captures that SUCCEEDED. frame_index is the position's index in `fractions`, and
-        width/height are that decoded frame's true pixel dimensions.
-      all_ok  = True only if every requested fraction decoded. Any failure (bad open,
-        unreadable frame count, or a frame that won't decode) means the video is damaged
-        and the caller should mark it so.
+    Returns (frames, all_ok):
+      frames = [(time_ms:int, jpeg_bytes:bytes), ...] for the captures that SUCCEEDED.
+      all_ok = True only if every requested fraction decoded. Any failure (bad open,
+        unreadable frame count, or a frame that won't decode/encode) means the video is
+        damaged and the caller should mark it so.
     """
     import cv2  # heavy; imported lazily like the thumbnail path does
-    results = []
+    frames = []
     cap = cv2.VideoCapture(abs_path)
     try:
         if not cap.isOpened():
-            return results, False
+            return frames, False
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
         all_ok = total > 0
-        for i, frac in enumerate(fractions):
+        for frac in fractions:
             frame = None
+            pos = 0
             if total > 0:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, min(total - 1, int(total * frac)))
+                pos = min(total - 1, int(total * frac))
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
                 ok, frame = cap.read()
                 if not ok:
                     frame = None
             if frame is None:
                 all_ok = False
                 continue
-            im = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-            ph, dh = compute_hashes(im)
-            results.append((i, ph, dh, int(frame.shape[1]), int(frame.shape[0])))
-        return results, all_ok
+            ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            if not ok2:
+                all_ok = False
+                continue
+            time_ms = int(pos / fps * 1000) if fps > 0 else 0
+            frames.append((time_ms, buf.tobytes()))
+        return frames, all_ok
     finally:
         cap.release()

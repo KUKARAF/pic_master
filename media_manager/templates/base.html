@@ -22,6 +22,7 @@
     <a class="nav-link" href="/studios">Studios</a>
     <a class="nav-link" href="/duplicates">Duplicates</a>
     <a class="nav-link" href="/trash">Trash</a>
+    <a class="nav-link" href="/bulk">⚡ Bulk</a>
     <a class="nav-link" href="/stats">Stats</a>
   </div>
 
@@ -32,57 +33,6 @@
   <span id="worker-badge" class="worker-badge" style="display:none;" title="">
     <span class="worker-dot"></span><span class="worker-label">🔧</span>
   </span>
-
-  <div style="position:relative;">
-    <button class="nav-tags-btn" id="bulk-actions-btn" type="button" title="Bulk actions">⚡</button>
-    <div class="tags-dropdown" id="bulk-actions-menu">
-      <div class="section-title" style="margin-bottom:6px;">Bulk actions</div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/index/start" data-status="/api/index/status">⚡ Index unindexed</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/body-index/start" data-status="/api/body-index/status">🧍 Index bodies</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/match-faces/start" data-status="/api/match-faces/status" data-count="matched">👤 Match faces</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/tile-index/start" data-status="/api/tile-index/status">▦ Index regions</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/capture-frames/start" data-status="/api/capture-frames/status">🎞 Capture video frames</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/phash/start" data-status="/api/phash/status">🧬 Perceptual hash (images)</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/estimate-age/start" data-status="/api/estimate-age/status">🎂 Estimate ages</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/metadata/start" data-status="/api/metadata/status">📍 Extract locations</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/fetch-cities/start" data-status="/api/fetch-cities/status">🌍 Download cities</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/match-cities/start" data-status="/api/match-cities/status">🏙 Match cities</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-      <div class="bulk-action-row">
-        <button type="button" class="bulk-action-btn" data-start="/api/imdb/rebuild" data-status="/api/imdb/status">🧠 Load index into memory</button>
-        <span class="bulk-action-status" data-role="status"></span>
-      </div>
-    </div>
-  </div>
 
   <div style="position:relative;">
     <button class="nav-tags-btn" id="warn-dropdown-btn" type="button">

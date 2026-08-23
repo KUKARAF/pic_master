@@ -1,0 +1,134 @@
+{% extends "base.html" %}
+
+{% block title %}Bulk jobs — media{% endblock %}
+
+{% block content %}
+<div class="bulk-page">
+  <h1 style="margin:0 0 4px;">⚡ Bulk jobs</h1>
+  <p class="sub" style="margin:0 0 20px;">
+    Each job runs in the background — start it and close the tab if you like; come back and
+    this page reattaches to anything still running (or shows how many items are pending).
+  </p>
+
+  <section class="bulk-section">
+    <h2>👤 Faces</h2>
+    <div class="bulk-threshold">
+      <label>Auto-match confidence
+        <input type="range" id="match-threshold" min="0.3" max="0.9" step="0.01"
+               value="{{ auto_match_threshold }}">
+        <span id="match-threshold-val">{{ auto_match_threshold }}</span>
+      </label>
+      <span class="sub">higher = fewer, more certain matches</span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start-base="/api/detect-faces/start"
+              data-status="/api/detect-faces/status" data-count="matched" data-threshold="1">
+        🔍 Detect faces (images with none)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start-base="/api/match-faces/start"
+              data-status="/api/match-faces/status" data-count="matched" data-threshold="1">
+        🤝 Auto-match unknown → known</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/estimate-age/start"
+              data-status="/api/estimate-age/status">🎂 Estimate ages (named faces)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+  </section>
+
+  <section class="bulk-section">
+    <h2>🎬 Videos</h2>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/capture-frames/start"
+              data-status="/api/capture-frames/status">🎞 Capture video frames</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <p class="sub" style="margin:6px 2px 0;">
+      Saves real stills at 10/25/50/75/90% (reuses the frame-capture architecture); the
+      perceptual-hash job then indexes them. A video whose frames won't decode is flagged damaged.
+    </p>
+  </section>
+
+  <section class="bulk-section">
+    <h2>🖼 Photos &amp; indexing</h2>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/index/start" data-status="/api/index/status">⚡ Index unindexed (CLIP)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/body-index/start" data-status="/api/body-index/status">🧍 Index bodies</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/tile-index/start" data-status="/api/tile-index/status">▦ Index regions</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/phash/start" data-status="/api/phash/status">🧬 Perceptual hash (images)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/metadata/start" data-status="/api/metadata/status">📍 Extract locations (EXIF)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+  </section>
+
+  <section class="bulk-section">
+    <h2>🗺 Places</h2>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/fetch-cities/start" data-status="/api/fetch-cities/status">🌍 Download cities</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/match-cities/start" data-status="/api/match-cities/status">🏙 Match cities</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+  </section>
+
+  <section class="bulk-section">
+    <h2>🧠 Search index</h2>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/imdb/rebuild" data-status="/api/imdb/status">🧠 Load index into memory</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+  </section>
+</div>
+
+<style>
+  .bulk-page { max-width: 760px; }
+  .bulk-section { margin: 0 0 26px; }
+  .bulk-section h2 { font-size: 1.05em; margin: 0 0 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border, #333); }
+  .bulk-page .bulk-action-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
+  .bulk-page .bulk-action-btn { min-width: 260px; text-align: left; }
+  .bulk-page .bulk-action-status { color: var(--muted, #999); font-size: 0.9em; }
+  .bulk-threshold { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    margin: 0 0 12px; }
+  .bulk-threshold label { display: flex; align-items: center; gap: 8px; }
+  #match-threshold-val { font-variant-numeric: tabular-nums; min-width: 2.5em; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* The face jobs take a confidence threshold. runBulkAction (app.js) POSTs each button's
+   data-start verbatim, so we keep data-start in sync with the slider for the buttons
+   marked data-threshold. */
+(function () {
+  var slider = document.getElementById('match-threshold');
+  var out = document.getElementById('match-threshold-val');
+  if (!slider) return;
+  function sync() {
+    if (out) out.textContent = slider.value;
+    document.querySelectorAll('.bulk-action-btn[data-threshold]').forEach(function (btn) {
+      btn.dataset.start = btn.dataset.startBase + '?threshold=' + encodeURIComponent(slider.value);
+    });
+  }
+  slider.addEventListener('input', sync);
+  sync();
+})();
+</script>
+{% endblock %}

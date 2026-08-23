@@ -919,6 +919,13 @@ class ManualDB(ThreadLocalDB):
                     (parent_checksum,))
         return [{'child_checksum': r[0], 'time_ms': r[1]} for r in cur.fetchall()]
 
+    def get_capture_counts_by_parent(self):
+        """{parent_checksum: number_of_captured_stills} across the whole library — one
+        query so the bulk 'Capture frames' job can skip videos that already have enough."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT parent_checksum, COUNT(*) FROM frame_captures GROUP BY parent_checksum')
+        return {row[0]: row[1] for row in cur.fetchall()}
+
     def get_parent_capture(self, child_checksum):
         """{parent_checksum, time_ms} for a captured still, or None if not a capture."""
         cur = self.conn.cursor()

@@ -2184,6 +2184,7 @@ def create_app(data_root: str) -> FastAPI:
     phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2547,38 +2548,46 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(_unphashed_images()),
         }
 
+    def _videos_needing_frames():
+        """(fid, rel_path, checksum) for healthy videos with fewer than 3 captured stills."""
+        counts = manual.get_capture_counts_by_parent()
+        return [(fid, path, cs) for fid, path, cs in db.get_video_files(list(VIDEO_EXTENSIONS))
+                if counts.get(cs, 0) < 3]
+
     @app.post('/api/capture-frames/start')
     def api_capture_frames_start():
-        """Capture + perceptually-hash frames from every video at 10/25/50/75/90% of
-        playback (stored as phash frames 0..4 with each frame's true dimensions). A video
-        that already has >=3 frames is skipped. If any of the five frames fails to decode
-        the video is flagged damaged (files.broken) — a failed capture is the damage
-        signal. CPU-only."""
+        """Capture real still frames from every video at 10/25/50/75/90% of playback,
+        saved through the existing frame-capture architecture (hidden JPEGs linked to the
+        source video via frame_captures — same as the in-viewer capture button). The image
+        phasher then hashes those stills like any photo; that's how videos join near-dup
+        detection (incl. screenshot↔video), with no separate 'phash frame' concept. A video
+        with >=3 captured stills is skipped; if any of the five fails to decode the video is
+        flagged damaged (files.broken). CPU-only."""
         import threading
         from media_manager import phasher
 
         if capture_frames_job['running']:
             return {'started': False, 'message': 'Frame capture already running.'}
-        candidates = db.get_videos_needing_frames(list(VIDEO_EXTENSIONS), min_frames=3)
+        candidates = _videos_needing_frames()
         capture_frames_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
             try:
                 done = 0
-                for fid, rel_path in candidates:
+                for fid, rel_path, _cs in candidates:
                     abs_path = _live_abs_path(fid, rel_path)
                     if abs_path is None:
                         errors.log(rel_path, 'capture-frames: file not on disk')
                         done += 1; capture_frames_job['done'] = done; continue
                     try:
-                        results, all_ok = phasher.hash_video_frames(abs_path)
-                        for idx, ph, dh, w, h in results:
-                            db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
-                                            w, h, phasher.ALGO_TAG, frame_index=idx)
+                        parent_row = db.get_file_by_id(fid)
+                        frames, all_ok = phasher.extract_video_frames(abs_path)
+                        for time_ms, jpeg in frames:
+                            _save_captured_still(parent_row, jpeg, time_ms)
                         if not all_ok:
                             db.mark_broken(fid)
                             errors.log(rel_path, 'capture-frames: video damaged — only '
-                                       f'{len(results)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
+                                       f'{len(frames)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
                     except Exception as exc:
                         errors.log(rel_path, f'capture-frames: {exc}')
                     done += 1
@@ -2598,7 +2607,7 @@ def create_app(data_root: str) -> FastAPI:
             'done': capture_frames_job['done'],
             'total': capture_frames_job['total'],
             'error': capture_frames_job['error'],
-            'pending': len(db.get_videos_needing_frames(list(VIDEO_EXTENSIONS), min_frames=3)),
+            'pending': len(_videos_needing_frames()),
         }
 
     def _faces_needing_age():
@@ -2655,6 +2664,74 @@ def create_app(data_root: str) -> FastAPI:
             'total': estimate_age_job['total'],
             'error': estimate_age_job['error'],
             'pending': len(_faces_needing_age()),
+        }
+
+    def _faceless_images():
+        """(fid, rel_path) for IMAGES with no faces detected yet (excludes .noface)."""
+        return [
+            (fid, rel_path) for fid, rel_path in db.get_unface_indexed_files(limit=None)
+            if os.path.splitext(rel_path)[1].lower() in IMAGE_EXTENSIONS
+        ]
+
+    @app.post('/api/detect-faces/start')
+    def api_detect_faces_start(threshold: float = None):
+        """Run face detection (InsightFace) on every image that has no faces yet, then
+        auto-match each detected face to a known identity above `threshold` (cosine;
+        defaults to AUTO_MATCH_THRESHOLD). The library-wide, background version of the
+        per-photo detect button. Uses the worker when configured."""
+        import threading
+
+        if detect_faces_job['running']:
+            return {'started': False, 'message': 'Face detection already running.'}
+        candidates = _faceless_images()
+        detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None)
+
+        def _run():
+            try:
+                detector = _get_face_detector()
+                model_id = detector.model_id(detector._model_name)
+                done = 0
+                matched = 0
+                for start in range(0, len(candidates), 8):
+                    batch = candidates[start:start + 8]
+                    paths = [os.path.join(data_root, rel) for _fid, rel in batch]
+                    results = detector.detect_faces(paths)
+                    for (fid, rel_path), (_p, faces, error) in zip(batch, results):
+                        done += 1
+                        detect_faces_job['done'] = done
+                        if error:
+                            errors.log(rel_path, f'detect-faces: {error}')
+                            continue
+                        db.insert_faces(fid, faces, model_id)
+                        row = db.get_file_by_id(fid)
+                        for face_row in db.get_faces_for_file(fid):
+                            emb = db.get_face_embedding(face_row['id'])
+                            if not emb:
+                                continue
+                            name, _score = manual.find_matching_identity(emb, threshold=threshold)
+                            if name is None:
+                                continue
+                            manual.promote_auto_face(face_row['id'], row['checksum'],
+                                                     json.loads(face_row['bbox']), emb, name, None, None)
+                            matched += 1
+                            detect_faces_job['matched'] = matched
+            except Exception as exc:
+                detect_faces_job['error'] = str(exc)
+            finally:
+                detect_faces_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': detect_faces_job['total']}
+
+    @app.get('/api/detect-faces/status')
+    def api_detect_faces_status():
+        return {
+            'running': detect_faces_job['running'],
+            'done': detect_faces_job['done'],
+            'total': detect_faces_job['total'],
+            'matched': detect_faces_job['matched'],
+            'error': detect_faces_job['error'],
+            'pending': len(_faceless_images()),
         }
 
     @app.post('/api/metadata/start')
@@ -2871,12 +2948,13 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/match-faces/start')
-    def api_match_faces_start():
+    def api_match_faces_start(threshold: float = None):
         """Match every not-yet-named auto-detected face against known identities and
         promote the confident hits — the library-wide version of the auto-match that
-        api_detect_faces already does per photo. Needs no model: find_matching_identity
-        is a dot-product against the cached named-face matrix, so this is fast and
-        never touches the worker."""
+        api_detect_faces already does per photo. `threshold` (cosine, 0..1) overrides the
+        default AUTO_MATCH_THRESHOLD so the /bulk page can dial confidence up or down.
+        Needs no model: find_matching_identity is a dot-product against the cached
+        named-face matrix, so this is fast and never touches the worker."""
         import threading
 
         if match_faces_job['running']:
@@ -2895,7 +2973,7 @@ def create_app(data_root: str) -> FastAPI:
                     match_faces_job['done'] = done
                     if not emb_bytes:
                         continue
-                    name, _score = manual.find_matching_identity(emb_bytes)
+                    name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
                     if name is None:
                         continue
                     file_row = db.get_file_by_id(file_id)
@@ -4928,6 +5006,19 @@ def create_app(data_root: str) -> FastAPI:
         """Review the trash (soft-deleted content) and restore items. Deletion of the
         underlying bytes is intentionally not offered here yet."""
         return templates.TemplateResponse(request, 'trash.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/bulk', response_class=HTMLResponse)
+    def bulk_page(request: Request):
+        """One place for every long-running maintenance job, grouped by area. Each job
+        runs server-side in a daemon thread, so you can start it and close the tab — the
+        page re-attaches to a running job (or shows a pending count) when you come back.
+        AUTO_MATCH_THRESHOLD seeds the face auto-match confidence slider."""
+        from media_manager.manual_db import AUTO_MATCH_THRESHOLD
+        return templates.TemplateResponse(request, 'bulk.html', {
+            'auto_match_threshold': AUTO_MATCH_THRESHOLD,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
