@@ -85,27 +85,9 @@
   @keyframes feedSwipeHintL { 0%,100%{transform:translateX(0);opacity:.5} 50%{transform:translateX(-5px);opacity:.9} }
   .feed-swipe.flash { color:#79f279; }
   .feed-swipe.flash .feed-swipe-arrow, .feed-swipe.flash .feed-swipe-label { opacity:1; }
-  /* Swipe confirmation banner: names the set/category being added and slides across
-     the image in the swipe direction, then fades. */
-  .feed-swipe-anim { position:absolute; top:50%; left:50%; z-index:8; pointer-events:none;
-    background:rgba(0,0,0,.62); color:#fff; border:1px solid rgba(121,242,121,.7);
-    border-radius:22px; padding:10px 18px; font-size:1.02em; font-weight:600;
-    max-width:78%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-    box-shadow:0 2px 14px rgba(0,0,0,.55); }
-  .feed-swipe-anim.to-left  { animation:feedAnimLeft  .9s ease forwards; }
-  .feed-swipe-anim.to-right { animation:feedAnimRight .9s ease forwards; }
-  @keyframes feedAnimLeft {
-    0%   { opacity:0; transform:translate(-50%,-50%) translateX(80px) scale(.9); }
-    22%  { opacity:1; transform:translate(-50%,-50%) translateX(0) scale(1); }
-    70%  { opacity:1; transform:translate(-50%,-50%) translateX(0) scale(1); }
-    100% { opacity:0; transform:translate(-50%,-50%) translateX(-80px) scale(.95); }
-  }
-  @keyframes feedAnimRight {
-    0%   { opacity:0; transform:translate(-50%,-50%) translateX(-80px) scale(.9); }
-    22%  { opacity:1; transform:translate(-50%,-50%) translateX(0) scale(1); }
-    70%  { opacity:1; transform:translate(-50%,-50%) translateX(0) scale(1); }
-    100% { opacity:0; transform:translate(-50%,-50%) translateX(80px) scale(.95); }
-  }
+  /* Tinder card drag: horizontal drags are ours (pan-y keeps vertical scrolling with
+     the browser); the card transform is driven live in JS. */
+  .feed-item.is-random { touch-action:pan-y; }
   .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
     background:rgba(255,255,255,.22); cursor:pointer; }
   .feed-progress:hover { height:8px; }
@@ -133,11 +115,11 @@
   // current item. /random only. Dedupes against `seen`.
   function injectFrom(kind, value) {
     var exclude = Object.keys(seen).map(Number);
-    fetch('/api/feed/more', {
+    return fetch('/api/feed/more', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ kind: kind, value: String(value), exclude: exclude }),
     }).then(function (r) { return r.json(); }).then(function (d) {
-      var anchor = activeItem, added = 0;
+      var anchor = activeItem, added = 0, first = null;
       (d.items || []).forEach(function (it) {
         if (seen[it.file_id]) return;
         seen[it.file_id] = true;
@@ -145,10 +127,12 @@
         fillMeta(node, it);
         if (anchor && anchor.parentNode) { anchor.parentNode.insertBefore(node, anchor.nextSibling); anchor = node; }
         else feed.appendChild(node);
+        if (!first) first = node;
         added++;
       });
       if (window.showToast) showToast(added ? ('Added ' + added + ' to the mix') : 'Nothing new to add');
-    }).catch(function (e) { if (window.showToast) showToast('Failed: ' + e.message); });
+      return first;  // the first newly-inserted item (for the Tinder advance), or null
+    }).catch(function (e) { if (window.showToast) showToast('Failed: ' + e.message); return null; });
   }
 
   function doFavorite(item) {
@@ -326,26 +310,50 @@
     el.classList.add('flash');
     setTimeout(function () { el.classList.remove('flash'); }, 350);
   }
-  // A banner that slides across the image in the swipe direction, naming the set/
-  // category being pulled into the mix. dir: 'to-left' (set) / 'to-right' (category).
-  function swipeAnim(item, dir, icon, name) {
-    var el = document.createElement('div');
-    el.className = 'feed-swipe-anim ' + dir;
-    el.textContent = icon + ' ' + name;
-    item.appendChild(el);
-    setTimeout(function () { if (el.parentNode) el.remove(); }, 900);
+  function clearStrips(item) {
+    item.querySelectorAll('.feed-swipe').forEach(function (s) { s.style.opacity = ''; });
   }
-  function triggerSet(item) {
-    if (!item || !item._sets || !item._sets.length) return;  // nothing to add — just ignore
-    flashSwipe(item.querySelector('.feed-swipe.right'));
-    swipeAnim(item, 'to-left', '🗂', item._sets[0].name);
-    injectFrom('set', item._sets[0].id);
+  // Live Tinder drag: the card follows the finger (translate + tilt + fade) and the
+  // target edge strip fades in proportionally as you pass the commit threshold.
+  function dragMove(item, dx) {
+    item.style.transition = 'none';
+    item.style.transform = 'translateX(' + dx + 'px) rotate(' + (dx / 22) + 'deg)';
+    item.style.opacity = String(Math.max(0.4, 1 - Math.abs(dx) / 800));
+    var near = item.querySelector(dx < 0 ? '.feed-swipe.right' : '.feed-swipe.left');
+    var far = item.querySelector(dx < 0 ? '.feed-swipe.left' : '.feed-swipe.right');
+    if (far) far.style.opacity = '';
+    if (near && !near.hidden) near.style.opacity = String(Math.min(1, Math.abs(dx) / 90));
   }
-  function triggerCategory(item) {
-    if (!item || !item._cats || !item._cats.length) return;
-    flashSwipe(item.querySelector('.feed-swipe.left'));
-    swipeAnim(item, 'to-right', '🏷', item._cats[0].name);
-    injectFrom('category', item._cats[0].name);
+  function springBack(item) {
+    clearStrips(item);
+    item.style.transition = 'transform .28s cubic-bezier(.22,.61,.36,1), opacity .28s ease';
+    item.style.transform = '';
+    item.style.opacity = '';
+  }
+  // Commit a swipe: throw the card off in the swipe direction (dir -1 = swipe left =
+  // set, +1 = swipe right = category), pull those photos into the mix, then advance to
+  // the first new one — Tinder-style. Springs back instead if there's nothing to add.
+  function commitSwipe(item, dir) {
+    if (!item) return;
+    var avail = dir < 0 ? (item._sets && item._sets.length) : (item._cats && item._cats.length);
+    if (!avail) { springBack(item); return; }
+    clearStrips(item);
+    flashSwipe(item.querySelector(dir < 0 ? '.feed-swipe.right' : '.feed-swipe.left'));
+    var w = item.offsetWidth || window.innerWidth;
+    item.style.transition = 'transform .32s cubic-bezier(.22,.61,.36,1), opacity .32s ease';
+    item.style.transform = 'translateX(' + (dir * (w * 1.15 + 120)) + 'px) rotate(' + (dir * 15) + 'deg)';
+    item.style.opacity = '0';
+    var inj = dir < 0 ? injectFrom('set', item._sets[0].id) : injectFrom('category', item._cats[0].name);
+    Promise.resolve(inj).then(function (firstNode) {
+      // let the throw play a beat even if the fetch resolved instantly
+      return new Promise(function (res) { setTimeout(function () { res(firstNode); }, 160); });
+    }).then(function (firstNode) {
+      var nxt = firstNode || item.nextElementSibling;
+      item.style.transition = 'none';       // reset the thrown card so it's intact if scrolled back to
+      item.style.transform = '';
+      item.style.opacity = '';
+      if (nxt) nxt.scrollIntoView();        // instant advance; the thrown card is now above the fold
+    });
   }
 
   // Reveal the helper chrome for one tap — the caption (heart / filename / Open) plus
@@ -369,39 +377,49 @@
       var right = document.createElement('div');
       right.className = 'feed-swipe right'; right.hidden = true;
       right.innerHTML = '<span class="feed-swipe-label"></span><span class="feed-swipe-arrow">←</span>';
-      right.addEventListener('click', function (e) { e.stopPropagation(); triggerSet(section); });
+      right.addEventListener('click', function (e) { e.stopPropagation(); commitSwipe(section, -1); });
       section.appendChild(right);
       var left = document.createElement('div');
       left.className = 'feed-swipe left'; left.hidden = true;
       left.innerHTML = '<span class="feed-swipe-arrow">→</span><span class="feed-swipe-label"></span>';
-      left.addEventListener('click', function (e) { e.stopPropagation(); triggerCategory(section); });
+      left.addEventListener('click', function (e) { e.stopPropagation(); commitSwipe(section, 1); });
       section.appendChild(left);
     }
     section.appendChild(Object.assign(document.createElement('div'), { className: 'feed-caption' }));
     if (source === 'random') {
-      // One pointer handler for the whole gesture set (mouse + touch, so it works on
-      // desktop too — the earlier touch-only version was dead under a mouse). We never
-      // preventDefault, so vertical scroll-snap is untouched. Taps on the interactive
-      // overlays (face squares / swipe strips / caption controls) are left to their own
-      // click handlers.
-      //   horizontal drag → set (right) / category (left)
-      //   single tap      → reveal helpers (face squares + swipe arrows)
+      // One pointer handler set (mouse + touch, so it works on desktop too). The card
+      // is `touch-action: pan-y`, so the browser keeps vertical scrolling while
+      // horizontal drags come to us for the Tinder card-throw.
+      //   horizontal drag → the card follows the finger; past ~90px it flies off and
+      //                      pulls in the set (left) / category (right), then advances
+      //   single tap      → reveal helpers (caption + face squares + swipe arrows)
       //   fast double tap → favorite + inject visually-similar
-      var downX = 0, downY = 0, downT = 0, isDown = false, tapTimer = null;
+      var downX = 0, downY = 0, downT = 0, isDown = false, locked = null, curDx = 0, tapTimer = null;
       section.addEventListener('pointerdown', function (e) {
         if (e.pointerType === 'mouse' && e.button !== 0) return;
-        downX = e.clientX; downY = e.clientY; downT = e.timeStamp; isDown = true;
+        if (e.target.closest('.feed-caption, .feed-muted, .feed-progress')) return;  // real controls
+        downX = e.clientX; downY = e.clientY; downT = e.timeStamp;
+        isDown = true; locked = null; curDx = 0;
+      });
+      section.addEventListener('pointermove', function (e) {
+        if (!isDown) return;
+        var dx = e.clientX - downX, dy = e.clientY - downY;
+        if (locked === null) {
+          if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+          locked = Math.abs(dx) > Math.abs(dy) ? 'h' : 'v';
+        }
+        if (locked === 'h') { curDx = dx; dragMove(section, dx); }
       });
       section.addEventListener('pointerup', function (e) {
         if (!isDown) return; isDown = false;
+        if (locked === 'h') {                       // finished a horizontal drag
+          if (Math.abs(curDx) >= 90) commitSwipe(section, curDx < 0 ? -1 : 1);
+          else springBack(section);
+          locked = null; return;
+        }
+        locked = null;
         if (e.target.closest('.feed-caption, .feed-muted, .feed-progress, .feed-face-box, .feed-swipe')) return;
         var dx = e.clientX - downX, dy = e.clientY - downY, dt = e.timeStamp - downT;
-        if (Math.abs(dx) >= 45 && Math.abs(dx) > Math.abs(dy) * 1.2) {   // horizontal swipe
-          // Swipe toward the edge you want to pull in: left → the right-edge set,
-          // right → the left-edge category.
-          if (dx < 0) triggerSet(section); else triggerCategory(section);
-          return;
-        }
         if (Math.abs(dx) > 12 || Math.abs(dy) > 12 || dt > 600) return;  // a scroll / long-press, not a tap
         if (tapTimer) {  // second tap inside the window → double tap
           clearTimeout(tapTimer); tapTimer = null;
@@ -409,6 +427,11 @@
         } else {
           tapTimer = setTimeout(function () { tapTimer = null; showHelpers(section); }, 280);
         }
+      });
+      section.addEventListener('pointercancel', function () {
+        if (!isDown) return; isDown = false;
+        if (locked === 'h') springBack(section);
+        locked = null;
       });
     }
     mountObs.observe(section);
@@ -518,10 +541,9 @@
     if (isTyping(document.activeElement) || e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key === 'ArrowDown' || e.key === 'j') { e.preventDefault(); feed.scrollBy({ top: feed.clientHeight, behavior: 'smooth' }); }
     else if (e.key === 'ArrowUp' || e.key === 'k') { e.preventDefault(); feed.scrollBy({ top: -feed.clientHeight, behavior: 'smooth' }); }
-    // /random: ← pulls in the right-edge set, → pulls in the left-edge category
-    // (mirrors the swipe direction).
-    else if (source === 'random' && e.key === 'ArrowLeft') { e.preventDefault(); triggerSet(activeItem); }
-    else if (source === 'random' && e.key === 'ArrowRight') { e.preventDefault(); triggerCategory(activeItem); }
+    // /random: ← throws the card left (pull in the set), → throws it right (category).
+    else if (source === 'random' && e.key === 'ArrowLeft') { e.preventDefault(); commitSwipe(activeItem, -1); }
+    else if (source === 'random' && e.key === 'ArrowRight') { e.preventDefault(); commitSwipe(activeItem, 1); }
   });
 
   function reset() {
