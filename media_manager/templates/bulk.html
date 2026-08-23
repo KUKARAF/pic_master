@@ -5,10 +5,14 @@
 {% block content %}
 <div class="bulk-page">
   <h1 style="margin:0 0 4px;">⚡ Bulk jobs</h1>
-  <p class="sub" style="margin:0 0 20px;">
+  <p class="sub" style="margin:0 0 12px;">
     Each job runs in the background — start it and close the tab if you like; come back and
     this page reattaches to anything still running (or shows how many items are pending).
   </p>
+  <label class="sub" style="display:flex;align-items:center;gap:8px;margin:0 0 20px;">
+    <input type="checkbox" id="include-trashed"> Include trashed items
+    <span style="opacity:.7;">(off by default — trashed content is skipped)</span>
+  </label>
 
   <section class="bulk-section">
     <h2>👤 Faces</h2>
@@ -132,20 +136,26 @@
 
 {% block scripts %}
 <script>
-/* The face jobs take a confidence threshold. runBulkAction (app.js) POSTs each button's
-   data-start verbatim, so we keep data-start in sync with the slider for the buttons
-   marked data-threshold. */
+/* runBulkAction (app.js) POSTs each button's data-start verbatim, so we rebuild every
+   button's data-start from its base URL + the current options: the "Include trashed"
+   checkbox (all jobs) and the face-confidence slider (buttons marked data-threshold).
+   Endpoints that don't take a param just ignore the extra query string. */
 (function () {
   var slider = document.getElementById('match-threshold');
   var out = document.getElementById('match-threshold-val');
-  if (!slider) return;
+  var trashCb = document.getElementById('include-trashed');
   function sync() {
-    if (out) out.textContent = slider.value;
-    document.querySelectorAll('.bulk-action-btn[data-threshold]').forEach(function (btn) {
-      btn.dataset.start = btn.dataset.startBase + '?threshold=' + encodeURIComponent(slider.value);
+    if (out && slider) out.textContent = slider.value;
+    document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
+      if (!btn.dataset.startBase) btn.dataset.startBase = btn.dataset.start;  // capture base once
+      var params = [];
+      if (btn.hasAttribute('data-threshold') && slider) params.push('threshold=' + encodeURIComponent(slider.value));
+      if (trashCb && trashCb.checked) params.push('include_trashed=1');
+      btn.dataset.start = btn.dataset.startBase + (params.length ? ('?' + params.join('&')) : '');
     });
   }
-  slider.addEventListener('input', sync);
+  if (slider) slider.addEventListener('input', sync);
+  if (trashCb) trashCb.addEventListener('change', sync);
   sync();
 })();
 </script>

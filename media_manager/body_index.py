@@ -109,15 +109,18 @@ def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None
     return len(bodies)
 
 
-def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=None):
+def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=None, exclude_ids=None):
     """Body-index every tracked file that has no body row yet — the background
     corpus build behind the web UI's "Build body index" button. No longer requires
     `media index` to have run first: files with stored YOLO-World detections reuse
     them (fast path, no model call), everything else gets a dedicated person-only
-    detection pass via `detector`. Failures go to the error log (same policy as the
-    batch ML passes in media_manager.py); a failed file is left un-sentineled so a
-    rebuild retries it. Returns (processed, total)."""
+    detection pass via `detector`. `exclude_ids` (e.g. trashed file ids) are dropped up
+    front. Failures go to the error log (same policy as the batch ML passes in
+    media_manager.py); a failed file is left un-sentineled so a rebuild retries it.
+    Returns (processed, total)."""
     files = db.get_unbody_indexed_files()
+    if exclude_ids:
+        files = [f for f in files if f[0] not in exclude_ids]
     total = len(files)
     processed = 0
     for file_id, rel_path in files:

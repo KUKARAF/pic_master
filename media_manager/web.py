@@ -2195,7 +2195,7 @@ def create_app(data_root: str) -> FastAPI:
         return pd.descriptors_for_boxes(bgr, [box])[0]
 
     @app.post('/api/pattern-index/start')
-    def api_pattern_index_start():
+    def api_pattern_index_start(include_trashed: bool = False):
         """Build the find-by-pattern index: a classical texture/colour descriptor per
         grid tile for every image. The worker computes the descriptors (web sends the
         image bytes); falls back to local compute if the worker is down. CPU-only."""
@@ -2205,10 +2205,10 @@ def create_app(data_root: str) -> FastAPI:
 
         if pattern_index_job['running']:
             return {'started': False, 'message': 'Pattern indexing already running.'}
-        candidates = [
+        candidates = _drop_trashed([
             (fid, os.path.join(data_root, rel)) for fid, rel in db.get_unpattern_indexed_files(limit=None)
             if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS
-        ]
+        ], include_trashed)
         pattern_index_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
@@ -2528,7 +2528,7 @@ def create_app(data_root: str) -> FastAPI:
         return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.post('/api/body-index/start')
-    def api_body_index_start():
+    def api_body_index_start(include_trashed: bool = False):
         import threading
         from media_manager import body_index
 
@@ -2544,7 +2544,8 @@ def create_app(data_root: str) -> FastAPI:
                     body_index_job['total'] = total
                 body_index.build_body_index(
                     db, errors, _get_clip_indexer(), _get_object_detector(), data_root,
-                    on_progress=_progress)
+                    on_progress=_progress,
+                    exclude_ids=(None if include_trashed else _trashed_file_ids()))
             except Exception as exc:
                 body_index_job['error'] = str(exc)
             finally:
@@ -2564,7 +2565,7 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/index/start')
-    def api_index_start():
+    def api_index_start(include_trashed: bool = False):
         """Bulk-embed every photo that has no CLIP embedding yet — the library-wide
         equivalent of the /similar page's per-file "embed now". Mirrors
         MediaManager.embed_files but with progress + the web CLIP accessor (so it
@@ -2574,11 +2575,11 @@ def create_app(data_root: str) -> FastAPI:
 
         if index_job['running']:
             return {'started': False, 'message': 'Indexing already running.'}
-        candidates = [
+        candidates = _drop_trashed([
             (fid, os.path.join(data_root, rel_path))
             for fid, rel_path in db.get_unindexed_files(limit=None)
             if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS
-        ]
+        ], include_trashed)
         index_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
@@ -2626,7 +2627,7 @@ def create_app(data_root: str) -> FastAPI:
         ]
 
     @app.post('/api/phash/start')
-    def api_phash_start():
+    def api_phash_start(include_trashed: bool = False):
         """Perceptual-hash every IMAGE with none yet (near-duplicate detection). Hashes
         the cached 400px thumbnail (cheap, plenty for pHash) and records the ORIGINAL
         pixel dimensions so a later merge can keep the highest-resolution copy. Ignores
@@ -2637,7 +2638,7 @@ def create_app(data_root: str) -> FastAPI:
 
         if phash_job['running']:
             return {'started': False, 'message': 'Perceptual hashing already running.'}
-        candidates = _unphashed_images()
+        candidates = _drop_trashed(_unphashed_images(), include_trashed)
         phash_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
@@ -2696,7 +2697,7 @@ def create_app(data_root: str) -> FastAPI:
                 if counts.get(cs, 0) < 3]
 
     @app.post('/api/capture-frames/start')
-    def api_capture_frames_start():
+    def api_capture_frames_start(include_trashed: bool = False):
         """Capture real still frames from every video at 10/25/50/75/90% of playback,
         saved through the existing frame-capture architecture (hidden JPEGs linked to the
         source video via frame_captures — same as the in-viewer capture button). The image
@@ -2709,7 +2710,7 @@ def create_app(data_root: str) -> FastAPI:
 
         if capture_frames_job['running']:
             return {'started': False, 'message': 'Frame capture already running.'}
-        candidates = _videos_needing_frames()
+        candidates = _drop_trashed(_videos_needing_frames(), include_trashed)
         capture_frames_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
@@ -2757,7 +2758,7 @@ def create_app(data_root: str) -> FastAPI:
         return manual.get_all_checksums_with_named_face() - manual.get_checksums_with_age_estimate()
 
     @app.post('/api/estimate-age/start')
-    def api_estimate_age_start():
+    def api_estimate_age_start(include_trashed: bool = False):
         """Estimate age/gender for every photo that has a named face but no estimate yet
         (MiVOLO in its isolated venv, via subprocess — see age_estimator.py). One pass per
         photo; skips photos already estimated."""
@@ -2767,6 +2768,9 @@ def create_app(data_root: str) -> FastAPI:
         if estimate_age_job['running']:
             return {'started': False, 'message': 'Age estimation already running.'}
         candidates = list(_faces_needing_age())
+        if not include_trashed:
+            trashed = manual.get_trashed_checksums()
+            candidates = [cs for cs in candidates if cs not in trashed]
         estimate_age_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
@@ -2817,6 +2821,27 @@ def create_app(data_root: str) -> FastAPI:
             if os.path.splitext(rel_path)[1].lower() in IMAGE_EXTENSIONS
         ]
 
+    def _trashed_file_ids():
+        """file_ids currently in the trash — bulk jobs skip these by default (a trashed
+        file is on its way out, no point re-processing it). Trash is small, so resolving
+        each checksum→id is cheap; recomputed per job start."""
+        ids = set()
+        for cs in manual.get_trashed_checksums():
+            r = db.get_file_by_checksum(cs)
+            if r is not None:
+                ids.add(r['id'])
+        return ids
+
+    def _drop_trashed(candidates, include_trashed, fid_pos=0):
+        """Filter trashed file_ids out of a bulk-job candidate list unless include_trashed.
+        `fid_pos` is the tuple index holding the file_id (0 for (fid, ...) rows)."""
+        if include_trashed:
+            return candidates
+        tset = _trashed_file_ids()
+        if not tset:
+            return candidates
+        return [c for c in candidates if c[fid_pos] not in tset]
+
     def _link_face_match_to_video(child_checksum, name):
         """If `child_checksum` is a captured video still, credit the match to the SOURCE
         video too: a whole-photo identity assignment on the parent's checksum. So a face
@@ -2846,7 +2871,7 @@ def create_app(data_root: str) -> FastAPI:
         return cards
 
     @app.post('/api/detect-faces/start')
-    def api_detect_faces_start(threshold: float = None):
+    def api_detect_faces_start(threshold: float = None, include_trashed: bool = False):
         """Run face detection (InsightFace) on every image that has no faces yet, then
         auto-match each detected face to a known identity above `threshold` (cosine;
         defaults to AUTO_MATCH_THRESHOLD). The library-wide, background version of the
@@ -2855,7 +2880,7 @@ def create_app(data_root: str) -> FastAPI:
 
         if detect_faces_job['running']:
             return {'started': False, 'message': 'Face detection already running.'}
-        candidates = _faceless_images()
+        candidates = _drop_trashed(_faceless_images(), include_trashed)
         detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None)
 
         def _run():
@@ -3301,7 +3326,7 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/match-faces/start')
-    def api_match_faces_start(threshold: float = None):
+    def api_match_faces_start(threshold: float = None, include_trashed: bool = False):
         """Match every not-yet-named auto-detected face against known identities and
         promote the confident hits — the library-wide version of the auto-match that
         api_detect_faces already does per photo. `threshold` (cosine, 0..1) overrides the
@@ -3312,7 +3337,7 @@ def create_app(data_root: str) -> FastAPI:
 
         if match_faces_job['running']:
             return {'started': False, 'message': 'Face matching already running.'}
-        pool = _unpromoted_auto_faces(limit=None)
+        pool = _drop_trashed(_unpromoted_auto_faces(limit=None), include_trashed, fid_pos=1)
         match_faces_job.update(running=True, done=0, total=len(pool), matched=0, error=None)
 
         def _run():
@@ -3357,7 +3382,7 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/tile-index/start')
-    def api_tile_index_start():
+    def api_tile_index_start(include_trashed: bool = False):
         """Build the per-image CLIP tile index that powers precise region search —
         an overlapping grid of crops embedded per photo. Same background-job shape
         as the body index; CLIP goes through _get_clip_indexer() so it offloads to
@@ -3376,7 +3401,8 @@ def create_app(data_root: str) -> FastAPI:
                     tile_index_job['done'] = done
                     tile_index_job['total'] = total
                 tile_index.build_tile_index(
-                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress)
+                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress,
+                    exclude_ids=(None if include_trashed else _trashed_file_ids()))
             except Exception as exc:
                 tile_index_job['error'] = str(exc)
             finally:
