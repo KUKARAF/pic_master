@@ -201,6 +201,27 @@ class Database(ThreadLocalDB):
                 PRIMARY KEY (file_id, frame_index)
             )
         ''')
+        # Perceptual hashes: the near-duplicate detector's primary signal (DCT pHash +
+        # difference-hash, 8 bytes each, big-endian uint64 BLOBs — INTEGER would overflow
+        # SQLite's signed range for hashes with the top bit set). width/height are the
+        # ORIGINAL pixel dimensions (not the 400px thumbnail we hash from) so the detector
+        # can pick the highest-resolution copy as the keeper. Derived + rebuildable, so
+        # CREATE IF NOT EXISTS is the whole migration. frame_index generalises to
+        # per-video-frame hashes later (Phase 3); today every row is the primary frame 0.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS phashes (
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                frame_index INTEGER NOT NULL DEFAULT 0,
+                phash BLOB NOT NULL,
+                dhash BLOB NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                algo TEXT NOT NULL,
+                hashed_at INTEGER NOT NULL,
+                PRIMARY KEY (file_id, frame_index)
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_phashes_file ON phashes(file_id)')
         # Tags table: user-defined labels attached to files
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tags (
@@ -919,6 +940,61 @@ class Database(ThreadLocalDB):
         cursor.execute('SELECT COUNT(*) FROM embeddings WHERE frame_index = 0')
         row = cursor.fetchone()
         return row[0] if row else 0
+
+    # --- perceptual hashes (near-duplicate detection, Phase 1) -----------------------
+    def insert_phash(self, file_id, phash_bytes, dhash_bytes, width, height, algo,
+                     frame_index=0):
+        """Upsert the perceptual hashes (+ original dimensions) for a file at a frame.
+        phash_bytes/dhash_bytes are 8-byte big-endian uint64 (see phasher.py)."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO phashes
+                (file_id, frame_index, phash, dhash, width, height, algo, hashed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (file_id, frame_index, phash_bytes, dhash_bytes, width, height, algo,
+              int(time.time())))
+        self.conn.commit()
+
+    def get_phash(self, file_id, frame_index=0):
+        """Return (phash_bytes, dhash_bytes, width, height) or None."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT phash, dhash, width, height FROM phashes '
+                       'WHERE file_id = ? AND frame_index = ?', (file_id, frame_index))
+        return cursor.fetchone()
+
+    def get_unphashed_files(self, limit=None):
+        """(id, path) for files with no primary (frame_index=0) perceptual hash —
+        mirrors get_unindexed_files. The caller skips non-image/video extensions."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN phashes p ON p.file_id = f.id AND p.frame_index = 0
+            WHERE p.file_id IS NULL AND f.hidden = 0
+        '''
+        if limit is None:
+            cursor.execute(sql)
+        else:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        return cursor.fetchall()
+
+    def count_phashed(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM phashes WHERE frame_index = 0')
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_all_phashes(self):
+        """(file_id, path, phash_bytes, dhash_bytes, width, height, checksum) for every
+        primary (frame_index=0) hash — the batch fetch the Phase 2 grouping consumes."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT p.file_id, f.path, p.phash, p.dhash, p.width, p.height, f.checksum
+            FROM phashes p
+            JOIN files_with_path f ON f.id = p.file_id
+            WHERE p.frame_index = 0
+        ''')
+        return cursor.fetchall()
 
     # ------------------------------------------------------------------
     # Tag methods

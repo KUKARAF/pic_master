@@ -2181,6 +2181,7 @@ def create_app(data_root: str) -> FastAPI:
                       'seconds': 0.0, 'results': None, 'error': None}
     # Precompute each unidentified face's closest known person (for /find_all_faces).
     face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2470,6 +2471,91 @@ def create_app(data_root: str) -> FastAPI:
             'total': index_job['total'],
             'error': index_job['error'],
             'pending': len(db.get_unindexed_files()),
+        }
+
+    @app.post('/api/phash/start')
+    def api_phash_start():
+        """Backfill perceptual hashes (near-duplicate detection, Phase 1) for every
+        image/video with none yet. Hashes the cached 400px thumbnail (cheap and plenty
+        for pHash) but records the ORIGINAL pixel dimensions so a later merge can keep
+        the highest-resolution copy. CPU-only; no worker or model needed."""
+        import threading
+        from media_manager import phasher
+
+        if phash_job['running']:
+            return {'started': False, 'message': 'Perceptual hashing already running.'}
+        candidates = [
+            (fid, rel_path) for fid, rel_path in db.get_unphashed_files(limit=None)
+            if os.path.splitext(rel_path)[1].lower() in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS)
+        ]
+        phash_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _original_dims(abs_path, is_video):
+            """Original (width, height) in pixels, or (None, None). Header-only for
+            images (no full decode); a cheap capture-props read for videos."""
+            try:
+                if is_video:
+                    import cv2
+                    cap = cv2.VideoCapture(abs_path)
+                    try:
+                        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+                        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+                    finally:
+                        cap.release()
+                    return w, h
+                from PIL import Image as PILImage
+                with PILImage.open(abs_path) as im:
+                    return im.width, im.height
+            except Exception:
+                return None, None
+
+        def _run():
+            from PIL import Image as PILImage
+            try:
+                done = 0
+                for fid, rel_path in candidates:
+                    ext = os.path.splitext(rel_path)[1].lower()
+                    is_video = ext in VIDEO_EXTENSIONS
+                    abs_path = _live_abs_path(fid, rel_path)
+                    if abs_path is None:
+                        errors.log(rel_path, 'phash: file not on disk')
+                        done += 1; phash_job['done'] = done; continue
+                    # Hash the thumbnail (generate it the same way serve_thumb does if
+                    # it isn't cached yet); take dimensions from the original.
+                    thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
+                    if not os.path.isfile(thumb_path):
+                        make_thumb = _make_video_thumbnail if is_video else _make_thumbnail
+                        ok, msg = make_thumb(abs_path, thumb_path)
+                        if msg:
+                            errors.log(rel_path, msg)
+                        if not ok:
+                            done += 1; phash_job['done'] = done; continue
+                    try:
+                        with PILImage.open(thumb_path) as im:
+                            ph, dh = phasher.compute_hashes(im)
+                        w, h = _original_dims(abs_path, is_video)
+                        db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                                        w, h, phasher.ALGO_TAG)
+                    except Exception as exc:
+                        errors.log(rel_path, f'phash: {exc}')
+                    done += 1
+                    phash_job['done'] = done
+            except Exception as exc:
+                phash_job['error'] = str(exc)
+            finally:
+                phash_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': phash_job['total']}
+
+    @app.get('/api/phash/status')
+    def api_phash_status():
+        return {
+            'running': phash_job['running'],
+            'done': phash_job['done'],
+            'total': phash_job['total'],
+            'error': phash_job['error'],
+            'pending': len(db.get_unphashed_files()),
         }
 
     @app.post('/api/metadata/start')
