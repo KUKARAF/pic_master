@@ -70,9 +70,13 @@ def _is_degenerate(phash: int) -> bool:
 def group(items, max_hamming=H_NEAR, blocked_pairs=None):
     """Cluster `items` into candidate near-dup groups (lists of file_ids, size >= 2).
 
-    Banded bucketing over the pHash yields candidate pairs sharing any 16-bit band;
-    each is verified by full Hamming <= max_hamming before union. Same-parent stills
-    are never unioned, and pairs the user marked "not a duplicate" (blocked_pairs, a set
+    Multi-index hashing: the 64-bit pHash is split into 4 bands of 16 bits, and each
+    item is probed against its band-key AND every 1-bit neighbour of it (radius 1). By
+    the pigeonhole principle a pair within Hamming distance 7 must agree on some band to
+    within 1 bit, so this GUARANTEES finding all pairs up to distance 7 (covering exact/
+    lower-quality copies and damaged twins) and best-effort up to `max_hamming`. Every
+    candidate is verified by full Hamming <= max_hamming before union. Same-parent video
+    stills never union, and pairs the user marked "not a duplicate" (blocked_pairs, a set
     of frozenset({checksum_a, checksum_b})) are skipped so they never regroup. Singletons
     are dropped."""
     blocked_pairs = blocked_pairs or set()
@@ -91,26 +95,33 @@ def group(items, max_hamming=H_NEAR, blocked_pairs=None):
             buckets[bi].setdefault(key, []).append(it['file_id'])
 
     seen_pairs = set()
-    for band in buckets:
-        for members in band.values():
-            if len(members) < 2:
-                continue
-            for i in range(len(members)):
-                for j in range(i + 1, len(members)):
-                    a, b = members[i], members[j]
-                    pair = (a, b) if a < b else (b, a)
-                    if pair in seen_pairs:
-                        continue
-                    seen_pairs.add(pair)
-                    ia, ib = by_id[a], by_id[b]
-                    # never treat two sampled frames of the same video as duplicates
-                    if ia['is_still'] and ib['is_still'] and ia.get('parent') \
-                       and ia.get('parent') == ib.get('parent'):
-                        continue
-                    if blocked_pairs and frozenset((ia.get('checksum'), ib.get('checksum'))) in blocked_pairs:
-                        continue  # user marked these "not a duplicate"
-                    if hamming(ia['phash'], ib['phash']) <= max_hamming:
-                        uf.union(a, b)
+    for it in items:
+        ph = it['phash']
+        if _is_degenerate(ph):
+            continue
+        a = it['file_id']
+        for bi in range(_BANDS):
+            key = (ph >> (bi * _BAND_BITS)) & _BAND_MASK
+            band = buckets[bi]
+            cand = list(band.get(key, ()))                     # exact band
+            for bit in range(_BAND_BITS):                       # + 1-bit neighbours
+                cand.extend(band.get(key ^ (1 << bit), ()))
+            for b in cand:
+                if b == a:
+                    continue
+                pair = (a, b) if a < b else (b, a)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                ia, ib = by_id[a], by_id[b]
+                # never treat two sampled frames of the same video as duplicates
+                if ia['is_still'] and ib['is_still'] and ia.get('parent') \
+                   and ia.get('parent') == ib.get('parent'):
+                    continue
+                if blocked_pairs and frozenset((ia.get('checksum'), ib.get('checksum'))) in blocked_pairs:
+                    continue  # user marked these "not a duplicate"
+                if hamming(ia['phash'], ib['phash']) <= max_hamming:
+                    uf.union(a, b)
 
     return [g for g in uf.groups() if len(g) >= 2]
 
