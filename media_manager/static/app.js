@@ -3342,6 +3342,23 @@
   });
   if (searchRegionState) boxDrawStates.push(searchRegionState);
 
+  /* Find pill — 🧩 pattern segment: same drag-a-box UX as 🔲, but a DIFFERENT
+     mechanism — the crop's texture/colour is matched (see pattern_descriptor.py),
+     so it finds the same *pattern* (a wallpaper, a fabric) rather than the same
+     *thing*. Needs the pattern index built (/bulk → Index patterns). */
+  const searchPatternBtn = document.querySelector('.find-by-pattern-btn');
+  const searchPatternState = wireBoxDraw(searchPatternBtn, '✏️', '🧩', function (bbox) {
+    openMatchesAsQueue({
+      el: searchPatternBtn,
+      url: '/api/files/' + fileId + '/pattern-search',
+      fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
+      label: 'Pattern matches',
+      extractIds: function (data) { return (data.results || []).map(function (r) { return r.file_id; }); },
+      onEmpty: function () { if (window.showToast) showToast('No pattern matches — is the pattern index built? (/bulk)'); },
+    });
+  });
+  if (searchPatternState) boxDrawStates.push(searchPatternState);
+
   // Deep-link: /photo/{id}#label-person (from find-by-body) enters draw mode on load.
   if (window.location.hash === '#label-person' && labelPersonBtn) {
     labelPersonBtn.click();

@@ -355,6 +355,28 @@ class WorkerClient:
             out.append((d[0], float(d[1]), float(d[2]), float(d[3]), float(d[4]), float(d[5])))
         return out
 
+    def pattern_query(self, image_bytes: bytes, box, name: str = "<query>"):
+        """Descriptor for one region (find-by-pattern query). `box` is [x1,y1,x2,y2] in
+        image pixels, or None for the whole image. Returns a float32 np.ndarray or None.
+        Raises WorkerError on a worker-side failure."""
+        self.record("pattern_query", name)
+        resp = self.request(worker_protocol.PATH_PATTERN,
+                            {"name": name, "image": image_bytes, "boxes": [box]})
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        ds = resp.get("descriptors") or []
+        return np.frombuffer(ds[0], np.float32).copy() if ds and ds[0] else None
+
+    def pattern_index(self, image_bytes: bytes, name: str = "<image>"):
+        """Auto-tile an image and describe each tile (find-by-pattern indexing). Returns
+        [(bbox: list[float], descriptor: np.ndarray[float32]), ...]."""
+        self.record("pattern_index", name)
+        resp = self.request(worker_protocol.PATH_PATTERN, {"name": name, "image": image_bytes})
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        return [(t["bbox"], np.frombuffer(t["descriptor"], np.float32).copy())
+                for t in (resp.get("tiles") or [])]
+
     # -- imdb: resident search index ---------------------------------------
     # The host (remote_index_builder.py) streams a matrix to the worker in bounded
     # chunks so neither side ever holds the whole ~1 GB blob. Control messages are

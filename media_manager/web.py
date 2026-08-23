@@ -2156,6 +2156,134 @@ def create_app(data_root: str) -> FastAPI:
         return {'mode': 'whole', 'results': results}
 
     # ------------------------------------------------------------------
+    # Find-by-pattern: classical texture/colour matching (see pattern_descriptor.py).
+    # The WORKER does the descriptor compute (like the CLIP/face offloads); the web
+    # only orchestrates + stores. Falls back to local compute when the worker is
+    # unavailable (surfaced in the error log, per no-silent-failures).
+    # ------------------------------------------------------------------
+    def _pattern_index_tiles(image_bytes, name):
+        """[(bbox, descriptor np.ndarray)] for an image's auto tile grid — worker first,
+        local fallback."""
+        wc = _worker_client
+        if wc is not None and wc.is_configured():
+            try:
+                return wc.pattern_index(image_bytes, name)
+            except Exception as exc:
+                errors.log('pattern-index', f'worker unavailable, computing locally: {exc}')
+        from media_manager import pattern_descriptor as pd
+        from media_manager.tile_index import generate_tiles
+        bgr = pd.decode_bgr(image_bytes)
+        if bgr is None:
+            return []
+        h, w = bgr.shape[:2]
+        tiles = generate_tiles(w, h)
+        descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
+        return [(list(tiles[i]), descs[i]) for i in range(len(tiles)) if descs[i] is not None]
+
+    def _pattern_query_descriptor(image_bytes, box, name='<query>'):
+        """One region's pattern descriptor — worker first, local fallback."""
+        wc = _worker_client
+        if wc is not None and wc.is_configured():
+            try:
+                return wc.pattern_query(image_bytes, box, name)
+            except Exception as exc:
+                errors.log('pattern-search', f'worker unavailable, computing locally: {exc}')
+        from media_manager import pattern_descriptor as pd
+        bgr = pd.decode_bgr(image_bytes)
+        if bgr is None:
+            return None
+        return pd.descriptors_for_boxes(bgr, [box])[0]
+
+    @app.post('/api/pattern-index/start')
+    def api_pattern_index_start():
+        """Build the find-by-pattern index: a classical texture/colour descriptor per
+        grid tile for every image. The worker computes the descriptors (web sends the
+        image bytes); falls back to local compute if the worker is down. CPU-only."""
+        import threading
+        from media_manager import pattern_descriptor
+        from media_manager.indexer import SUPPORTED_EXTENSIONS
+
+        if pattern_index_job['running']:
+            return {'started': False, 'message': 'Pattern indexing already running.'}
+        candidates = [
+            (fid, os.path.join(data_root, rel)) for fid, rel in db.get_unpattern_indexed_files(limit=None)
+            if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS
+        ]
+        pattern_index_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                done = 0
+                for fid, abs_path in candidates:
+                    try:
+                        with open(abs_path, 'rb') as f:
+                            image_bytes = f.read()
+                        tiles = _pattern_index_tiles(image_bytes, os.path.basename(abs_path))
+                        if tiles:
+                            db.insert_pattern_tiles(
+                                fid, [{'bbox': b, 'descriptor': d} for b, d in tiles],
+                                pattern_descriptor.ALGO_TAG)
+                    except Exception as exc:
+                        errors.log(abs_path, f'pattern-index: {exc}')
+                    done += 1
+                    pattern_index_job['done'] = done
+            except Exception as exc:
+                pattern_index_job['error'] = str(exc)
+            finally:
+                pattern_index_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': pattern_index_job['total']}
+
+    @app.get('/api/pattern-index/status')
+    def api_pattern_index_status():
+        return {
+            'running': pattern_index_job['running'],
+            'done': pattern_index_job['done'],
+            'total': pattern_index_job['total'],
+            'error': pattern_index_job['error'],
+            'pending': len(db.get_unpattern_indexed_files()),
+        }
+
+    @app.post('/api/files/{file_id}/pattern-search')
+    def api_pattern_search(file_id: int, body: RegionSearchBody, limit: int = 50):
+        """Find-by-pattern: describe the drawn region's texture/colour and rank the
+        library by each photo's BEST-matching pattern tile. Different mechanism from
+        region-search (which is CLIP/semantic) — this finds the same *pattern*, not the
+        same *thing*. Needs the pattern index (run 'Index patterns' first)."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None or not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        x1, y1, x2, y2 = [float(v) for v in body.bbox]
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            raise HTTPException(status_code=400, detail='Region too small.')
+        if db.count_pattern_indexed() == 0:
+            raise HTTPException(status_code=400, detail='No pattern index yet — run "Index patterns" on /bulk.')
+        with open(abs_path, 'rb') as f:
+            image_bytes = f.read()
+        query = _pattern_query_descriptor(image_bytes, [x1, y1, x2, y2])
+        if query is None:
+            raise HTTPException(status_code=500, detail='Could not describe that region.')
+
+        import numpy as np
+        q = np.asarray(query, dtype=np.float32)
+        best = {}   # file_id -> best tile cosine
+        for file_ids, matrix in db.iter_pattern_tiles():
+            if matrix.shape[0] == 0 or matrix.shape[1] != q.shape[0]:
+                continue   # dim mismatch = a stale-algo descriptor; skip it
+            scores = matrix.dot(q)
+            for idx in range(scores.shape[0]):
+                fid = int(file_ids[idx])
+                if fid == file_id:
+                    continue
+                s = float(scores[idx])
+                if s > best.get(fid, -1.0):
+                    best[fid] = s
+        ranked = sorted(best.items(), key=lambda kv: -kv[1])[:limit]
+        return {'mode': 'pattern', 'results': [{'file_id': fid, 'score': round(s, 4)} for fid, s in ranked]}
+
+    # ------------------------------------------------------------------
     # Find-by-body: person re-ID by outfit/build (see body_index.py).
     # Web-only by design — the body index is built and queried from here,
     # never by a CLI command.
@@ -2197,6 +2325,7 @@ def create_app(data_root: str) -> FastAPI:
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
+    pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the

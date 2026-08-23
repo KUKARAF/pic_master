@@ -166,6 +166,40 @@ def handle_ping(path, data, request_id, link_id, remote_identity, requested_at):
         return worker_protocol.pack({"ok": False, "models": [], "error": str(e)})
 
 
+def handle_pattern(path, data, request_id, link_id, remote_identity, requested_at):
+    """Find-by-pattern descriptor(s). Pure numpy+OpenCV — no model/GPU, no models.lock.
+      req {image, boxes}      -> {descriptors: [bytes,...]}  (one per box; for the query)
+      req {image} (no boxes)  -> {tiles: [{bbox, descriptor}]} (auto grid; for indexing)"""
+    name = None
+    try:
+        from media_manager import pattern_descriptor as pd
+        req = worker_protocol.unpack(data)
+        name = req.get("name")
+        bgr = pd.decode_bgr(req["image"])
+        if bgr is None:
+            return worker_protocol.pack({"error": "could not decode image"})
+        boxes = req.get("boxes")
+        if boxes is not None:
+            descs = pd.descriptors_for_boxes(bgr, boxes)
+            out = [(d.tobytes() if d is not None else b"") for d in descs]
+            print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> {len(out)} descriptors",
+                  flush=True)
+            return worker_protocol.pack({"descriptors": out, "algo": pd.ALGO_TAG, "error": None})
+        # No boxes → index mode: lay down the shared tile grid and describe each tile.
+        from media_manager.tile_index import generate_tiles
+        h, w = bgr.shape[:2]
+        tiles = generate_tiles(w, h)
+        descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
+        out = [{"bbox": [float(v) for v in tiles[i]], "descriptor": descs[i].tobytes()}
+               for i in range(len(tiles)) if descs[i] is not None]
+        print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> {len(out)} tiles", flush=True)
+        return worker_protocol.pack({"tiles": out, "algo": pd.ALGO_TAG, "error": None})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> ERROR {e}", flush=True)
+        return worker_protocol.pack({"error": str(e)})
+
+
 def handle_detect_faces(path, data, request_id, link_id, remote_identity, requested_at):
     name = None
     tmp = None
@@ -836,6 +870,7 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
 # Map of request path -> handler, used both by run() and the loopback test.
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
+    worker_protocol.PATH_PATTERN: handle_pattern,
     worker_protocol.PATH_DETECT_FACES: handle_detect_faces,
     worker_protocol.PATH_EMBED_BBOX: handle_embed_bbox,
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,

@@ -321,6 +321,22 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tile_file ON tile_embeddings(file_id)')
+        # Pattern tiles: classical texture+colour descriptors per grid tile (find-by-
+        # pattern — see pattern_descriptor.py). Same shape as tile_embeddings but a
+        # different descriptor; `algo` versions it so a query ignores stale descriptors
+        # after an algorithm change. Derived + rebuildable.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pattern_tiles (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                tile_index INTEGER NOT NULL,
+                x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+                descriptor BLOB NOT NULL,
+                algo TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_file ON pattern_tiles(file_id)')
         # Cities: offline GeoNames reference data (cities15000, CC-BY 4.0) for
         # reverse-geocoding a photo's EXIF GPS to the nearest known city NAME
         # (files.city_id → cities.id). Optional/rebuildable — stays empty until
@@ -2031,6 +2047,76 @@ class Database(ThreadLocalDB):
         cursor.execute('SELECT COUNT(DISTINCT file_id) FROM tile_embeddings')
         row = cursor.fetchone()
         return row[0] if row else 0
+
+    # --- pattern tiles (find-by-pattern) ---------------------------------------------
+    def insert_pattern_tiles(self, file_id: int, tiles: list, algo: str) -> None:
+        """Replace the pattern-tile rows for a file (idempotent re-index).
+        tiles: [{'bbox': [x1,y1,x2,y2], 'descriptor': np.ndarray}, ...] in ORIGINAL px."""
+        import numpy as np
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM pattern_tiles WHERE file_id = ?', (file_id,))
+        now = int(time.time())
+        for tile_index, tile in enumerate(tiles):
+            x1, y1, x2, y2 = tile['bbox']
+            cursor.execute(
+                'INSERT INTO pattern_tiles (file_id, tile_index, x1, y1, x2, y2, descriptor, algo, indexed_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?)',
+                (file_id, tile_index, x1, y1, x2, y2,
+                 np.asarray(tile['descriptor'], np.float32).tobytes(), algo, now))
+        self.conn.commit()
+
+    def count_pattern_indexed(self) -> int:
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM pattern_tiles')
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_unpattern_indexed_files(self, limit=None) -> list:
+        """(id, path) for tracked files with NO pattern_tiles row. Caller skips non-images."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN pattern_tiles p ON p.file_id = f.id
+            WHERE p.file_id IS NULL AND f.hidden = 0
+        '''
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def iter_pattern_tiles(self, batch_size=20000):
+        """Yield (file_ids: int64[k], matrix: float32[k, D]) chunks over ALL pattern
+        tiles — the RAM-bounded find-by-pattern search primitive (mirrors
+        iter_tile_embeddings). Malformed blobs are skipped with a WARNING."""
+        import numpy as np
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, file_id, descriptor FROM pattern_tiles ORDER BY id')
+        batch_fids, batch_blobs, D = [], [], None
+
+        def _flush():
+            fids = np.array(batch_fids, dtype=np.int64)
+            matrix = np.frombuffer(b''.join(batch_blobs), np.float32).reshape(len(batch_blobs), D)
+            return fids, matrix
+
+        for row_id, file_id, blob in cursor:
+            if not blob or (len(blob) % 4) != 0:
+                print(f"[iter_pattern_tiles] WARNING: skipping row {row_id} (file {file_id}): bad blob")
+                continue
+            row_D = len(blob) // 4
+            if D is None:
+                D = row_D
+            elif row_D != D:
+                print(f"[iter_pattern_tiles] WARNING: skipping row {row_id} (file {file_id}): D={row_D}!={D}")
+                continue
+            batch_fids.append(file_id)
+            batch_blobs.append(blob)
+            if len(batch_blobs) >= batch_size:
+                yield _flush()
+                batch_fids, batch_blobs = [], []
+        if batch_blobs:
+            yield _flush()
 
     def get_tiles_for_file(self, file_id):
         """(x1, y1, x2, y2, embedding_bytes) for every tile of one file, in tile

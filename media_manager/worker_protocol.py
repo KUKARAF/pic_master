@@ -42,9 +42,11 @@ PATH_IMDB_BUILD_CHUNK = "imdb_build_chunk"
 PATH_IMDB_BUILD_END = "imdb_build_end"
 PATH_IMDB_STATUS = "imdb_status"
 PATH_IMDB_SEARCH = "imdb_search"
+PATH_PATTERN = "pattern_descriptor"
 
 ALL_PATHS = [
     PATH_PING,
+    PATH_PATTERN,
     PATH_DETECT_FACES,
     PATH_EMBED_BBOX,
     PATH_EMBED_IMAGE,
