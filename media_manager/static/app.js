@@ -130,6 +130,48 @@
     });
   })();
 
+  /* Rotating video thumbnails: hovering a video card (.card with a ▶ .video-badge)
+     cycles its <img> through the video's captured frames (/api/files/{id}/frames →
+     /thumb/{child}). Delegated so it also covers JS-rendered grids; frames are fetched
+     once per card and cached; the original poster is restored on mouse-out. */
+  (function () {
+    var ROT_MS = 700;
+    function startRotate(card) {
+      if (card._rotTimer) return;
+      var img = card.querySelector('.card-img-link img') || card.querySelector('img');
+      if (!img) return;
+      card._rotImg = img;
+      if (card._rotOrig == null) card._rotOrig = img.getAttribute('src');
+      function begin(frames) {
+        if (!frames || !frames.length || !card.matches(':hover')) return;
+        var i = 0;
+        card._rotTimer = setInterval(function () {
+          i = (i + 1) % frames.length;
+          img.src = '/thumb/' + frames[i];
+        }, ROT_MS);
+      }
+      if (card._frames) { begin(card._frames); return; }
+      fetch('/api/files/' + card.dataset.fileId + '/frames')
+        .then(function (r) { return r.json(); })
+        .then(function (d) { card._frames = d.frames || []; begin(card._frames); })
+        .catch(function () { card._frames = []; });
+    }
+    function stopRotate(card) {
+      if (card._rotTimer) { clearInterval(card._rotTimer); card._rotTimer = null; }
+      if (card._rotImg && card._rotOrig != null) card._rotImg.src = card._rotOrig;
+    }
+    document.addEventListener('mouseover', function (e) {
+      var card = e.target.closest && e.target.closest('.card[data-file-id]');
+      if (card && card.querySelector('.video-badge')) startRotate(card);
+    });
+    document.addEventListener('mouseout', function (e) {
+      var card = e.target.closest && e.target.closest('.card[data-file-id]');
+      if (!card) return;
+      if (e.relatedTarget && card.contains(e.relatedTarget)) return;  // still inside the card
+      stopRotate(card);
+    });
+  })();
+
   /* Mobile hamburger — toggles the collapsed nav links (see .nav-links in CSS). */
   (function () {
     var navToggle = document.getElementById('nav-toggle');

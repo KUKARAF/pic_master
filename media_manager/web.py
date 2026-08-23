@@ -5010,6 +5010,19 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    @app.get('/api/files/{file_id}/frames')
+    def api_file_frames(file_id: int):
+        """Captured-still file ids for a video, in time order — lets grid thumbnails
+        rotate through a video's frames on hover. Empty until the frames are captured
+        (in-viewer capture button or the /bulk Capture-frames job)."""
+        row = _file_or_404(file_id)
+        frames = []
+        for cap in manual.get_frame_captures_for(row['checksum']):
+            child = db.get_file_by_checksum(cap['child_checksum'])
+            if child is not None:
+                frames.append(child['id'])
+        return {'frames': frames}
+
     @app.get('/bulk', response_class=HTMLResponse)
     def bulk_page(request: Request):
         """One place for every long-running maintenance job, grouped by area. Each job
