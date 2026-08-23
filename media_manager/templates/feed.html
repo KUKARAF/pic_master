@@ -166,43 +166,86 @@
   }
 
   // --- media mount/unmount (shared by every source) --------------------------------
+  // Videos are heavy on mobile: a paused <video> renders black (mobile won't paint the
+  // first frame the way desktop does) and mobile GPUs decode only a couple at once. So a
+  // mounted-but-inactive video shows a lightweight poster <img> (/thumb, a real ~1s-in
+  // frame); the live <video> is created only for the active card (activateVideo) and torn
+  // back down to the poster when it scrolls away (deactivateVideo), freeing the decoder.
+  function makePoster(id) {
+    var p = document.createElement('img');
+    p.className = 'feed-poster'; p.src = '/thumb/' + id; p.alt = ''; p.draggable = false;
+    return p;
+  }
+
   function mountMedia(item) {
     if (item.dataset.mounted === '1' || item.dataset.metaLoaded === '0') return;
     item.dataset.mounted = '1';
     var id = item.dataset.fileId;
     if (item.dataset.isVideo === '1') {
-      var video = document.createElement('video');
-      video.src = '/image/' + id;
-      video.loop = true; video.playsInline = true; video.muted = !soundOn; video.preload = 'auto';
-      item.insertBefore(video, item.firstChild);
-      var mbtn = document.createElement('button');
-      mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = video.muted ? '🔇' : '🔊';
-      mbtn.addEventListener('click', function (e) {
-        e.stopPropagation();
-        soundOn = video.muted; video.muted = !soundOn;
-        mbtn.textContent = video.muted ? '🔇' : '🔊';
-      });
-      item.appendChild(mbtn);
-      var prog = document.createElement('div');
-      prog.className = 'feed-progress';
-      var fill = document.createElement('div');
-      fill.className = 'feed-progress-fill';
-      prog.appendChild(fill);
-      video.addEventListener('timeupdate', function () {
-        if (video.duration) fill.style.width = (video.currentTime / video.duration * 100) + '%';
-      });
-      prog.addEventListener('click', function (e) {
-        if (!video.duration) return;
-        var r = prog.getBoundingClientRect();
-        video.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * video.duration;
-      });
-      item.appendChild(prog);
+      item.insertBefore(makePoster(id), item.firstChild);
+      if (item === activeItem) activateVideo(item);  // mounted while already in view
     } else {
       var img = document.createElement('img');
       img.src = '/image/' + id; img.loading = 'eager'; img.alt = '';
       img.draggable = false;  // else a horizontal mouse-drag starts a native image-drag and eats the swipe
       if (source === 'random') img.addEventListener('load', function () { positionFaceBoxes(item); });
       item.insertBefore(img, item.firstChild);
+    }
+  }
+
+  // Create the live <video> for the active card (poster set so there's no black flash
+  // before decode) and play it. No-op if already live or not mounted yet.
+  function activateVideo(item) {
+    if (item.dataset.isVideo !== '1' || item.dataset.mounted !== '1') return;
+    var existing = item.querySelector('video');
+    if (existing) { existing.muted = !soundOn; existing.play().catch(function () {}); return; }
+    var id = item.dataset.fileId;
+    var video = document.createElement('video');
+    video.src = '/image/' + id; video.poster = '/thumb/' + id;
+    video.loop = true; video.playsInline = true; video.muted = !soundOn; video.preload = 'auto';
+    video.draggable = false;
+    item.insertBefore(video, item.firstChild);
+    // drop the placeholder poster <img> once the video actually has a frame (no black gap)
+    var poster = item.querySelector('.feed-poster');
+    if (poster) video.addEventListener('loadeddata', function () { if (poster.parentNode) poster.remove(); }, { once: true });
+
+    var mbtn = document.createElement('button');
+    mbtn.type = 'button'; mbtn.className = 'feed-muted'; mbtn.textContent = video.muted ? '🔇' : '🔊';
+    mbtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      soundOn = video.muted; video.muted = !soundOn;
+      mbtn.textContent = video.muted ? '🔇' : '🔊';
+    });
+    item.appendChild(mbtn);
+
+    var prog = document.createElement('div');
+    prog.className = 'feed-progress';
+    var fill = document.createElement('div');
+    fill.className = 'feed-progress-fill';
+    prog.appendChild(fill);
+    video.addEventListener('timeupdate', function () {
+      if (video.duration) fill.style.width = (video.currentTime / video.duration * 100) + '%';
+    });
+    prog.addEventListener('click', function (e) {
+      if (!video.duration) return;
+      var r = prog.getBoundingClientRect();
+      video.currentTime = Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * video.duration;
+    });
+    item.appendChild(prog);
+
+    video.currentTime = 0;
+    video.play().catch(function () {});
+  }
+
+  // Tear the live <video> back down to a poster <img> when the card leaves the active
+  // slot — frees the mobile decoder for the next one.
+  function deactivateVideo(item) {
+    var v = item.querySelector('video');
+    if (!v) return;
+    v.pause(); v.removeAttribute('src'); v.load();
+    item.querySelectorAll('video, .feed-muted, .feed-progress').forEach(function (el) { el.remove(); });
+    if (item.dataset.mounted === '1' && !item.querySelector('.feed-poster')) {
+      item.insertBefore(makePoster(item.dataset.fileId), item.firstChild);
     }
   }
 
@@ -230,11 +273,10 @@
       if (e.isIntersecting) {
         activeItem = e.target;
         if (source === 'queue') onActive(e.target);
+        if (e.target.dataset.isVideo === '1') activateVideo(e.target);
+      } else if (e.target.dataset.isVideo === '1') {
+        deactivateVideo(e.target);
       }
-      var v = e.target.querySelector('video');
-      if (!v) return;
-      if (e.isIntersecting) { v.muted = !soundOn; v.currentTime = 0; v.play().catch(function () {}); }
-      else { v.pause(); }
     });
   }, { root: feed, threshold: 0.7 });
 
