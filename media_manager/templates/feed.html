@@ -90,10 +90,14 @@
      off so a double tap favorites instead of selecting text or the image. */
   .feed-item.is-random { touch-action:pan-y; -webkit-user-select:none; user-select:none;
     -webkit-touch-callout:none; }
-  .feed-progress { position:absolute; left:0; right:0; bottom:0; height:4px; z-index:4;
-    background:rgba(255,255,255,.22); cursor:pointer; }
-  .feed-progress:hover { height:8px; }
-  .feed-progress-fill { height:100%; width:0; background:#fff; }
+  /* Scrub bar: a tall, easy-to-hit transparent strip lifted above the caption, with a
+     thin visible track at its bottom (was a 4px sliver pinned to the screen edge). */
+  .feed-progress { position:absolute; left:0; right:0; bottom:56px; height:26px; z-index:7;
+    cursor:pointer; background:transparent; }
+  .feed-progress::after { content:''; position:absolute; left:0; right:0; bottom:0; height:5px;
+    z-index:0; background:rgba(255,255,255,.3); }
+  .feed-progress-fill { position:absolute; left:0; bottom:0; height:5px; width:0; z-index:1; background:#fff; }
+  .feed-progress:hover::after, .feed-progress:hover .feed-progress-fill { height:9px; }
   #feed-status { position:fixed; left:0; right:0; bottom:6px; text-align:center; z-index:5;
     pointer-events:none; color:#fff; font-size:0.85em; text-shadow:0 1px 3px #000; }
 </style>
