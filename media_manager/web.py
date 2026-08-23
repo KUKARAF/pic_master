@@ -630,6 +630,7 @@ def create_app(data_root: str) -> FastAPI:
         _attach_set_people(sets_map.values())
         identities_map = _people_with_ages(manual.get_identities_for_checksums(checksums))
         category_map = resolve_categories_for_checksums(manual, db, [(row[0], row[3]) for row in rows])
+        trashed = manual.get_trashed_checksums(checksums)  # mark, don't hide — see card badge
         result = []
         for row in rows:
             file_id = row[0]
@@ -650,6 +651,7 @@ def create_app(data_root: str) -> FastAPI:
                 'sets': card_sets,
                 'people': _people_not_in_sets(identities_map.get(checksum, []), card_sets),
                 'categories': category_map.get(checksum, []),
+                'trashed': checksum in trashed,
             }
             if scores is not None and file_id in scores:
                 card['score'] = scores[file_id]

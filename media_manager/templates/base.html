@@ -92,6 +92,9 @@ document.addEventListener('click', function (e) {
   if (!link) return;
   var cardEl = link.closest('.card[data-file-id]');
   if (!cardEl) return;
+  // Opt-out: grids marked [data-no-queue] (e.g. the /faces people grid, whose cards
+  // link to /person/{name}) navigate to their own hrefs instead of the photo queue.
+  if (cardEl.closest('[data-no-queue]')) return;
   var container = cardEl.closest('[data-queue-source]') || cardEl.parentElement;
   if (!container) return;
   var cards = Array.prototype.slice.call(container.querySelectorAll('.card[data-file-id]'));

@@ -60,8 +60,9 @@
   </label>
 </div>
 
-<!-- One grid of unique people (identities), not one card per confirmed face -->
-<div class="grid" id="people-grid"></div>
+<!-- One grid of unique people (identities), not one card per confirmed face.
+     data-no-queue: clicking a person opens THEIR page (/person/{name}), not a photo queue. -->
+<div class="grid" id="people-grid" data-no-queue></div>
 <p id="people-empty" class="empty-state" style="display:none;">
   <span class="icon">🖼️</span>
   <br>No confirmed faces yet.
@@ -139,7 +140,7 @@
   function cardHtml(p) {
     return (
       '<div class="card" data-file-id="' + p.file_id + '" data-identity="' + escapeHtml(p.identity) + '">' +
-        '<a class="card-img-link" href="/photo/' + p.file_id + '">' +
+        '<a class="card-img-link" href="/person/' + encodeURIComponent(p.identity) + '">' +
           '<img src="/face-crop/' + encodeURIComponent(p.ref) + '" alt="' + escapeHtml(p.identity) + '" loading="lazy">' +
         '</a>' +
         '<div class="card-body">' +

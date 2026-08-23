@@ -765,6 +765,23 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
+/* Trashed content stays visible in every grid — just flagged with this badge (top-right)
+   rather than hidden. Trash is a reversible holding area; nothing is deleted. */
+.card .trash-badge {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.6);
+  font-size: 14px;
+  pointer-events: none;
+}
+
 .card img {
   width: 100%;
   aspect-ratio: 1;
