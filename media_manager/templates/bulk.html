@@ -77,6 +77,20 @@
   </section>
 
   <section class="bulk-section">
+    <h2>👯 Duplicates</h2>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/near-dup/compute/start"
+              data-status="/api/near-dup/compute/status">🔎 Find near-duplicates</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <p class="sub" style="margin:6px 2px 0;">
+      Clusters hashed photos + video stills into look-alike groups, then
+      <a href="/near-duplicates">review them here</a> (merge copies, keep bursts, link screenshots).
+      Run 🧬 Perceptual hash and 🎞 Capture video frames first.
+    </p>
+  </section>
+
+  <section class="bulk-section">
     <h2>🗺 Places</h2>
     <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start="/api/fetch-cities/start" data-status="/api/fetch-cities/status">🌍 Download cities</button>

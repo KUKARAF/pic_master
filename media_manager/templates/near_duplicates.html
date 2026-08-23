@@ -1,0 +1,250 @@
+{% extends "base.html" %}
+
+{% block title %}Near-duplicates — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Near-duplicates</h1>
+  <a href="/bulk" class="sub">Bulk jobs →</a>
+</div>
+
+<p class="sub" style="margin-bottom:20px;">
+  Visually-similar clusters found by the near-duplicate job (perceptual hash / embeddings).
+  Nothing is changed automatically — resolve each group yourself. To (re)compute groups, run
+  <a href="/bulk">Find near-duplicates on the Bulk page</a>.
+</p>
+
+<p id="ndup-loading" class="sub" style="text-align:center;margin:24px 0;">
+  <span class="spinner" aria-hidden="true"></span> Loading near-duplicate groups…
+</p>
+
+<div id="ndup-groups"></div>
+
+<div id="ndup-empty" class="empty-state" style="display:none;">
+  <div class="icon">✨</div>
+  <p>No near-duplicate groups to review.</p>
+  <p class="sub">Run "Find near-duplicates" on the <a href="/bulk">Bulk page</a> first.</p>
+</div>
+
+<style>
+  .ndup-group { margin: 0 0 34px; padding-bottom: 22px; border-bottom: 1px solid var(--border, #333); }
+  .ndup-group:last-child { border-bottom: none; }
+  .ndup-reason { color: var(--muted, #999); font-size: 0.9em; margin: 2px 0 14px; }
+  /* The keeper radio sits over the top-left of each card so the choice reads
+     as "which of these do I keep", mirroring the card-select-checkbox overlay
+     used by the selectable grids elsewhere. */
+  .ndup-group .card .ndup-keeper {
+    position: absolute; top: 6px; left: 6px; z-index: 3;
+    display: inline-flex; align-items: center; gap: 4px;
+    background: rgba(0, 0, 0, 0.7); border-radius: 6px;
+    padding: 3px 7px; font-size: 0.78em; color: #eee; cursor: pointer;
+  }
+  .ndup-group .card .ndup-keeper input { margin: 0; cursor: pointer; }
+  .ndup-still-badge {
+    position: absolute; top: 6px; right: 6px; z-index: 3;
+    background: rgba(0, 0, 0, 0.7); color: #cfe6cf; border-radius: 6px;
+    padding: 2px 6px; font-size: 0.72em;
+  }
+  .ndup-quality { color: var(--muted, #999); font-size: 0.78em; margin-top: 4px;
+    font-variant-numeric: tabular-nums; }
+  .ndup-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+  .ndup-actions .btn-similar { display: inline-block; width: auto; }
+</style>
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* Near-duplicate review. The groups are produced by a background job (see the
+   Bulk page's "Find near-duplicates"), so this page just lists whatever groups
+   currently exist via GET on load and lets the user resolve each one against
+   POST /api/near-dup/resolve. Vanilla JS to match the rest of the app; card
+   markup mirrors body_similar.html's cardHtml so click-through into the photo
+   viewer (base.html's data-queue-source handler) works identically here. */
+(function () {
+  var escapeHtml = window.escapeHtml || function (s) {
+    var d = document.createElement('div');
+    d.textContent = s == null ? '' : s;
+    return d.innerHTML;
+  };
+
+  var LABELS = {
+    lower_quality_copy: 'Lower-quality copy',
+    damaged_twin: 'Damaged twin',
+    screenshot: 'Screenshot of video',
+    burst: 'Burst',
+    review: 'Needs review'
+  };
+
+  var loadingEl = document.getElementById('ndup-loading');
+  var groupsEl = document.getElementById('ndup-groups');
+  var emptyEl = document.getElementById('ndup-empty');
+
+  function humanBytes(n) {
+    if (n == null) return '';
+    var units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    var i = 0, v = n;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return (i === 0 ? v : v.toFixed(1)) + ' ' + units[i];
+  }
+
+  function qualityLine(f) {
+    var parts = [];
+    if (f.width && f.height) parts.push(f.width + '×' + f.height);
+    if (f.size != null) parts.push(humanBytes(f.size));
+    return parts.join(' · ');
+  }
+
+  function cardHtml(f, groupId, isKeeper) {
+    var q = qualityLine(f);
+    return (
+      '<div class="card" data-file-id="' + f.id + '">' +
+        '<label class="ndup-keeper" title="Keep this one when merging">' +
+          '<input type="radio" name="keeper-' + groupId + '" value="' + f.id + '"' +
+            (isKeeper ? ' checked' : '') + '> keep' +
+        '</label>' +
+        (f.is_still ? '<span class="ndup-still-badge" title="Captured video still">still</span>' : '') +
+        '<a class="card-img-link" href="/photo/' + f.id + '">' +
+          '<img src="/thumb/' + f.id + '" alt="' + escapeHtml(f.filename) + '" loading="lazy">' +
+          (f.is_video ? '<span class="video-badge" title="Video">▶</span>' : '') +
+        '</a>' +
+        '<button type="button" class="heart-btn file-heart-btn ' + (f.favorite ? 'is-favorite' : '') + '" ' +
+          'data-file-id="' + f.id + '" data-fav-count="' + (f.favorite || 0) + '" ' +
+          'title="Favorite this photo (right-click to lower)">' +
+          (f.favorite ? '♥ ' + f.favorite : '♡') + '</button>' +
+        '<div class="card-body">' +
+          '<a class="card-name" href="/photo/' + f.id + '" title="' + escapeHtml(f.path) + '">' +
+            escapeHtml(f.filename) + '</a>' +
+          (q ? '<div class="ndup-quality">' + escapeHtml(q) + '</div>' : '') +
+        '</div>' +
+      '</div>'
+    );
+  }
+
+  function checkEmpty() {
+    if (!groupsEl.querySelector('.ndup-group')) {
+      emptyEl.style.display = 'block';
+    }
+  }
+
+  // POST resolve, then drop the block on success. Buttons are disabled for the
+  // duration so a group can't be double-resolved mid-request.
+  function resolve(groupEl, body, btns, successMsg) {
+    btns.forEach(function (b) { b.disabled = true; });
+    fetch('/api/near-dup/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (!data || !data.ok) throw new Error((data && data.error) || 'Request failed');
+        groupEl.remove();
+        if (window.showToast) showToast(successMsg, 'success');
+        checkEmpty();
+      })
+      .catch(function (err) {
+        btns.forEach(function (b) { b.disabled = false; });
+        if (window.showToast) showToast('Failed: ' + err.message, 'error');
+      });
+  }
+
+  function buildGroup(g) {
+    var groupEl = document.createElement('div');
+    groupEl.className = 'ndup-group';
+    groupEl.dataset.groupId = g.group_id;
+
+    var members = g.members || [];
+    var keeperId = g.keeper_file_id != null
+      ? g.keeper_file_id
+      : (members.length ? members[0].id : null);
+
+    var labelText = LABELS[g.label] || 'Needs review';
+
+    var cards = members.map(function (f) {
+      return cardHtml(f, g.group_id, f.id === keeperId);
+    }).join('');
+
+    groupEl.innerHTML =
+      '<div class="section-title">' + escapeHtml(labelText) +
+        ' <span class="sub">(' + members.length + ')</span></div>' +
+      (g.reason ? '<div class="ndup-reason">' + escapeHtml(g.reason) + '</div>' : '') +
+      '<div class="grid" data-queue-source="Near-dup group ' + g.group_id + '">' + cards + '</div>' +
+      '<div class="ndup-actions">' +
+        '<button type="button" class="btn-similar" data-role="merge">Merge → keep selected</button>' +
+        '<button type="button" class="btn-similar" data-role="keep">Keep all (not duplicates)</button>' +
+        '<button type="button" class="btn-similar" data-role="link">Link into a set…</button>' +
+      '</div>';
+
+    // Wire the heart buttons the same way body_similar.html does for JS-built cards.
+    if (window.wireHeartButton) {
+      groupEl.querySelectorAll('.file-heart-btn').forEach(function (heartBtn) {
+        wireHeartButton(heartBtn, '/api/files/' + heartBtn.dataset.fileId + '/favorite');
+      });
+    }
+
+    var btns = Array.prototype.slice.call(groupEl.querySelectorAll('.ndup-actions .btn-similar'));
+    var mergeBtn = groupEl.querySelector('[data-role="merge"]');
+    var keepBtn = groupEl.querySelector('[data-role="keep"]');
+    var linkBtn = groupEl.querySelector('[data-role="link"]');
+
+    mergeBtn.addEventListener('click', function () {
+      var checked = groupEl.querySelector('input[name="keeper-' + g.group_id + '"]:checked');
+      if (!checked) {
+        if (window.showToast) showToast('Pick which copy to keep first.', 'error');
+        return;
+      }
+      var keeper = parseInt(checked.value, 10);
+      var others = members.length - 1;
+      if (!confirm('Merge ' + others + ' cop' + (others === 1 ? 'y' : 'ies') +
+          ' into the selected keeper and move the rest to Trash?')) return;
+      resolve(groupEl, { group_id: g.group_id, action: 'merge', keeper_file_id: keeper },
+        btns, 'Merged — kept 1, trashed ' + others + '.');
+    });
+
+    keepBtn.addEventListener('click', function () {
+      resolve(groupEl, { group_id: g.group_id, action: 'keep' }, btns,
+        'Marked as not duplicates.');
+    });
+
+    linkBtn.addEventListener('click', function () {
+      function doLink(setId) {
+        resolve(groupEl, { group_id: g.group_id, action: 'link', set_id: setId },
+          btns, 'Linked into set.');
+      }
+      if (window.openSetSearchModal) {
+        // Same picker every other add-to-set flow uses (see set_detail.html);
+        // callback receives the chosen/created set object with its id.
+        window.openSetSearchModal(function (set) {
+          if (set && set.id != null) doLink(set.id);
+        });
+      } else {
+        var sid = prompt('Set id to link these into:');
+        if (sid) {
+          var parsed = parseInt(sid, 10);
+          if (!isNaN(parsed)) doLink(parsed);
+        }
+      }
+    });
+
+    return groupEl;
+  }
+
+  fetch('/api/near-dup/groups')
+    .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+    .then(function (data) {
+      loadingEl.style.display = 'none';
+      var groups = (data && data.groups) || [];
+      if (!groups.length) {
+        emptyEl.style.display = 'block';
+        return;
+      }
+      groups.forEach(function (g) { groupsEl.appendChild(buildGroup(g)); });
+    })
+    .catch(function (err) {
+      loadingEl.style.display = 'none';
+      emptyEl.style.display = 'block';
+      if (window.showToast) showToast('Failed to load near-duplicate groups: ' + err.message, 'error');
+    });
+})();
+</script>
+{% endblock %}

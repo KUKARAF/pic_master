@@ -249,6 +249,17 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
+        # not_a_duplicate: pairs of checksums the user confirmed are NOT duplicates (e.g.
+        # a burst that merely looks alike). Canonical order (checksum_a < checksum_b) so a
+        # pair is stored once; the near-dup grouper skips these so they never resurface.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS not_a_duplicate (
+                checksum_a TEXT NOT NULL,
+                checksum_b TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum_a, checksum_b)
+            )
+        ''')
         # Manually-captured video frames: each still (child_checksum, a hidden file in
         # media.db) links back to the source video (parent_checksum) + the timestamp it
         # was grabbed at. Lets the video's page list its saved frames and a captured
@@ -926,6 +937,13 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT parent_checksum, COUNT(*) FROM frame_captures GROUP BY parent_checksum')
         return {row[0]: row[1] for row in cur.fetchall()}
 
+    def get_all_frame_capture_parents(self):
+        """{child_still_checksum: parent_video_checksum} for the whole library — lets the
+        near-dup grouper tell a captured video still (and its source) from a real photo."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT child_checksum, parent_checksum FROM frame_captures')
+        return {row[0]: row[1] for row in cur.fetchall()}
+
     def get_parent_capture(self, child_checksum):
         """{parent_checksum, time_ms} for a captured still, or None if not a capture."""
         cur = self.conn.cursor()
@@ -1039,6 +1057,145 @@ class ManualDB(ThreadLocalDB):
             (limit, offset)
         )
         return cur.fetchall()
+
+    def merge_labels(self, keeper_checksum, loser_checksum, same_image=True):
+        """UNION every user label from `loser_checksum` onto `keeper_checksum`, preserving
+        max information (see the near-dup merge). Additive: never deletes a keeper label.
+        One transaction, one commit; rolls back and re-raises on any error (no silent
+        partial merge). Returns a summary dict of what was absorbed (for the trash note).
+
+        same_image=True  (lower-quality copy / damaged twin — identical pixels): also
+        migrates the PIXEL-TIED labels (spatial tags, faces + their age estimates,
+        video frame-captures), which only make sense when the bboxes still line up.
+        same_image=False (burst / screenshot — different pixels): skips those.
+
+        Auto data (media.db tags/detections/category matches) is intentionally NOT
+        migrated. Does NOT trash the loser — the caller does that after this returns."""
+        now = int(time.time())
+        cur = self.conn.cursor()
+        summary = {}
+        try:
+            # Title — keeper wins; only take the loser's if the keeper has none.
+            ktitle = cur.execute('SELECT title FROM file_titles WHERE checksum=?', (keeper_checksum,)).fetchone()
+            ltitle = cur.execute('SELECT title FROM file_titles WHERE checksum=?', (loser_checksum,)).fetchone()
+            if ltitle and not ktitle:
+                cur.execute('INSERT OR REPLACE INTO file_titles (checksum, title, created_at) VALUES (?, ?, ?)',
+                            (keeper_checksum, ltitle[0], now))
+                summary['title'] = 'taken'
+
+            # Favorites — sum the counters.
+            lfav = cur.execute('SELECT count FROM file_favorites WHERE checksum=?', (loser_checksum,)).fetchone()
+            if lfav and lfav[0]:
+                cur.execute(
+                    '''INSERT INTO file_favorites (checksum, created_at, count) VALUES (?, ?, ?)
+                       ON CONFLICT(checksum) DO UPDATE SET count = count + excluded.count''',
+                    (keeper_checksum, now, lfav[0]))
+                summary['fav_added'] = lfav[0]
+
+            # Tags — copy loser rows with no matching keeper signature (NULL-safe via IS).
+            # Spatial (bbox) tags are pixel-tied → same-image only.
+            spatial_filter = '' if same_image else ' AND l.x1 IS NULL'
+            cur.execute(
+                f'''INSERT INTO file_tags
+                        (checksum, tag_id, polarity, x1, y1, x2, y2, image_width, image_height,
+                         frame_index, favorite, created_at)
+                    SELECT ?, l.tag_id, l.polarity, l.x1, l.y1, l.x2, l.y2, l.image_width,
+                           l.image_height, l.frame_index, l.favorite, ?
+                    FROM file_tags l
+                    WHERE l.checksum = ?{spatial_filter}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM file_tags k WHERE k.checksum = ?
+                            AND k.tag_id = l.tag_id AND k.polarity = l.polarity
+                            AND k.frame_index IS l.frame_index
+                            AND k.x1 IS l.x1 AND k.y1 IS l.y1 AND k.x2 IS l.x2 AND k.y2 IS l.y2)''',
+                (keeper_checksum, now, loser_checksum, keeper_checksum))
+            summary['tags_added'] = cur.rowcount
+
+            # Sets — add memberships (dedup on PK), clear any keeper exclusion for a set it
+            # now belongs to, then carry loser exclusions for sets the keeper isn't in.
+            cur.execute('''INSERT OR IGNORE INTO file_sets (checksum, set_id, created_at)
+                           SELECT ?, set_id, ? FROM file_sets WHERE checksum = ?''',
+                        (keeper_checksum, now, loser_checksum))
+            summary['sets_added'] = cur.rowcount
+            cur.execute('''DELETE FROM file_set_exclusions WHERE checksum = ?
+                           AND set_id IN (SELECT set_id FROM file_sets WHERE checksum = ?)''',
+                        (keeper_checksum, keeper_checksum))
+            cur.execute('''INSERT OR IGNORE INTO file_set_exclusions (checksum, set_id, created_at)
+                           SELECT ?, set_id, ? FROM file_set_exclusions WHERE checksum = ?
+                           AND set_id NOT IN (SELECT set_id FROM file_sets WHERE checksum = ?)''',
+                        (keeper_checksum, now, loser_checksum, keeper_checksum))
+
+            # Categories — same shape as sets.
+            cur.execute('''INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
+                           SELECT ?, category_id, ? FROM file_categories WHERE checksum = ?''',
+                        (keeper_checksum, now, loser_checksum))
+            summary['cats_added'] = cur.rowcount
+            cur.execute('''DELETE FROM file_category_exclusions WHERE checksum = ?
+                           AND category_id IN (SELECT category_id FROM file_categories WHERE checksum = ?)''',
+                        (keeper_checksum, keeper_checksum))
+            cur.execute('''INSERT OR IGNORE INTO file_category_exclusions (checksum, category_id, created_at)
+                           SELECT ?, category_id, ? FROM file_category_exclusions WHERE checksum = ?
+                           AND category_id NOT IN (SELECT category_id FROM file_categories WHERE checksum = ?)''',
+                        (keeper_checksum, now, loser_checksum, keeper_checksum))
+
+            # Locations + whole-photo identity assignments — semantic, safe for both modes.
+            cur.execute('''INSERT OR IGNORE INTO file_locations (checksum, location_id, created_at)
+                           SELECT ?, location_id, ? FROM file_locations WHERE checksum = ?''',
+                        (keeper_checksum, now, loser_checksum))
+            cur.execute('''INSERT OR IGNORE INTO identity_photo_assignments (checksum, identity, created_at)
+                           SELECT ?, identity, ? FROM identity_photo_assignments WHERE checksum = ?''',
+                        (keeper_checksum, now, loser_checksum))
+
+            if same_image:
+                # Pixel-tied: re-key faces (+ their age estimates) and video frame-captures
+                # to the keeper. UPDATE OR IGNORE so the source_face_id partial-unique index
+                # can't abort the merge (a colliding row is simply left behind).
+                cur.execute('UPDATE OR IGNORE faces SET checksum = ? WHERE checksum = ?',
+                            (keeper_checksum, loser_checksum))
+                summary['faces_moved'] = cur.rowcount
+                cur.execute('UPDATE face_age_estimates SET checksum = ? WHERE checksum = ?',
+                            (keeper_checksum, loser_checksum))
+                cur.execute('UPDATE frame_captures SET parent_checksum = ? WHERE parent_checksum = ?',
+                            (keeper_checksum, loser_checksum))
+
+            self.conn.commit()
+            return summary
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # --- not-a-duplicate memory (near-dup review) -------------------------------------
+    @staticmethod
+    def _dup_pair(a, b):
+        return (a, b) if a <= b else (b, a)
+
+    def add_not_duplicate(self, checksum_a, checksum_b):
+        """Record that two files are NOT duplicates so the grouper never pairs them again."""
+        a, b = self._dup_pair(checksum_a, checksum_b)
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO not_a_duplicate (checksum_a, checksum_b, created_at) VALUES (?, ?, ?)',
+                    (a, b, int(time.time())))
+        self.conn.commit()
+
+    def add_not_duplicate_group(self, checksums):
+        """Mark every pair within a group as not-a-duplicate (e.g. a whole burst)."""
+        cur = self.conn.cursor()
+        now = int(time.time())
+        cs = list(checksums)
+        rows = []
+        for i in range(len(cs)):
+            for j in range(i + 1, len(cs)):
+                a, b = self._dup_pair(cs[i], cs[j])
+                rows.append((a, b, now))
+        cur.executemany('INSERT OR IGNORE INTO not_a_duplicate (checksum_a, checksum_b, created_at) VALUES (?, ?, ?)', rows)
+        self.conn.commit()
+
+    def get_not_duplicate_pairs(self):
+        """All dismissed pairs as a set of frozenset({a, b}) — fed to near_dup.group so
+        they never regroup."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum_a, checksum_b FROM not_a_duplicate')
+        return {frozenset((a, b)) for a, b in cur.fetchall()}
 
     def get_random_favorite_checksums(self, limit=6):
         """Random sample of favorited whole-photo checksums, bounded by `limit`

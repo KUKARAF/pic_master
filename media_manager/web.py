@@ -98,6 +98,15 @@ class TrashBody(BaseModel):
     kept_checksum: Optional[str] = None
     note: Optional[str] = None
 
+class NearDupResolveBody(BaseModel):
+    # Resolve one near-duplicate group. action: merge (keep keeper_file_id, trash the
+    # rest, union their labels) | keep (mark not-a-duplicate, keep all) | link (add all
+    # members to set_id + mark not-a-duplicate).
+    group_id: int
+    action: str
+    keeper_file_id: Optional[int] = None
+    set_id: Optional[int] = None
+
 class FeedQueueBody(BaseModel):
     # Ordered file ids for the watch-queue feed (/api/feed/queue).
     ids: List[int] = []
@@ -2185,6 +2194,7 @@ def create_app(data_root: str) -> FastAPI:
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
+    near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -2733,6 +2743,180 @@ def create_app(data_root: str) -> FastAPI:
             'error': detect_faces_job['error'],
             'pending': len(_faceless_images()),
         }
+
+    @app.post('/api/near-dup/compute/start')
+    def api_near_dup_compute_start():
+        """Find near-duplicate groups (Phase 2/3): pHash-cluster all hashed images/stills,
+        add a CLIP wide net that links a video's captured still to a matching standalone
+        image (screenshot↔video), pre-classify each group, and store the results for the
+        /near-duplicates review page. Excludes trashed content and user-dismissed pairs.
+        CPU-only for pHash; the CLIP pass is best-effort and skipped (logged) if it can't
+        load the embedding matrix."""
+        import threading
+        from media_manager import near_dup
+
+        if near_dup_job['running']:
+            return {'started': False, 'message': 'Near-duplicate scan already running.'}
+        near_dup_job.update(running=True, done=0, total=0, groups=0, error=None)
+
+        def _run():
+            try:
+                trashed = manual.get_trashed_checksums()
+                parents = manual.get_all_frame_capture_parents()   # {child_cs: parent_cs}
+                blocked = manual.get_not_duplicate_pairs()
+                items, by_id = [], {}
+                for (fid, _fi, path, ph, _dh, w, h, cs, size, taken_at, broken) in db.get_all_phashes():
+                    if cs in trashed:
+                        continue
+                    it = {'file_id': fid, 'phash': int.from_bytes(ph, 'big'),
+                          'width': w, 'height': h, 'size': size, 'taken_at': taken_at,
+                          'broken': broken is not None, 'is_still': cs in parents,
+                          'parent': parents.get(cs), 'checksum': cs}
+                    items.append(it)
+                    by_id[fid] = it
+                near_dup_job['total'] = len(items)
+
+                # pHash grouping → seed a union-find; then the CLIP cross-media net.
+                uf = near_dup._UnionFind()
+                for it in items:
+                    uf.find(it['file_id'])
+                for g in near_dup.group(items, blocked_pairs=blocked):
+                    for k in range(1, len(g)):
+                        uf.union(g[0], g[k])
+                still_ids = [it['file_id'] for it in items if it['is_still']]
+                near_dup_job['done'] = max(0, len(items) - len(still_ids))
+
+                try:
+                    import numpy as np
+                    from media_manager.similarity import top_k_indices
+                    file_ids, _cksums, matrix = db.get_embeddings_matrix()   # cached
+                    if matrix.shape[0]:
+                        pos = {int(file_ids[i]): i for i in range(len(file_ids))}
+                        done = near_dup_job['done']
+                        for sid in still_ids:
+                            done += 1; near_dup_job['done'] = done
+                            if sid not in pos:
+                                continue
+                            scores = matrix.dot(matrix[pos[sid]])
+                            for i in top_k_indices(scores, min(matrix.shape[0], 20)):
+                                cand = int(file_ids[i])
+                                cit = by_id.get(cand)
+                                if cand == sid or cit is None or cit['is_still']:
+                                    continue  # link a still only to a standalone image
+                                if float(scores[i]) < near_dup.CROSS_THRESH:
+                                    continue
+                                if frozenset((by_id[sid]['checksum'], cit['checksum'])) in blocked:
+                                    continue
+                                uf.union(sid, cand)
+                except Exception as exc:
+                    errors.log('near-dup', f'CLIP cross-media pass skipped: {exc}')
+
+                near_dup_job['done'] = len(items)
+                db.clear_dup_groups()
+                n = 0
+                for g in uf.groups():
+                    if len(g) < 2:
+                        continue
+                    gitems = [by_id[fid] for fid in g if fid in by_id]
+                    if len(gitems) < 2:
+                        continue
+                    c = near_dup.classify(gitems)
+                    db.insert_dup_group(c['label'], c['action'], c['keeper'], c['reason'], g)
+                    n += 1
+                near_dup_job['groups'] = n
+            except Exception as exc:
+                near_dup_job['error'] = str(exc)
+            finally:
+                near_dup_job['running'] = False
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {'started': True, 'total': near_dup_job['total']}
+
+    @app.get('/api/near-dup/compute/status')
+    def api_near_dup_compute_status():
+        return {
+            'running': near_dup_job['running'],
+            'done': near_dup_job['done'],
+            'total': near_dup_job['total'],
+            'error': near_dup_job['error'],
+            'pending': db.count_dup_groups(),   # groups awaiting review
+            'groups': near_dup_job['groups'],
+        }
+
+    @app.get('/api/near-dup/groups')
+    def api_near_dup_groups():
+        """Every computed near-dup group + member details for the review page."""
+        groups = []
+        for g in db.list_dup_groups():
+            members = []
+            for fid in g['file_ids']:
+                r = db.get_file_by_id(fid)
+                if r is None:
+                    continue
+                ph = db.get_phash(fid)   # (phash, dhash, width, height) or None
+                members.append({
+                    'id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path'],
+                    'is_video': os.path.splitext(r['path'])[1].lower() in VIDEO_EXTENSIONS,
+                    'favorite': manual.get_file_favorite_count(r['checksum']),
+                    'width': ph[2] if ph else None, 'height': ph[3] if ph else None,
+                    'size': r['size'], 'is_still': r['checksum'] in _frame_still_checksums(),
+                })
+            groups.append({'group_id': g['group_id'], 'label': g['label'], 'action': g['action'],
+                           'keeper_file_id': g['keeper_file_id'], 'reason': g['reason'],
+                           'members': members})
+        return {'groups': groups}
+
+    def _frame_still_checksums():
+        # Small memo per-request would be ideal; the map is one cheap query.
+        return set(manual.get_all_frame_capture_parents().keys())
+
+    @app.post('/api/near-dup/resolve')
+    def api_near_dup_resolve(body: NearDupResolveBody):
+        """Resolve one group: merge (union labels onto keeper + trash the rest), keep
+        (mark not-a-duplicate), or link (add all to a set + mark not-a-duplicate)."""
+        g = db.get_dup_group(body.group_id)
+        if g is None:
+            raise HTTPException(status_code=404, detail='group not found')
+        members = [m for m in (db.get_file_by_id(fid) for fid in g['file_ids']) if m is not None]
+        if not members:
+            db.delete_dup_group(body.group_id)
+            return {'ok': True}
+        cs_by_id = {m['id']: m['checksum'] for m in members}
+
+        if body.action == 'merge':
+            keeper_id = body.keeper_file_id or g['keeper_file_id'] or members[0]['id']
+            keeper_cs = cs_by_id.get(keeper_id)
+            if keeper_cs is None:
+                raise HTTPException(status_code=400, detail='keeper is not a member of this group')
+            # pixel-tied labels only migrate when it's genuinely the same image.
+            same_image = g['label'] in ('lower_quality_copy', 'damaged_twin', 'review')
+            for m in members:
+                if m['id'] == keeper_id:
+                    continue
+                summary = manual.merge_labels(keeper_cs, m['checksum'], same_image=same_image)
+                note = (f"{m['path']} | merged→{keeper_cs} "
+                        f"mode={'same' if same_image else 'diff'} "
+                        + ' '.join(f'{k}={v}' for k, v in summary.items()))
+                manual.add_to_trash(m['checksum'], reason='duplicate', kept_checksum=keeper_cs,
+                                    source_file_id=m['id'], note=note)
+            db.delete_dup_group(body.group_id)
+            return {'ok': True}
+
+        if body.action == 'keep':
+            manual.add_not_duplicate_group([m['checksum'] for m in members])
+            db.delete_dup_group(body.group_id)
+            return {'ok': True}
+
+        if body.action == 'link':
+            if body.set_id is None:
+                raise HTTPException(status_code=400, detail='set_id is required to link')
+            for m in members:
+                manual.assign_file_to_set(m['checksum'], body.set_id)
+            manual.add_not_duplicate_group([m['checksum'] for m in members])
+            db.delete_dup_group(body.group_id)
+            return {'ok': True}
+
+        raise HTTPException(status_code=400, detail=f'unknown action {body.action!r}')
 
     @app.post('/api/metadata/start')
     def api_metadata_start():
@@ -5022,6 +5206,16 @@ def create_app(data_root: str) -> FastAPI:
             if child is not None:
                 frames.append(child['id'])
         return {'frames': frames}
+
+    @app.get('/near-duplicates', response_class=HTMLResponse)
+    def near_duplicates_page(request: Request):
+        """Review near-duplicate groups (Phase 2/3): merge lower-quality/damaged copies,
+        keep bursts, link screenshots. Groups are computed by the /bulk 'Find
+        near-duplicates' job and read here via /api/near-dup/groups."""
+        return templates.TemplateResponse(request, 'near_duplicates.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
 
     @app.get('/bulk', response_class=HTMLResponse)
     def bulk_page(request: Request):

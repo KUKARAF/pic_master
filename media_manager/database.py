@@ -222,6 +222,27 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_phashes_file ON phashes(file_id)')
+        # Near-duplicate groups computed by the "Find near-duplicates" job (Phase 2).
+        # Derived + rebuildable (dropped/rewritten each run), so CREATE IF NOT EXISTS is
+        # the whole migration. The human's actual decisions live in manual.db (trash +
+        # not_a_duplicate); a resolved group is just deleted from here.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dup_groups (
+                group_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                action TEXT NOT NULL,
+                keeper_file_id INTEGER,
+                reason TEXT,
+                computed_at INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS dup_group_members (
+                group_id INTEGER NOT NULL REFERENCES dup_groups(group_id) ON DELETE CASCADE,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                PRIMARY KEY (group_id, file_id)
+            )
+        ''')
         # Tags table: user-defined labels attached to files
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tags (
@@ -1013,17 +1034,79 @@ class Database(ThreadLocalDB):
         return row[0] if row else 0
 
     def get_all_phashes(self):
-        """(file_id, frame_index, path, phash_bytes, dhash_bytes, width, height, checksum)
-        for every stored hash — the batch fetch the Phase 2 grouping consumes. Images have
-        one row (frame 0); videos have one row per sampled frame, so a file_id can repeat
-        and grouping matches on any frame-pair."""
+        """(file_id, frame_index, path, phash, dhash, width, height, checksum, size,
+        taken_at, broken) for every stored hash — the batch fetch the Phase 2 grouping
+        consumes (size/taken_at/broken are the classification signals). One row per file
+        for images; captured video stills are their own image files, each one row."""
         cursor = self.conn.cursor()
         cursor.execute('''
-            SELECT p.file_id, p.frame_index, f.path, p.phash, p.dhash, p.width, p.height, f.checksum
+            SELECT p.file_id, p.frame_index, f.path, p.phash, p.dhash, p.width, p.height,
+                   f.checksum, f.size, f.taken_at, f.broken
             FROM phashes p
             JOIN files_with_path f ON f.id = p.file_id
         ''')
         return cursor.fetchall()
+
+    # --- near-duplicate groups (Phase 2 review) --------------------------------------
+    def clear_dup_groups(self):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM dup_group_members')
+        cursor.execute('DELETE FROM dup_groups')
+        self.conn.commit()
+
+    def insert_dup_group(self, label, action, keeper_file_id, reason, member_file_ids):
+        """Store one computed near-dup group + its members. Returns the group_id."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'INSERT INTO dup_groups (label, action, keeper_file_id, reason, computed_at) '
+            'VALUES (?, ?, ?, ?, ?)',
+            (label, action, keeper_file_id, reason, int(time.time())))
+        group_id = cursor.lastrowid
+        cursor.executemany(
+            'INSERT OR IGNORE INTO dup_group_members (group_id, file_id) VALUES (?, ?)',
+            [(group_id, fid) for fid in member_file_ids])
+        self.conn.commit()
+        return group_id
+
+    def list_dup_groups(self):
+        """[{group_id, label, action, keeper_file_id, reason, file_ids:[...]}], newest
+        first — backs the /near-duplicates review page."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT group_id, label, action, keeper_file_id, reason FROM dup_groups '
+                       'ORDER BY group_id')
+        groups = {gid: {'group_id': gid, 'label': lb, 'action': ac,
+                        'keeper_file_id': kp, 'reason': rs, 'file_ids': []}
+                  for gid, lb, ac, kp, rs in cursor.fetchall()}
+        cursor.execute('SELECT group_id, file_id FROM dup_group_members')
+        for gid, fid in cursor.fetchall():
+            if gid in groups:
+                groups[gid]['file_ids'].append(fid)
+        return list(groups.values())
+
+    def delete_dup_group(self, group_id):
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM dup_group_members WHERE group_id = ?', (group_id,))
+        cursor.execute('DELETE FROM dup_groups WHERE group_id = ?', (group_id,))
+        self.conn.commit()
+
+    def get_dup_group(self, group_id):
+        """One group as {group_id, label, action, keeper_file_id, reason, file_ids}, or None."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT group_id, label, action, keeper_file_id, reason FROM dup_groups '
+                       'WHERE group_id = ?', (group_id,))
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        cursor.execute('SELECT file_id FROM dup_group_members WHERE group_id = ?', (group_id,))
+        return {'group_id': row[0], 'label': row[1], 'action': row[2],
+                'keeper_file_id': row[3], 'reason': row[4],
+                'file_ids': [r[0] for r in cursor.fetchall()]}
+
+    def count_dup_groups(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM dup_groups')
+        row = cursor.fetchone()
+        return row[0] if row else 0
 
     # ------------------------------------------------------------------
     # Tag methods

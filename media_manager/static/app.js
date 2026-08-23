@@ -75,28 +75,54 @@
      the body-index build poll. On page load each row also checks its status once,
      so a job started elsewhere keeps updating and idle rows show "N pending". */
   (function () {
-    function fmt(d, countKey) {
+    // Renders `<90s => Ns`, else `Xm Ys`.
+    function humanDur(sec) {
+      var e = Math.round(sec);
+      return e < 90 ? e + 's' : Math.floor(e / 60) + 'm ' + (e % 60) + 's';
+    }
+    // `rate` (items/sec, from the client-side EMA) is passed only while running.
+    function fmt(d, countKey, rate) {
       if (d.error) return 'error: ' + d.error;
-      var s = (d.done || 0).toLocaleString() + '/' + (d.total || 0).toLocaleString();
+      var doneN = d.done || 0, total = d.total || 0;
+      var s = doneN.toLocaleString() + '/' + total.toLocaleString();
       if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' matched';
-      // Optional server-provided time-left estimate (e.g. the imdb index load).
-      if (d.eta_seconds != null) {
-        var e = Math.round(d.eta_seconds);
-        s += ' · ~' + (e < 90 ? e + 's' : Math.floor(e / 60) + 'm ' + (e % 60) + 's') + ' left';
-      }
+      if (rate && rate > 0) s += ' · ~' + Math.round(rate * 60) + '/min';
+      // ETA: prefer a server-provided estimate (e.g. the imdb index load),
+      // else derive from the smoothed rate. Only shown when finite and work remains.
+      var eta = d.eta_seconds != null ? d.eta_seconds
+              : (rate && rate > 0 ? (total - doneN) / rate : null);
+      if (eta != null && isFinite(eta) && total > doneN) s += ' · ~' + humanDur(eta) + ' left';
       return s;
     }
     document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
       var statusEl = btn.parentElement.querySelector('[data-role="status"]');
       var countKey = btn.dataset.count || null;
 
-      function done() { btn.disabled = false; delete btn.dataset.busy; }
+      // Forget throughput samples so a (re)start or finish begins a fresh EMA.
+      function resetRate() { delete btn._emaRate; delete btn._lastDone; delete btn._lastT; }
+      function done() { btn.disabled = false; delete btn.dataset.busy; resetRate(); }
+
+      // Update the exponential-moving-average throughput from successive polls and
+      // return the current smoothed rate (items/sec), or 0 until a Δdone>0 sample exists.
+      function tickRate(doneN) {
+        var now = Date.now();
+        if (btn._lastT != null && doneN >= btn._lastDone) {
+          var dt = (now - btn._lastT) / 1000, dd = doneN - btn._lastDone;
+          if (dt > 0 && dd > 0) {
+            var inst = dd / dt;
+            btn._emaRate = btn._emaRate ? btn._emaRate * 0.6 + inst * 0.4 : inst;
+          }
+        }
+        btn._lastDone = doneN;
+        btn._lastT = now;
+        return btn._emaRate || 0;
+      }
 
       function poll() {
         fetch(btn.dataset.status)
           .then(function (r) { return r.json(); })
           .then(function (d) {
-            if (d.running) { statusEl.textContent = fmt(d, countKey); setTimeout(poll, 1500); return; }
+            if (d.running) { statusEl.textContent = fmt(d, countKey, tickRate(d.done || 0)); setTimeout(poll, 1500); return; }
             statusEl.textContent = d.error ? ('error: ' + d.error) : ('done · ' + fmt(d, countKey));
             done();
           })
@@ -108,6 +134,7 @@
         if (btn.dataset.busy) return;
         btn.dataset.busy = '1';
         btn.disabled = true;
+        resetRate();
         statusEl.textContent = 'starting…';
         fetch(btn.dataset.start, { method: 'POST' })
           .then(function (r) { return r.json(); })
