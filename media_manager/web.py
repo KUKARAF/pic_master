@@ -3125,21 +3125,30 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/near-dup/groups')
     def api_near_dup_groups():
-        """Every computed near-dup group + member details for the review page."""
+        """Every computed near-dup group + member details for the review page. Includes
+        per-photo tag/face counts + broken flag so the reviewer never trashes the copy
+        that carries the annotations."""
+        still_cs = _frame_still_checksums()  # once per request, not once per member
         groups = []
         for g in db.list_dup_groups():
+            rows = [(fid, db.get_file_by_id(fid)) for fid in g['file_ids']]
+            rows = [(fid, r) for fid, r in rows if r is not None]
+            checksums = [r['checksum'] for _fid, r in rows]
+            tags_map = manual.list_tags_for_checksums(checksums)
+            ids_map = manual.get_identities_for_checksums(checksums)
             members = []
-            for fid in g['file_ids']:
-                r = db.get_file_by_id(fid)
-                if r is None:
-                    continue
+            for fid, r in rows:
+                cs = r['checksum']
                 ph = db.get_phash(fid)   # (phash, dhash, width, height) or None
                 members.append({
                     'id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path'],
                     'is_video': os.path.splitext(r['path'])[1].lower() in VIDEO_EXTENSIONS,
-                    'favorite': manual.get_file_favorite_count(r['checksum']),
+                    'favorite': manual.get_file_favorite_count(cs),
                     'width': ph[2] if ph else None, 'height': ph[3] if ph else None,
-                    'size': r['size'], 'is_still': r['checksum'] in _frame_still_checksums(),
+                    'size': r['size'], 'is_still': cs in still_cs,
+                    'broken': r['broken'] is not None,
+                    'tag_count': len(tags_map.get(cs, [])),
+                    'people_count': len(ids_map.get(cs, [])),
                 })
             groups.append({'group_id': g['group_id'], 'label': g['label'], 'action': g['action'],
                            'keeper_file_id': g['keeper_file_id'], 'reason': g['reason'],
