@@ -1173,6 +1173,14 @@ def create_app(data_root: str) -> FastAPI:
     # Thumbnail / image serving
     # ------------------------------------------------------------------
 
+    def _mark_decode_failure(file_id, path, reason):
+        """A file that exists on disk but can't be decoded is damaged — mark it broken
+        (so it shows up in the Damaged bucket) and log why. Shared by every decode site
+        so 'can't decode at any point' consistently lands in Damaged. Safe: the broken
+        flag does NOT hide the file from browsing (see get_broken_files semantics)."""
+        errors.log(path, f'decode failed → marked damaged: {reason}')
+        db.mark_broken(file_id)
+
     @app.get('/thumb/{file_id}')
     def serve_thumb(file_id: int):
         row = db.get_file_by_id(file_id)
@@ -1195,10 +1203,14 @@ def create_app(data_root: str) -> FastAPI:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
             make_thumb = _make_video_thumbnail if is_video else _make_thumbnail
             success, message = make_thumb(abs_path, thumb_path)
+            if not success:
+                # abs_path resolved (file IS on disk) but its pixels won't decode →
+                # it's damaged, not merely missing. Mark it so browsing the library
+                # naturally surfaces broken media into the Damaged bucket.
+                _mark_decode_failure(file_id, rel_path, message or 'thumbnail decode failed')
+                return Response(content=_gray_placeholder(), media_type='image/jpeg')
             if message:
                 errors.log(rel_path, message)
-            if not success:
-                return Response(content=_gray_placeholder(), media_type='image/jpeg')
 
         return FileResponse(thumb_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
@@ -2234,7 +2246,8 @@ def create_app(data_root: str) -> FastAPI:
     # ------------------------------------------------------------------
     def _pattern_index_tiles(image_bytes, name):
         """[(bbox, descriptor np.ndarray)] for an image's auto tile grid — worker first,
-        local fallback."""
+        local fallback. Returns None (not []) when the image can't be decoded at all, so
+        the caller can mark it damaged; [] means decoded-but-no-describable-tiles."""
         wc = _worker_client
         if wc is not None and wc.is_configured():
             try:
@@ -2245,7 +2258,7 @@ def create_app(data_root: str) -> FastAPI:
         from media_manager.tile_index import generate_tiles
         bgr = pd.decode_bgr(image_bytes)
         if bgr is None:
-            return []
+            return None  # decode failure — distinct from [] (decoded, no tiles)
         h, w = bgr.shape[:2]
         tiles = generate_tiles(w, h)
         descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
@@ -2290,7 +2303,9 @@ def create_app(data_root: str) -> FastAPI:
                         with open(abs_path, 'rb') as f:
                             image_bytes = f.read()
                         tiles = _pattern_index_tiles(image_bytes, os.path.basename(abs_path))
-                        if tiles:
+                        if tiles is None:
+                            _mark_decode_failure(fid, abs_path, 'could not decode image (pattern-index)')
+                        elif tiles:
                             db.insert_pattern_tiles(
                                 fid, [{'bbox': b, 'descriptor': d} for b, d in tiles],
                                 pattern_descriptor.ALGO_TAG)
