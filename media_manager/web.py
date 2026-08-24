@@ -3128,9 +3128,19 @@ def create_app(data_root: str) -> FastAPI:
         """Every computed near-dup group + member details for the review page. Includes
         per-photo tag/face counts + broken flag so the reviewer never trashes the copy
         that carries the annotations."""
+        from media_manager import near_dup
         still_cs = _frame_still_checksums()  # once per request, not once per member
         groups = []
         for g in db.list_dup_groups():
+            # A stored cluster bigger than MAX_GROUP is an over-linked runaway blob
+            # (single-linkage chaining A≈B≈C… into one useless group) — the compute
+            # never keeps these, so any that exist are stale/corrupt. Purge + skip so
+            # the reviewer never renders a wall of thousands of unrelated photos.
+            if len(g['file_ids']) > near_dup.MAX_GROUP:
+                errors.log('near-dup', f"purged over-linked cluster {g['group_id']} "
+                           f"({len(g['file_ids'])} members > {near_dup.MAX_GROUP})")
+                db.delete_dup_group(g['group_id'])
+                continue
             rows = [(fid, db.get_file_by_id(fid)) for fid in g['file_ids']]
             rows = [(fid, r) for fid, r in rows if r is not None]
             checksums = [r['checksum'] for _fid, r in rows]
