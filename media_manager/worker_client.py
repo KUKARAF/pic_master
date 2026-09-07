@@ -112,6 +112,20 @@ class WorkerClient:
                 self.reticulum = RNS.Reticulum.get_instance() or RNS.Reticulum(None)
         return self.reticulum
 
+    @staticmethod
+    def _safe_teardown(link):
+        """Tear down an RNS link, swallowing any error. An abandoned link stays
+        registered with RNS and holds resources (file descriptors) until torn down,
+        so every path that replaces/drops ``self._link`` must call this first — a
+        flaky worker otherwise leaks one link per failed attempt until the process
+        runs out of FDs. Cleanup must never mask the original failure, hence best-effort."""
+        if link is None:
+            return
+        try:
+            link.teardown()
+        except Exception:
+            pass
+
     def _ensure_link(self, address, path_timeout=_PATH_TIMEOUT, link_timeout=_LINK_TIMEOUT):
         """Return an ACTIVE link to the worker, (re)establishing it if needed.
 
@@ -125,6 +139,11 @@ class WorkerClient:
         """Link establishment core; assumes ``self._lock`` is already held."""
         if self._link is not None and self._link.status == RNS.Link.ACTIVE:
             return self._link
+        # A stale/half-open link left behind (a failed request, or a probe that never
+        # activated) must be torn down, not just dropped — see _safe_teardown.
+        if self._link is not None:
+            self._safe_teardown(self._link)
+            self._link = None
 
         dest_hash = worker_config.address_hash_bytes(address)
 
@@ -155,6 +174,7 @@ class WorkerClient:
         deadline = time.time() + link_timeout
         while link.status != RNS.Link.ACTIVE:
             if time.time() > deadline:
+                self._safe_teardown(link)  # don't leak a link that never activated
                 raise WorkerUnavailable(
                     f"link to worker {address[:8]} not active after {link_timeout}s "
                     f"(status={link.status})")
@@ -200,6 +220,7 @@ class WorkerClient:
             except (WorkerUnavailable, WorkerError) as exc:
                 last_exc = exc
                 with self._lock:
+                    self._safe_teardown(self._link)  # tear down before dropping — don't leak it
                     self._link = None  # force a fresh link on the next attempt
                 if attempt < retries:
                     _warn(f"worker request {path!r} failed ({exc}); "
