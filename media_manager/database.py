@@ -142,6 +142,14 @@ class Database(ThreadLocalDB):
         # lets search filter by city. NULL until the "Match cities" job resolves it.
         if 'city_id' not in files_cols:
             cursor.execute('ALTER TABLE files ADD COLUMN city_id INTEGER')
+        # width/height: original pixel dimensions. Historically only in the phashes
+        # table; now a first-class file attribute populated by the czkawka dedup scan
+        # (its JSON reports dims), so the near-dup review can pick the highest-res keeper
+        # without a phash. NULL until a scan fills them in.
+        if 'width' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN width INTEGER')
+        if 'height' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN height INTEGER')
         # file_paths: every location this content has been seen at. One-to-many — this
         # is where duplicates (same checksum, multiple paths) live. last_seen_at is
         # bumped on every scan that still finds the path on disk, so a path whose
@@ -699,6 +707,13 @@ class Database(ThreadLocalDB):
         """Store this photo's nearest-city match (files.city_id → cities.id)."""
         cursor = self.conn.cursor()
         cursor.execute('UPDATE files SET city_id = ? WHERE id = ?', (city_id, file_id))
+        self.conn.commit()
+
+    def set_file_dimensions_batch(self, rows):
+        """Batch-write (width, height, file_id) tuples — the czkawka dedup scan reports
+        dimensions, so we cache them on files for the near-dup keeper/quality display."""
+        cursor = self.conn.cursor()
+        cursor.executemany('UPDATE files SET width = ?, height = ? WHERE id = ?', rows)
         self.conn.commit()
 
     def get_geotagged_files_without_city(self, limit=None):
@@ -2057,6 +2072,28 @@ class Database(ThreadLocalDB):
             cursor.execute(sql)
         return cursor.fetchall()
 
+    def count_body_sentinels(self) -> int:
+        """Number of files sentineled as 'no people' (bbox='[]', primary frame). A
+        large count after an old build usually means people were missed by the exact
+        'person' label filter — see clear_body_sentinels / PERSON_LIKE_CLASSES."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM body_embeddings WHERE bbox = '[]' AND frame_index IS NULL")
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def clear_body_sentinels(self) -> int:
+        """Delete every 'no people' sentinel body row (bbox='[]', primary frame) so
+        the next body-index build re-processes those files. Recovers from an earlier
+        build that only matched the exact 'person' label and so wrote false 'no
+        people' sentinels for people YOLO-World had labeled portrait/selfie/child/etc
+        (see body_index.PERSON_LIKE_CLASSES). Genuinely peopleless files get
+        re-detected once and re-sentineled. Returns rows deleted."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM body_embeddings WHERE bbox = '[]' AND frame_index IS NULL")
+        self.conn.commit()
+        self._body_ver += 1  # invalidate cached body-embeddings matrix
+        return cursor.rowcount
+
     # ------------------------------------------------------------------
     # Tile embeddings methods (region search)
     # ------------------------------------------------------------------
@@ -2247,16 +2284,21 @@ class Database(ThreadLocalDB):
         )
         return cursor.fetchone() is not None
 
-    def get_person_detections_for_file(self, file_id: int, min_conf: float = 0.3) -> list:
+    def get_person_detections_for_file(self, file_id: int, min_conf: float = 0.3,
+                                       class_names=('person',)) -> list:
         """Return [x1,y1,x2,y2] person boxes from the primary-frame YOLO detections
-        for a file. Only rows with real coordinates count — old rows and sentinels
-        have NULL coords."""
+        for a file. class_names is the set of labels to accept as a person — the body
+        index passes body_index.PERSON_LIKE_CLASSES (person/portrait/selfie/child),
+        because YOLO-World over the full vocab often labels a lone person as one of
+        those rather than 'person'. Only rows with real coordinates count — old rows
+        and sentinels have NULL coords."""
         cursor = self.conn.cursor()
-        cursor.execute('''
+        placeholders = ','.join('?' for _ in class_names)
+        cursor.execute(f'''
             SELECT x1, y1, x2, y2 FROM detections
-            WHERE file_id = ? AND class_name = 'person' AND confidence >= ?
+            WHERE file_id = ? AND class_name IN ({placeholders}) AND confidence >= ?
               AND frame_index IS NULL AND x1 IS NOT NULL
-        ''', (file_id, min_conf))
+        ''', (file_id, *class_names, min_conf))
         return [list(row) for row in cursor.fetchall()]
 
     # ------------------------------------------------------------------

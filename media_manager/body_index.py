@@ -7,13 +7,23 @@ triggers both the background corpus build and the on-demand per-photo embedding
 on the find-by-body page.
 
 Person boxes are reused from `media index`'s stored YOLO-World detections when a
-file already has them (cheap — no model call), but for a file that's never been
-object-indexed this runs its own dedicated person-only detection pass instead of
-skipping the file — otherwise the body-search corpus would silently exclude every
-photo that only ever went through `media add`/`media faces`, regardless of how
-visible the person in it is (confirmed: YOLO-World's 'person' confidence barely
-drops with the face occluded or entirely out of frame — detection quality was
-never the bottleneck, the missing `media index` prerequisite was).
+file already has a person-like box (cheap — no model call). Crucially, "person-like"
+is NOT just the exact label 'person': `media index` runs YOLO-World over the full
+DEFAULT_VOCAB, which is open-vocabulary and assigns ONE best label per box, so a
+person is frequently stored as 'portrait'/'selfie'/'child' rather than 'person'.
+Matching only 'person' silently dropped all of those from the body corpus (they
+appeared indexable but returned no crops), so PERSON_LIKE_CLASSES widens the reuse
+to every single-person label. 'crowd'/'group of people' are deliberately excluded:
+their box spans many people, so the crop is a useless blend for re-ID.
+
+When NO person-like box is stored — the file was never object-indexed, OR it was but
+YOLO-World gave the people only excluded labels (crowd/group) or a scene label — we
+do NOT trust that as "no person": we run a dedicated person-only detection pass, the
+same one behind the find-by-body "Reindex now" button. The (possibly empty) result
+is sentineled by the caller, so this one-time pass never repeats for a genuinely
+peopleless photo. (Confirmed: YOLO-World's 'person' confidence barely drops with the
+face occluded or entirely out of frame — detection quality was never the bottleneck,
+trusting the general index's labels was.)
 
 match_face_to_body duplicates the logic in age_estimator_worker.py, which runs in
 an isolated venv and can't import from the main app — keep the two in sync.
@@ -32,6 +42,13 @@ MIN_FACE_IN_BODY_OVERLAP = 0.7
 # Stored YOLO-World detections go down to conf 0.15; body crops want more certain
 # person boxes than tag search does, so filter harder here.
 MIN_PERSON_CONFIDENCE = 0.3
+
+# DEFAULT_VOCAB labels that denote ONE croppable person, any of which the general
+# object index may have assigned to a person instead of 'person' (open-vocab, one
+# best label per box). Body re-ID must treat all of them as person boxes — see the
+# module docstring. 'crowd'/'group of people' are excluded on purpose: one box over
+# many people crops to a blend that's useless for re-identification.
+PERSON_LIKE_CLASSES = ('person', 'child', 'selfie', 'portrait')
 
 
 def _containment(face_bbox, person_bbox):
@@ -81,17 +98,23 @@ def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None
     """Crop + embed one file's person boxes and upsert its body_embeddings rows
     (sentinel when none). person_boxes, when given, skips detection entirely (used
     when a caller already has fresh boxes on hand). Otherwise: reuse this file's
-    stored YOLO-World detections if `media index` already ran on it; for a file
-    that's never been object-indexed at all, run a dedicated person-only pass with
-    `detector` instead of treating "no stored detections" as "no person" — that
-    distinction (via db.has_object_detections) is what makes this self-sufficient
-    rather than silently skipping every never-object-indexed file. Returns the
-    number of bodies embedded."""
+    stored PERSON_LIKE_CLASSES boxes from `media index` if it has any (cheap, no
+    model call — and this counts 'portrait'/'selfie'/'child', not just the exact
+    'person' label, since YOLO-World often labels a lone person that way); if it has
+    none, run a dedicated person-only pass with `detector` rather than treating the
+    absence of a person-like box as "no person" (see the module docstring). Returns
+    the number of bodies embedded."""
     if person_boxes is None:
-        person_boxes = db.get_person_detections_for_file(file_id, min_conf=MIN_PERSON_CONFIDENCE)
-        if not person_boxes and not db.has_object_detections(file_id):
+        person_boxes = db.get_person_detections_for_file(
+            file_id, min_conf=MIN_PERSON_CONFIDENCE, class_names=PERSON_LIKE_CLASSES)
+        if not person_boxes:
+            # No stored person-like box. Do NOT trust that as "no person" — the file
+            # may never have been object-indexed, or the general index may have given
+            # the people only excluded labels (crowd/group) or a scene label. Run the
+            # dedicated person-only pass (same as the "Reindex now" button); its result
+            # gets sentineled by insert_body_embeddings, so this never repeats.
             if detector is None:
-                raise ValueError('file has no stored object index and no detector was given')
+                raise ValueError('file has no stored person box and no detector was given')
             detector.set_vocab(['person'])
             _, detections, error = detector.detect_images([abs_path])[0]
             if error:

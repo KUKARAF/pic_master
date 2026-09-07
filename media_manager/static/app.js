@@ -3422,18 +3422,41 @@
     });
   });
 
-  /* Find pill — 📏 distance segment: whole-image CLIP similarity into the queue. */
+  /* Find pill — 📏 distance segment: whole-image CLIP similarity into the queue.
+     If the photo isn't embedded yet, ask to embed it now (y/n) and, on yes, embed
+     then re-run the search — instead of a dead-end "no embedding" toast. */
   var findDistanceBtn = document.querySelector('.find-by-distance-btn');
   if (findDistanceBtn) {
-    findDistanceBtn.addEventListener('click', function () {
+    var distFileId = findDistanceBtn.dataset.fileId;
+
+    function embedThenRetryDistance() {
+      if (window.showToast) showToast('Embedding this photo…');
+      fetch('/api/files/' + distFileId + '/embed', { method: 'POST' })
+        .then(function (r) {
+          if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('Request failed: ' + r.status)); });
+          return r.json();
+        })
+        .then(function () { runDistanceSearch(); })
+        .catch(function (err) { if (window.showToast) showToast('Embed failed: ' + err.message); });
+    }
+
+    function runDistanceSearch() {
       openMatchesAsQueue({
         el: findDistanceBtn,
-        url: '/api/files/' + findDistanceBtn.dataset.fileId + '/similar',
+        url: '/api/files/' + distFileId + '/similar',
         label: 'Similar images',
         extractIds: function (data) { return (data.results || []).map(function (r) { return r.file_id; }); },
-        onEmpty: function (data) { if (window.showToast) showToast((data && data.message) || 'No similar images found.'); },
+        onEmpty: function (data) {
+          if (data && data.no_embedding) {
+            if (window.confirm('No embedding present for this image. Embed now?')) embedThenRetryDistance();
+            return;
+          }
+          if (window.showToast) showToast((data && data.message) || 'No similar images found.');
+        },
       });
-    });
+    }
+
+    findDistanceBtn.addEventListener('click', runDistanceSearch);
   }
 
   /* Find pill — 🧍 body segment: find-by-body into the queue. First open of a
@@ -4374,12 +4397,14 @@
   if (bodyIndexBanner) {
     const bodyIndexText = document.getElementById('body-index-text');
     const bodyIndexBtn = document.getElementById('body-index-build-btn');
+    const bodyIndexRescanBtn = document.getElementById('body-index-rescan-btn');
     let bodyIndexWasRunning = false;
 
     function refreshBodyIndexBanner() {
       fetch('/api/body-index/status')
         .then(function (r) { return r.json(); })
         .then(function (s) {
+          if (bodyIndexRescanBtn) bodyIndexRescanBtn.style.display = 'none';
           if (s.running) {
             bodyIndexWasRunning = true;
             bodyIndexBanner.style.display = '';
@@ -4396,6 +4421,14 @@
             bodyIndexBanner.style.display = '';
             bodyIndexBtn.style.display = '';
             bodyIndexText.textContent = s.pending + ' photo(s) are not in the body index yet.';
+          } else if (s.empty > 0 && bodyIndexRescanBtn) {
+            // Nothing left to index, but some files are sentineled "no people" —
+            // often people an older build missed (labeled portrait/selfie/etc, not
+            // 'person'). Offer a re-scan that clears those sentinels and re-detects.
+            bodyIndexBanner.style.display = '';
+            bodyIndexBtn.style.display = 'none';
+            bodyIndexRescanBtn.style.display = 'inline-block';
+            bodyIndexText.textContent = s.empty + ' photo(s) are indexed as “no people”.';
           } else {
             bodyIndexBanner.style.display = 'none';
           }
@@ -4411,6 +4444,18 @@
           refreshBodyIndexBanner();
         });
     });
+
+    if (bodyIndexRescanBtn) {
+      bodyIndexRescanBtn.addEventListener('click', function () {
+        bodyIndexRescanBtn.disabled = true;
+        fetch('/api/body-index/start?retry_empty=true', { method: 'POST' })
+          .then(function () {
+            bodyIndexWasRunning = true;
+            bodyIndexRescanBtn.disabled = false;
+            refreshBodyIndexBanner();
+          });
+      });
+    }
 
     refreshBodyIndexBanner();
   }

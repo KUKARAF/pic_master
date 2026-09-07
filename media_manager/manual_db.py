@@ -1193,8 +1193,8 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
 
     def get_not_duplicate_pairs(self):
-        """All dismissed pairs as a set of frozenset({a, b}) — fed to near_dup.group so
-        they never regroup."""
+        """All dismissed pairs as a set of frozenset({a, b}) — the near-dup compute skips
+        any czkawka group whose every pair is dismissed, so they never resurface."""
         cur = self.conn.cursor()
         cur.execute('SELECT checksum_a, checksum_b FROM not_a_duplicate')
         return {frozenset((a, b)) for a, b in cur.fetchall()}

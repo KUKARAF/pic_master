@@ -1,135 +1,24 @@
-"""Near-duplicate grouping + pre-classification (Phase 2).
+"""Near-duplicate keeper-selection + pre-classification (Phase 2).
 
-Pure logic — no DB access. The web layer assembles `items` from the phashes/files
-tables and hands them here; this module clusters them into candidate near-duplicate
-groups and pre-labels each group into one of the cases the human then confirms.
+Pure logic — no DB access. Grouping is done by the external **czkawka** CLI (see
+`czkawka.py`); the web layer resolves each czkawka group to `items` and hands them
+here to pick a keeper and pre-label the group into one of the cases the human confirms.
 
 An `item` is a dict with:
     file_id       int
-    phash         int   (64-bit; from the stored 8-byte BLOB)
     width,height  int|None   (ORIGINAL pixels — picks the keeper)
     size          int|None   (bytes — keeper tiebreak)
     taken_at      int|None   (unix seconds; separates a burst from a copy)
     broken        bool       (damaged)
     is_still      bool       (a captured video still, not a standalone photo)
     parent        str|None   (source-video checksum, when is_still)
-
-Grouping uses banded (multi-index) bucketing over the 64-bit pHash so it's ~linear
-instead of O(n^2), then verifies each candidate pair by full Hamming distance and
-unions them. Two sampled stills of the *same* video are never grouped (they're
-intentional samples, not duplicates).
 """
 
-# Tunable thresholds (64-bit Hamming). Conservative on purpose — a human confirms.
-H_DUP = 4        # <= this: the same pixels (re-encode/resize/damage)
-H_NEAR = 10      # <= this: near — same scene / burst / possible dup
+# Tunable thresholds. Conservative on purpose — a human confirms.
+H_DUP = 4        # czkawka image `difference` <= this reads as "the same pixels"
 BURST_SECS = 3   # capture-time gap under which near frames read as a burst, not a copy
 RATIO_DIFF = 1.2 # resolution/size ratio above which two copies "differ" in quality
-CROSS_THRESH = 0.95  # CLIP cosine for the screenshot↔video-still wide net (Phase 3)
-# Grouping is single-linkage union-find, so a loose threshold CHAINS dissimilar photos
-# (A≈B≈C… drags in unrelated D) into big useless blobs. Group tight — near-identical
-# only — so a group is genuinely "the same shot"; and drop any runaway group (a
-# degenerate hub / over-linked cluster) rather than present a wall of unrelated photos.
-GROUP_HAMMING = 6
-MAX_GROUP = 12
-
-_BANDS = 4
-_BAND_BITS = 16
-_BAND_MASK = (1 << _BAND_BITS) - 1
-
-
-def hamming(a: int, b: int) -> int:
-    return bin(a ^ b).count('1')
-
-
-class _UnionFind:
-    def __init__(self):
-        self.parent = {}
-
-    def find(self, x):
-        self.parent.setdefault(x, x)
-        root = x
-        while self.parent[root] != root:
-            root = self.parent[root]
-        while self.parent[x] != root:      # path compression
-            self.parent[x], x = root, self.parent[x]
-        return root
-
-    def union(self, a, b):
-        ra, rb = self.find(a), self.find(b)
-        if ra != rb:
-            self.parent[ra] = rb
-
-    def groups(self):
-        out = {}
-        for x in self.parent:
-            out.setdefault(self.find(x), []).append(x)
-        return list(out.values())
-
-
-def _is_degenerate(phash: int) -> bool:
-    """All-zero / all-one hashes come from solid-colour or featureless frames and would
-    form a giant false hub — skip them from grouping."""
-    return phash == 0 or phash == 0xFFFFFFFFFFFFFFFF
-
-
-def group(items, max_hamming=H_NEAR, blocked_pairs=None):
-    """Cluster `items` into candidate near-dup groups (lists of file_ids, size >= 2).
-
-    Multi-index hashing: the 64-bit pHash is split into 4 bands of 16 bits, and each
-    item is probed against its band-key AND every 1-bit neighbour of it (radius 1). By
-    the pigeonhole principle a pair within Hamming distance 7 must agree on some band to
-    within 1 bit, so this GUARANTEES finding all pairs up to distance 7 (covering exact/
-    lower-quality copies and damaged twins) and best-effort up to `max_hamming`. Every
-    candidate is verified by full Hamming <= max_hamming before union. Same-parent video
-    stills never union, and pairs the user marked "not a duplicate" (blocked_pairs, a set
-    of frozenset({checksum_a, checksum_b})) are skipped so they never regroup. Singletons
-    are dropped."""
-    blocked_pairs = blocked_pairs or set()
-    by_id = {it['file_id']: it for it in items}
-    uf = _UnionFind()
-    for it in items:                        # every id is a node so singletons resolve
-        uf.find(it['file_id'])
-
-    buckets = [dict() for _ in range(_BANDS)]
-    for it in items:
-        ph = it['phash']
-        if _is_degenerate(ph):
-            continue
-        for bi in range(_BANDS):
-            key = (ph >> (bi * _BAND_BITS)) & _BAND_MASK
-            buckets[bi].setdefault(key, []).append(it['file_id'])
-
-    seen_pairs = set()
-    for it in items:
-        ph = it['phash']
-        if _is_degenerate(ph):
-            continue
-        a = it['file_id']
-        for bi in range(_BANDS):
-            key = (ph >> (bi * _BAND_BITS)) & _BAND_MASK
-            band = buckets[bi]
-            cand = list(band.get(key, ()))                     # exact band
-            for bit in range(_BAND_BITS):                       # + 1-bit neighbours
-                cand.extend(band.get(key ^ (1 << bit), ()))
-            for b in cand:
-                if b == a:
-                    continue
-                pair = (a, b) if a < b else (b, a)
-                if pair in seen_pairs:
-                    continue
-                seen_pairs.add(pair)
-                ia, ib = by_id[a], by_id[b]
-                # never treat two sampled frames of the same video as duplicates
-                if ia['is_still'] and ib['is_still'] and ia.get('parent') \
-                   and ia.get('parent') == ib.get('parent'):
-                    continue
-                if blocked_pairs and frozenset((ia.get('checksum'), ib.get('checksum'))) in blocked_pairs:
-                    continue  # user marked these "not a duplicate"
-                if hamming(ia['phash'], ib['phash']) <= max_hamming:
-                    uf.union(a, b)
-
-    return [g for g in uf.groups() if len(g) >= 2]
+MAX_GROUP = 12   # drop any czkawka group bigger than this as noise rather than present it
 
 
 def _megapixels(it):
@@ -147,15 +36,6 @@ def _pick_keeper(group_items):
     )[0]['file_id']
 
 
-def _max_pair_hamming(group_items):
-    hs = [it['phash'] for it in group_items]
-    worst = 0
-    for i in range(len(hs)):
-        for j in range(i + 1, len(hs)):
-            worst = max(worst, hamming(hs[i], hs[j]))
-    return worst
-
-
 def _resolution_or_size_varies(group_items):
     mps = [_megapixels(it) for it in group_items if _megapixels(it)]
     if len(mps) >= 2 and max(mps) >= min(mps) * RATIO_DIFF:
@@ -169,8 +49,12 @@ def _time_spread(group_items):
     return (max(ts) - min(ts)) if len(ts) == len(group_items) and len(ts) >= 2 else None
 
 
-def classify(group_items):
+def classify(group_items, worst_diff=None):
     """Pre-label a group. Returns {label, action, keeper, reason}.
+
+    `worst_diff` is the largest pairwise dissimilarity within the group (czkawka's
+    image `difference`, 0 = identical). It replaces the old pHash `_max_pair_hamming`
+    as the "same pixels" signal for the lower_quality_copy gate; None disables that gate.
 
     label/action:
       damaged_twin      -> merge  (keep the healthy, highest-res copy)
@@ -198,10 +82,10 @@ def classify(group_items):
         return {'label': 'damaged_twin', 'action': 'merge', 'keeper': _pick_keeper(healthy),
                 'reason': 'one copy is damaged, another is intact'}
 
-    worst = _max_pair_hamming(group_items)
+    worst = worst_diff  # czkawka difference (0 = identical); None → skip the same-pixels gate
     spread = _time_spread(group_items)
 
-    if worst <= H_DUP and _resolution_or_size_varies(group_items):
+    if worst is not None and worst <= H_DUP and _resolution_or_size_varies(group_items):
         return {'label': 'lower_quality_copy', 'action': 'merge', 'keeper': _pick_keeper(group_items),
                 'reason': 'same image at different resolution/size'}
 

@@ -85,16 +85,31 @@
   </section>
 
   <section class="bulk-section">
-    <h2>👯 Duplicates</h2>
+    <h2>👯 Duplicates &amp; damaged <span class="sub">(czkawka)</span></h2>
+    {% if not czkawka_available %}
+    <p class="sub bulk-unavailable" style="margin:0 2px 10px;">
+      ⚠️ <strong>czkawka not found</strong> — deduplication &amp; damaged-file scanning are
+      disabled. Install <code>czkawka_cli</code> (≥ v12) on the server to enable these.
+    </p>
+    {% endif %}
     <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start="/api/near-dup/compute/start"
-              data-status="/api/near-dup/compute/status">🔎 Find near-duplicates</button>
+              data-status="/api/near-dup/compute/status"
+              {% if not czkawka_available %}disabled{% endif %}>🔎 Find near-duplicates</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/broken/scan/start"
+              data-status="/api/broken/scan/status"
+              {% if not czkawka_available %}disabled{% endif %}>🩹 Find damaged files</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <p class="sub" style="margin:6px 2px 0;">
-      Clusters hashed photos + video stills into look-alike groups, then
-      <a href="/near-duplicates">review them here</a> (merge copies, keep bursts, link screenshots).
-      Run 🧬 Perceptual hash and 🎞 Capture video frames first.
+      czkawka scans the library for look-alike images{% if ffmpeg_available %}, similar videos{% endif %},
+      byte-identical copies and corrupt files — it only <em>lists</em>; nothing is ever deleted.
+      Review near-duplicates <a href="/near-duplicates">here</a> (merge copies, keep bursts, link
+      screenshots); damaged files land in the <a href="/browse/broken">Damaged</a> bucket.
+      {% if not ffmpeg_available %}<br><span class="sub">Install ffmpeg + ffprobe to also scan videos.</span>{% endif %}
     </p>
   </section>
 
@@ -127,6 +142,8 @@
   .bulk-page .bulk-action-row { display: flex; align-items: center; gap: 12px; margin: 8px 0; }
   .bulk-page .bulk-action-btn { min-width: 260px; text-align: left; }
   .bulk-page .bulk-action-status { color: var(--muted, #999); font-size: 0.9em; }
+  .bulk-page .bulk-action-btn[disabled] { opacity: .45; cursor: not-allowed; }
+  .bulk-unavailable { color: #e0a; }
   .bulk-threshold { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
     margin: 0 0 12px; }
   .bulk-threshold label { display: flex; align-items: center; gap: 8px; }

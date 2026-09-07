@@ -499,6 +499,18 @@ def create_app(data_root: str) -> FastAPI:
     # the big transient embedding matrices otherwise ratchet RSS upward.
     _start_malloc_trimmer()
 
+    # Deduplication + damaged-file scanning are powered by the external czkawka CLI
+    # (find-only — we never let it delete). Detect it once; if it's missing, log and
+    # disable those features rather than crash. Similar-videos + broken-video checks
+    # additionally need ffmpeg.
+    from media_manager import czkawka as _czkawka_mod
+    _czkawka = _czkawka_mod.info()
+    _ffmpeg = _czkawka_mod.has_ffmpeg()
+    if _czkawka is None:
+        print("[web] czkawka not found, deduplication will not be available", flush=True)
+    else:
+        print(f"[web] czkawka {_czkawka['version']} (ffmpeg: {'yes' if _ffmpeg else 'no'})", flush=True)
+
     if not os.path.isdir(media_dir):
         raise RuntimeError(
             f"No media repository found at '{data_root}'. "
@@ -2161,7 +2173,8 @@ def create_app(data_root: str) -> FastAPI:
         _file_or_404(file_id)
         emb_bytes = db.get_embedding(file_id)
         if emb_bytes is None:
-            return {'results': [], 'message': 'This photo has no embedding yet.'}
+            # Distinct flag so the client can offer "embed now?" instead of a dead-end toast.
+            return {'results': [], 'no_embedding': True, 'message': 'This photo has no embedding yet.'}
         import numpy as np
         from media_manager.similarity import top_k_indices
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
@@ -2411,6 +2424,7 @@ def create_app(data_root: str) -> FastAPI:
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
+    broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
     pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
@@ -2614,12 +2628,16 @@ def create_app(data_root: str) -> FastAPI:
         return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
 
     @app.post('/api/body-index/start')
-    def api_body_index_start(include_trashed: bool = False):
+    def api_body_index_start(include_trashed: bool = False, retry_empty: bool = False):
         import threading
         from media_manager import body_index
 
         if body_index_job['running']:
             return {'started': False, 'message': 'Body index build already running.'}
+        # retry_empty clears prior 'no people' sentinels so files that an older build
+        # wrongly skipped (people labeled portrait/selfie/child, not 'person') get
+        # re-detected. Peopleless files are re-detected once and re-sentineled.
+        cleared = db.clear_body_sentinels() if retry_empty else 0
         body_index_job.update(
             running=True, done=0, total=len(db.get_unbody_indexed_files()), error=None)
 
@@ -2638,7 +2656,7 @@ def create_app(data_root: str) -> FastAPI:
                 body_index_job['running'] = False
 
         _spawn_job(_run)
-        return {'started': True, 'total': body_index_job['total']}
+        return {'started': True, 'total': body_index_job['total'], 'cleared_sentinels': cleared}
 
     @app.get('/api/body-index/status')
     def api_body_index_status():
@@ -2648,6 +2666,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': body_index_job['total'],
             'error': body_index_job['error'],
             'pending': len(db.get_unbody_indexed_files()),
+            'empty': db.count_body_sentinels(),
         }
 
     @app.post('/api/index/start')
@@ -3020,15 +3039,17 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/near-dup/compute/start')
     def api_near_dup_compute_start():
-        """Find near-duplicate groups (Phase 2/3): pHash-cluster all hashed images/stills,
-        add a CLIP wide net that links a video's captured still to a matching standalone
-        image (screenshot↔video), pre-classify each group, and store the results for the
-        /near-duplicates review page. Excludes trashed content and user-dismissed pairs.
-        CPU-only for pHash; the CLIP pass is best-effort and skipped (logged) if it can't
-        load the embedding matrix."""
-        import threading
-        from media_manager import near_dup
+        """Find near-duplicate groups with czkawka (FIND-ONLY — nothing is ever deleted).
+        Runs czkawka's similar-images, similar-videos (if ffmpeg) and exact-duplicate scans,
+        maps each reported path back to a file_id, pre-classifies every group, and stores the
+        results for the /near-duplicates review page. Also caches czkawka's per-image
+        width/height onto files. Excludes trashed content, user-dismissed ("not a duplicate")
+        pairs, and clusters of sampled frames of the same video."""
+        from itertools import combinations
+        from media_manager import near_dup, czkawka
 
+        if _czkawka is None:
+            return {'started': False, 'message': 'czkawka not found, deduplication will not be available'}
         if near_dup_job['running']:
             return {'started': False, 'message': 'Near-duplicate scan already running.'}
         near_dup_job.update(running=True, done=0, total=0, groups=0, error=None)
@@ -3037,72 +3058,79 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 trashed = manual.get_trashed_checksums()
                 parents = manual.get_all_frame_capture_parents()   # {child_cs: parent_cs}
-                blocked = manual.get_not_duplicate_pairs()
-                items, by_id = [], {}
-                for (fid, _fi, path, ph, _dh, w, h, cs, size, taken_at, broken) in db.get_all_phashes():
-                    if cs in trashed:
-                        continue
-                    it = {'file_id': fid, 'phash': int.from_bytes(ph, 'big'),
-                          'width': w, 'height': h, 'size': size, 'taken_at': taken_at,
-                          'broken': broken is not None, 'is_still': cs in parents,
-                          'parent': parents.get(cs), 'checksum': cs}
-                    items.append(it)
-                    by_id[fid] = it
-                near_dup_job['total'] = len(items)
+                blocked = manual.get_not_duplicate_pairs()          # {frozenset({cs,cs}), ...}
+                path_to_id = {rel: fid for rel, fid in db.list_all_paths()}
 
-                # pHash grouping → seed a union-find; then the CLIP cross-media net.
-                uf = near_dup._UnionFind()
-                for it in items:
-                    uf.find(it['file_id'])
-                for g in near_dup.group(items, max_hamming=near_dup.GROUP_HAMMING, blocked_pairs=blocked):
-                    for k in range(1, len(g)):
-                        uf.union(g[0], g[k])
-                still_ids = [it['file_id'] for it in items if it['is_still']]
-                near_dup_job['done'] = max(0, len(items) - len(still_ids))
+                def resolve(abspath):
+                    rel = os.path.relpath(abspath, data_root).replace(os.sep, '/')
+                    return path_to_id.get(rel)
 
-                try:
-                    import numpy as np
-                    from media_manager.similarity import top_k_indices
-                    file_ids, _cksums, matrix = db.get_embeddings_matrix()   # cached
-                    if matrix.shape[0]:
-                        pos = {int(file_ids[i]): i for i in range(len(file_ids))}
-                        done = near_dup_job['done']
-                        for sid in still_ids:
-                            done += 1; near_dup_job['done'] = done
-                            if sid not in pos:
-                                continue
-                            scores = matrix.dot(matrix[pos[sid]])
-                            for i in top_k_indices(scores, min(matrix.shape[0], 20)):
-                                cand = int(file_ids[i])
-                                cit = by_id.get(cand)
-                                if cand == sid or cit is None or cit['is_still']:
-                                    continue  # link a still only to a standalone image
-                                if float(scores[i]) < near_dup.CROSS_THRESH:
-                                    continue
-                                if frozenset((by_id[sid]['checksum'], cit['checksum'])) in blocked:
-                                    continue
-                                uf.union(sid, cand)
-                except Exception as exc:
-                    errors.log('near-dup', f'CLIP cross-media pass skipped: {exc}')
+                # czkawka similarity scans (FIND-ONLY — never deletes; we only parse its
+                # JSON). Each group is a list of member dicts carrying 'path' (+ width/
+                # height/size/difference for images/videos).
+                scans = [('image', czkawka.similar_images([data_root])),
+                         ('video', czkawka.similar_videos([data_root])),
+                         ('exact', czkawka.exact_duplicates([data_root]))]
 
-                near_dup_job['done'] = len(items)
+                dims = []        # (w, h, file_id) to cache on files.width/height
+                raw_groups = []  # (kind, [(file_id, entry), ...])
+                for kind, groups in scans:
+                    for grp in groups:
+                        members = []
+                        for e in grp:
+                            fid = resolve(e.get('path', ''))
+                            if fid is None:
+                                continue  # a path this library doesn't track — skip
+                            if e.get('width') and e.get('height'):
+                                dims.append((e['width'], e['height'], fid))
+                            members.append((fid, e))
+                        if members:
+                            raw_groups.append((kind, members))
+                if dims:
+                    db.set_file_dimensions_batch(dims)
+                near_dup_job['total'] = len(raw_groups)
+
                 db.clear_dup_groups()
                 n = 0
-                oversized = 0
-                for g in uf.groups():
-                    if len(g) < 2:
+                for kind, members in raw_groups:
+                    near_dup_job['done'] += 1
+                    # Distinct, non-trashed file_ids. Identical content already collapses
+                    # to ONE file_id in our content-addressed DB, so 'exact' groups usually
+                    # shrink to a single id here (and are skipped) — that's expected.
+                    entry_by_id = {}
+                    for fid, e in members:
+                        entry_by_id.setdefault(fid, e)
+                    rows = {}
+                    for fid in entry_by_id:
+                        r = db.get_file_by_id(fid)
+                        if r is not None and r['checksum'] not in trashed:
+                            rows[fid] = r
+                    file_ids = list(rows)
+                    if not (2 <= len(file_ids) <= near_dup.MAX_GROUP):
                         continue
-                    if len(g) > near_dup.MAX_GROUP:
-                        oversized += 1   # a runaway/over-linked cluster — noise, don't present it
+                    css = [rows[fid]['checksum'] for fid in file_ids]
+                    # A group the user already dismissed as "not duplicates" (every pair blocked).
+                    if blocked and all(frozenset(p) in blocked for p in combinations(css, 2)):
                         continue
-                    gitems = [by_id[fid] for fid in g if fid in by_id]
-                    if len(gitems) < 2:
+                    gitems = []
+                    for fid in file_ids:
+                        r, e = rows[fid], entry_by_id[fid]
+                        cs = r['checksum']
+                        gitems.append({'file_id': fid,
+                                       'width': e.get('width') or r['width'],
+                                       'height': e.get('height') or r['height'],
+                                       'size': r['size'], 'taken_at': r['taken_at'],
+                                       'broken': r['broken'] is not None, 'is_still': cs in parents,
+                                       'parent': parents.get(cs), 'checksum': cs})
+                    # Never present a cluster of sampled frames of the SAME video.
+                    if all(it['is_still'] and it['parent'] and it['parent'] == gitems[0]['parent']
+                           for it in gitems):
                         continue
-                    c = near_dup.classify(gitems)
-                    db.insert_dup_group(c['label'], c['action'], c['keeper'], c['reason'], g)
+                    worst_diff = (max((e.get('difference') or 0) for _f, e in members)
+                                  if kind == 'image' else (0 if kind == 'exact' else None))
+                    c = near_dup.classify(gitems, worst_diff=worst_diff)
+                    db.insert_dup_group(c['label'], c['action'], c['keeper'], c['reason'], file_ids)
                     n += 1
-                if oversized:
-                    errors.log('near-dup', f'dropped {oversized} oversized (>{near_dup.MAX_GROUP}) cluster(s) as noise')
                 near_dup_job['groups'] = n
             except Exception as exc:
                 near_dup_job['error'] = str(exc)
@@ -3121,6 +3149,52 @@ def create_app(data_root: str) -> FastAPI:
             'error': near_dup_job['error'],
             'pending': db.count_dup_groups(),   # groups awaiting review
             'groups': near_dup_job['groups'],
+        }
+
+    @app.post('/api/broken/scan/start')
+    def api_broken_scan_start():
+        """Scan the whole library for corrupt/undecodable files with czkawka and mark
+        each one broken (→ Damaged bucket). FIND-ONLY: czkawka never deletes; we only
+        flag. Complements the on-decode-failure marking + `media find_broken`."""
+        from media_manager import czkawka
+
+        if _czkawka is None:
+            return {'started': False, 'message': 'czkawka not found, deduplication will not be available'}
+        if broken_scan_job['running']:
+            return {'started': False, 'message': 'Damaged-file scan already running.'}
+        broken_scan_job.update(running=True, done=0, total=0, marked=0, error=None)
+
+        def _run():
+            try:
+                path_to_id = {rel: fid for rel, fid in db.list_all_paths()}
+                entries = czkawka.broken_files([data_root])
+                broken_scan_job['total'] = len(entries)
+                marked = 0
+                for e in entries:
+                    broken_scan_job['done'] += 1
+                    rel = os.path.relpath(e.get('path', ''), data_root).replace(os.sep, '/')
+                    fid = path_to_id.get(rel)
+                    if fid is None:
+                        continue
+                    db.mark_broken(fid)
+                    marked += 1
+                    broken_scan_job['marked'] = marked
+            except Exception as exc:
+                broken_scan_job['error'] = str(exc)
+            finally:
+                broken_scan_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': broken_scan_job['total']}
+
+    @app.get('/api/broken/scan/status')
+    def api_broken_scan_status():
+        return {
+            'running': broken_scan_job['running'],
+            'done': broken_scan_job['done'],
+            'total': broken_scan_job['total'],
+            'marked': broken_scan_job['marked'],
+            'error': broken_scan_job['error'],
         }
 
     @app.get('/api/near-dup/groups')
@@ -3149,12 +3223,16 @@ def create_app(data_root: str) -> FastAPI:
             members = []
             for fid, r in rows:
                 cs = r['checksum']
-                ph = db.get_phash(fid)   # (phash, dhash, width, height) or None
+                w, h = r['width'], r['height']    # czkawka-populated on files
+                if w is None or h is None:
+                    ph = db.get_phash(fid)        # (phash, dhash, width, height) or None
+                    if ph:
+                        w, h = ph[2], ph[3]
                 members.append({
                     'id': r['id'], 'filename': os.path.basename(r['path']), 'path': r['path'],
                     'is_video': os.path.splitext(r['path'])[1].lower() in VIDEO_EXTENSIONS,
                     'favorite': manual.get_file_favorite_count(cs),
-                    'width': ph[2] if ph else None, 'height': ph[3] if ph else None,
+                    'width': w, 'height': h,
                     'size': r['size'], 'is_still': cs in still_cs,
                     'broken': r['broken'] is not None,
                     'tag_count': len(tags_map.get(cs, [])),
@@ -5546,6 +5624,8 @@ def create_app(data_root: str) -> FastAPI:
             'auto_match_threshold': AUTO_MATCH_THRESHOLD,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
+            'czkawka_available': _czkawka is not None,
+            'ffmpeg_available': _ffmpeg,
         })
 
     @app.patch('/api/files/{file_id}/title')

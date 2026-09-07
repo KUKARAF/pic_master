@@ -69,6 +69,18 @@ runtime network calls. Then the `🏙 Match cities` bulk action (⚡ menu) label
 geotagged photo with its nearest city, so photos show a place **name** (and are searchable
 by the `city:` facet) instead of raw coordinates. City data © GeoNames, CC-BY 4.0.
 
+## Optional: duplicate & damaged-file detection (czkawka)
+
+Near-duplicate and corrupt-file scanning are powered by the external
+[czkawka](https://github.com/qarmin/czkawka) CLI (`czkawka_cli` ≥ 12) — install it on the
+server and put it on `PATH`. On startup the app probes for it; if it's missing it logs
+`czkawka not found, deduplication will not be available`, disables the two bulk actions
+(**🔎 Find near-duplicates** and **🩹 Find damaged files** in the ⚡ menu), and everything
+else keeps working. **czkawka is only ever used to *find*** — this app never passes it a
+delete/move flag; removing anything stays your own reversible **Trash** / mark-damaged
+action. Similar-**video** scanning additionally needs `ffmpeg` + `ffprobe` on `PATH`; the
+damaged-file scan validates images/PDF/archive/music (not video streams).
+
 ## Optional: age/gender estimation (MiVOLO)
 
 MiVOLO pins old `ultralytics`/`timm` versions that conflict with this app's own
