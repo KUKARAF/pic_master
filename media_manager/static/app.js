@@ -1156,6 +1156,7 @@
                                  // ever reaches here for types with no createFn —
                                  // set/category resolve to the real created object)
      } */
+  let ENTITY_LISTBOX_SEQ = 0;
   function openEntitySearchModal(options) {
     const config = ENTITY_TYPE_CONFIGS[options.type];
     if (!config) throw new Error('Unknown entity type: ' + options.type);
@@ -1183,6 +1184,14 @@
       input.placeholder = config.placeholder;
       input.autocomplete = 'off';
       input.style.flex = '1';
+      // Keyboard-first combobox: focus stays here; the active row is pointed at via
+      // aria-activedescendant (set in updateHighlight), not by moving DOM focus.
+      const listboxId = 'esm-listbox-' + (ENTITY_LISTBOX_SEQ++);
+      input.setAttribute('role', 'combobox');
+      input.setAttribute('aria-autocomplete', 'list');
+      input.setAttribute('aria-expanded', 'true');
+      input.setAttribute('aria-controls', listboxId);
+      input.setAttribute('aria-label', config.placeholder);
       inputRow.appendChild(input);
       const createBtn = document.createElement('button');
       createBtn.type = 'button';
@@ -1311,97 +1320,65 @@
 
       const list = document.createElement('div');
       list.className = 'modal-list';
+      list.id = listboxId;
+      list.setAttribute('role', 'listbox');
+      list.setAttribute('aria-label', config.title);
       box.appendChild(list);
 
       const extraBox = document.createElement('div');
       box.appendChild(extraBox);
 
-      // Suggested sets surfaced INSIDE the picker (only when opened from a photo
-      // page, which passes suggestForFileId). CLIP-centroid ranked matches shown
-      // above the search list as one-click picks — clicking one assigns it, the
-      // same as picking a search result. Absent for bulk-add-from-search callers.
-      let suggestWrap = null;
+      // Suggested sets (only when opened from a photo, via suggestForFileId): CLIP-
+      // ranked matches. They are NOT a separate click-only block anymore — they are
+      // merged into the ONE keyboard-navigable list below (see buildRows): they lead
+      // the list while the box is empty, and the instant the user types, plain fuzzy
+      // search takes over so the typed name is always the top row.
+      let allItems = [];
       let suggestSets = [];
+      let rows = [];        // [{kind:'suggestion'|'existing', item} | {kind:'create', text}]
+      let rowEls = [];      // interactive row nodes, 1:1 with `rows` (headings excluded)
+      let highlighted = -1;
+      let highlightedKey = null;   // identity of the highlighted row, so a rebuild
+                                   // (async suggestions arriving, a chip change) keeps
+                                   // the SAME set selected instead of a stale index.
+      let userNavigated = false;   // has the user arrowed? if not, rebuilds pick the top
+      let lastKeyNavTs = 0;        // suppress the hover-highlight that fires when
+                                   // scrollIntoView slides a row under a still pointer
+      let resolved = false;
+      let optSeq = 0;
+
       if (options.suggestForFileId != null && options.type === 'set') {
-        suggestWrap = document.createElement('div');
-        suggestWrap.className = 'modal-suggest';
-        box.insertBefore(suggestWrap, list);
         fetch('/api/files/' + options.suggestForFileId + '/suggested-sets?limit=6')
           .then(function (r) { return r.ok ? r.json() : { results: [] }; })
           .then(function (data) {
             if (resolved) return;
-            suggestSets = (data.results || []).filter(function (s) { return excludeIds.indexOf(s.id) === -1; });
-            renderSuggestions();
+            suggestSets = (data.results || []).filter(function (s) { return excludeIds.indexOf(Number(s.id)) === -1; });
+            applyFilter();   // merge into the one list, coherent with the current query/nav
           })
           .catch(function () { /* suggestions are best-effort; search still works */ });
       }
 
-      // The smart suggestions are NOT filtered by the person chips / text (that
-      // would often empty them) — they're RE-RANKED: a set matching the active
-      // person chips (and then the typed text) floats to the top, so selecting
-      // "Joe" honors the filter by surfacing Joe's sets first. Re-run from
-      // applyFilter on every keystroke / chip change.
+      // Order the suggestion slice (only shown while the box is empty): person-chip
+      // matches first, then CLIP score.
       function suggestionSortKey(set) {
         const people = (set.people || []).map(function (p) { return p.name.toLowerCase(); });
         const chipMatches = personChips.filter(function (c) { return people.indexOf(c.toLowerCase()) !== -1; }).length;
-        const q = input.value.trim();
-        let textMiss = 0, textScore = 0;
-        if (q) {
-          const s = fuzzyScore(q, [set.name, set.studio || '', people.join(' ')].join(' '));
-          if (s === null) { textMiss = 1; textScore = Infinity; } else { textScore = s; }
-        }
-        return { chipMatches: chipMatches, textMiss: textMiss, textScore: textScore, clip: -(set.score || 0) };
+        return { chipMatches: chipMatches, clip: -(set.score || 0) };
       }
 
-      function renderSuggestions() {
-        if (!suggestWrap) return;
-        suggestWrap.innerHTML = '';
-        if (!suggestSets.length || resolved) return;
-        const ordered = suggestSets.slice().sort(function (a, b) {
-          const ka = suggestionSortKey(a), kb = suggestionSortKey(b);
-          return (kb.chipMatches - ka.chipMatches)
-            || (ka.textMiss - kb.textMiss)
-            || (ka.textScore - kb.textScore)
-            || (ka.clip - kb.clip);
-        });
-        const heading = document.createElement('div');
-        heading.className = 'modal-suggest-title';
-        heading.textContent = '✨ Suggested sets';
-        suggestWrap.appendChild(heading);
-        ordered.forEach(function (set) {
-          const row = document.createElement('div');
-          row.className = 'modal-list-item';
-          const text = document.createElement('div');
-          const label = document.createElement('div');
-          label.textContent = set.name;
-          text.appendChild(label);
-          const metaLine = buildSetMetaLine(set);
-          if (metaLine) { const sub = document.createElement('div'); sub.className = 'sub'; sub.appendChild(metaLine); text.appendChild(sub); }
-          row.appendChild(text);
-          if (set.score != null) {
-            const scoreSpan = document.createElement('span');
-            scoreSpan.className = 'score-badge';
-            scoreSpan.style.position = 'static';
-            scoreSpan.style.marginLeft = 'auto';
-            scoreSpan.textContent = Number(set.score).toFixed(2);
-            row.appendChild(scoreSpan);
-          }
-          // Representative cover thumbnail, same square style as set search rows.
-          if (set.thumb_id != null) {
-            const thumb = document.createElement('img');
-            thumb.className = 'modal-list-item-thumb square';
-            thumb.src = '/thumb/' + set.thumb_id;
-            row.appendChild(thumb);
-          }
-          row.addEventListener('click', function () { resolveWith(set); });
-          suggestWrap.appendChild(row);
-        });
+      function rowKey(entry) {
+        return entry.kind + ':' + (entry.kind === 'create' ? entry.text : entry.item.id);
       }
 
-      let allItems = [];
-      let visible = []; // [{kind:'existing', item} | {kind:'create', text}]
-      let highlighted = -1;
-      let resolved = false;
+      function chipFilter(items) {
+        if (!personChips.length) return items;
+        return items.filter(function (item) {
+          const people = item.people || [];
+          return personChips.every(function (chipName) {
+            return people.some(function (p) { return p.name.toLowerCase() === chipName.toLowerCase(); });
+          });
+        });
+      }
 
       function resolveWith(entity) {
         if (resolved) return;
@@ -1426,98 +1403,180 @@
         } else if (entry.kind === 'create') {
           resolveWith({ name: entry.text, isNew: true });
         } else {
-          resolveWith(entry.item);
+          resolveWith(entry.item);   // suggestion or existing — both carry a full item
         }
       }
 
       function updateHighlight() {
-        Array.from(list.children).forEach(function (row, i) {
-          row.classList.toggle('is-highlighted', i === highlighted);
+        rowEls.forEach(function (row, i) {
+          const on = i === highlighted;
+          row.classList.toggle('is-highlighted', on);
+          row.setAttribute('aria-selected', on ? 'true' : 'false');
         });
+        if (highlighted >= 0 && rowEls[highlighted]) {
+          input.setAttribute('aria-activedescendant', rowEls[highlighted].id);
+          rowEls[highlighted].scrollIntoView({ block: 'nearest' });
+        } else {
+          input.removeAttribute('aria-activedescendant');
+        }
+      }
+
+      function renderRow(entry, i) {
+        const row = document.createElement('div');
+        row.className = 'modal-list-item';
+        row.setAttribute('role', 'option');
+        row.id = listboxId + '-opt-' + (optSeq++);
+        row.setAttribute('aria-selected', 'false');
+        if (entry.kind === 'create') {
+          row.textContent = '＋ Create "' + entry.text + '"';
+        } else {
+          const item = entry.item;
+          const text = document.createElement('div');
+          const label = document.createElement('div');
+          label.textContent = config.label(item);
+          if (entry.suggested) {
+            const mark = document.createElement('span');
+            mark.className = 'esm-sugg-mark';
+            mark.textContent = ' ✨';
+            mark.title = 'Suggested for this photo';
+            label.appendChild(mark);
+          }
+          text.appendChild(label);
+          let sub = null;
+          if (entry.kind === 'suggestion') {
+            const metaLine = buildSetMetaLine(item);
+            if (metaLine) { sub = document.createElement('div'); sub.className = 'sub'; sub.appendChild(metaLine); }
+          } else {
+            const secondary = config.secondary ? config.secondary(item) : '';
+            if (secondary) { sub = document.createElement('div'); sub.className = 'sub'; sub.textContent = secondary; }
+          }
+          if (sub) text.appendChild(sub);
+          row.appendChild(text);
+          const imgUrl = entry.kind === 'suggestion'
+            ? (item.thumb_id != null ? '/thumb/' + item.thumb_id : null)
+            : (config.image ? config.image(item) : null);
+          if (imgUrl) {
+            const thumb = document.createElement('img');
+            thumb.className = 'modal-list-item-thumb' + (entry.kind === 'suggestion' || config.imageSquare ? ' square' : '');
+            thumb.src = imgUrl;
+            row.appendChild(thumb);
+          }
+        }
+        row.addEventListener('click', function () { resolveEntry(entry); });
+        row.addEventListener('mouseenter', function () {
+          if (Date.now() - lastKeyNavTs < 250) return;   // don't let a settling scroll steal the cursor
+          highlighted = i; highlightedKey = rowKey(entry); updateHighlight();
+        });
+        return row;
       }
 
       function renderList() {
         list.innerHTML = '';
-        visible.forEach(function (entry, i) {
-          const row = document.createElement('div');
-          row.className = 'modal-list-item' + (i === highlighted ? ' is-highlighted' : '');
-          if (entry.kind === 'create') {
-            row.textContent = '＋ Create "' + entry.text + '"';
-          } else {
-            const item = entry.item;
-            const text = document.createElement('div');
-            const label = document.createElement('div');
-            label.textContent = config.label(item);
-            text.appendChild(label);
-            const secondary = config.secondary ? config.secondary(item) : '';
-            if (secondary) {
-              const sub = document.createElement('div');
-              sub.className = 'sub';
-              sub.textContent = secondary;
-              text.appendChild(sub);
-            }
-            row.appendChild(text);
-            const imgUrl = config.image ? config.image(item) : null;
-            if (imgUrl) {
-              const thumb = document.createElement('img');
-              thumb.className = 'modal-list-item-thumb' + (config.imageSquare ? ' square' : '');
-              thumb.src = imgUrl;
-              row.appendChild(thumb);
-            }
+        rowEls = [];
+        let lastKind = null;
+        rows.forEach(function (entry, i) {
+          if (entry.kind === 'suggestion' && lastKind !== 'suggestion') {
+            const heading = document.createElement('div');
+            heading.className = 'modal-suggest-title';
+            heading.setAttribute('role', 'presentation');
+            heading.textContent = '✨ Suggested';
+            list.appendChild(heading);
           }
-          row.addEventListener('click', function () { resolveEntry(entry); });
-          row.addEventListener('mouseenter', function () { highlighted = i; updateHighlight(); });
-          list.appendChild(row);
+          lastKind = entry.kind;
+          const row = renderRow(entry, i);
+          rowEls.push(row);   // 1:1 with rows — headings above are NOT pushed, so the
+          list.appendChild(row); // keyboard index never skews
         });
+        updateHighlight();
+      }
+
+      function updateStatus(query) {
+        if (rows.length) { status.style.display = 'none'; status.textContent = ''; return; }
+        status.style.display = '';
+        if (!query) {
+          status.textContent = excludeIds.length
+            ? 'This photo is already in every matching set.'
+            : (allItems.length ? 'No sets to show.' : 'Nothing yet — type a name and press Enter to create one.');
+        } else if (personChips.length) {
+          status.textContent = 'No sets match the current filter.';
+        } else {
+          status.textContent = 'No match — press Enter to create "' + query + '".';
+        }
+      }
+
+      // The single ordered model both the keyboard and the mouse index into. Empty box:
+      // ✨ suggestions lead (deduped from the rest); typing: pure fuzzy so the typed
+      // name is the first row — a set that was also suggested keeps a ✨ marker.
+      function buildRows() {
+        const query = input.value.trim();
+        const pool = chipFilter(allItems);
+        const out = [];
+        if (!query) {
+          const sugg = chipFilter(suggestSets).slice().sort(function (a, b) {
+            const ka = suggestionSortKey(a), kb = suggestionSortKey(b);
+            return (kb.chipMatches - ka.chipMatches) || (ka.clip - kb.clip);
+          });
+          const sIds = {};
+          sugg.forEach(function (s) { sIds[s.id] = true; out.push({ kind: 'suggestion', item: s }); });
+          pool.filter(function (it) { return !sIds[it.id]; }).slice(0, 50)
+            .forEach(function (it) { out.push({ kind: 'existing', item: it }); });
+        } else {
+          const sIds = {};
+          suggestSets.forEach(function (s) { sIds[s.id] = true; });
+          pool.map(function (item) { return { item: item, score: fuzzyScore(query, config.matchText ? config.matchText(item) : config.label(item)) }; })
+            .filter(function (x) { return x.score !== null; })
+            .sort(function (a, b) { return a.score - b.score; })
+            .slice(0, 50)
+            .forEach(function (x) { out.push({ kind: 'existing', item: x.item, suggested: !!sIds[x.item.id] }); });
+        }
+        return out;
       }
 
       function applyFilter() {
         const query = input.value.trim();
-        let pool = allItems;
-        if (personChips.length) {
-          pool = pool.filter(function (item) {
-            const people = item.people || [];
-            return personChips.every(function (chipName) {
-              return people.some(function (p) { return p.name.toLowerCase() === chipName.toLowerCase(); });
-            });
-          });
+        rows = buildRows();
+        // Highlight: keep the SAME row the user arrowed to (by identity) across an async
+        // rebuild / chip change; otherwise highlight the top row — the top suggestion
+        // when the box is empty, the top fuzzy match the instant they type.
+        let idx = -1;
+        if (userNavigated && highlightedKey) {
+          idx = rows.findIndex(function (e) { return rowKey(e) === highlightedKey; });
         }
-        let matched;
-        if (!query) {
-          matched = pool.slice(0, 50);
-        } else {
-          matched = pool
-            .map(function (item) { return { item: item, score: fuzzyScore(query, config.matchText ? config.matchText(item) : config.label(item)) }; })
-            .filter(function (x) { return x.score !== null; })
-            .sort(function (a, b) { return a.score - b.score; })
-            .slice(0, 50)
-            .map(function (x) { return x.item; });
-        }
-        visible = matched.map(function (item) { return { kind: 'existing', item: item }; });
-        highlighted = visible.length ? 0 : -1;
+        if (idx < 0) idx = rows.length ? 0 : -1;
+        highlighted = idx;
+        highlightedKey = idx >= 0 ? rowKey(rows[idx]) : null;
+        input.setAttribute('aria-expanded', rows.length ? 'true' : 'false');
         renderList();
-        updateCreateBtn();       // create now lives in the input row, not the list
-        renderSuggestions();     // re-rank the smart suggestions for the new filter
+        updateCreateBtn();
+        updateStatus(query);
       }
 
       input.addEventListener('input', function () {
+        userNavigated = false;   // a keystroke re-filters — highlight the new top row
         renderNameSuggestions();
         applyFilter();
       });
 
       input.addEventListener('keydown', function (e) {
+        if (e.isComposing || e.keyCode === 229) return;   // never hijack an IME commit
         if (e.key === 'ArrowDown') {
           e.preventDefault();
-          if (highlighted < visible.length - 1) { highlighted++; updateHighlight(); }
+          if (highlighted < rows.length - 1) { highlighted++; highlightedKey = rowKey(rows[highlighted]); userNavigated = true; lastKeyNavTs = Date.now(); updateHighlight(); }
         } else if (e.key === 'ArrowUp') {
           e.preventDefault();
-          if (highlighted > 0) { highlighted--; updateHighlight(); }
+          if (highlighted > 0) { highlighted--; highlightedKey = rowKey(rows[highlighted]); userNavigated = true; lastKeyNavTs = Date.now(); updateHighlight(); }
+        } else if (e.key === 'Home') {
+          e.preventDefault();
+          if (rows.length) { highlighted = 0; highlightedKey = rowKey(rows[0]); userNavigated = true; lastKeyNavTs = Date.now(); updateHighlight(); }
+        } else if (e.key === 'End') {
+          e.preventDefault();
+          if (rows.length) { highlighted = rows.length - 1; highlightedKey = rowKey(rows[highlighted]); userNavigated = true; lastKeyNavTs = Date.now(); updateHighlight(); }
         } else if (e.key === 'Enter') {
           e.preventDefault();
-          if (highlighted >= 0 && visible[highlighted]) {
-            resolveEntry(visible[highlighted]);
+          if (highlighted >= 0 && rows[highlighted]) {
+            resolveEntry(rows[highlighted]);   // always exactly the visibly-highlighted row
           } else {
-            // Nothing matched/highlighted — Enter creates, same as the ＋ Create button.
+            // Nothing highlighted — Enter creates, same as the ＋ Create button.
             const q = input.value.trim();
             if (q && !personChips.length) resolveEntry({ kind: 'create', text: q });
           }
@@ -4228,11 +4287,16 @@
   function openSetPickerModal() {
     // Opened from the photo page → surface CLIP-ranked suggested sets inside the
     // picker (suggestForFileId). See openEntitySearchModal's set-suggestion block.
+    // Exclude sets the photo is ALREADY in — read fresh from the live chips each open
+    // (so a set added earlier this session is excluded too), so neither the suggestions
+    // nor the search results offer a set that's already assigned.
+    const currentSetIds = Array.from(setCurrent.querySelectorAll('[data-set-id]'))
+      .map(function (el) { return Number(el.dataset.setId); });
     openSetSearchModal(function (set) {
       assignSetById(set.id)
         .then(function (data) { appendSetChip(data); })
         .catch(function (err) { showToast('Failed to add set: ' + err.message); });
-    }, undefined, { suggestForFileId: fileId });
+    }, currentSetIds, { suggestForFileId: fileId });
   }
 
   if (setPickerBtn) {

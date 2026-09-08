@@ -506,8 +506,13 @@ input[type="range"] { accent-color: var(--accent); }
   cursor: pointer;
   font-size: 17px;
 }
-.modal-list-item:hover, .modal-list-item.is-highlighted { background: var(--input-bg); color: var(--accent); }
+/* Hover is a light cue; the keyboard-active row gets a distinct non-color cue (an
+   inset accent bar) so a keyboard user can always tell which row Enter will pick,
+   even when the pointer happens to rest on a different row. */
+.modal-list-item:hover { background: var(--input-bg); }
+.modal-list-item.is-highlighted { background: var(--input-bg); color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
 .modal-list-item .sub { font-size: 14px; color: var(--text-muted); }
+.esm-sugg-mark { color: var(--accent); font-size: 0.85em; opacity: 0.85; }
 .modal-list-item-thumb { width: 76px; height: 76px; border-radius: 50%; object-fit: cover; margin-left: 10px; flex-shrink: 0; }
 .modal-list-item-thumb.square { border-radius: var(--radius-card); }
 
