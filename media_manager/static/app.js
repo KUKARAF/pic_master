@@ -223,6 +223,7 @@
   function openModal(titleText, buildFn) {
     if (!modalOverlay || !modalBox) return;
     modalBox.innerHTML = '';
+    modalBox.className = 'modal-box';   // reset any per-modal modifier (e.g. modal-box-flex)
     var title = document.createElement('div');
     title.className = 'modal-title';
     var titleSpan = document.createElement('span');
@@ -1164,6 +1165,10 @@
       : Array.isArray(options.excludeIds) ? options.excludeIds : [options.excludeIds];
 
     openModal(options.title || config.title, function (box) {
+      // Flex-column layout so the results list is the ONLY scroll region: the box
+      // itself never scrolls (see .modal-box-flex), so there's never a scrollbar inside
+      // a scrollbar, and nothing scrolls at all when the content fits.
+      box.classList.add('modal-box-flex');
       if (options.previewImage) {
         const preview = document.createElement('img');
         preview.src = options.previewImage;

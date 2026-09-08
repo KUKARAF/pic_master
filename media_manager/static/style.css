@@ -497,6 +497,14 @@ input[type="range"] { accent-color: var(--accent); }
 }
 .modal-title .modal-close-btn:hover { color: var(--accent); }
 .modal-list { display: flex; flex-direction: column; gap: 2px; margin-bottom: 12px; max-height: 420px; overflow-y: auto; }
+
+/* Flex-column picker (openEntitySearchModal): the box is bounded by its own
+   max-height and never scrolls itself (overflow:hidden); the fixed header (title,
+   input, chips, status) sits at natural height, and the results list is the single
+   region that scrolls, only when the content can't fit. Result: no scrollbar when it
+   fits, exactly one when it doesn't, and never a scrollbar nested inside another. */
+.modal-box.modal-box-flex { display: flex; flex-direction: column; overflow: hidden; }
+.modal-box-flex .modal-list { flex: 1 1 auto; min-height: 0; max-height: none; margin-bottom: 0; }
 .modal-list-item {
   display: flex;
   justify-content: space-between;
