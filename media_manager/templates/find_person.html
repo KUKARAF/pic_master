@@ -23,10 +23,9 @@
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:4px;flex-wrap:wrap;">
   <input type="checkbox" id="find-person-auto-approve-toggle">
   Auto-approve above threshold
-  <input type="number" id="find-person-auto-approve-threshold" min="0" max="1" step="0.01" value="0.75"
-         style="display:none;width:70px;" title="Suggested starting point — raise it if auto-approved matches turn out wrong.">
+  <input type="number" id="find-person-auto-approve-threshold" min="0" max="1" step="0.01" value="0.85"
+         style="display:none;width:70px;" title="Matches at/above this score are confirmed automatically — raise it if auto-approved matches turn out wrong.">
 </label>
-<div id="find-person-auto-approve-timer" class="sub" style="display:none;margin-bottom:10px;"></div>
 
 <!-- Auto-labeling action, grouped with the settings above the swipe stack. -->
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
@@ -97,26 +96,22 @@
 
   const bufferSizeSlider = document.getElementById('find-person-buffer-size-slider');
 
-  /* Auto-approve above threshold: once a card's own match score clears the
-     configured threshold, show a 5s countdown and auto-confirm it if nothing
-     interrupts first. Any card change (a manual decide, undo, or a refill
-     that re-renders) re-arms from scratch via onTopCardChange below, so
-     there's never more than one countdown live and a manual swipe always
-     cancels the pending one for free (decide() re-renders before the timeout
-     could fire). Unchecking the box, or a top card whose score doesn't clear
-     the bar, just cancels/skips arming — nothing else changes. */
+  /* Auto-approve above threshold: whenever the top card's own match score clears the
+     configured threshold, confirm it immediately and silently — no countdown, no
+     "about to approve X" preview. Each confirm re-renders the next card, which re-arms
+     via onTopCardChange below, so it churns straight through every above-threshold
+     match until one falls below the bar (or the stack empties). The confirm is deferred
+     to a 0ms task purely to avoid re-entering decide() synchronously from within the
+     render callback; a manual swipe/undo or unchecking the box cancels a pending one. */
   const autoApproveToggle = document.getElementById('find-person-auto-approve-toggle');
   const autoApproveThresholdInput = document.getElementById('find-person-auto-approve-threshold');
-  const autoApproveTimerEl = document.getElementById('find-person-auto-approve-timer');
-  let autoApproveHandle = null; // {intervalId, timeoutId}
+  let autoApproveHandle = null;
 
   function cancelAutoApprove() {
     if (autoApproveHandle) {
-      clearInterval(autoApproveHandle.intervalId);
-      clearTimeout(autoApproveHandle.timeoutId);
+      clearTimeout(autoApproveHandle);
       autoApproveHandle = null;
     }
-    autoApproveTimerEl.style.display = 'none';
   }
 
   function armAutoApprove(card) {
@@ -124,21 +119,10 @@
     if (!autoApproveToggle.checked || !card) return;
     const threshold = parseFloat(autoApproveThresholdInput.value);
     if (!isFinite(threshold) || card.score < threshold) return;
-    let remaining = 5;
-    function paint() {
-      autoApproveTimerEl.textContent = 'Auto-approving in ' + remaining + 's… (swipe or click to cancel)';
-    }
-    autoApproveTimerEl.style.display = 'block';
-    paint();
-    const intervalId = setInterval(function () {
-      remaining--;
-      if (remaining > 0) paint();
-    }, 1000);
-    const timeoutId = setTimeout(function () {
-      cancelAutoApprove();
+    autoApproveHandle = setTimeout(function () {
+      autoApproveHandle = null;
       stack.decide('confirm');
-    }, 5000);
-    autoApproveHandle = { intervalId, timeoutId };
+    }, 0);
   }
 
   autoApproveToggle.addEventListener('change', function () {
