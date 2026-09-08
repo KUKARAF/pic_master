@@ -21,6 +21,13 @@ class ThreadLocalDB:
     def __init__(self, db_path):
         self.db_path = db_path
         self._local = threading.local()
+        # Registry of every live connection keyed by the Thread OBJECT that opened it
+        # (not its ident — idents are recycled when a thread dies, which would overwrite
+        # and orphan a still-open connection). Holding the Thread object lets the reaper
+        # ask is_alive() and close connections whose thread has retired; see
+        # reap_dead_thread_connections.
+        self._conns = {}
+        self._conns_lock = threading.Lock()
         # Persistent for the db file, so one-time here on the creating thread.
         self.conn.execute('PRAGMA journal_mode=WAL')
 
@@ -28,10 +35,17 @@ class ThreadLocalDB:
     def conn(self):
         conn = getattr(self._local, 'conn', None)
         if conn is None:
-            conn = sqlite3.connect(self.db_path)
+            # check_same_thread=False so a retired thread's connection can be closed by
+            # the reaper thread. This does NOT make the connection shared: each thread
+            # still opens and uses only its OWN connection (threading.local), so there is
+            # never concurrent use of one connection — the guard is only relaxed so
+            # close() can run from the reaper after the owning thread is gone.
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute('PRAGMA busy_timeout=5000')
             self._local.conn = conn
+            with self._conns_lock:
+                self._conns[threading.current_thread()] = conn
         return conn
 
     def close(self):
@@ -40,6 +54,31 @@ class ThreadLocalDB:
         if conn is not None:
             conn.close()
             self._local.conn = None
+            with self._conns_lock:
+                self._conns.pop(threading.current_thread(), None)
+
+    def reap_dead_thread_connections(self):
+        """Close connections whose owning thread has exited, and return how many.
+
+        FastAPI runs sync handlers on a pool of worker threads; each opens one
+        connection per DB (WAL mode = ~3 fds: .db, -wal, -shm) on first use and keeps it
+        on thread-local storage. When such a thread retires, CPython would *eventually*
+        finalize the connection, but under this process's finalizer lag (the same effect
+        the malloc-trimmer exists for) those fds accumulate until every open() fails with
+        '[Errno 24] Too many open files'. This reaps them deterministically. Safe because
+        connections use check_same_thread=False and a dead thread by definition isn't
+        using its connection, so closing it from here races with nobody."""
+        closed = 0
+        with self._conns_lock:
+            for thread in [t for t in self._conns if not t.is_alive()]:
+                conn = self._conns.pop(thread, None)
+                try:
+                    if conn is not None:
+                        conn.close()
+                        closed += 1
+                except Exception:
+                    pass
+        return closed
 
     @staticmethod
     def _chunked(items, size=500):

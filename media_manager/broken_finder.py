@@ -36,11 +36,15 @@ def verify_video(path):
     """Return (healthy, message)."""
     try:
         cap = cv2.VideoCapture(str(path))
-        if not cap.isOpened():
-            return False, 'could not open video'
-        ret, _ = cap.read()
-        cap.release()
-        return (True, None) if ret else (False, 'could not read a frame')
+        # release() inside finally so an un-openable/corrupt file (isOpened() False but
+        # a partial FFmpeg handle held) never leaks its fd on the early return.
+        try:
+            if not cap.isOpened():
+                return False, 'could not open video'
+            ret, _ = cap.read()
+            return (True, None) if ret else (False, 'could not read a frame')
+        finally:
+            cap.release()
     except Exception as exc:
         return False, str(exc)
 

@@ -256,9 +256,13 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
     from PIL import Image as PILImage
     try:
         cap = cv2.VideoCapture(src_path)
-        if not cap.isOpened():
-            return False, 'could not open video'
+        # isOpened() check lives INSIDE the try so the finally always releases: FFmpeg
+        # can partially open a corrupt file (grabs the fd, then fails), leaving
+        # isOpened() False with a handle still held — returning before release() there
+        # leaks an fd on every uncached /thumb of a damaged video.
         try:
+            if not cap.isOpened():
+                return False, 'could not open video'
             cap.set(cv2.CAP_PROP_POS_MSEC, 1000)
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -455,6 +459,51 @@ def _read_rss_bytes():
     return None
 
 
+def _read_open_fds():
+    """Number of open file descriptors this process holds (Linux: count /proc/self/fd).
+    Pairs with _read_rss_bytes as a leak canary — a value that climbs and never plateaus
+    under steady use means fds are being leaked. None on non-Linux / when unavailable."""
+    try:
+        return len(os.listdir('/proc/self/fd'))
+    except Exception:
+        return None
+
+
+def _raise_fd_limit(target=65536):
+    """Raise this process's soft open-file limit toward `target` (capped at the hard
+    limit) at startup, so a long-running server launched from a plain shell doesn't
+    inherit the default (often 1024) and start failing every open() with '[Errno 24] Too
+    many open files'. This is headroom, not a cure — connections are still reaped
+    deterministically (ThreadLocalDB.reap_dead_thread_connections) and the count is
+    visible on /stats (open_fds). Returns the new soft limit, or None if unchanged/
+    unsupported."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = target if hard == resource.RLIM_INFINITY else min(target, hard)
+        if soft != resource.RLIM_INFINITY and soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            return want
+    except Exception:
+        pass
+    return None
+
+
+def _start_fd_reaper(dbs, interval=90.0):
+    """Periodically close DB connections whose owning threadpool thread has retired
+    (see ThreadLocalDB.reap_dead_thread_connections), so their fds don't accumulate to
+    the open-file limit over a long-running process."""
+    def _loop():
+        while True:
+            time.sleep(interval)
+            for d in dbs:
+                try:
+                    d.reap_dead_thread_connections()
+                except Exception:
+                    pass
+    threading.Thread(target=_loop, daemon=True, name='fd-reaper').start()
+
+
 def _start_malloc_trimmer(interval=60.0):
     """Periodically hand freed heap memory back to the OS via glibc malloc_trim.
 
@@ -487,6 +536,14 @@ def create_app(data_root: str) -> FastAPI:
     """Create and return the FastAPI application rooted at data_root."""
     data_root = os.path.abspath(data_root)
     media_dir = os.path.join(data_root, '.media')
+
+    # Raise the soft open-file limit before anything opens fds — a server started from a
+    # plain shell inherits the default (often 1024), which a long-running process with
+    # per-thread WAL DB connections will eventually exhaust ([Errno 24]). Headroom only;
+    # the real bound is the fd reaper + request lifecycle below.
+    _new_fd_limit = _raise_fd_limit()
+    if _new_fd_limit:
+        print(f"[web] raised open-file soft limit to {_new_fd_limit}", flush=True)
 
     # Wire the process-global worker client for this data_root so the model getters
     # can offload to a remote worker when one is configured + reachable. Cheap: no
@@ -530,6 +587,10 @@ def create_app(data_root: str) -> FastAPI:
     errors = ErrorLog(os.path.join(media_dir, 'error.db'))
     manual = ManualDB(os.path.join(media_dir, 'manual.db'))
 
+    # Reap DB connections left behind by retired threadpool threads so their WAL fds
+    # (~3 per connection × 3 DBs per thread) don't accumulate to the open-file limit.
+    _start_fd_reaper([db, errors, manual])
+
     def _spawn_job(target):
         """Run a bulk-job body in a daemon thread, then close that thread's per-thread
         sqlite connections. db/manual/errors are ThreadLocalDB (one connection per
@@ -548,6 +609,7 @@ def create_app(data_root: str) -> FastAPI:
         threading.Thread(target=_wrapped, daemon=True).start()
 
     app = FastAPI(title='media gallery')
+    app.state.dbs = (db, errors, manual)  # observability / manual-reap hook (see _start_fd_reaper)
 
     # Every route on this app is hit by fetch()-based JS that always does
     # `await res.json()` on the response, success or failure (see static/app.js).
@@ -1243,6 +1305,12 @@ def create_app(data_root: str) -> FastAPI:
         thumb_path = os.path.join(thumbs_dir, f'{file_id}.jpg')
 
         if not os.path.isfile(thumb_path):
+            if row['broken'] is not None:
+                # Already known un-decodable (a prior thumb attempt marked it damaged).
+                # Don't re-run the decoder on every /thumb hit — that per-request decode
+                # is what churned CPU and, for videos, leaked an fd per request. Serve the
+                # placeholder; a rescan / mark-healthy clears `broken` and re-enables it.
+                return Response(content=_gray_placeholder(), media_type='image/jpeg')
             abs_path = _live_abs_path(file_id, rel_path)
             if abs_path is None:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
@@ -5134,6 +5202,7 @@ def create_app(data_root: str) -> FastAPI:
                 'manual_db_bytes': manual_stats['db_bytes'],
             },
             'rss_bytes': _read_rss_bytes(),
+            'open_fds': _read_open_fds(),
         }
 
     @app.get('/stats', response_class=HTMLResponse)
@@ -5161,6 +5230,7 @@ def create_app(data_root: str) -> FastAPI:
         loaded = db.loaded_matrix_bytes()
         return {
             'rss_bytes': _read_rss_bytes(),
+            'open_fds': _read_open_fds(),
             'embeddings': emb,
             'embeddings_loaded': loaded,
             'embeddings_total_bytes': sum(e['bytes'] for e in emb.values()),

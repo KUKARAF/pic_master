@@ -19,6 +19,8 @@
   <table class="stats-table">
     <tr><td>Process RSS (resident)</td>
         <td class="num">{% if stats.rss_bytes %}{{ mb(stats.rss_bytes) }}{% else %}n/a{% endif %}</td></tr>
+    <tr><td>Open file descriptors</td>
+        <td class="num">{% if stats.open_fds is not none %}{{ '{:,}'.format(stats.open_fds) }}{% else %}n/a{% endif %}</td></tr>
     <tr><td>Embedding matrices if all resident (est.)</td>
         <td class="num">{{ mb(stats.embeddings_total_bytes) }}</td></tr>
     <tr><td>Embedding matrices currently loaded</td>
