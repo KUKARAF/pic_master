@@ -601,11 +601,27 @@ def create_app(data_root: str) -> FastAPI:
                 return other_abs
         return None
 
+    def _match_existing_face(existing_rows, bbox, min_iou=None):
+        """Best primary-frame row in `existing_rows` (from get_all_faces_for_checksum)
+        whose box overlaps `bbox` at/above the same-face IoU, or None. Lets a re-detect
+        recognise a face the human already saved instead of cloning it."""
+        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU
+        thresh = FACE_SAME_BOX_IOU if min_iou is None else min_iou
+        best, best_iou = None, thresh
+        for r in existing_rows:
+            if r['frame_index'] is not None:
+                continue
+            iou = _bbox_iou(bbox, (r['x1'], r['y1'], r['x2'], r['y2']))
+            if iou >= best_iou:
+                best, best_iou = r, iou
+        return best
+
     def _combined_faces_for_file(file_id, checksum):
         """Merge manual.db's rows for this file (hand-drawn + promoted/named, keyed by
         checksum) with media.db's auto-detected rows that haven't been named yet
         (keyed by file_id, since those live entirely inside this one media.db)."""
         import json as _json
+        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU
         manual_rows = manual.get_faces_for_file(checksum)
         promoted = {r['source_face_id'] for r in manual_rows if r['source_face_id']}
         out = [{'ref': f"manual:{r['id']}", 'bbox': [r['x1'], r['y1'], r['x2'], r['y2']],
@@ -616,7 +632,24 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             out.append({'ref': f"auto:{r['id']}", 'bbox': _json.loads(r['bbox']),
                         'identity': None, 'frame_index': r['frame_index'], 'favorite': 0})
-        return out
+
+        # Display safety net: collapse boxes that land on the same face (same frame,
+        # IoU >= same-face threshold) so a photo whose manual.db still holds pre-fix
+        # duplicate rows never shows the same person twice. A named/manual entry always
+        # wins over an unnamed auto one.
+        deduped = []
+        for face in out:
+            dup = next((k for k in deduped
+                        if k['frame_index'] == face['frame_index']
+                        and _bbox_iou(k['bbox'], face['bbox']) >= FACE_SAME_BOX_IOU), None)
+            if dup is None:
+                deduped.append(face)
+                continue
+            keep_new = ((1 if face['identity'] else 0, face['favorite'], face['ref'].startswith('manual:'))
+                        > (1 if dup['identity'] else 0, dup['favorite'], dup['ref'].startswith('manual:')))
+            if keep_new:
+                deduped[deduped.index(dup)] = face
+        return deduped
 
     def _parse_face_ref(face_id: str):
         if ':' not in face_id:
@@ -6512,21 +6545,36 @@ def create_app(data_root: str) -> FastAPI:
 
         db.insert_faces(file_id, faces, detector.model_id(detector._model_name))
 
+        # Re-detection is idempotent. insert_faces regenerates media.db's face rows
+        # with fresh ids, so a face already saved in manual.db (named, hand-drawn, or
+        # rejected) now has a stale source_face_id. Match each re-detected box against
+        # the existing rows: if the human already handled this face, re-point that row
+        # at the new media.db id and leave their decision alone — DON'T auto-promote a
+        # second copy (the old duplication bug). Only genuinely new boxes get matched.
+        existing = manual.get_all_faces_for_checksum(row['checksum'])
         auto_matched = []
         for face_row in db.get_faces_for_file(file_id):
+            if face_row['frame_index'] is not None:
+                continue  # primary-frame detection only; frame stills are their own flow
             face_db_id = face_row['id']
+            bbox = json.loads(face_row['bbox'])
+            prior = _match_existing_face(existing, bbox)
+            if prior is not None:
+                manual.set_face_source_id(prior['id'], face_db_id)  # re-attach, keep decision
+                continue
             emb_bytes = db.get_face_embedding(face_db_id)
             if not emb_bytes:
                 continue
             name, score = manual.find_matching_identity(emb_bytes)
             if name is None:
                 continue
-            bbox = json.loads(face_row['bbox'])
             manual.promote_auto_face(face_db_id, row['checksum'], bbox, emb_bytes, name, None, None)
             _link_face_match_to_video(row['checksum'], name)
             auto_matched.append({'name': name, 'score': round(score, 3)})
 
-        return {'faces_found': len(faces), 'auto_matched': auto_matched}
+        # Heal any duplicates an earlier (pre-fix) re-detect already wrote for this photo.
+        removed = manual.dedupe_auto_faces_for_checksum(row['checksum'])
+        return {'faces_found': len(faces), 'auto_matched': auto_matched, 'deduped': removed}
 
     # Safety cap on a single "scan all frames" job — a pathologically long GIF
     # shouldn't be able to run forever. This is a deliberate, manual, single-image

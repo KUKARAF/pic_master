@@ -18,6 +18,30 @@ from collections import Counter
 
 from media_manager.database import ThreadLocalDB
 
+
+def _bbox_iou(a, b):
+    """Intersection-over-union of two [x1,y1,x2,y2] boxes. Used to recognise that a
+    freshly re-detected face is the SAME face as one already stored (the InsightFace
+    detector is deterministic, so re-running it on an unchanged image reproduces each
+    box almost exactly) — so re-detection re-attaches to the existing row instead of
+    cloning it."""
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / union if union > 0 else 0.0
+
+
+# IoU at/above which two boxes on the same photo+frame are treated as the same face.
+# A deterministic detector reproduces a box at ~1.0; two different people's faces
+# essentially never overlap this much, so this is safe against false merges.
+FACE_SAME_BOX_IOU = 0.7
+
 # Cosine similarity above which a newly detected face is auto-assigned to a known
 # identity without asking — deliberately stricter than the 0.45 "suggest a match and
 # let a human confirm" threshold used elsewhere, since auto-assignment has no human
@@ -2471,6 +2495,72 @@ class ManualDB(ThreadLocalDB):
             (checksum,)
         )
         return cur.fetchall()
+
+    def get_all_faces_for_checksum(self, checksum):
+        """Every face row for a photo INCLUDING rejected ones, with coordinates +
+        source metadata — the reconciliation input for a re-detect (see
+        relink_or_none / web.api_detect_faces). Unlike get_faces_for_file this does
+        not drop rejected rows: a re-detect must recognise a box the human already
+        rejected and NOT re-promote it."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT id, x1,y1,x2,y2, identity, bbox_source, source_face_id, rejected, frame_index '
+            'FROM faces WHERE checksum = ? ORDER BY id',
+            (checksum,)
+        )
+        return cur.fetchall()
+
+    def set_face_source_id(self, manual_face_id, source_face_id):
+        """Repoint a manual.db face row at a (new) media.db face id. Clears the id from
+        any other row first so the partial-unique index on source_face_id can't be
+        violated. Used by a re-detect to re-attach an existing decision to the freshly
+        regenerated media.db face rather than creating a duplicate."""
+        cur = self.conn.cursor()
+        cur.execute('UPDATE faces SET source_face_id = NULL WHERE source_face_id = ?', (source_face_id,))
+        cur.execute('UPDATE faces SET source_face_id = ? WHERE id = ?', (source_face_id, manual_face_id))
+        self.conn.commit()
+        self._face_ver += 1
+
+    def dedupe_auto_faces_for_checksum(self, checksum, min_iou=FACE_SAME_BOX_IOU):
+        """Collapse duplicate auto-promoted face rows a pre-fix re-detect left behind.
+
+        Earlier, each re-run of face detection promoted a fresh manual.db row under a
+        new source_face_id (media.db regenerates its face ids), so the same face piled
+        up as N identical named rows and showed N times on the photo. Two rows are
+        duplicates when they share frame_index and their boxes overlap >= min_iou; the
+        keeper is the one WITH an identity, then the newest. Only bbox_source='auto',
+        non-rejected rows are considered — hand-drawn boxes and rejected hard-negatives
+        are never touched. Returns the number of rows deleted."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT id, x1,y1,x2,y2, identity, created_at, frame_index FROM faces '
+            "WHERE checksum = ? AND rejected = 0 AND bbox_source = 'auto' ORDER BY id",
+            (checksum,)
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+        used = [False] * len(rows)
+        drop = []
+        for i in range(len(rows)):
+            if used[i]:
+                continue
+            used[i] = True
+            cluster = [rows[i]]
+            bi = (rows[i]['x1'], rows[i]['y1'], rows[i]['x2'], rows[i]['y2'])
+            for j in range(i + 1, len(rows)):
+                if used[j] or rows[j]['frame_index'] != rows[i]['frame_index']:
+                    continue
+                bj = (rows[j]['x1'], rows[j]['y1'], rows[j]['x2'], rows[j]['y2'])
+                if _bbox_iou(bi, bj) >= min_iou:
+                    used[j] = True
+                    cluster.append(rows[j])
+            if len(cluster) > 1:
+                cluster.sort(key=lambda r: (1 if r['identity'] else 0, r['created_at'], r['id']))
+                drop.extend(r['id'] for r in cluster[:-1])   # keep the last (best) one
+        if drop:
+            cur.executemany('DELETE FROM faces WHERE id = ?', [(d,) for d in drop])
+            self.conn.commit()
+            self._face_ver += 1
+        return len(drop)
 
     def get_identities_for_checksums(self, checksums):
         """Batched lookup: {checksum: [name, ...]} of *named* faces only (unknown/
