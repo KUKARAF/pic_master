@@ -2583,6 +2583,28 @@ class ManualDB(ThreadLocalDB):
                 result.setdefault(checksum, []).append(identity)
         return result
 
+    def get_photo_assignments_for_checksums(self, checksums):
+        """Batched form of get_identities_assigned_to_photo: {checksum: [name, ...]} of
+        whole-photo (faceless) identity assignments. Chunked like
+        get_identities_for_checksums. A recognized person on a photo can come from
+        EITHER a named face or one of these assignments, so callers that reason about
+        'who is in this photo' (e.g. the set 'exclude non-matching faces' filter) must
+        union both sources — a face lookup alone silently misses faceless assignments."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(
+                f'''SELECT DISTINCT checksum, identity FROM identity_photo_assignments
+                    WHERE checksum IN ({placeholders})''',
+                tuple(chunk)
+            )
+            for checksum, identity in cur.fetchall():
+                result.setdefault(checksum, []).append(identity)
+        return result
+
     def get_named_faces_with_bbox_for_checksums(self, checksums):
         """Batched lookup: {checksum: [{identity, x1, y1, x2, y2, frame_index}, ...]}
         of *named* (identified, non-rejected) faces with their bounding boxes — feeds

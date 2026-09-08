@@ -4708,10 +4708,17 @@ def create_app(data_root: str) -> FastAPI:
         if exclude_non_matching_faces and passing:
             set_people = set(manual.get_people_present_in_set(set_id, member_checksums).keys())
             if set_people:
-                identities_map = manual.get_identities_for_checksums([item[0][2] for item in passing])
+                cand_checksums = [item[0][2] for item in passing]
+                # A candidate's recognized people come from BOTH named faces AND
+                # faceless whole-photo assignments — mirror get_people_present_in_set,
+                # which counts both on the set side. Using faces alone here let a photo
+                # whose only non-member person was assigned without a face slip through.
+                identities_map = manual.get_identities_for_checksums(cand_checksums)
+                assigned_map = manual.get_photo_assignments_for_checksums(cand_checksums)
                 passing = [
                     item for item in passing
-                    if not (set(identities_map.get(item[0][2], [])) - set_people)
+                    if not ((set(identities_map.get(item[0][2], []))
+                             | set(assigned_map.get(item[0][2], []))) - set_people)
                 ]
         if avoid_existing and passing:
             member_checksums_anywhere = manual.get_all_set_member_checksums()
