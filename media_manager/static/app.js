@@ -217,27 +217,6 @@
   })();
 
   /* Generic modal — used by the set picker and face-naming modal */
-  /* Light/dark theme toggle. base.html's head script already applied any saved
-     data-theme before paint; this only wires the button + persists a change. With no
-     stored pref the OS's prefers-color-scheme decides, so effective() falls back to it. */
-  (function () {
-    var btn = document.getElementById('theme-toggle-btn');
-    if (!btn) return;
-    function effective() {
-      var a = document.documentElement.getAttribute('data-theme');
-      if (a === 'light' || a === 'dark') return a;
-      return (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
-    }
-    function paint() { btn.textContent = effective() === 'dark' ? '◐' : '◑'; }
-    paint();
-    btn.addEventListener('click', function () {
-      var next = effective() === 'dark' ? 'light' : 'dark';
-      document.documentElement.setAttribute('data-theme', next);
-      try { localStorage.setItem('theme', next); } catch (e) {}
-      paint();
-    });
-  })();
-
   var modalOverlay = document.getElementById('modal-overlay');
   var modalBox = document.getElementById('modal-box');
 

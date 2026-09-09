@@ -78,71 +78,6 @@
 
 :root { color-scheme: dark; }
 
-/* ------------------------------------------------------------------ */
-/* Light theme — a "paper terminal" variant of the CRT identity: dark    */
-/* green ink on warm paper, the phosphor accent darkened so it clears    */
-/* contrast on a light field. Follows the OS by default; a manual toggle */
-/* stamps data-theme on <html> (see base.html) and wins either way.      */
-/* Only the tokens change — the 400+ var() usages retune automatically.  */
-/* ------------------------------------------------------------------ */
-:root[data-theme="light"] {
-  color-scheme: light;
-  --bg:           #EEF2EA;
-  --surface:      #F8FBF5;
-  --surface-2:    #E9EFE4;
-  --input-bg:     #FFFFFF;
-  --border:       #BBC8B6;
-  --divider:      #D6DfD1;
-  --accent:       #1C7A32;  /* darkened phosphor — readable on light */
-  --accent-ink:   #F4FBF3;
-  --accent-hover: #145E26;
-  --border-accent: rgba(28, 122, 50, 0.55);
-  --orange:       #9A5B00;
-  --danger:       #C0392B;
-  --text:         #17251A;
-  --text-mid:     #35473A;
-  --text-muted:   #5C6E5C;
-  --text-faint:   #94A493;
-  --chip-blue:    #2657C6;
-  --sort-chip:    #7A46C9;
-  --glow-accent:  none;      /* no CRT glow on paper */
-  --scanline: repeating-linear-gradient(
-    to bottom,
-    transparent 0, transparent 2px,
-    rgba(0, 0, 0, 0.035) 2px, rgba(0, 0, 0, 0.035) 3px
-  );
-}
-@media (prefers-color-scheme: light) {
-  /* Auto light when the OS prefers it AND the user hasn't forced dark. */
-  :root:not([data-theme="dark"]) {
-    color-scheme: light;
-    --bg:           #EEF2EA;
-    --surface:      #F8FBF5;
-    --surface-2:    #E9EFE4;
-    --input-bg:     #FFFFFF;
-    --border:       #BBC8B6;
-    --divider:      #D6DfD1;
-    --accent:       #1C7A32;
-    --accent-ink:   #F4FBF3;
-    --accent-hover: #145E26;
-    --border-accent: rgba(28, 122, 50, 0.55);
-    --orange:       #9A5B00;
-    --danger:       #C0392B;
-    --text:         #17251A;
-    --text-mid:     #35473A;
-    --text-muted:   #5C6E5C;
-    --text-faint:   #94A493;
-    --chip-blue:    #2657C6;
-    --sort-chip:    #7A46C9;
-    --glow-accent:  none;
-    --scanline: repeating-linear-gradient(
-      to bottom,
-      transparent 0, transparent 2px,
-      rgba(0, 0, 0, 0.035) 2px, rgba(0, 0, 0, 0.035) 3px
-    );
-  }
-}
-
 @keyframes kv-pulse { 0% { opacity: 1; } 100% { opacity: 0.3; } }
 @keyframes kv-blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -259,7 +194,7 @@ input[type="range"] { accent-color: var(--accent); }
 .nav {
   background: rgba(10, 11, 10, 0.85);
   backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid #1c221c;
   padding: 0 18px;
   display: flex;
   align-items: center;
@@ -360,7 +295,7 @@ input[type="range"] { accent-color: var(--accent); }
     gap: 0;
     background: rgba(10, 11, 10, 0.97);
     backdrop-filter: blur(8px);
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid #1c221c;
     padding: 6px 0;
     z-index: 100;
   }
@@ -695,7 +630,7 @@ input[type="range"] { accent-color: var(--accent); }
 .palette-chip-category { color: var(--orange); background: rgba(255, 177, 61, .1); border-color: rgba(255, 177, 61, .4); }
 .palette-chip-tag { color: var(--chip-blue); background: rgba(143, 183, 255, .1); border-color: rgba(143, 183, 255, .4); }
 .palette-chip-face { color: var(--accent); background: rgba(121, 242, 121, .08); border-color: rgba(121, 242, 121, .35); }
-.palette-chip-set { color: var(--text-mid); background: var(--surface-2); border-color: var(--border); }
+.palette-chip-set { color: var(--text-mid); background: #111811; border-color: var(--border); }
 .palette-chip-file { color: var(--text-muted); background: var(--surface-2); border-color: var(--border); }
 .palette-chip-sort { color: var(--sort-chip); background: rgba(199, 146, 234, .12); border-color: rgba(199, 146, 234, .45); }
 
@@ -1015,7 +950,7 @@ input[type="range"] { accent-color: var(--accent); }
   align-items: flex-start;
   padding: 2px 6px;
   border-radius: var(--radius);
-  background: var(--surface-2);
+  background: #111811;
   border: 1px solid var(--border);
   color: var(--text-mid);
   font-size: 14px;

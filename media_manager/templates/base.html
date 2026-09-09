@@ -5,11 +5,6 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}media{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
-  <script>
-    /* Apply the saved theme before first paint (no flash). No saved pref =>
-       the prefers-color-scheme media query decides. See the toggle in app.js. */
-    (function () { try { var t = localStorage.getItem('theme'); if (t) document.documentElement.setAttribute('data-theme', t); } catch (e) {} })();
-  </script>
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -39,8 +34,6 @@
   <span id="worker-badge" class="worker-badge" style="display:none;" title="">
     <span class="worker-dot"></span><span class="worker-label">🔧</span>
   </span>
-
-  <button type="button" class="nav-tags-btn" id="theme-toggle-btn" title="Toggle light / dark theme" aria-label="Toggle light or dark theme">◐</button>
 
   <div style="position:relative;">
     <button class="nav-tags-btn" id="warn-dropdown-btn" type="button">
