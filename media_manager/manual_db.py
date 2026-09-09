@@ -813,6 +813,9 @@ class ManualDB(ThreadLocalDB):
 
     def get_files_by_tag(self, label, limit=100):
         """Positive matches only — a negative tag is a rejection, it must never match search.
+        Tag membership here = a positive whole-image OR region row (any frame); this is the
+        canonical 'files that have tag T' definition, shared with list_all_tags (counts).
+        list_tags_for_checksums (card chips) is a display subset that omits frame-scoped.
         Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""
         cur = self.conn.cursor()
         cur.execute(
@@ -878,10 +881,17 @@ class ManualDB(ThreadLocalDB):
         return cur.fetchall()
 
     def list_all_tags(self):
-        """Return [(label, count), ...] for positive tags only, ordered by count descending."""
+        """[(label, file_count), ...] for positive tags, ordered by count desc. Counts
+        DISTINCT files, not tag rows, so the nav count equals what get_files_by_tag
+        returns for that label (a photo with three 'cat' region boxes counts once, not
+        three times). Tag membership = a positive whole-image OR region row, any frame —
+        the ONE definition shared with get_files_by_tag (search); cards
+        (list_tags_for_checksums) show a display subset that omits frame-scoped rows.
+        Keep these three in sync."""
         cur = self.conn.cursor()
         cur.execute(
-            "SELECT label, COUNT(*) as cnt FROM file_tags_with_label WHERE polarity = 'positive' GROUP BY label ORDER BY cnt DESC"
+            "SELECT label, COUNT(DISTINCT checksum) as cnt FROM file_tags_with_label "
+            "WHERE polarity = 'positive' GROUP BY label ORDER BY cnt DESC"
         )
         return cur.fetchall()
 
