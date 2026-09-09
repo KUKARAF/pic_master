@@ -1458,6 +1458,20 @@ class Database(ThreadLocalDB):
         )
         return [row[0] for row in cursor.fetchall()]
 
+    def get_detection_class_counts(self, file_id):
+        """{class_name: n} — how many primary-frame boxes each detected class has.
+        Lets a caller tell a single-instance class (safe to reject as a region hard
+        negative at its one box) from a multi-instance one (rejecting the chip must not
+        box whichever instance happened to score highest — it might be a true positive)."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT class_name, COUNT(*) FROM detections "
+            "WHERE file_id = ? AND frame_index IS NULL AND class_name != '__indexed__' "
+            "AND x1 IS NOT NULL GROUP BY class_name",
+            (file_id,)
+        )
+        return {row[0]: row[1] for row in cursor.fetchall()}
+
     def get_detection_bboxes(self, file_id):
         """{class_name: [x1, y1, x2, y2]} for a file's primary-frame detections —
         each class's own highest-confidence box (mirrors get_detected_classes'

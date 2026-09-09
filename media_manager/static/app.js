@@ -2883,6 +2883,10 @@
 
   const tagList = document.getElementById('tag-list');
 
+  // Set inside the photo-stage block (where showHoverBbox lives) so renderTags can
+  // re-attach region-tag hover after it rebuilds #tag-list. Null on pages without a stage.
+  let rebindTagHovers = null;
+
   function renderTags(tags) {
     tagList.innerHTML = '';
     tags.forEach(function (tag) {
@@ -2890,6 +2894,17 @@
       const isNegative = tag.polarity === 'negative';
       span.className = isNegative ? 'tag-negative' : 'tag-removable';
       span.dataset.tagId = tag.id;
+
+      // A located (region) tag carries its box so it can be hover-located; the ▦ badge
+      // sits OUTSIDE .tag-label-display so edit-in-place never captures the glyph.
+      if (tag.located && tag.x1 != null) {
+        span.setAttribute('data-bbox', JSON.stringify([tag.x1, tag.y1, tag.x2, tag.y2]));
+        const badge = document.createElement('span');
+        badge.className = 'tag-loc-badge';
+        badge.title = 'Labeled region — hover to locate on the photo';
+        badge.textContent = '▦';
+        span.appendChild(badge);
+      }
 
       const display = document.createElement('span');
       display.className = 'tag-label-display';
@@ -2899,7 +2914,12 @@
         labelSpan.textContent = tag.label;
         display.appendChild(labelSpan);
       } else {
-        display.appendChild(document.createTextNode(tag.label));
+        // Positive labels link to the tag (matches the server-rendered chip).
+        const link = document.createElement('a');
+        link.className = 'tag-label-link';
+        link.href = '/search?tag=' + encodeURIComponent(tag.label);
+        link.textContent = tag.label;
+        display.appendChild(link);
       }
       span.appendChild(display);
 
@@ -2938,6 +2958,7 @@
       span.textContent = cls;
       tagList.appendChild(span);
     });
+    if (rebindTagHovers) rebindTagHovers();   // re-attach hover for the rebuilt region chips
   }
 
   // Event delegation: covers the initial server-rendered tag chips too,
@@ -3042,18 +3063,46 @@
         const label = detectedChip.dataset.detectedLabel;
         if (!label) return;
         btn.disabled = true;
-        fetch('/api/files/' + fileId + '/tags', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ tag: label, polarity: 'negative' }),
-        })
+        // Reject WITH its location when we know it: a detected object has a bbox
+        // (window.DETECTED_BBOXES), so record a REGION negative at that exact box —
+        // "this box is not a hand" — a precise hard negative that doesn't wrongly
+        // claim the whole photo has no hand (a real one may be elsewhere). Only when
+        // no bbox is known (stale/renamed detection) do we fall back to the
+        // whole-image negative. Either way get_negated_labels (kind-agnostic) hides
+        // the gray chip on reload.
+        const bbox = (window.DETECTED_BBOXES || {})[label];
+        // Only box the negative when this class has exactly ONE detected box — otherwise
+        // the stored box (highest-confidence) might be a true positive, and boxing it as
+        // a hard negative would poison the training set. Multi-instance → whole-image.
+        const single = (window.DETECTED_SINGLE || []).indexOf(label) !== -1;
+        var req;
+        if (single && Array.isArray(bbox) && bbox.length === 4) {
+          const pimg = document.getElementById('photo-image');
+          req = fetch('/api/files/' + fileId + '/tags/region', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              label: label, bbox: bbox, polarity: 'negative',
+              remove_detection: true,   // drop the detection at the source, like the old path
+              image_width: pimg ? pimg.naturalWidth : null,
+              image_height: pimg ? pimg.naturalHeight : null,
+            }),
+          });
+        } else {
+          req = fetch('/api/files/' + fileId + '/tags', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: label, polarity: 'negative' }),
+          });
+        }
+        req
           .then(function (r) {
             if (!r.ok) throw new Error('Request failed: ' + r.status);
             return r.json();
           })
           .then(function () {
-            // The detection row is gone server-side too — reload so the
-            // gray chip disappears and the new red one renders correctly.
+            // Reload so the gray chip disappears (now suppressed as a negative) and
+            // the new red region-negative chip renders in the tag list.
             location.reload();
           })
           .catch(function (err) {
@@ -3290,6 +3339,29 @@
       el.addEventListener('mouseenter', function () { showHoverBbox(bbox, 'face-hilite-box'); });
       el.addEventListener('mouseleave', hideHoverBbox);
     });
+
+    /* Region (labeled-region) tag chips carry their own [x1,y1,x2,y2] in data-bbox —
+       hover/focus one to highlight WHERE it is on the photo, same overlay as the
+       detected-object and face hovers, with a distinct box colour. focusin/focusout
+       so a keyboard user tabbing to the chip's link also sees its region light up.
+       Exposed as rebindTagHovers so renderTags can re-attach after it rebuilds the
+       list (the listeners are per-element and are lost when innerHTML is replaced). */
+    function bindRegionTagHovers() {
+      document.querySelectorAll('#tag-list [data-bbox]').forEach(function (el) {
+        if (el.dataset.hoverBound) return;    // idempotent — safe to call after each rebuild
+        let bbox;
+        try { bbox = JSON.parse(el.getAttribute('data-bbox')); } catch (e) { return; }
+        if (!Array.isArray(bbox) || bbox.length !== 4) return;
+        el.dataset.hoverBound = '1';
+        const show = function () { showHoverBbox(bbox, 'tag-hilite-box'); };
+        el.addEventListener('mouseenter', show);
+        el.addEventListener('mouseleave', hideHoverBbox);
+        el.addEventListener('focusin', show);
+        el.addEventListener('focusout', hideHoverBbox);
+      });
+    }
+    bindRegionTagHovers();
+    rebindTagHovers = bindRegionTagHovers;
   }
 
   /* Add face */

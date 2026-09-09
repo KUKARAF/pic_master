@@ -886,9 +886,13 @@ class ManualDB(ThreadLocalDB):
         return cur.fetchall()
 
     def list_tags_for_checksums(self, checksums):
-        """Batched positive whole-file (non-frame-scoped) tag lookup:
-        {checksum: [label, ...]}. Avoids N+1 queries on list pages. Chunked (see
-        _chunked) since callers can hand this an unbounded, library-wide list."""
+        """Batched positive tag lookup for cards: {checksum: [label, ...]}, deduped by
+        label. Includes REGION (bbox) tags, not just whole-image ones — a hand-drawn
+        region is the strongest 'this photo contains X' signal, so a region-only-tagged
+        photo must still show the chip (this matches get_files_by_tag/list_all_tags,
+        which never filtered on x1; the old `x1 IS NULL` here made cards silently
+        disagree with search + counts). Frame-scoped tags stay excluded — they belong to
+        one video frame, not the whole file. Chunked for unbounded caller lists."""
         if not checksums:
             return {}
         cur = self.conn.cursor()
@@ -896,7 +900,8 @@ class ManualDB(ThreadLocalDB):
         for chunk in self._chunked(checksums):
             placeholders = ','.join('?' for _ in chunk)
             cur.execute(
-                f"SELECT checksum, label FROM file_tags_with_label WHERE x1 IS NULL AND frame_index IS NULL AND polarity = 'positive' "
+                f"SELECT DISTINCT checksum, label FROM file_tags_with_label "
+                f"WHERE frame_index IS NULL AND polarity = 'positive' "
                 f'AND checksum IN ({placeholders}) ORDER BY label',
                 tuple(chunk)
             )

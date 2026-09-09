@@ -1263,6 +1263,18 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
+/* Labeled-region tag: the ▦ badge on the chip, and the box lit when hovering it.
+   Distinct dashed cyan so a located-tag highlight doesn't read as a face or a
+   draw-in-progress. */
+.tag-loc-badge { color: var(--accent); opacity: 0.85; margin-right: 3px; cursor: default; }
+.tag-hilite-box {
+  position: absolute;
+  border: 2px dashed #58c7d6;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .55), 0 0 14px rgba(88, 199, 214, .5);
+  pointer-events: none;
+}
+
 /* ------------------------------------------------------------------ */
 /* Floating stage chrome + corner "pods" — liquid-glass overlays.       */
 /* Very transparent fill + heavy backdrop blur/saturate so controls     */

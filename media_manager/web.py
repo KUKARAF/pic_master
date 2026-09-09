@@ -84,6 +84,16 @@ class SpatialTagBody(BaseModel):
     label: str
     bbox: List[float]
     polarity: str = 'positive'
+    # Optional: the client can supply the original image dimensions (it already knows
+    # them — img.naturalWidth/Height) so the server needn't re-open the file. This lets
+    # a region tag be recorded even when the file isn't reachable on disk (e.g. an
+    # offline drive), which the whole-image tag path never required.
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    # When rejecting an auto-detected object as a region negative, also delete the
+    # detection row at the source (parity with the old whole-image reject path), so the
+    # rejected class doesn't linger in non-negation-aware detection consumers.
+    remove_detection: bool = False
 
 class FavoriteBody(BaseModel):
     # Favorites are a counter now: the client sends a signed delta (+1 on
@@ -1639,24 +1649,24 @@ def create_app(data_root: str) -> FastAPI:
         # loads and cache-served /image requests don't reach here). Feeds the home
         # "Needs attention" least-viewed-first ordering.
         db.increment_view_count(file_id)
-        tag_rows = manual.get_tags(checksum)
-        whole_tags = [
-            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity'], 'favorite': t['favorite']}
-            for t in tag_rows if t['x1'] is None
-        ]
-        spatial_tags = [
-            {'id': t['id'], 'label': t['label'], 'polarity': t['polarity']}
-            for t in tag_rows if t['x1'] is not None
-        ]
+        # One tag list — a region (bbox) tag is a tag that also has a location, not a
+        # separate species (see _photo_tags). Every tag-mutation endpoint returns this
+        # same shape so the client re-render never disagrees with the page.
+        tags = _photo_tags(checksum)
         all_tags = manual.list_all_tags()
         negated = manual.get_negated_labels(checksum)
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
         detection_bboxes = db.get_detection_bboxes(file_id)
+        # Classes with exactly one detected box — only these are safe to reject as a
+        # region hard-negative at that box (a multi-instance class's top-confidence box
+        # might be a true positive, so its reject falls back to a whole-image negative).
+        _det_counts = db.get_detection_class_counts(file_id)
+        single_detections = [c for c in detected_classes if _det_counts.get(c, 0) == 1]
         faces = _combined_faces_for_file(file_id, checksum)
         whole_photo_identities = manual.get_identities_assigned_to_photo(checksum)
         file_info = dict(row)
         file_info['filename'] = os.path.basename(file_info['path'])
-        file_info['tags'] = whole_tags
+        file_info['tags'] = tags
         ext = os.path.splitext(file_info['path'])[1].lower()
         file_info['is_image'] = ext in IMAGE_EXTENSIONS
         file_info['is_video'] = ext in VIDEO_EXTENSIONS
@@ -1712,9 +1722,9 @@ def create_app(data_root: str) -> FastAPI:
             'file': file_info,
             'detected_classes': detected_classes,
             'detection_bboxes': detection_bboxes,
+            'single_detections': single_detections,
             'faces': faces,
             'whole_photo_identities': whole_photo_identities,
-            'spatial_tags': spatial_tags,
             'all_tags': all_tags,
             'all_categories': all_categories,
             'current_sets': current_sets,
@@ -3745,6 +3755,23 @@ def create_app(data_root: str) -> FastAPI:
             for t in manual.get_tags(checksum) if t['x1'] is None
         ]
 
+    def _photo_tags(checksum):
+        """The one merged tag list the photo sidebar renders and every tag-mutation
+        endpoint returns: whole-image AND region (bbox) tags as ONE list, each carrying
+        its location so the client can badge + hover-locate it. Ordered by certainty:
+        positive-located, then positive-whole, then negatives. `located` is False for
+        frame-scoped rows — their bbox lives on a specific video frame, not the primary
+        image, so it must never drive a primary-frame hover (returning it here would draw
+        the box at the wrong place)."""
+        out = []
+        for t in manual.get_tags(checksum):
+            located = t['x1'] is not None and t['frame_index'] is None
+            out.append({'id': t['id'], 'label': t['label'], 'polarity': t['polarity'],
+                        'favorite': t['favorite'], 'located': located,
+                        'x1': t['x1'], 'y1': t['y1'], 'x2': t['x2'], 'y2': t['y2']})
+        out.sort(key=lambda t: (0 if t['polarity'] == 'positive' else 1, 0 if t['located'] else 1))
+        return out
+
     @app.post('/api/files/{file_id}/tags')
     def api_add_tag(file_id: int, body: TagBody):
         row = _file_or_404(file_id)
@@ -3760,13 +3787,13 @@ def create_app(data_root: str) -> FastAPI:
                 # A human rejected this YOLO detection — remove it at the source so it
                 # doesn't come back next time detections are viewed or re-indexed.
                 db.remove_detection(file_id, tag)
-        return {'tags': _whole_tags(checksum)}
+        return {'tags': _photo_tags(checksum)}
 
     @app.delete('/api/files/{file_id}/tags/{tag_id}')
     def api_remove_tag(file_id: int, tag_id: int):
         row = _file_or_404(file_id)
         manual.remove_tag(tag_id)
-        return {'tags': _whole_tags(row['checksum'])}
+        return {'tags': _photo_tags(row['checksum'])}
 
     @app.delete('/api/files/{file_id}/tags-by-label')
     def api_remove_tag_by_label(file_id: int, label: str, polarity: str = 'positive'):
@@ -3776,7 +3803,7 @@ def create_app(data_root: str) -> FastAPI:
         assigned (it doesn't read the response body)."""
         row = _file_or_404(file_id)
         manual.remove_tag_by_label(row['checksum'], label, polarity)
-        return {'tags': _whole_tags(row['checksum'])}
+        return {'tags': _photo_tags(row['checksum'])}
 
     @app.patch('/api/files/{file_id}/tags/{tag_id}')
     def api_update_tag(file_id: int, tag_id: int, body: TagLabelBody):
@@ -3785,7 +3812,7 @@ def create_app(data_root: str) -> FastAPI:
         if not label:
             raise HTTPException(status_code=400, detail='Label must not be empty')
         manual.update_tag_label(tag_id, label)
-        return {'tags': _whole_tags(row['checksum'])}
+        return {'tags': _photo_tags(row['checksum'])}
 
     @app.post('/api/tags/{tag_id}/favorite')
     def api_set_tag_favorite(tag_id: int, body: FavoriteBody):
@@ -3805,15 +3832,30 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=400, detail='Invalid bbox')
         polarity = 'negative' if body.polarity == 'negative' else 'positive'
 
-        abs_path = os.path.join(data_root, row['path'])
-        if not os.path.isfile(abs_path):
-            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        # Prefer client-supplied original dimensions (it already has them) so we don't
+        # re-open the file — and so a reject/label still works when the file is offline.
+        if body.image_width and body.image_height and body.image_width > 0 and body.image_height > 0:
+            width, height = int(body.image_width), int(body.image_height)
+        else:
+            abs_path = os.path.join(data_root, row['path'])
+            if not os.path.isfile(abs_path):
+                raise HTTPException(status_code=404, detail='Image file not found on disk')
+            from PIL import Image as PILImage
+            with PILImage.open(abs_path) as img:
+                width, height = img.size
 
-        from PIL import Image as PILImage
-        with PILImage.open(abs_path) as img:
-            width, height = img.size
+        # Clamp to the image bounds (the offline path trusts client-supplied dims, and
+        # a box slightly outside the frame shouldn't be stored raw), then re-validate.
+        x1 = max(0.0, min(x1, width)); x2 = max(0.0, min(x2, width))
+        y1 = max(0.0, min(y1, height)); y2 = max(0.0, min(y2, height))
+        if x2 <= x1 or y2 <= y1:
+            raise HTTPException(status_code=400, detail='bbox is outside the image')
 
         tag_id = manual.add_spatial_tag(row['checksum'], label, x1, y1, x2, y2, width, height, polarity=polarity)
+        # Rejecting an auto-detected object → also drop the detection at the source
+        # (parity with the whole-image reject path's remove_detection).
+        if polarity == 'negative' and body.remove_detection:
+            db.remove_detection(file_id, label)
         return {'id': tag_id, 'label': label, 'bbox': [x1, y1, x2, y2], 'polarity': polarity}
 
     @app.post('/api/files/{file_id}/reindex')
