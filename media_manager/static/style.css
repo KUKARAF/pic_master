@@ -1098,19 +1098,23 @@ input[type="range"] { accent-color: var(--accent); }
 }
 #tag-negative-btn:hover { border-color: var(--danger); }
 
+/* Auto-detected = a machine CANDIDATE, not a confirmed tag: a dashed outline (no
+   solid fill) reads as "suggested — confirm or reject" and, since it's shape not just
+   colour, it's distinguishable from a confirmed chip without relying on hue. */
 .tag-detected {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   padding: 3px 7px;
   border-radius: var(--radius);
-  background: #111811;
-  border: 1px solid var(--border);
+  background: transparent;
+  border: 1px dashed var(--border);
   color: var(--text-mid);
   font-size: 15px;
 }
 .tag-detected a { color: var(--text-mid); }
 .tag-detected a:hover { color: var(--accent); }
+.tag-detected .tag-accept-btn,
 .tag-detected .rm {
   cursor: pointer;
   opacity: .7;
@@ -1121,6 +1125,7 @@ input[type="range"] { accent-color: var(--accent); }
   color: var(--text-muted);
   padding: 0;
 }
+.tag-detected .tag-accept-btn:hover { opacity: 1; color: var(--accent); }
 .tag-detected .rm:hover { opacity: 1; color: var(--danger); }
 
 .tag-label-link { color: inherit; }

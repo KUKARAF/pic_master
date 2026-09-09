@@ -2951,14 +2951,35 @@
     });
     // Detected-object chips (gray, read-only) live in the same list but aren't
     // part of the add/remove round-trip — re-append them after every rebuild.
+    // Detected candidate chips (dashed) — rebuilt with their full controls so accept ✓ /
+    // reject × and hover keep working after any manual-tag round-trip, not just on load.
     (window.DETECTED_CLASSES || []).forEach(function (cls) {
       const span = document.createElement('span');
       span.className = 'tag-detected';
-      span.title = 'Auto-detected';
-      span.textContent = cls;
+      span.dataset.detectedLabel = cls;
+      span.title = 'Auto-detected — confirm or reject';
+      const link = document.createElement('a');
+      link.className = 'tag-label-link';
+      link.href = '/search?q=' + encodeURIComponent(cls);
+      link.textContent = cls;
+      span.appendChild(link);
+      const accept = document.createElement('button');
+      accept.type = 'button';
+      accept.className = 'tag-accept-btn';
+      accept.title = 'Confirm — add as a tag';
+      accept.setAttribute('aria-label', 'Confirm tag');
+      accept.textContent = '✓';
+      span.appendChild(accept);
+      const rej = document.createElement('button');
+      rej.type = 'button';
+      rej.className = 'rm';
+      rej.title = 'Not in this photo — reject';
+      rej.setAttribute('aria-label', 'Reject tag');
+      rej.textContent = '×';
+      span.appendChild(rej);
       tagList.appendChild(span);
     });
-    if (rebindTagHovers) rebindTagHovers();   // re-attach hover for the rebuilt region chips
+    if (rebindTagHovers) rebindTagHovers();   // re-attach hover for the rebuilt chips
   }
 
   // Event delegation: covers the initial server-rendered tag chips too,
@@ -3048,6 +3069,42 @@
         display.replaceWith(input);
         input.focus();
         input.select();
+        return;
+      }
+
+      // ✓ Confirm a detected candidate → make it a real tag. Mirrors the reject: a
+      // single-box class becomes a REGION positive at that box (so the confirmation is
+      // located too); otherwise a whole-image positive. remove_detection clears the gray
+      // candidate. Reload so the new confirmed chip renders in place.
+      const acceptBtn = e.target.closest('.tag-accept-btn');
+      if (acceptBtn) {
+        const chip = acceptBtn.closest('.tag-detected');
+        const label = chip && chip.dataset.detectedLabel;
+        if (!label) return;
+        acceptBtn.disabled = true;
+        const abbox = (window.DETECTED_BBOXES || {})[label];
+        const asingle = (window.DETECTED_SINGLE || []).indexOf(label) !== -1;
+        var areq;
+        if (asingle && Array.isArray(abbox) && abbox.length === 4) {
+          const pimg = document.getElementById('photo-image');
+          areq = fetch('/api/files/' + fileId + '/tags/region', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              label: label, bbox: abbox, polarity: 'positive', remove_detection: true,
+              image_width: pimg ? pimg.naturalWidth : null,
+              image_height: pimg ? pimg.naturalHeight : null,
+            }),
+          });
+        } else {
+          areq = fetch('/api/files/' + fileId + '/tags', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tag: label, polarity: 'positive', remove_detection: true }),
+          });
+        }
+        areq
+          .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+          .then(function () { location.reload(); })
+          .catch(function (err) { acceptBtn.disabled = false; showToast('Failed to confirm tag: ' + err.message); });
         return;
       }
 
@@ -3319,14 +3376,6 @@
       photoWrap.appendChild(hoverBox);
     }
 
-    document.querySelectorAll('.tag-detected[data-detected-label]').forEach(function (chip) {
-      const bboxes = window.DETECTED_BBOXES || {};
-      const bbox = bboxes[chip.dataset.detectedLabel];
-      if (!bbox) return; // detected before bboxes were stored, or a stale/renamed label — nothing to show
-      chip.addEventListener('mouseenter', function () { showHoverBbox(bbox); });
-      chip.addEventListener('mouseleave', hideHoverBbox);
-    });
-
     /* Hover a face (its chip in the Faces menu, or its at-a-glance avatar) to
        highlight WHERE that face is on the photo — same overlay + coordinate
        mapping as the detected-object hover, with a distinct solid box so a face
@@ -3346,7 +3395,8 @@
        so a keyboard user tabbing to the chip's link also sees its region light up.
        Exposed as rebindTagHovers so renderTags can re-attach after it rebuilds the
        list (the listeners are per-element and are lost when innerHTML is replaced). */
-    function bindRegionTagHovers() {
+    function bindTagHovers() {
+      // Region tag chips: bbox in data-bbox, distinct highlight colour.
       document.querySelectorAll('#tag-list [data-bbox]').forEach(function (el) {
         if (el.dataset.hoverBound) return;    // idempotent — safe to call after each rebuild
         let bbox;
@@ -3359,9 +3409,21 @@
         el.addEventListener('focusin', show);
         el.addEventListener('focusout', hideHoverBbox);
       });
+      // Detected candidate chips: bbox looked up from window.DETECTED_BBOXES by label.
+      document.querySelectorAll('.tag-detected[data-detected-label]').forEach(function (chip) {
+        if (chip.dataset.hoverBound) return;
+        const bbox = (window.DETECTED_BBOXES || {})[chip.dataset.detectedLabel];
+        if (!bbox) return;
+        chip.dataset.hoverBound = '1';
+        const show = function () { showHoverBbox(bbox); };
+        chip.addEventListener('mouseenter', show);
+        chip.addEventListener('mouseleave', hideHoverBbox);
+        chip.addEventListener('focusin', show);   // keyboard parity with region chips
+        chip.addEventListener('focusout', hideHoverBbox);
+      });
     }
-    bindRegionTagHovers();
-    rebindTagHovers = bindRegionTagHovers;
+    bindTagHovers();
+    rebindTagHovers = bindTagHovers;
   }
 
   /* Add face */

@@ -57,6 +57,9 @@ _HERE = Path(__file__).parent
 class TagBody(BaseModel):
     tag: str
     polarity: str = 'positive'
+    # Set when confirming (or rejecting) an auto-detected class: also delete the
+    # detection row so the gray candidate chip doesn't linger next to the new tag.
+    remove_detection: bool = False
 
 class SetBody(BaseModel):
     name: Optional[str] = None
@@ -3783,10 +3786,10 @@ def create_app(data_root: str) -> FastAPI:
         existing = [t for t in _whole_tags(checksum) if t['label'] == tag and t['polarity'] == polarity]
         if not existing:
             manual.add_tag(checksum, tag, polarity=polarity)
-            if polarity == 'negative':
-                # A human rejected this YOLO detection — remove it at the source so it
-                # doesn't come back next time detections are viewed or re-indexed.
-                db.remove_detection(file_id, tag)
+        # Remove the source detection when rejecting (a negative always did this) or when
+        # the caller confirms a detection (accept) so the gray candidate chip clears.
+        if polarity == 'negative' or body.remove_detection:
+            db.remove_detection(file_id, tag)
         return {'tags': _photo_tags(checksum)}
 
     @app.delete('/api/files/{file_id}/tags/{tag_id}')
@@ -3851,10 +3854,21 @@ def create_app(data_root: str) -> FastAPI:
         if x2 <= x1 or y2 <= y1:
             raise HTTPException(status_code=400, detail='bbox is outside the image')
 
+        # Dedup: don't stack an identical region row (e.g. confirming a detection whose
+        # box was already hand-labeled). Reuse the existing row's id.
+        dup = next((t for t in manual.get_tags(row['checksum'])
+                    if t['label'] == label and t['polarity'] == polarity and t['x1'] is not None
+                    and all(abs((t[k] or 0) - v) < 0.5 for k, v in (('x1', x1), ('y1', y1), ('x2', x2), ('y2', y2)))),
+                   None)
+        if dup is not None:
+            if body.remove_detection:
+                db.remove_detection(file_id, label)
+            return {'id': dup['id'], 'label': label, 'bbox': [x1, y1, x2, y2], 'polarity': polarity}
+
         tag_id = manual.add_spatial_tag(row['checksum'], label, x1, y1, x2, y2, width, height, polarity=polarity)
-        # Rejecting an auto-detected object → also drop the detection at the source
-        # (parity with the whole-image reject path's remove_detection).
-        if polarity == 'negative' and body.remove_detection:
+        # Confirming or rejecting an auto-detected object → drop the detection at the
+        # source (the flag carries the intent for either polarity).
+        if body.remove_detection:
             db.remove_detection(file_id, label)
         return {'id': tag_id, 'label': label, 'bbox': [x1, y1, x2, y2], 'polarity': polarity}
 

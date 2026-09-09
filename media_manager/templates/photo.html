@@ -196,9 +196,10 @@
         </span>
         {% endfor %}
         {% for cls in detected_classes %}
-        <span class="tag-detected" data-detected-label="{{ cls }}" title="Auto-detected">
+        <span class="tag-detected" data-detected-label="{{ cls }}" title="Auto-detected — confirm or reject">
           <a href="/search?q={{ cls | urlencode }}" class="tag-label-link">{{ cls }}</a>
-          <button class="rm" type="button" title="Not in this photo — mark as rejected">×</button>
+          <button class="tag-accept-btn" type="button" title="Confirm — add as a tag" aria-label="Confirm tag">✓</button>
+          <button class="rm" type="button" title="Not in this photo — reject" aria-label="Reject tag">×</button>
         </span>
         {% endfor %}
       </div>
