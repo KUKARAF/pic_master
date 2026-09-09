@@ -505,6 +505,26 @@ input[type="range"] { accent-color: var(--accent); }
    fits, exactly one when it doesn't, and never a scrollbar nested inside another. */
 .modal-box.modal-box-flex { display: flex; flex-direction: column; overflow: hidden; }
 .modal-box-flex .modal-list { flex: 1 1 auto; min-height: 0; max-height: none; margin-bottom: 0; }
+
+/* Optional right-hand panel (openEntitySearchModal's `aside`, e.g. the face-naming
+   "Closest matches"): a title stays on top, then the main column and a fixed-width
+   aside sit side by side, each scrolling independently. */
+.modal-box.modal-box-wide { width: 720px; }
+.modal-split-row { display: flex; gap: 14px; flex: 1 1 auto; min-height: 0; align-items: stretch; }
+.modal-split-row .modal-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; overflow: hidden; }
+.modal-aside { flex: 0 0 200px; overflow-y: auto; border-left: 1px solid var(--border); padding-left: 12px; }
+.modal-aside-title {
+  font-family: var(--font-pixel); font-size: 8px; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--text-muted); margin-bottom: 8px;
+}
+.modal-aside-face {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: none; border: 1px solid transparent; border-radius: var(--radius);
+  padding: 4px; cursor: pointer; margin-bottom: 4px;
+}
+.modal-aside-face:hover { border-color: var(--border-accent); background: var(--input-bg); }
+.modal-aside-face-img { border-radius: 50%; object-fit: cover; flex-shrink: 0; }
+.modal-aside-face-name { color: var(--chip-blue); font-size: 15px; line-height: 1.1; }
 .modal-list-item {
   display: flex;
   justify-content: space-between;

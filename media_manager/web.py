@@ -6442,22 +6442,23 @@ def create_app(data_root: str) -> FastAPI:
             emb_bytes = row[0] if row is not None else None
         if emb_bytes is None:
             return {'suggestions': []}
-        named = manual.get_named_face_embeddings()
+        named = manual.get_named_face_embeddings_with_ids()
         if not named:
             return {'suggestions': []}
         import numpy as np
         query = np.frombuffer(emb_bytes, dtype=np.float32)
-        names = [n for n, _ in named]
-        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
+        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _fid, _n, e in named])
         scores = matrix.dot(query)
-        ranked = sorted(zip(names, scores.tolist()), key=lambda x: x[1], reverse=True)
-        seen = set()
+        # Best-scoring face id per name, so each suggestion can show that person's crop.
+        best = {}  # name -> (score, face_id)
+        for (fid, name, _e), score in zip(named, scores.tolist()):
+            if name not in best or score > best[name][0]:
+                best[name] = (float(score), fid)
         out = []
-        for name, score in ranked:
-            if name in seen or score < 0.3:
+        for name, (score, fid) in sorted(best.items(), key=lambda kv: kv[1][0], reverse=True):
+            if score < 0.3:
                 continue
-            seen.add(name)
-            out.append({'name': name, 'score': round(float(score), 3)})
+            out.append({'name': name, 'score': round(score, 3), 'ref': 'manual:' + str(fid)})
             if len(out) >= 5:
                 break
         return {'suggestions': out}

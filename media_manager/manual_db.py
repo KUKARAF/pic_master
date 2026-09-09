@@ -2747,6 +2747,14 @@ class ManualDB(ThreadLocalDB):
         cur.execute("SELECT identity, embedding FROM faces WHERE identity IS NOT NULL AND rejected = 0")
         return cur.fetchall()
 
+    def get_named_face_embeddings_with_ids(self):
+        """Like get_named_face_embeddings but includes each face's id, so a caller can
+        show the closest matching person's actual crop (via /face-crop/manual:<id>) next
+        to the name — used by the face-naming 'closest matches' suggestions."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, identity, embedding FROM faces WHERE identity IS NOT NULL AND rejected = 0")
+        return cur.fetchall()
+
     def get_named_face_matrix(self):
         """Cached, write-invalidated counterpart to get_named_face_embeddings for the
         hot auto-match path (find_matching_identity): returns

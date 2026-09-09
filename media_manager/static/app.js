@@ -1625,6 +1625,27 @@
 
       if (options.extraSuggestion) options.extraSuggestion(resolveWith, extraBox);
 
+      // Optional right-hand panel: when a caller passes options.aside(panel, resolve), move
+      // the built content into a left column and add a fixed-width aside beside it (a
+      // title stays on top spanning both). Only restructures when aside is set — every
+      // other picker keeps its single-column layout untouched.
+      if (options.aside) {
+        const row = document.createElement('div');
+        row.className = 'modal-split-row';
+        const main = document.createElement('div');
+        main.className = 'modal-main';
+        Array.from(box.children).forEach(function (ch) {
+          if (!ch.classList.contains('modal-title')) main.appendChild(ch);
+        });
+        const asideEl = document.createElement('div');
+        asideEl.className = 'modal-aside';
+        row.appendChild(main);
+        row.appendChild(asideEl);
+        box.appendChild(row);
+        box.classList.add('modal-box-wide');
+        options.aside(asideEl, resolveWith);
+      }
+
       setTimeout(function () { input.focus(); }, 0);
     });
   }
@@ -3770,22 +3791,54 @@
       title: 'Name this face',
       previewImage: '/face-crop/' + faceRef,
       allowEmpty: true,
-      extraSuggestion: function (resolve, box) {
+      // Right-hand panel: the closest existing named people by face-embedding similarity
+      // (up to 5), each shown with their own crop — click one to name this face them.
+      aside: function (panel, resolve) {
+        const heading = document.createElement('div');
+        heading.className = 'modal-aside-title';
+        heading.textContent = 'Closest matches';
+        panel.appendChild(heading);
+        const loading = document.createElement('div');
+        loading.className = 'sub';
+        loading.textContent = 'Loading…';
+        panel.appendChild(loading);
         fetch('/api/faces/' + faceRef + '/suggestions')
           .then(function (r) { return r.json(); })
           .then(function (data) {
-            const top = data.suggestions && data.suggestions[0];
-            if (!top) return;
-            const suggestBtn = document.createElement('button');
-            suggestBtn.type = 'button';
-            suggestBtn.className = 'btn-similar';
-            suggestBtn.style.fontSize = '0.85em';
-            suggestBtn.style.marginTop = '8px';
-            suggestBtn.textContent = 'Looks like ' + top.name + '? (' + top.score.toFixed(2) + ')';
-            suggestBtn.addEventListener('click', function () { resolve({ name: top.name }); });
-            box.appendChild(suggestBtn);
+            loading.remove();
+            const sugg = (data.suggestions || []);
+            if (!sugg.length) {
+              const empty = document.createElement('div');
+              empty.className = 'sub';
+              empty.textContent = 'No similar named faces.';
+              panel.appendChild(empty);
+              return;
+            }
+            sugg.forEach(function (s) {
+              const item = document.createElement('button');
+              item.type = 'button';
+              item.className = 'modal-aside-face';
+              item.title = 'Name this face "' + s.name + '"';
+              const img = document.createElement('img');
+              img.className = 'modal-aside-face-img';
+              img.width = 44; img.height = 44;
+              img.src = '/face-crop/' + s.ref;
+              item.appendChild(img);
+              const meta = document.createElement('div');
+              meta.className = 'modal-aside-face-meta';
+              const nm = document.createElement('div');
+              nm.className = 'modal-aside-face-name';
+              nm.textContent = s.name;
+              const sc = document.createElement('div');
+              sc.className = 'sub';
+              sc.textContent = s.score.toFixed(2);
+              meta.appendChild(nm); meta.appendChild(sc);
+              item.appendChild(meta);
+              item.addEventListener('click', function () { resolve({ name: s.name }); });
+              panel.appendChild(item);
+            });
           })
-          .catch(function () {});
+          .catch(function () { loading.textContent = "Couldn't load suggestions."; });
       },
       onResolved: function (entity) { saveName(entity.name); },
     });
@@ -4879,6 +4932,20 @@
         if (slider) slider.value = String(idx);
         if (counter) counter.textContent = (idx + 1) + ' / ' + frameCount;
       }
+
+      // Warm the server-rendered frame JPEGs in the background so a scrub swaps instantly
+      // instead of waiting on a per-step fetch (capped so a pathological GIF can't fire
+      // thousands of requests — the browser only runs a handful concurrently anyway).
+      for (let i = 0; i < Math.min(frameCount, 240); i++) {
+        const warm = new Image();
+        warm.src = '/api/files/' + fileId + '/frame/' + i;
+      }
+
+      // Stop the autoplaying animation the MOMENT the scrubber is grabbed (pointerdown),
+      // before any drag — otherwise the GIF keeps animating over the not-yet-loaded frame
+      // and scrubbing only appears to engage once the animation is replaced.
+      function pinNow() { if (selectedFrameIndex === null) showFrame(parseInt(slider && slider.value, 10) || 0); }
+      if (slider) slider.addEventListener('pointerdown', pinNow);
 
       if (prevBtn) prevBtn.addEventListener('click', function () {
         showFrame((selectedFrameIndex === null ? 0 : selectedFrameIndex) - 1);
