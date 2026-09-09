@@ -2535,6 +2535,7 @@ def create_app(data_root: str) -> FastAPI:
     face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    video_face_scan_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'captured': 0, 'error': None}
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
@@ -2969,6 +2970,149 @@ def create_app(data_root: str) -> FastAPI:
             'total': capture_frames_job['total'],
             'error': capture_frames_job['error'],
             'pending': len(_videos_needing_frames()),
+        }
+
+    # Cosine similarity at/above which two face embeddings are treated as the SAME person
+    # within one video (for the unmatched-person dedup — same-person faces across a
+    # video's frames sit well above this; different people don't).
+    VIDEO_FACE_DEDUP_THRESHOLD = 0.5
+
+    def _videos_needing_face_scan():
+        """(fid, rel_path, checksum) for healthy videos NOT yet face-scanned by the bulk
+        video-face job (skip list = video_frame_scans marker)."""
+        scanned = manual.get_frame_scanned_video_checksums()
+        return [(fid, path, cs) for fid, path, cs in db.get_video_files(list(VIDEO_EXTENSIONS))
+                if cs not in scanned]
+
+    def _known_people_for_video(video_cs):
+        """Seed the per-video dedup: (known_identity_names:set, known_embeddings:list[np]).
+        People already credited to the video (whole-photo assignments) + the faces on its
+        existing captured stills, so a scan doesn't re-capture someone already found."""
+        import numpy as np
+        known_names = set(manual.get_identities_assigned_to_photo(video_cs))
+        child_css = [c['child_checksum'] for c in manual.get_frame_captures_for(video_cs)]
+        known_embs = []
+        if child_css:
+            for names in manual.get_identities_for_checksums(child_css).values():
+                known_names.update(names)
+            for ccs in child_css:
+                frow = db.get_file_by_checksum(ccs)
+                if frow is None:
+                    continue
+                for face in db.get_faces_for_file(frow['id']):
+                    eb = db.get_face_embedding(face['id'])
+                    if eb:
+                        known_embs.append(np.frombuffer(eb, dtype=np.float32))
+        return known_names, known_embs
+
+    @app.post('/api/scan-video-faces/start')
+    def api_scan_video_faces_start(include_trashed: bool = False, capture_unmatched: bool = True):
+        """Sample every not-yet-scanned video at ~1 fps, run face detection + auto-match,
+        and capture a still ONLY for a face NEW to that video (dedup by matched identity, or
+        by embedding similarity for unmatched people) — so a video ends up with ~one
+        representative named still per distinct person. `capture_unmatched` (UI toggle): when
+        off, only faces that match a known identity produce a still. Videos are marked
+        scanned so re-runs skip them."""
+        import tempfile
+        import numpy as np
+        from media_manager import phasher
+
+        if video_face_scan_job['running']:
+            return {'started': False, 'message': 'Video face scan already running.'}
+        candidates = _drop_trashed(_videos_needing_face_scan(), include_trashed)
+        video_face_scan_job.update(running=True, done=0, total=len(candidates),
+                                   matched=0, captured=0, error=None)
+
+        def _run():
+            try:
+                detector = _get_face_detector()
+                done = 0
+                for fid, rel_path, video_cs in candidates:
+                    abs_path = _live_abs_path(fid, rel_path)
+                    if abs_path is None:
+                        errors.log(rel_path, 'scan-video-faces: file not on disk')
+                        manual.mark_video_frame_scanned(video_cs)  # don't retry a missing file
+                        done += 1; video_face_scan_job['done'] = done; continue
+                    try:
+                        video_row = db.get_file_by_id(fid)
+                        known_names, known_embs = _known_people_for_video(video_cs)
+
+                        def _handle_face(f, jpeg, time_ms):
+                            emb_bytes = f['embedding'].tobytes()
+                            vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                            name, _score = manual.find_matching_identity(emb_bytes)
+                            if name is not None:
+                                if name in known_names:
+                                    return  # already have this person on the video
+                            else:
+                                if not capture_unmatched:
+                                    return  # toggle off — skip unmatched faces
+                                if any(float(e.dot(vec)) >= VIDEO_FACE_DEDUP_THRESHOLD for e in known_embs):
+                                    return  # same unknown person already captured
+                            # NEW face → capture the frame as a still + attach the face.
+                            child_id = _save_captured_still(video_row, jpeg, time_ms)
+                            child = db.get_file_by_id(child_id)
+                            face_db_id = db.add_manual_face(child_id, f['bbox'], emb_bytes, f['det_score'])
+                            if name is not None:
+                                manual.promote_auto_face(face_db_id, child['checksum'], f['bbox'],
+                                                         emb_bytes, name, None, None)
+                                _link_face_match_to_video(child['checksum'], name)
+                                known_names.add(name)
+                                video_face_scan_job['matched'] += 1
+                            known_embs.append(vec)
+                            video_face_scan_job['captured'] += 1
+
+                        # Batch detection to limit remote-worker round-trips; process each
+                        # frame's faces in time order so dedup is deterministic.
+                        batch = []  # (time_ms, jpeg, tmp_path)
+
+                        def _flush():
+                            if not batch:
+                                return
+                            try:
+                                results = detector.detect_faces([b[2] for b in batch])
+                            finally:
+                                for b in batch:
+                                    try: os.unlink(b[2])
+                                    except OSError: pass
+                            for (t_ms, jpeg, _p), res in zip(batch, results):
+                                _, faces, ferr = res
+                                if ferr or not faces:
+                                    continue
+                                for f in faces:
+                                    _handle_face(f, jpeg, t_ms)
+                            batch.clear()
+
+                        for time_ms, jpeg in phasher.iter_video_frames_sampled(abs_path):
+                            tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                            tmp.write(jpeg); tmp.close()
+                            batch.append((time_ms, jpeg, tmp.name))
+                            if len(batch) >= 8:
+                                _flush()
+                        _flush()
+                        manual.mark_video_frame_scanned(video_cs)
+                    except Exception as exc:
+                        errors.log(rel_path, f'scan-video-faces: {exc}')
+                    done += 1
+                    video_face_scan_job['done'] = done
+            except Exception as exc:
+                video_face_scan_job['error'] = str(exc)
+            finally:
+                video_face_scan_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': video_face_scan_job['total']}
+
+    @app.get('/api/scan-video-faces/status')
+    def api_scan_video_faces_status():
+        return {
+            'running': video_face_scan_job['running'],
+            'done': video_face_scan_job['done'],
+            'total': video_face_scan_job['total'],
+            'matched': video_face_scan_job['matched'],
+            'captured': video_face_scan_job['captured'],
+            'error': video_face_scan_job['error'],
+            'pending': len(_videos_needing_face_scan()),
         }
 
     def _faces_needing_age():

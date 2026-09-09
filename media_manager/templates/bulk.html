@@ -54,6 +54,20 @@
       Saves real stills at 10/25/50/75/90% (reuses the frame-capture architecture); the
       perceptual-hash job then indexes them. A video whose frames won't decode is flagged damaged.
     </p>
+
+    <div class="bulk-action-row" style="margin-top:12px;">
+      <button type="button" class="bulk-action-btn" data-start="/api/scan-video-faces/start"
+              data-status="/api/scan-video-faces/status" data-count="matched" data-capture-unmatched>🧑‍🔍 Scan video frames for faces &amp; match</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <label class="sub" style="display:flex;align-items:center;gap:6px;margin:4px 2px 0;">
+      <input type="checkbox" id="capture-unmatched-faces" checked>
+      Also capture unmatched new faces (to label later)
+    </label>
+    <p class="sub" style="margin:6px 2px 0;">
+      Samples each video at ~1 fps, detects faces and auto-matches them, capturing a still only
+      when a face is NEW to that video (≈ one still per distinct person). Skips videos already scanned.
+    </p>
   </section>
 
   <section class="bulk-section">
@@ -161,6 +175,7 @@
   var slider = document.getElementById('match-threshold');
   var out = document.getElementById('match-threshold-val');
   var trashCb = document.getElementById('include-trashed');
+  var capCb = document.getElementById('capture-unmatched-faces');
   function sync() {
     if (out && slider) out.textContent = slider.value;
     document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
@@ -168,11 +183,14 @@
       var params = [];
       if (btn.hasAttribute('data-threshold') && slider) params.push('threshold=' + encodeURIComponent(slider.value));
       if (trashCb && trashCb.checked) params.push('include_trashed=1');
+      // Only send when OFF — the endpoint defaults capture_unmatched=true.
+      if (btn.hasAttribute('data-capture-unmatched') && capCb && !capCb.checked) params.push('capture_unmatched=0');
       btn.dataset.start = btn.dataset.startBase + (params.length ? ('?' + params.join('&')) : '');
     });
   }
   if (slider) slider.addEventListener('input', sync);
   if (trashCb) trashCb.addEventListener('change', sync);
+  if (capCb) capCb.addEventListener('change', sync);
   sync();
 })();
 </script>

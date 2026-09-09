@@ -297,6 +297,15 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_frame_captures_parent ON frame_captures (parent_checksum)')
+        # Marks a video whose frames have already been face-scanned by the bulk
+        # "Scan video frames for faces" job, so a re-run skips it (the scan is expensive).
+        # Additive/idempotent — keyed by the video's content checksum like everything here.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS video_frame_scans (
+                checksum TEXT PRIMARY KEY,
+                scanned_at INTEGER NOT NULL
+            )
+        ''')
         # Experimental age/gender estimation (MiVOLO, run in an isolated venv — see
         # age_estimator.py) — deliberately its own table, not touching files/faces at
         # all, so the whole feature can be dropped with a single DROP TABLE if it
@@ -968,6 +977,20 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT child_checksum, time_ms FROM frame_captures WHERE parent_checksum = ? ORDER BY time_ms',
                     (parent_checksum,))
         return [{'child_checksum': r[0], 'time_ms': r[1]} for r in cur.fetchall()]
+
+    def mark_video_frame_scanned(self, checksum):
+        """Record that this video's frames were face-scanned (bulk video-face job), so a
+        re-run skips it. Idempotent — re-marking just refreshes scanned_at."""
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR REPLACE INTO video_frame_scans (checksum, scanned_at) VALUES (?, ?)',
+                    (checksum, int(time.time())))
+        self.conn.commit()
+
+    def get_frame_scanned_video_checksums(self):
+        """Set of video checksums already face-scanned — the skip list for the bulk job."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM video_frame_scans')
+        return {row[0] for row in cur.fetchall()}
 
     def get_capture_counts_by_parent(self):
         """{parent_checksum: number_of_captured_stills} across the whole library — one

@@ -112,3 +112,49 @@ def extract_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
         return frames, all_ok
     finally:
         cap.release()
+
+
+def iter_video_frames_sampled(abs_path, target_fps=1.0, max_frames=3600):
+    """Yield (time_ms:int, jpeg_bytes:bytes) for frames sampled at ~`target_fps` across a
+    real video, decoding with cv2 (PIL can't open .mp4/.mov/...). Opens the capture ONCE
+    and takes one frame every `step` frames (step = round(fps / target_fps)); capped at
+    `max_frames`. A generator so a long video never buffers hundreds of JPEGs at once.
+    Same fd-safe `try/finally: cap.release()` as extract_video_frames — the caller must
+    exhaust it or close it (a for-loop does both on normal/exception exit)."""
+    import cv2  # heavy; lazy like the rest of this module
+    cap = cv2.VideoCapture(abs_path)
+    try:
+        if not cap.isOpened():
+            return
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        step = max(1, int(round((fps or 30.0) / max(target_fps, 0.01))))
+        count = 0
+        if total > 0:
+            for pos in range(0, total, step):
+                if count >= max_frames:
+                    break
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                if not ok2:
+                    continue
+                count += 1
+                yield (int(pos / fps * 1000) if fps > 0 else 0), buf.tobytes()
+        else:
+            # Unknown length: linear read, keep every step-th decoded frame.
+            idx = 0
+            while count < max_frames:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    break
+                if idx % step == 0:
+                    ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                    if ok2:
+                        count += 1
+                        yield (int(idx / fps * 1000) if fps > 0 else 0), buf.tobytes()
+                idx += 1
+    finally:
+        cap.release()
