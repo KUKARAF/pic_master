@@ -1763,9 +1763,31 @@ def create_app(data_root: str) -> FastAPI:
         page fetch)."""
         instances = []
         seen_face_checksums = set()
+
+        def _source_video(cs):
+            """If `cs` is a captured video still, return its SOURCE video checksum
+            (so a person's video appearance shows/links to the video, never the
+            hidden frame still); otherwise return `cs` unchanged."""
+            cap = manual.get_parent_capture(cs)
+            if cap and db.get_file_by_checksum(cap['parent_checksum']) is not None:
+                return cap['parent_checksum']
+            return cs
+
+        collapsed_videos = set()  # source videos already emitted from a still
         for face_id, checksum, _embedding in manual.get_faces_for_identity(name):
-            instances.append({'checksum': checksum, 'face_ref': f'manual:{face_id}'})
-            seen_face_checksums.add(checksum)
+            vid_cs = _source_video(checksum)
+            if vid_cs != checksum:
+                # A captured video still: collapse to the source video, one card
+                # per video (multiple frames of the same person → a single video
+                # entry), carrying the first frame's face_ref for its age chip.
+                if vid_cs in collapsed_videos:
+                    continue
+                collapsed_videos.add(vid_cs)
+                instances.append({'checksum': vid_cs, 'face_ref': f'manual:{face_id}'})
+                seen_face_checksums.add(vid_cs)
+            else:
+                instances.append({'checksum': checksum, 'face_ref': f'manual:{face_id}'})
+                seen_face_checksums.add(checksum)
         for checksum in manual.get_photos_assigned_to_identity(name, limit=1000):
             if checksum not in seen_face_checksums:
                 instances.append({'checksum': checksum, 'face_ref': None})
