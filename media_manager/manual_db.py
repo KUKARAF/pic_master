@@ -674,6 +674,12 @@ class ManualDB(ThreadLocalDB):
         # self-consistency score comes out.
         if 'reviewed_ok' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN reviewed_ok INTEGER NOT NULL DEFAULT 0')
+        # Quarter-turns (0..3, clockwise) to apply to this face's crop when rendering
+        # it — set when a user manually rotates a sideways/upside-down face while
+        # naming it; the stored embedding is re-computed at the same orientation so
+        # display and matching agree.
+        if 'rotation' not in existing_face_cols2:
+            cur.execute('ALTER TABLE faces ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_checksum ON file_tags (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags (tag_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_checksum ON faces (checksum)')
@@ -2511,6 +2517,21 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
         self._face_ver += 1
 
+    def set_face_rotation(self, manual_face_id, rotation, embedding_bytes=None):
+        """Persist a manual 90° rotation (0..3 quarter-turns, clockwise) on a face so
+        its crop renders upright everywhere. When `embedding_bytes` is given, replace
+        the stored embedding with the one computed at this orientation so matching
+        agrees with what's displayed."""
+        cur = self.conn.cursor()
+        if embedding_bytes is not None:
+            cur.execute('UPDATE faces SET rotation = ?, embedding = ? WHERE id = ?',
+                        (int(rotation) % 4, embedding_bytes, manual_face_id))
+        else:
+            cur.execute('UPDATE faces SET rotation = ? WHERE id = ?',
+                        (int(rotation) % 4, manual_face_id))
+        self.conn.commit()
+        self._face_ver += 1
+
     def assign_identity(self, manual_face_id, name):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET identity = ?, rejected = 0 WHERE id = ?', (name.strip(), manual_face_id))
@@ -2611,7 +2632,7 @@ class ManualDB(ThreadLocalDB):
         result lets the UI badge frame-specific detections."""
         cur = self.conn.cursor()
         cur.execute(
-            'SELECT id, x1,y1,x2,y2, identity, bbox_source, source_face_id, frame_index, favorite FROM faces '
+            'SELECT id, x1,y1,x2,y2, identity, bbox_source, source_face_id, frame_index, favorite, rotation FROM faces '
             'WHERE checksum = ? AND rejected = 0 ORDER BY id',
             (checksum,)
         )

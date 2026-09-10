@@ -430,9 +430,9 @@
                title="Find similar faces" style="font-size:0.85em;cursor:pointer;">🔎</a>
             {% if face.identity %}
               <a href="/person/{{ face.identity | urlencode }}">{{ face.identity }}</a>
-              <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}" title="Rename this face" style="font-size:0.85em;">✏️</a>
+              <a href="#" class="face-name-btn" data-face-ref="{{ face.ref }}" data-face-rotation="{{ face.rotation or 0 }}" title="Rename this face" style="font-size:0.85em;">✏️</a>
             {% else %}
-              <a href="#" class="unknown face-name-btn" data-face-ref="{{ face.ref }}">Unknown</a>
+              <a href="#" class="unknown face-name-btn" data-face-ref="{{ face.ref }}" data-face-rotation="{{ face.rotation or 0 }}">Unknown</a>
             {% endif %}
             <span class="face-age-gender {{ 'gender-male' if face.gender == 'male' else ('gender-female' if face.gender == 'female' else '') }}"
                   data-face-ref="{{ face.ref }}" style="font-size:0.85em;">

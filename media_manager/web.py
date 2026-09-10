@@ -76,6 +76,10 @@ class ReorderBody(BaseModel):
 
 class IdentityBody(BaseModel):
     name: Optional[str] = None
+    # Absolute quarter-turns (0..3, clockwise) the user rotated the face to before
+    # naming it — persisted so the crop renders upright and the embedding is
+    # re-computed at this orientation. 0 == unchanged.
+    rotate: Optional[int] = 0
 
 class ConfirmAboveThresholdBody(BaseModel):
     threshold: float
@@ -422,8 +426,11 @@ def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 
         return False
 
 
-def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 200) -> bool:
-    """Crop a face from src_path using bbox JSON, save JPEG to dst_path. Returns True on success."""
+def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 200,
+                    rotation: int = 0) -> bool:
+    """Crop a face from src_path using bbox JSON, save JPEG to dst_path. `rotation`
+    is quarter-turns clockwise (0..3) applied to the crop — for a face the user
+    manually rotated upright while naming it. Returns True on success."""
     import json
     from PIL import Image as PILImage
     try:
@@ -439,6 +446,9 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
             if x2 <= x1 or y2 <= y1:
                 return False
             face = img.crop((x1, y1, x2, y2))
+            if rotation % 4:
+                # PIL rotates counter-clockwise; negate for clockwise quarter-turns.
+                face = face.rotate(-90 * (rotation % 4), expand=True)
             face = face.resize((size, size), PILImage.LANCZOS)
             _save_jpeg_atomic(face, dst_path, quality=85)
             return True
@@ -789,12 +799,13 @@ def create_app(data_root: str) -> FastAPI:
         promoted = {r['source_face_id'] for r in manual_rows if r['source_face_id']}
         out = [{'ref': f"manual:{r['id']}", 'bbox': [r['x1'], r['y1'], r['x2'], r['y2']],
                 'identity': r['identity'], 'frame_index': r['frame_index'],
-                'favorite': r['favorite']} for r in manual_rows]
+                'favorite': r['favorite'], 'rotation': r['rotation']} for r in manual_rows]
         for r in db.get_faces_for_file(file_id):
             if r['id'] in promoted:
                 continue
             out.append({'ref': f"auto:{r['id']}", 'bbox': _json.loads(r['bbox']),
-                        'identity': None, 'frame_index': r['frame_index'], 'favorite': 0})
+                        'identity': None, 'frame_index': r['frame_index'], 'favorite': 0,
+                        'rotation': 0})
 
         # Display safety net: collapse boxes that land on the same face (same frame,
         # IoU >= same-face threshold) so a photo whose manual.db still holds pre-fix
@@ -6457,11 +6468,13 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/face-crop/{face_id}')
     def serve_face_crop(face_id: str):
         kind, raw_id = _parse_face_ref(face_id)
+        rotation = 0
         if kind == 'manual':
             row = manual.get_face(raw_id)
             if row is None:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg', status_code=404)
             bbox_json = json.dumps([row['x1'], row['y1'], row['x2'], row['y2']])
+            rotation = (row['rotation'] if 'rotation' in row.keys() else 0) or 0
             file_row = db.get_file_by_checksum(row['checksum'])
         else:
             cursor = db.conn.cursor()
@@ -6476,11 +6489,16 @@ def create_app(data_root: str) -> FastAPI:
             return Response(content=_gray_placeholder(), media_type='image/jpeg', status_code=404)
 
         src_path = os.path.join(data_root, file_row['path'])
-        crop_path = os.path.join(thumbs_dir, f'face_{kind}_{raw_id}.jpg')
+        # Rotation is in the cache filename so a re-rotated face renders fresh bytes.
+        crop_path = os.path.join(thumbs_dir, f'face_{kind}_{raw_id}_r{rotation}.jpg')
         if not os.path.isfile(crop_path):
-            if not _make_face_crop(src_path, bbox_json, crop_path):
+            if not _make_face_crop(src_path, bbox_json, crop_path, rotation=rotation):
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
-        return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
+        # A manual face's rotation can change, so its crop must be revalidated (the
+        # ETag FileResponse derives from the file handles 304s); an auto face never
+        # rotates, so it stays immutable for max caching.
+        headers = {'Cache-Control': 'no-cache'} if kind == 'manual' else IMMUTABLE_CACHE_HEADERS
+        return FileResponse(crop_path, media_type='image/jpeg', headers=headers)
 
     @app.get('/api/faces')
     def api_list_faces():
@@ -7011,6 +7029,20 @@ def create_app(data_root: str) -> FastAPI:
         _link_face_match_to_video(src_file['checksum'], name)  # a frame confirm credits the video
         return new_id
 
+    def _persist_face_rotation(face_ref, manual_id, rotate):
+        """Store the user's chosen 90° orientation on a (now-manual) face and re-embed
+        it at that orientation, so its crop renders upright everywhere and matching
+        agrees with what's shown. No-op when the rotation is unchanged."""
+        rotate = (rotate or 0) % 4
+        row = manual.get_face(manual_id)
+        if row is None:
+            return
+        current = (row['rotation'] if 'rotation' in row.keys() else 0) or 0
+        if rotate == current:
+            return
+        emb = _rotated_face_embedding(face_ref, rotate)
+        manual.set_face_rotation(manual_id, rotate, emb.tobytes() if emb is not None else None)
+
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):
         # A blank/omitted name confirms "this is a distinct person" without
@@ -7019,18 +7051,22 @@ def create_app(data_root: str) -> FastAPI:
         # suggestion matching, /person/{name}, ...), it's just waiting to be
         # renamed, or not.
         name = (body.name or '').strip() or manual.generate_placeholder_identity_name()
+        rotate = (body.rotate or 0) % 4
         kind, raw_id = _parse_face_ref(face_id)
         if kind == 'manual':
             row = manual.get_face(raw_id)
             if row is None:
                 raise HTTPException(status_code=404, detail='Face not found')
             manual.assign_identity(raw_id, name)
+            _persist_face_rotation(face_id, raw_id, rotate)
             _link_face_match_to_video(row['checksum'], name)  # a frame confirm credits the video
             return {'face_id': face_id, 'identity': name}
 
         new_id = _confirm_auto_face(raw_id, name)
         if new_id is None:
             raise HTTPException(status_code=404, detail='Face not found')
+        # The face is now a manual row; persist the chosen orientation on it.
+        _persist_face_rotation(f"manual:{new_id}", new_id, rotate)
         return {'face_id': f"manual:{new_id}", 'identity': name}
 
     @app.post('/api/faces/{face_id}/reject')

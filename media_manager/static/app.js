@@ -3797,12 +3797,14 @@
      like "Unnamed N", renamable later exactly like any other name). The
      embedding-similarity match, if any, is wired in as an extra one-click
      suggestion alongside the regular search results. */
-  function openFaceNamingModal(faceRef) {
+  function openFaceNamingModal(faceRef, initialRotation) {
+    initialRotation = ((initialRotation || 0) % 4 + 4) % 4;
+    let rotate = initialRotation;  // absolute quarter-turns (0..3) clockwise from original
     function saveName(name) {
       fetch('/api/faces/' + faceRef + '/identity', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name || null }),
+        body: JSON.stringify({ name: name || null, rotate: rotate }),
       })
         .then(function (r) {
           if (!r.ok) throw new Error('Request failed: ' + r.status);
@@ -3822,7 +3824,6 @@
       // A "Rotate 90°" control re-embeds the face from a rotated crop and re-runs the
       // search — for a face the detector aligned wrong because it was upside-down.
       aside: function (panel, resolve) {
-        let rotate = 0;  // 0..3 quarter-turns clockwise
         const heading = document.createElement('div');
         heading.className = 'modal-aside-title';
         heading.textContent = 'Closest matches';
@@ -3846,7 +3847,9 @@
           loading.className = 'sub';
           loading.textContent = 'Loading…';
           list.appendChild(loading);
-          const qs = rotate ? ('?rotate=' + rotate) : '';
+          // The stored embedding already reflects initialRotation, so only ask the
+          // server to re-embed when the user actually turned the face from there.
+          const qs = (rotate !== initialRotation) ? ('?rotate=' + rotate) : '';
           fetch('/api/faces/' + faceRef + '/suggestions' + qs)
             .then(function (r) { return r.json(); })
             .then(function (data) {
@@ -3888,8 +3891,11 @@
 
         rotateBtn.addEventListener('click', function () {
           rotate = (rotate + 1) % 4;
+          // The preview crop is already served at initialRotation, so rotate it by
+          // the delta from there (0 on open, +90 per click).
+          const delta = ((rotate - initialRotation) % 4 + 4) % 4;
           const preview = document.querySelector('.modal-preview');
-          if (preview) preview.style.transform = 'rotate(' + (rotate * 90) + 'deg)';
+          if (preview) preview.style.transform = 'rotate(' + (delta * 90) + 'deg)';
           render();
         });
 
@@ -3902,7 +3908,7 @@
   document.querySelectorAll('.face-name-btn').forEach(function (el) {
     el.addEventListener('click', function (e) {
       e.preventDefault();
-      openFaceNamingModal(el.dataset.faceRef);
+      openFaceNamingModal(el.dataset.faceRef, parseInt(el.dataset.faceRotation || '0', 10));
     });
   });
 
