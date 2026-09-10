@@ -2818,6 +2818,33 @@ def create_app(data_root: str) -> FastAPI:
             file_id, used_bbox, embs[0].astype('float32').tobytes(), indexer.model_name)
         return {'id': body_id, 'bbox': used_bbox}
 
+    @app.post('/api/files/{file_id}/body-search')
+    def api_body_search(file_id: int, body: ManualFaceBody, limit: int = 50):
+        """Rank the library by how closely each indexed body matches a user-DRAWN box
+        on this photo — crops + CLIP-embeds exactly that region and searches the body
+        index. Unlike /body-similar (which auto-detects the whole image and needs a
+        pre-pick when several people share the frame), this searches the precise body
+        the user selected, so a multi-person photo gives good results. The query crop
+        is transient — embedded and ranked, never saved."""
+        from media_manager import body_index
+        if len(body.bbox) != 4:
+            raise HTTPException(status_code=400, detail='bbox must be [x1, y1, x2, y2]')
+        x1, y1, x2, y2 = body.bbox
+        if x2 <= x1 or y2 <= y1 or (x2 - x1) < 20 or (y2 - y1) < 20:
+            raise HTTPException(status_code=400, detail='Region too small')
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='Image file not found on disk')
+        pairs = body_index.crop_bodies(abs_path, [[int(x1), int(y1), int(x2), int(y2)]])
+        if not pairs:
+            raise HTTPException(status_code=400, detail='Region too small or out of bounds')
+        indexer = _get_clip_indexer()
+        embs = indexer.embed_pil_images([crop for _, crop in pairs])
+        # _body_search reads query_row[2] as the embedding bytes; id/file_id unused here.
+        query_row = (None, file_id, embs[0].astype('float32').tobytes())
+        return {'results': _body_search(query_row, exclude_file_id=file_id, limit=limit)}
+
     @app.get('/body-crop/{body_id}')
     def serve_body_crop(body_id: int):
         rec = db.get_body_embedding(body_id)

@@ -3798,91 +3798,23 @@
     findDistanceBtn.addEventListener('click', runDistanceSearch);
   }
 
-  /* Find pill — 🧍 body segment: find-by-body into the queue. First open of a
-     not-yet-indexed photo runs a person-only YOLO/CLIP pass server-side (hence
-     the ⏳). If the photo has multiple people and none is pre-selected the API
-     returns no ranked results — fall back to the /body-similar page so the user
-     can pick which person. If NO person was detected at all, pop a recovery
-     modal offering a forced person-only reindex or manual labeling (the same
-     two escape hatches the dedicated /body-similar page has). */
-  var findBodyBtn = document.querySelector('.find-by-body-btn');
-  if (findBodyBtn) {
-    var bodyFileId = findBodyBtn.dataset.fileId;
-
-    function runFindByBody() {
-      openMatchesAsQueue({
-        el: findBodyBtn,
-        url: '/api/files/' + bodyFileId + '/body-similar',
-        label: 'Similar people',
-        extractIds: function (data) { return (data.results || []).map(function (r) { return r.id; }); },
-        onEmpty: function (data) {
-          if (data && data.no_people) { openBodyRecoveryModal(); return; }
-          if (data && data.crops && data.crops.length > 1) {
-            window.location.href = '/body-similar/' + bodyFileId;
-            return;
-          }
-          if (window.showToast) showToast((data && data.message) || 'No similar people found.');
-        },
-      });
-    }
-
-    function openBodyRecoveryModal() {
-      if (!window.openModal) {   // no modal on this page — degrade to the full page
-        window.location.href = '/body-similar/' + bodyFileId;
-        return;
-      }
-      openModal('No people detected', function (box) {
-        var msg = document.createElement('div');
-        msg.className = 'sub';
-        msg.style.marginBottom = '12px';
-        msg.textContent = 'The general index found no person here — it may have been '
-          + 'labeled as child/crowd/etc. Force a person-only reindex, or draw the box yourself.';
-        box.appendChild(msg);
-
-        var actions = document.createElement('div');
-        actions.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
-
-        var reBtn = document.createElement('button');
-        reBtn.type = 'button';
-        reBtn.className = 'btn-similar';
-        reBtn.style.width = 'auto';
-        reBtn.textContent = '🔄 Reindex now';
-        reBtn.addEventListener('click', function () {
-          reBtn.disabled = true;
-          reBtn.textContent = 'Reindexing…';
-          fetch('/api/files/' + bodyFileId + '/body-reindex', { method: 'POST' })
-            .then(function (r) {
-              if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || ('status ' + r.status)); });
-              return r.json();
-            })
-            .then(function () { closeModal(); runFindByBody(); })  // retry with fresh crops
-            .catch(function (err) {
-              reBtn.disabled = false;
-              reBtn.textContent = '🔄 Reindex now';
-              if (window.showToast) showToast('Reindex failed: ' + err.message);
-            });
-        });
-
-        var labelBtn = document.createElement('button');
-        labelBtn.type = 'button';
-        labelBtn.className = 'btn-similar';
-        labelBtn.style.width = 'auto';
-        labelBtn.textContent = '🧍 Manually label person';
-        labelBtn.addEventListener('click', function () {
-          closeModal();
-          var lp = document.getElementById('label-person-btn');
-          if (lp) lp.click();   // enter the draw-a-box-around-the-person flow, right here
-          else window.location.href = '/photo/' + bodyFileId + '#label-person';
-        });
-
-        actions.appendChild(reBtn);
-        actions.appendChild(labelBtn);
-        box.appendChild(actions);
-      });
-    }
-
-    findBodyBtn.addEventListener('click', runFindByBody);
-  }
+  /* Find pill — 🧍 body segment: draw a box around the person, then rank the library
+     by how closely each indexed body/build/outfit matches that crop (CLIP over the
+     body index, /body-search). Same drag-a-box UX as 🔲/🧩 — you pick exactly which
+     body to search by, which is what makes a multi-person photo give good results
+     (the old auto-detect-the-whole-image path couldn't tell which person you meant). */
+  const searchBodyBtn = document.querySelector('.find-by-body-btn');
+  const searchBodyState = wireBoxDraw(searchBodyBtn, '✏️', '🧍', function (bbox) {
+    openMatchesAsQueue({
+      el: searchBodyBtn,
+      url: '/api/files/' + fileId + '/body-search',
+      fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
+      label: 'Similar people',
+      extractIds: function (data) { return (data.results || []).map(function (r) { return r.id; }); },
+      onEmpty: function () { if (window.showToast) showToast('No similar people found for that region — is the body index built? (/bulk)'); },
+    });
+  });
+  if (searchBodyState) boxDrawStates.push(searchBodyState);
 
   /* Face naming modal — click any face chip (named or "Unknown") to name/rename
      it. Goes through the shared entity picker: fuzzy-search known people, pick
