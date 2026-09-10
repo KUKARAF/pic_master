@@ -2972,9 +2972,19 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(_videos_needing_frames()),
         }
 
-    # Cosine similarity at/above which two face embeddings are treated as the SAME person
-    # within one video (for the unmatched-person dedup — same-person faces across a
-    # video's frames sit well above this; different people don't).
+    # Video-face-scan quality/dedup knobs. Video frames are far noisier than photos
+    # (motion blur, tiny background faces, profile views), so the scan must be much
+    # stricter than per-photo detection or it produces a flood of trash matches and
+    # dozens of junk stills per video. The scan CLUSTERS faces across sampled frames and
+    # only captures a person who RECURS — a real person appears in many frames; a
+    # spurious one-frame detection doesn't.
+    VIDEO_FACE_DET_MIN = 0.65        # min detection confidence (detector floors at 0.5)
+    VIDEO_FACE_MIN_PX = 48           # min face box side in px — drop tiny background faces
+    VIDEO_FACE_CLUSTER_SIM = 0.5     # cosine at/above which frames are the SAME person
+    VIDEO_FACE_MIN_APPEARANCES = 3   # a person must recur in >= this many sampled frames
+    VIDEO_FACE_MAX_CAPTURES = 12     # hard cap of new stills captured per video
+    VIDEO_FACE_MAX_CLUSTERS = 200    # memory backstop for a pathological crowd video
+    # Cosine at/above which a candidate is the same as someone ALREADY on the video.
     VIDEO_FACE_DEDUP_THRESHOLD = 0.5
 
     def _videos_needing_face_scan():
@@ -3006,13 +3016,17 @@ def create_app(data_root: str) -> FastAPI:
         return known_names, known_embs
 
     @app.post('/api/scan-video-faces/start')
-    def api_scan_video_faces_start(include_trashed: bool = False, capture_unmatched: bool = True):
-        """Sample every not-yet-scanned video at ~1 fps, run face detection + auto-match,
-        and capture a still ONLY for a face NEW to that video (dedup by matched identity, or
-        by embedding similarity for unmatched people) — so a video ends up with ~one
-        representative named still per distinct person. `capture_unmatched` (UI toggle): when
-        off, only faces that match a known identity produce a still. Videos are marked
-        scanned so re-runs skip them."""
+    def api_scan_video_faces_start(include_trashed: bool = False, capture_unmatched: bool = True,
+                                   threshold: float = None):
+        """Sample every not-yet-scanned video at ~1 fps, then CLUSTER the detected faces
+        across frames and capture a still only for a person who RECURS (>= a few frames) —
+        so noisy one-frame detections and tiny/blurry background faces don't become junk
+        stills or trash matches. Quality-gated (min detection confidence + min face size);
+        each captured person uses their BEST-quality frame, which also makes the match more
+        reliable. `capture_unmatched` (toggle): off = only clusters matching a known person
+        are captured. `threshold` (confidence slider) is the auto-match cutoff. New people
+        are deduped against those already on the video; captures are capped per video.
+        Videos are marked scanned so re-runs skip them."""
         import tempfile
         import numpy as np
         from media_manager import phasher
@@ -3037,33 +3051,33 @@ def create_app(data_root: str) -> FastAPI:
                         video_row = db.get_file_by_id(fid)
                         known_names, known_embs = _known_people_for_video(video_cs)
 
-                        def _handle_face(f, jpeg, time_ms):
-                            emb_bytes = f['embedding'].tobytes()
-                            vec = np.frombuffer(emb_bytes, dtype=np.float32)
-                            name, _score = manual.find_matching_identity(emb_bytes)
-                            if name is not None:
-                                if name in known_names:
-                                    return  # already have this person on the video
-                            else:
-                                if not capture_unmatched:
-                                    return  # toggle off — skip unmatched faces
-                                if any(float(e.dot(vec)) >= VIDEO_FACE_DEDUP_THRESHOLD for e in known_embs):
-                                    return  # same unknown person already captured
-                            # NEW face → capture the frame as a still + attach the face.
-                            child_id = _save_captured_still(video_row, jpeg, time_ms)
-                            child = db.get_file_by_id(child_id)
-                            face_db_id = db.add_manual_face(child_id, f['bbox'], emb_bytes, f['det_score'])
-                            if name is not None:
-                                manual.promote_auto_face(face_db_id, child['checksum'], f['bbox'],
-                                                         emb_bytes, name, None, None)
-                                _link_face_match_to_video(child['checksum'], name)
-                                known_names.add(name)
-                                video_face_scan_job['matched'] += 1
-                            known_embs.append(vec)
-                            video_face_scan_job['captured'] += 1
+                        # --- Pass 1: cluster quality faces across all sampled frames. ---
+                        # Each cluster tracks its count (recurrence) and keeps the SINGLE
+                        # best-quality frame as the representative to capture + match on.
+                        clusters = []  # {emb, count, best_score, jpeg, bbox, time_ms}
 
-                        # Batch detection to limit remote-worker round-trips; process each
-                        # frame's faces in time order so dedup is deterministic.
+                        def _add_face(f, jpeg, time_ms):
+                            bbox = f['bbox']
+                            if f['det_score'] < VIDEO_FACE_DET_MIN:
+                                return  # weak/blurry detection
+                            if min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < VIDEO_FACE_MIN_PX:
+                                return  # tiny background face
+                            vec = np.frombuffer(f['embedding'].tobytes(), dtype=np.float32)
+                            best_i, best_sim = -1, VIDEO_FACE_CLUSTER_SIM
+                            for i, c in enumerate(clusters):
+                                sim = float(c['emb'].dot(vec))
+                                if sim >= best_sim:
+                                    best_sim, best_i = sim, i
+                            if best_i >= 0:
+                                c = clusters[best_i]
+                                c['count'] += 1
+                                if f['det_score'] > c['best_score']:
+                                    c.update(emb=vec, best_score=f['det_score'], jpeg=jpeg,
+                                             bbox=bbox, time_ms=time_ms)
+                            elif len(clusters) < VIDEO_FACE_MAX_CLUSTERS:
+                                clusters.append({'emb': vec, 'count': 1, 'best_score': f['det_score'],
+                                                 'jpeg': jpeg, 'bbox': bbox, 'time_ms': time_ms})
+
                         batch = []  # (time_ms, jpeg, tmp_path)
 
                         def _flush():
@@ -3080,7 +3094,7 @@ def create_app(data_root: str) -> FastAPI:
                                 if ferr or not faces:
                                     continue
                                 for f in faces:
-                                    _handle_face(f, jpeg, t_ms)
+                                    _add_face(f, jpeg, t_ms)
                             batch.clear()
 
                         for time_ms, jpeg in phasher.iter_video_frames_sampled(abs_path):
@@ -3090,6 +3104,37 @@ def create_app(data_root: str) -> FastAPI:
                             if len(batch) >= 8:
                                 _flush()
                         _flush()
+
+                        # --- Pass 2: capture the recurring people, best cluster first. ---
+                        captured_here = 0
+                        for c in sorted(clusters, key=lambda c: (c['count'], c['best_score']), reverse=True):
+                            if c['count'] < VIDEO_FACE_MIN_APPEARANCES:
+                                continue  # one-frame blip → trash, skip
+                            if captured_here >= VIDEO_FACE_MAX_CAPTURES:
+                                break
+                            emb_bytes = c['emb'].tobytes()
+                            name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
+                            if name is not None:
+                                if name in known_names:
+                                    continue  # already have this person on the video
+                            else:
+                                if not capture_unmatched:
+                                    continue
+                                if any(float(e.dot(c['emb'])) >= VIDEO_FACE_DEDUP_THRESHOLD for e in known_embs):
+                                    continue  # same unknown person already on the video
+                            child_id = _save_captured_still(video_row, c['jpeg'], c['time_ms'])
+                            child = db.get_file_by_id(child_id)
+                            face_db_id = db.add_manual_face(child_id, c['bbox'], emb_bytes, c['best_score'])
+                            if name is not None:
+                                manual.promote_auto_face(face_db_id, child['checksum'], c['bbox'],
+                                                         emb_bytes, name, None, None)
+                                _link_face_match_to_video(child['checksum'], name)
+                                known_names.add(name)
+                                video_face_scan_job['matched'] += 1
+                            known_embs.append(c['emb'])
+                            captured_here += 1
+                            video_face_scan_job['captured'] += 1
+
                         manual.mark_video_frame_scanned(video_cs)
                     except Exception as exc:
                         errors.log(rel_path, f'scan-video-faces: {exc}')
