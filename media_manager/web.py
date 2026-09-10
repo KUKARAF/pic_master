@@ -5068,13 +5068,11 @@ def create_app(data_root: str) -> FastAPI:
         already been shown", not a page number.
 
         `avoid_existing` (default True — a UI toggle, on by default): files
-        already belonging to ANY set are stable-sorted after ones in no set at
-        all, so browsing/swiping surfaces still-unsorted photos first without
-        hard-excluding files that happen to already be organized somewhere —
-        applied across the whole ranked pool before slicing to `limit`, not
-        just within whatever page/buffer size was requested, so it can
-        actually pull in fresh candidates rather than just reordering a
-        handful already selected.
+        already belonging to ANY set are hard-excluded from the candidate pool,
+        so swiping only ever surfaces still-unsorted photos (one already
+        organized somewhere is not offered at all) — applied across the whole
+        ranked pool before slicing to `limit`, so it pulls in fresh unsorted
+        candidates rather than padding the buffer with already-in-a-set photos.
 
         `honor_negatives` (default False — a UI toggle, off by default):
         rejected photos (file_set_exclusions) are always hard-excluded from the
@@ -5135,7 +5133,7 @@ def create_app(data_root: str) -> FastAPI:
                 ]
         if avoid_existing and passing:
             member_checksums_anywhere = manual.get_all_set_member_checksums()
-            passing.sort(key=lambda item: item[0][2] in member_checksums_anywhere)
+            passing = [item for item in passing if item[0][2] not in member_checksums_anywhere]
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]

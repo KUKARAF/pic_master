@@ -1686,6 +1686,83 @@
 
   window.openSetSearchModal = openSetSearchModal;
 
+  /* The one set picker used everywhere you add a photo to a set — the photo page's
+     "＋ Add to set" AND the set page's "o" quick-move — so there's a single component
+     with the "Likely sets" suggestions aside, not two. Pass the file the suggestions
+     should rank for (`fileId`), the sets to exclude (`excludeIds`), and what to do
+     with the chosen set (`onResolved`). Omitting fileId gives a plain search (no
+     suggestions), e.g. the "add queue to set" flow. */
+  function openSetPicker(opts) {
+    opts = opts || {};
+    var excludeIds = opts.excludeIds || [];
+    var fileId = opts.fileId;
+    var extra = {};
+    if (fileId != null) {
+      // Right-hand panel: the sets this photo most likely belongs to, ranked by
+      // CLIP image similarity to each set's members. Click one to add it there.
+      extra.aside = function (panel, resolve) {
+        var heading = document.createElement('div');
+        heading.className = 'modal-aside-title';
+        heading.textContent = 'Likely sets';
+        panel.appendChild(heading);
+        var loading = document.createElement('div');
+        loading.className = 'sub';
+        loading.textContent = 'Loading…';
+        panel.appendChild(loading);
+        fetch('/api/files/' + fileId + '/suggested-sets?limit=6')
+          .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+          .then(function (data) {
+            loading.remove();
+            var sugg = (data.results || [])
+              .filter(function (s) { return excludeIds.indexOf(Number(s.id)) === -1; })
+              .slice(0, 5);
+            if (!sugg.length) {
+              var empty = document.createElement('div');
+              empty.className = 'sub';
+              empty.textContent = 'No likely sets.';
+              panel.appendChild(empty);
+              return;
+            }
+            sugg.forEach(function (s) {
+              var item = document.createElement('button');
+              item.type = 'button';
+              item.className = 'modal-aside-set';
+              item.title = 'Add to "' + s.name + '"';
+              var img = document.createElement('img');
+              img.className = 'modal-aside-set-img';
+              img.width = 44; img.height = 44;
+              img.alt = '';
+              if (s.thumb_id != null) img.src = '/thumb/' + s.thumb_id;
+              item.appendChild(img);
+              var meta = document.createElement('div');
+              meta.className = 'modal-aside-face-meta';
+              var nm = document.createElement('div');
+              nm.className = 'modal-aside-set-name';
+              nm.textContent = s.name;
+              meta.appendChild(nm);
+              if (s.studio) {
+                var st = document.createElement('div');
+                st.className = 'modal-aside-set-studio';
+                st.textContent = s.studio;
+                meta.appendChild(st);
+              }
+              var sc = document.createElement('div');
+              sc.className = 'sub';
+              sc.textContent = (s.score != null ? Number(s.score).toFixed(2) : '');
+              meta.appendChild(sc);
+              item.appendChild(meta);
+              item.addEventListener('click', function () { resolve(s); });
+              panel.appendChild(item);
+            });
+          })
+          .catch(function () { loading.textContent = "Couldn't load suggestions."; });
+      };
+    }
+    openSetSearchModal(opts.onResolved, excludeIds, extra);
+  }
+
+  window.openSetPicker = openSetPicker;
+
   /* Shown when a set's studio matches an existing one under a different exact
      spelling only (studios have no id to merge — just reusing the existing
      spelling so it groups on /studios instead of fragmenting). Declining
@@ -4642,77 +4719,18 @@
   }
 
   function openSetPickerModal() {
-    // Opened from the photo page → the picker's right-hand aside surfaces the
-    // CLIP-ranked sets this photo most likely belongs to (see the `aside` below).
-    // Exclude sets the photo is ALREADY in — read fresh from the live chips each open
-    // (so a set added earlier this session is excluded too), so neither the suggestions
-    // nor the search results offer a set that's already assigned.
+    // The shared set picker (window.openSetPicker) with the "Likely sets" aside.
+    // Exclude sets the photo is ALREADY in — read fresh from the live chips each
+    // open (so a set added earlier this session is excluded too).
     const currentSetIds = Array.from(setCurrent.querySelectorAll('[data-set-id]'))
       .map(function (el) { return Number(el.dataset.setId); });
-    openSetSearchModal(function (set) {
-      assignSetById(set.id)
-        .then(function (data) { appendSetChip(data); })
-        .catch(function (err) { showToast('Failed to add set: ' + err.message); });
-    }, currentSetIds, {
-      // Right-hand panel (mirrors openFaceNamingModal's "Closest matches"): the
-      // sets this photo most likely belongs to, ranked by CLIP image similarity
-      // to each set's existing members. Click one to add the photo to that set.
-      aside: function (panel, resolve) {
-        const heading = document.createElement('div');
-        heading.className = 'modal-aside-title';
-        heading.textContent = 'Likely sets';
-        panel.appendChild(heading);
-        const loading = document.createElement('div');
-        loading.className = 'sub';
-        loading.textContent = 'Loading…';
-        panel.appendChild(loading);
-        fetch('/api/files/' + fileId + '/suggested-sets?limit=6')
-          .then(function (r) { return r.ok ? r.json() : { results: [] }; })
-          .then(function (data) {
-            loading.remove();
-            const sugg = (data.results || [])
-              .filter(function (s) { return currentSetIds.indexOf(Number(s.id)) === -1; })
-              .slice(0, 5);
-            if (!sugg.length) {
-              const empty = document.createElement('div');
-              empty.className = 'sub';
-              empty.textContent = 'No likely sets.';
-              panel.appendChild(empty);
-              return;
-            }
-            sugg.forEach(function (s) {
-              const item = document.createElement('button');
-              item.type = 'button';
-              item.className = 'modal-aside-set';
-              item.title = 'Add this photo to "' + s.name + '"';
-              const img = document.createElement('img');
-              img.className = 'modal-aside-set-img';
-              img.width = 44; img.height = 44;
-              img.alt = '';
-              if (s.thumb_id != null) img.src = '/thumb/' + s.thumb_id;
-              item.appendChild(img);
-              const meta = document.createElement('div');
-              meta.className = 'modal-aside-face-meta';
-              const nm = document.createElement('div');
-              nm.className = 'modal-aside-set-name';
-              nm.textContent = s.name;
-              meta.appendChild(nm);
-              if (s.studio) {
-                const st = document.createElement('div');
-                st.className = 'modal-aside-set-studio';
-                st.textContent = s.studio;
-                meta.appendChild(st);
-              }
-              const sc = document.createElement('div');
-              sc.className = 'sub';
-              sc.textContent = (s.score != null ? Number(s.score).toFixed(2) : '');
-              meta.appendChild(sc);
-              item.appendChild(meta);
-              item.addEventListener('click', function () { resolve(s); });
-              panel.appendChild(item);
-            });
-          })
-          .catch(function () { loading.textContent = "Couldn't load suggestions."; });
+    window.openSetPicker({
+      fileId: fileId,
+      excludeIds: currentSetIds,
+      onResolved: function (set) {
+        assignSetById(set.id)
+          .then(function (data) { appendSetChip(data); })
+          .catch(function (err) { showToast('Failed to add set: ' + err.message); });
       },
     });
   }

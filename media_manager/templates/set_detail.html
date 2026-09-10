@@ -99,7 +99,7 @@
 
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
   <input type="checkbox" id="set-avoid-existing-toggle" checked>
-  Deprioritize photos that already belong to a set
+  Hide photos that already belong to a set
 </label>
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
   <input type="checkbox" id="set-honor-negatives-toggle">
@@ -487,11 +487,15 @@
      this app already goes through. */
   document.querySelectorAll('.add-to-set-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      window.openSetSearchModal(function(otherSet) {
-        window.assignFileToSet(btn.dataset.fileId, otherSet.id)
-          .then(function() { location.reload(); })
-          .catch(function(err) { showToast('Failed to add to set: ' + err.message); });
-      }, setId);
+      window.openSetPicker({
+        fileId: btn.dataset.fileId,
+        excludeIds: [setId],
+        onResolved: function(otherSet) {
+          window.assignFileToSet(btn.dataset.fileId, otherSet.id)
+            .then(function() { location.reload(); })
+            .catch(function(err) { showToast('Failed to add to set: ' + err.message); });
+        },
+      });
     });
   });
 
@@ -955,9 +959,16 @@
     }
 
     if (e.key === 'o' || e.key === 'O') {
-      if (!stackHandle || !stackHandle.getTopCard()) return;
+      const card = stackHandle && stackHandle.getTopCard();
+      if (!card) return;
       e.preventDefault();
-      window.openSetSearchModal(function(otherSet) { addCurrentCardToSet(otherSet); }, setId);
+      // Same set picker as the photo page — with the "Likely sets" suggestions
+      // aside ranked for the current card — instead of a bare search box.
+      window.openSetPicker({
+        fileId: card.id,
+        excludeIds: [setId],
+        onResolved: function(otherSet) { addCurrentCardToSet(otherSet); },
+      });
       return;
     }
 
