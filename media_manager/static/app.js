@@ -1194,12 +1194,14 @@
       box.classList.add('modal-box-flex');
       if (options.previewImage) {
         const preview = document.createElement('img');
+        preview.className = 'modal-preview';
         preview.src = options.previewImage;
         preview.width = 80;
         preview.height = 80;
         preview.style.borderRadius = '6px';
         preview.style.display = 'block';
         preview.style.marginBottom = '10px';
+        preview.style.transition = 'transform 0.15s ease';
         box.appendChild(preview);
       }
 
@@ -3817,52 +3819,81 @@
       allowEmpty: true,
       // Right-hand panel: the closest existing named people by face-embedding similarity
       // (up to 5), each shown with their own crop — click one to name this face them.
+      // A "Rotate 90°" control re-embeds the face from a rotated crop and re-runs the
+      // search — for a face the detector aligned wrong because it was upside-down.
       aside: function (panel, resolve) {
+        let rotate = 0;  // 0..3 quarter-turns clockwise
         const heading = document.createElement('div');
         heading.className = 'modal-aside-title';
         heading.textContent = 'Closest matches';
         panel.appendChild(heading);
-        const loading = document.createElement('div');
-        loading.className = 'sub';
-        loading.textContent = 'Loading…';
-        panel.appendChild(loading);
-        fetch('/api/faces/' + faceRef + '/suggestions')
-          .then(function (r) { return r.json(); })
-          .then(function (data) {
-            loading.remove();
-            const sugg = (data.suggestions || []);
-            if (!sugg.length) {
-              const empty = document.createElement('div');
-              empty.className = 'sub';
-              empty.textContent = 'No similar named faces.';
-              panel.appendChild(empty);
-              return;
-            }
-            sugg.forEach(function (s) {
-              const item = document.createElement('button');
-              item.type = 'button';
-              item.className = 'modal-aside-face';
-              item.title = 'Name this face "' + s.name + '"';
-              const img = document.createElement('img');
-              img.className = 'modal-aside-face-img';
-              img.width = 44; img.height = 44;
-              img.src = '/face-crop/' + s.ref;
-              item.appendChild(img);
-              const meta = document.createElement('div');
-              meta.className = 'modal-aside-face-meta';
-              const nm = document.createElement('div');
-              nm.className = 'modal-aside-face-name';
-              nm.textContent = s.name;
-              const sc = document.createElement('div');
-              sc.className = 'sub';
-              sc.textContent = s.score.toFixed(2);
-              meta.appendChild(nm); meta.appendChild(sc);
-              item.appendChild(meta);
-              item.addEventListener('click', function () { resolve({ name: s.name }); });
-              panel.appendChild(item);
-            });
-          })
-          .catch(function () { loading.textContent = "Couldn't load suggestions."; });
+
+        const rotateBtn = document.createElement('button');
+        rotateBtn.type = 'button';
+        rotateBtn.className = 'btn-similar';
+        rotateBtn.style.margin = '0 0 10px';
+        rotateBtn.style.fontSize = '12px';
+        rotateBtn.textContent = '↻ Rotate 90°';
+        rotateBtn.title = 'Rotate the face and search again (for an upside-down / sideways face)';
+        panel.appendChild(rotateBtn);
+
+        const list = document.createElement('div');
+        panel.appendChild(list);
+
+        function render() {
+          list.innerHTML = '';
+          const loading = document.createElement('div');
+          loading.className = 'sub';
+          loading.textContent = 'Loading…';
+          list.appendChild(loading);
+          const qs = rotate ? ('?rotate=' + rotate) : '';
+          fetch('/api/faces/' + faceRef + '/suggestions' + qs)
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+              list.innerHTML = '';
+              const sugg = (data.suggestions || []);
+              if (!sugg.length) {
+                const empty = document.createElement('div');
+                empty.className = 'sub';
+                empty.textContent = 'No similar named faces.';
+                list.appendChild(empty);
+                return;
+              }
+              sugg.forEach(function (s) {
+                const item = document.createElement('button');
+                item.type = 'button';
+                item.className = 'modal-aside-face';
+                item.title = 'Name this face "' + s.name + '"';
+                const img = document.createElement('img');
+                img.className = 'modal-aside-face-img';
+                img.width = 44; img.height = 44;
+                img.src = '/face-crop/' + s.ref;
+                item.appendChild(img);
+                const meta = document.createElement('div');
+                meta.className = 'modal-aside-face-meta';
+                const nm = document.createElement('div');
+                nm.className = 'modal-aside-face-name';
+                nm.textContent = s.name;
+                const sc = document.createElement('div');
+                sc.className = 'sub';
+                sc.textContent = s.score.toFixed(2);
+                meta.appendChild(nm); meta.appendChild(sc);
+                item.appendChild(meta);
+                item.addEventListener('click', function () { resolve({ name: s.name }); });
+                list.appendChild(item);
+              });
+            })
+            .catch(function () { list.innerHTML = ''; const e = document.createElement('div'); e.className = 'sub'; e.textContent = "Couldn't load suggestions."; list.appendChild(e); });
+        }
+
+        rotateBtn.addEventListener('click', function () {
+          rotate = (rotate + 1) % 4;
+          const preview = document.querySelector('.modal-preview');
+          if (preview) preview.style.transform = 'rotate(' + (rotate * 90) + 'deg)';
+          render();
+        });
+
+        render();
       },
       onResolved: function (entity) { saveName(entity.name); },
     });

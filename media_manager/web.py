@@ -6601,24 +6601,80 @@ def create_app(data_root: str) -> FastAPI:
         ceiling = max(floor, min(1.0, ceiling))
         return _find_similar_unknown_faces(name, floor, limit=count, ceiling=ceiling, ascending=True)
 
-    @app.get('/api/faces/{face_id}/suggestions')
-    def api_face_suggestions(face_id: str):
+    def _rotated_face_embedding(face_id, rotate):
+        """Re-embed a face from its source image with the crop rotated by rotate*90°
+        (1/2/3 == 90/180/270° clockwise). Lets the face-naming popup retry the
+        similarity search on a face the detector aligned wrong because it was
+        in-plane rotated (someone upside-down). Returns a unit np.float32 embedding,
+        or None if it can't (no source file / empty crop / no face found)."""
+        import cv2, numpy as np, json as _json
         kind, raw_id = _parse_face_ref(face_id)
         if kind == 'manual':
             row = manual.get_face(raw_id)
-            emb_bytes = row['embedding'] if row is not None else None
+            if row is None:
+                return None
+            bbox = [row['x1'], row['y1'], row['x2'], row['y2']]
+            frow = db.get_file_by_checksum(row['checksum'])
         else:
-            cursor = db.conn.cursor()
-            cursor.execute('SELECT embedding FROM faces WHERE id = ?', (raw_id,))
-            row = cursor.fetchone()
-            emb_bytes = row[0] if row is not None else None
-        if emb_bytes is None:
-            return {'suggestions': []}
+            cur = db.conn.cursor()
+            cur.execute('SELECT bbox, file_id FROM faces WHERE id = ?', (raw_id,))
+            r = cur.fetchone()
+            if r is None:
+                return None
+            bbox = _json.loads(r['bbox'])
+            frow = db.get_file_by_id(r['file_id'])
+        if frow is None:
+            return None
+        abs_path = _live_abs_path(frow['id'], frow['path'])
+        if abs_path is None:
+            return None
+        img = cv2.imread(abs_path)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        bw, bh = x2 - x1, y2 - y1
+        px, py = bw * 0.3, bh * 0.3
+        cx1, cy1 = max(0, int(x1 - px)), max(0, int(y1 - py))
+        cx2, cy2 = min(w, int(x2 + px)), min(h, int(y2 + py))
+        crop = img[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return None
+        code = {1: cv2.ROTATE_90_CLOCKWISE, 2: cv2.ROTATE_180,
+                3: cv2.ROTATE_90_COUNTERCLOCKWISE}.get(rotate % 4)
+        if code is not None:
+            crop = cv2.rotate(crop, code)
+        res = _get_face_detector().embed_bbox(crop, [0, 0, crop.shape[1], crop.shape[0]])
+        emb = res.get('embedding') if res else None
+        if emb is None:
+            return None
+        emb = np.asarray(emb, dtype=np.float32)
+        norm = float(np.linalg.norm(emb))
+        return emb / norm if norm else emb
+
+    @app.get('/api/faces/{face_id}/suggestions')
+    def api_face_suggestions(face_id: str, rotate: int = 0):
+        import numpy as np
+        query = None
+        # rotate != 0: re-embed the face from a rotated crop (manual 90° retry).
+        if rotate % 4 != 0:
+            query = _rotated_face_embedding(face_id, rotate)
+        if query is None:
+            kind, raw_id = _parse_face_ref(face_id)
+            if kind == 'manual':
+                row = manual.get_face(raw_id)
+                emb_bytes = row['embedding'] if row is not None else None
+            else:
+                cursor = db.conn.cursor()
+                cursor.execute('SELECT embedding FROM faces WHERE id = ?', (raw_id,))
+                row = cursor.fetchone()
+                emb_bytes = row[0] if row is not None else None
+            if emb_bytes is None:
+                return {'suggestions': []}
+            query = np.frombuffer(emb_bytes, dtype=np.float32)
         named = manual.get_named_face_embeddings_with_ids()
         if not named:
             return {'suggestions': []}
-        import numpy as np
-        query = np.frombuffer(emb_bytes, dtype=np.float32)
         matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _fid, _n, e in named])
         scores = matrix.dot(query)
         # Best-scoring face id per name, so each suggestion can show that person's crop.
