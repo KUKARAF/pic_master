@@ -1559,6 +1559,7 @@ class Database(ThreadLocalDB):
             FROM detections d
             JOIN files_with_path f ON f.id = d.file_id
             WHERE ({like_clauses})
+              AND f.hidden = 0
               AND d.class_name != '__indexed__'
               AND d.frame_index IS NULL
             GROUP BY d.file_id
@@ -1582,6 +1583,7 @@ class Database(ThreadLocalDB):
             SELECT id, path, checksum
             FROM files_with_path
             WHERE LOWER(path) LIKE LOWER(?)
+              AND hidden = 0
             LIMIT ?
         ''', (f'%{query}%', limit))
         return cursor.fetchall()

@@ -1056,10 +1056,13 @@ def create_app(data_root: str) -> FastAPI:
         calling that once per identity on every keystroke was the single biggest
         cost in ranking suggestions once the category scan was fixed."""
         cur = manual.conn.cursor()
+        still_parents = manual.get_all_frame_capture_parents()  # still -> source video
         by_name = {}
         cur.execute('SELECT DISTINCT checksum, identity FROM faces WHERE identity IS NOT NULL AND rejected = 0')
         for checksum, identity in cur.fetchall():
-            by_name.setdefault(identity, set()).add(checksum)
+            # A face on a captured still credits the SOURCE video in search, never
+            # the hidden frame still (frame and video are indistinguishable).
+            by_name.setdefault(identity, set()).add(still_parents.get(checksum, checksum))
         cur.execute('SELECT checksum, identity FROM identity_photo_assignments')
         for checksum, identity in cur.fetchall():
             by_name.setdefault(identity, set()).add(checksum)
@@ -1093,7 +1096,9 @@ def create_app(data_root: str) -> FastAPI:
         if t == 'face':
             if identity_map is not None:
                 return set(identity_map.get(v, ()))
-            checksums = set(manual.get_files_by_face_identity(v, limit=1000))
+            still_parents = manual.get_all_frame_capture_parents()  # still -> source video
+            checksums = {still_parents.get(cs, cs)
+                         for cs in manual.get_files_by_face_identity(v, limit=1000)}
             checksums |= set(manual.get_photos_assigned_to_identity(v, limit=1000))
             for s in manual.get_sets_linked_to_identity(v):
                 checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
@@ -3299,6 +3304,16 @@ def create_app(data_root: str) -> FastAPI:
                     if 'filename' in c:
                         c['filename'] = os.path.basename(vid['path'])
         return cards
+
+    def _canonical_checksum(checksum):
+        """A captured video still is indistinguishable from its source video for
+        the end user, so item-level actions (set membership, studios, …) operate
+        on the VIDEO. Returns the source video's checksum when `checksum` is a
+        captured still, else `checksum` unchanged."""
+        cap = manual.get_parent_capture(checksum)
+        if cap and db.get_file_by_checksum(cap['parent_checksum']) is not None:
+            return cap['parent_checksum']
+        return checksum
 
     @app.post('/api/detect-faces/start')
     def api_detect_faces_start(threshold: float = None, include_trashed: bool = False):
@@ -5854,7 +5869,9 @@ def create_app(data_root: str) -> FastAPI:
         """Adds a set membership — a file can belong to any number of sets, so this
         never replaces an existing one."""
         row = _file_or_404(file_id)
-        checksum = row['checksum']
+        # Adding a captured frame to a set adds its SOURCE VIDEO, never the hidden
+        # still — the frame and the video are one item to the user.
+        checksum = _canonical_checksum(row['checksum'])
         if body.set_id is not None:
             set_row = manual.get_set(body.set_id)
             if set_row is None:
@@ -5874,7 +5891,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.delete('/api/files/{file_id}/sets/{set_id}')
     def api_remove_set(file_id: int, set_id: int):
         row = _file_or_404(file_id)
-        manual.remove_file_from_set(row['checksum'], set_id)
+        manual.remove_file_from_set(_canonical_checksum(row['checksum']), set_id)
         return {'ok': True}
 
     @app.post('/api/sets/{set_id}/reorder')
@@ -6120,14 +6137,17 @@ def create_app(data_root: str) -> FastAPI:
             for i in range(len(candidates)) if scores[i] >= threshold
         ]
         scored.sort(reverse=True)
-        return [
+        # Collapse any face that lives on a captured video still to its source
+        # video — the crop (keyed by ref) still shows, but the card links to the
+        # video, never the hidden frame still.
+        return _collapse_face_cards_to_video([
             {
                 'ref': ref, 'file_id': file_id_, 'path': path_,
                 'filename': os.path.basename(path_), 'identity': identity,
                 'score': round(score, 3),
             }
             for score, ref, file_id_, path_, identity in scored[:limit]
-        ]
+        ])
 
     def _find_similar_unknown_faces(name, threshold, limit=20, ceiling=None, ascending=False):
         """Unidentified auto-detected faces whose embedding is within `threshold` cosine
@@ -6179,10 +6199,18 @@ def create_app(data_root: str) -> FastAPI:
         favorite_faces = []
         people = []
         if favorite:
+            still_parents = manual.get_all_frame_capture_parents()
             for row in manual.get_favorite_faces():
                 file_row = db.get_file_by_checksum(row['checksum'])
                 if file_row is None:
                     continue
+                # If this favorite face lives on a captured still, link its card
+                # to the source video, not the hidden frame still.
+                vid_cs = still_parents.get(row['checksum'])
+                if vid_cs:
+                    vrow = db.get_file_by_checksum(vid_cs)
+                    if vrow is not None:
+                        file_row = vrow
                 favorite_faces.append({
                     'ref': f"manual:{row['id']}",
                     'file_id': file_row['id'],
@@ -6220,8 +6248,13 @@ def create_app(data_root: str) -> FastAPI:
         chosen sibling face per card, fixed for this queue build — the "peek
         at what we're comparing against" reference."""
         rows = manual.get_confirmed_faces_for_cleanup()
+        still_checksums = set(manual.get_all_frame_capture_parents())
         by_identity = {}
         for face_id_, checksum, identity, emb_bytes, reviewed_ok in rows:
+            # Faces that live on a captured video still never appear in the faces
+            # view — they belong to the video, reviewed there, not here.
+            if checksum in still_checksums:
+                continue
             by_identity.setdefault(identity, []).append((face_id_, checksum, emb_bytes, reviewed_ok))
 
         import numpy as np
@@ -6478,7 +6511,14 @@ def create_app(data_root: str) -> FastAPI:
     @app.delete('/api/files/{file_id}/identity-assignments/{name}')
     def api_remove_identity_assignment(file_id: int, name: str):
         row = _file_or_404(file_id)
-        manual.remove_identity_photo_assignment(row['checksum'], name)
+        checksum = row['checksum']
+        manual.remove_identity_photo_assignment(checksum, name)
+        # Frame and video are indistinguishable: removing a person from a video
+        # also clears that name from the faces on its captured frame stills, so
+        # the person doesn't linger on — and keep re-crediting — the video via a
+        # frame the user can't see.
+        for cap in manual.get_frame_captures_for(checksum):
+            manual.unassign_identity_for_checksum(cap['child_checksum'], name)
         return {'ok': True}
 
     @app.get('/api/identities/{name}/similar-faces')
@@ -6569,6 +6609,16 @@ def create_app(data_root: str) -> FastAPI:
             file_id = row['file_id']
         if identity:
             return RedirectResponse(url=f'/person/{quote(identity)}', status_code=307)
+        # A face on a captured video still: link back to the source video, not
+        # the hidden frame still (frame and video are indistinguishable here).
+        if file_id is not None:
+            frow = db.get_file_by_id(file_id)
+            if frow is not None:
+                cap = manual.get_parent_capture(frow['checksum'])
+                if cap:
+                    vrow = db.get_file_by_checksum(cap['parent_checksum'])
+                    if vrow is not None:
+                        file_id = vrow['id']
         est = manual.get_age_estimate_for_face_ref(face_ref)
         age = est['age'] if est is not None and est['age'] is not None else None
         gender = est['gender'] if age is not None else None
@@ -7188,7 +7238,9 @@ def create_app(data_root: str) -> FastAPI:
                     })
                 if len(results_out) >= 50:
                     break
-            return {'results': results_out}
+            # A matched face on a captured still points at its source video, not
+            # the hidden frame still.
+            return {'results': _collapse_face_cards_to_video(results_out)}
         finally:
             os.unlink(tmp_path)
 
