@@ -551,6 +551,88 @@ def _start_malloc_trimmer(interval=60.0):
     threading.Thread(target=_loop, daemon=True, name='malloc-trim').start()
 
 
+def _unrotate_bbox(bbox, code, w, h):
+    """Map a bbox detected in a cv2-rotated image back to the ORIGINAL image's
+    coordinates. `code` is the cv2 rotate code used (None == no rotation); `w`/`h`
+    are the ORIGINAL image's width/height."""
+    import cv2
+    x1, y1, x2, y2 = bbox
+
+    def back(xr, yr):
+        if code == cv2.ROTATE_90_CLOCKWISE:
+            return (yr, (h - 1) - xr)
+        if code == cv2.ROTATE_180:
+            return ((w - 1) - xr, (h - 1) - yr)
+        if code == cv2.ROTATE_90_COUNTERCLOCKWISE:
+            return ((w - 1) - yr, xr)
+        return (xr, yr)
+
+    ax, ay = back(x1, y1)
+    bx, by = back(x2, y2)
+    return [min(ax, bx), min(ay, by), max(ax, bx), max(ay, by)]
+
+
+def _detect_faces_multiorient(detector, abs_path):
+    """Detect faces at 0/90/180/270° whole-image rotations and merge the results,
+    so a face the detector only finds once the image is turned (e.g. someone doing
+    a handstand beside upright people) is caught too. Detection success is the
+    orientation oracle — it happens BEFORE there's any face to crop, which is why
+    the per-face crop sweep in FaceDetector can't catch a face that's missed
+    outright at 0°. Every bbox is mapped back to the original image's coordinates;
+    each face's embedding is the one InsightFace computed on the upright-rotated
+    face, so it's correctly aligned. A face found at more than one orientation is
+    kept once, at its highest det_score. Returns (faces, error)."""
+    import cv2, tempfile
+    from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU
+    img = cv2.imread(abs_path)
+    if img is None:
+        return [], 'Could not read image'
+    h, w = img.shape[:2]
+    ext = os.path.splitext(abs_path)[1].lower()
+    if ext not in ('.jpg', '.jpeg', '.png'):
+        ext = '.png'
+
+    candidates = []  # {'bbox','embedding','det_score'} in ORIGINAL coordinates
+    last_err = None
+    for code in (None, cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
+        if code is None:
+            path, tmp_name = abs_path, None
+        else:
+            tmp = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            tmp.close()
+            tmp_name = tmp.name
+            cv2.imwrite(tmp_name, cv2.rotate(img, code))
+            path = tmp_name
+        try:
+            _, faces, err = detector.detect_faces([path])[0]
+            if err:
+                last_err = err
+                continue
+            for f in faces:
+                candidates.append({
+                    'bbox': _unrotate_bbox(f['bbox'], code, w, h),
+                    'embedding': f['embedding'],
+                    'det_score': f['det_score'],
+                })
+        finally:
+            if tmp_name is not None:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
+    if not candidates:
+        return [], last_err
+    # Same face found at several orientations → keep the highest-det_score one.
+    candidates.sort(key=lambda c: c['det_score'], reverse=True)
+    kept = []
+    for c in candidates:
+        if any(_bbox_iou(c['bbox'], k['bbox']) >= FACE_SAME_BOX_IOU for k in kept):
+            continue
+        kept.append(c)
+    return kept, None
+
+
 def create_app(data_root: str) -> FastAPI:
     """Create and return the FastAPI application rooted at data_root."""
     data_root = os.path.abspath(data_root)
@@ -7054,9 +7136,11 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='Image file not found on disk')
 
         detector = _get_face_detector()
-        results = detector.detect_faces([abs_path])
-        _, faces, error = results[0]
-        if error:
+        # Detect at every 90° orientation and merge, so an in-plane-rotated face
+        # (e.g. a handstand) that the detector misses outright when the image is
+        # upright is still found — rotate-then-detect, not detect-then-match.
+        faces, error = _detect_faces_multiorient(detector, abs_path)
+        if error and not faces:
             raise HTTPException(status_code=500, detail=f'Face detection failed: {error}')
 
         db.insert_faces(file_id, faces, detector.model_id(detector._model_name))
