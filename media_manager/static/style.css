@@ -525,6 +525,21 @@ input[type="range"] { accent-color: var(--accent); }
 .modal-aside-face:hover { border-color: var(--border-accent); background: var(--input-bg); }
 .modal-aside-face-img { border-radius: 50%; object-fit: cover; flex-shrink: 0; }
 .modal-aside-face-name { color: var(--chip-blue); font-size: 15px; line-height: 1.1; }
+/* Suggested-set aside rows (the set picker's right column): same layout as a
+   face suggestion, but the thumbnail is a squared-off representative photo of the
+   set (not a round face crop) and the meta shows studio + similarity score. */
+.modal-aside-set {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: none; border: 1px solid transparent; border-radius: var(--radius);
+  padding: 4px; cursor: pointer; margin-bottom: 4px;
+}
+.modal-aside-set:hover { border-color: var(--border-accent); background: var(--input-bg); }
+.modal-aside-set-img {
+  width: 44px; height: 44px; border-radius: var(--radius); object-fit: cover;
+  flex-shrink: 0; background: var(--input-bg);
+}
+.modal-aside-set-name { color: var(--chip-blue); font-size: 15px; line-height: 1.1; }
+.modal-aside-set-studio { color: var(--text-muted); font-size: 12px; line-height: 1.2; }
 .modal-list-item {
   display: flex;
   justify-content: space-between;

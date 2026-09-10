@@ -4477,8 +4477,8 @@
   }
 
   function openSetPickerModal() {
-    // Opened from the photo page → surface CLIP-ranked suggested sets inside the
-    // picker (suggestForFileId). See openEntitySearchModal's set-suggestion block.
+    // Opened from the photo page → the picker's right-hand aside surfaces the
+    // CLIP-ranked sets this photo most likely belongs to (see the `aside` below).
     // Exclude sets the photo is ALREADY in — read fresh from the live chips each open
     // (so a set added earlier this session is excluded too), so neither the suggestions
     // nor the search results offer a set that's already assigned.
@@ -4488,7 +4488,68 @@
       assignSetById(set.id)
         .then(function (data) { appendSetChip(data); })
         .catch(function (err) { showToast('Failed to add set: ' + err.message); });
-    }, currentSetIds, { suggestForFileId: fileId });
+    }, currentSetIds, {
+      // Right-hand panel (mirrors openFaceNamingModal's "Closest matches"): the
+      // sets this photo most likely belongs to, ranked by CLIP image similarity
+      // to each set's existing members. Click one to add the photo to that set.
+      aside: function (panel, resolve) {
+        const heading = document.createElement('div');
+        heading.className = 'modal-aside-title';
+        heading.textContent = 'Likely sets';
+        panel.appendChild(heading);
+        const loading = document.createElement('div');
+        loading.className = 'sub';
+        loading.textContent = 'Loading…';
+        panel.appendChild(loading);
+        fetch('/api/files/' + fileId + '/suggested-sets?limit=6')
+          .then(function (r) { return r.ok ? r.json() : { results: [] }; })
+          .then(function (data) {
+            loading.remove();
+            const sugg = (data.results || [])
+              .filter(function (s) { return currentSetIds.indexOf(Number(s.id)) === -1; })
+              .slice(0, 5);
+            if (!sugg.length) {
+              const empty = document.createElement('div');
+              empty.className = 'sub';
+              empty.textContent = 'No likely sets.';
+              panel.appendChild(empty);
+              return;
+            }
+            sugg.forEach(function (s) {
+              const item = document.createElement('button');
+              item.type = 'button';
+              item.className = 'modal-aside-set';
+              item.title = 'Add this photo to "' + s.name + '"';
+              const img = document.createElement('img');
+              img.className = 'modal-aside-set-img';
+              img.width = 44; img.height = 44;
+              img.alt = '';
+              if (s.thumb_id != null) img.src = '/thumb/' + s.thumb_id;
+              item.appendChild(img);
+              const meta = document.createElement('div');
+              meta.className = 'modal-aside-face-meta';
+              const nm = document.createElement('div');
+              nm.className = 'modal-aside-set-name';
+              nm.textContent = s.name;
+              meta.appendChild(nm);
+              if (s.studio) {
+                const st = document.createElement('div');
+                st.className = 'modal-aside-set-studio';
+                st.textContent = s.studio;
+                meta.appendChild(st);
+              }
+              const sc = document.createElement('div');
+              sc.className = 'sub';
+              sc.textContent = (s.score != null ? Number(s.score).toFixed(2) : '');
+              meta.appendChild(sc);
+              item.appendChild(meta);
+              item.addEventListener('click', function () { resolve(s); });
+              panel.appendChild(item);
+            });
+          })
+          .catch(function () { loading.textContent = "Couldn't load suggestions."; });
+      },
+    });
   }
 
   if (setPickerBtn) {
@@ -4542,8 +4603,8 @@
     setCurrent.querySelectorAll('[data-set-id]').forEach(wireSetChip);
   }
 
-  // Suggested sets are now surfaced INSIDE the set picker modal (see
-  // openEntitySearchModal's suggestForFileId block) instead of a separate
+  // Suggested sets are now surfaced INSIDE the set picker modal (its right-hand
+  // "Likely sets" aside — see openSetPickerModal) instead of a separate
   // "✨ Suggest sets" button + inline list on the page.
 
   /* Photo (file) favorite heart */

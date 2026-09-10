@@ -56,3 +56,4 @@ Thumbs.db
 *.pt
 
 howto_start_worker_on_bigboy.md
+.claude/worktrees/
