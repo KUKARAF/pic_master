@@ -1579,20 +1579,37 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/files', response_class=HTMLResponse)
     @app.get('/files/{subpath:path}', response_class=HTMLResponse)
-    def files_page(request: Request, subpath: str = ''):
+    def files_page(request: Request, subpath: str = '',
+                   hide_with_face: bool = False, hide_with_set: bool = False):
         """Browse the tracked library as a folder tree. `subpath` (via the {path}
         converter, so it may contain slashes) is the current folder relative to
         data_root; '' is the root. Shows immediate subfolders + the media directly
         in this folder, and a "Use this folder" button that adds the whole subtree
-        to a set."""
+        to a set.
+
+        Two independent listing filters (off by default, toggled from the toolbar
+        and reloaded via ?hide_with_face=1 / ?hide_with_set=1): drop any file that
+        has at least one face (auto-detected in media.db OR named/hand-drawn in
+        manual.db), and/or any file that belongs to at least one set. The two
+        library-wide checksum sets are fetched once and filtered in-memory — same
+        shape as the /unloved feed's exclusion filter, no per-file queries."""
         folder = subpath.strip('/')
         subfolders, file_rows = db.browse_folder(folder)
         rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
         files = _enrich_rows(rows)
+        if hide_with_face:
+            with_face = (db.get_all_checksums_with_face()
+                         | manual.get_all_checksums_with_named_face())
+            files = [f for f in files if f['checksum'] not in with_face]
+        if hide_with_set:
+            with_set = manual.get_all_set_member_checksums()
+            files = [f for f in files if f['checksum'] not in with_set]
         return templates.TemplateResponse(request, 'files.html', {
             'folder': folder,
             'subfolders': subfolders,
             'files': files,
+            'hide_with_face': hide_with_face,
+            'hide_with_set': hide_with_set,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })

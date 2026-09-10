@@ -1844,6 +1844,22 @@ class Database(ThreadLocalDB):
         )
         return cursor.fetchall()
 
+    def get_all_checksums_with_face(self):
+        """Every checksum with at least one real detected face row (primary or
+        frame-specific), as a plain set() — one cheap library-wide query mirroring
+        manual_db.get_all_set_member_checksums, independent of any candidate list.
+        Excludes the '__indexed__' sentinel rows that mark a scanned-but-faceless
+        file, so a file that was face-scanned and found empty is correctly absent.
+        The manual.db side (hand-drawn / named faces with no media.db row) is unioned
+        on top by the caller via get_all_checksums_with_named_face."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT DISTINCT f.checksum FROM faces fa "
+            "JOIN files_with_path f ON f.id = fa.file_id "
+            "WHERE fa.identity IS NULL OR fa.identity != '__indexed__'"
+        )
+        return {row[0] for row in cursor.fetchall()}
+
     def get_face_embedding(self, face_id: int):
         """Return raw embedding bytes for a single face row."""
         cursor = self.conn.cursor()

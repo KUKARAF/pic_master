@@ -27,6 +27,18 @@
   {% endfor %}
 </div>
 
+{# Listing filters — server-side, reload with ?hide_with_face / ?hide_with_set. #}
+<div class="sub" style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:18px;">
+  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="hide-with-face" {% if hide_with_face %}checked{% endif %}>
+    Hide with face
+  </label>
+  <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;">
+    <input type="checkbox" id="hide-with-set" {% if hide_with_set %}checked{% endif %}>
+    Hide with set
+  </label>
+</div>
+
 {% if subfolders %}
 <div class="folder-list">
   {% for sub in subfolders %}
@@ -60,6 +72,20 @@
 document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
 });
+
+// Listing filter toggles — reload the current folder with the checkbox state as
+// query params (server-side filtering, so the grid always matches the URL).
+function reloadWithFileFilters() {
+  var params = new URLSearchParams(window.location.search);
+  var face = document.getElementById('hide-with-face').checked;
+  var set = document.getElementById('hide-with-set').checked;
+  if (face) { params.set('hide_with_face', '1'); } else { params.delete('hide_with_face'); }
+  if (set) { params.set('hide_with_set', '1'); } else { params.delete('hide_with_set'); }
+  var qs = params.toString();
+  window.location.search = qs ? '?' + qs : '';
+}
+document.getElementById('hide-with-face').addEventListener('change', reloadWithFileFilters);
+document.getElementById('hide-with-set').addEventListener('change', reloadWithFileFilters);
 
 document.getElementById('use-folder-btn').addEventListener('click', function () {
   var folder = this.dataset.folder;
