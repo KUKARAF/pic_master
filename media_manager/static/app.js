@@ -281,6 +281,37 @@
     }
   };
 
+  // "N together" in /person's Friends strip — open the photos/videos this person
+  // and the friend both appear in as a browsable watch-queue. Delegated on document
+  // so it works on the /person page (the photo-page block that owns
+  // openMatchesAsQueue returns early when there's no MEDIA_FILE_ID, so a handler
+  // wired inside it never ran here).
+  document.addEventListener('click', function (e) {
+    var el = e.target.closest && e.target.closest('.friend-shared-link');
+    if (!el || el.dataset.busy) return;
+    var person = el.dataset.person, friend = el.dataset.friend;
+    if (!person || !friend) return;
+    el.dataset.busy = '1';
+    var glyph = el.textContent;
+    el.textContent = '⏳';
+    fetch('/api/person/' + encodeURIComponent(person) + '/shared-with/' + encodeURIComponent(friend))
+      .then(function (r) { if (!r.ok) throw new Error('status ' + r.status); return r.json(); })
+      .then(function (data) {
+        var ids = (data && data.file_ids) || [];
+        if (!ids.length) {
+          el.textContent = glyph; delete el.dataset.busy;
+          if (window.showToast) showToast('No shared photos');
+          return;
+        }
+        window.setPhotoQueue(ids, 'Shared with ' + friend, 0);
+        window.openPhoto(ids[0]);
+      })
+      .catch(function (err) {
+        el.textContent = glyph; delete el.dataset.busy;
+        if (window.showToast) showToast('Failed: ' + err.message);
+      });
+  });
+
   // "Custom action" — a declarative, one-shot action shown as a button at the
   // very top of the photo page's sidebar (see the renderer IIFE further down).
   // Declarative (not a callback) because it has to survive a real page
@@ -3726,23 +3757,6 @@
         if (window.showToast) showToast('Failed: ' + err.message);
       });
   }
-
-  /* "N together" in /person's Friends strip — open the photos/videos this person
-     and the friend both appear in as a browsable watch-queue, starting at the
-     first. Reuses the same openMatchesAsQueue flow as the find-similar buttons. */
-  document.querySelectorAll('.friend-shared-link').forEach(function (el) {
-    el.addEventListener('click', function () {
-      var person = el.dataset.person, friend = el.dataset.friend;
-      if (!person || !friend) return;
-      openMatchesAsQueue({
-        el: el,
-        url: '/api/person/' + encodeURIComponent(person) + '/shared-with/' + encodeURIComponent(friend),
-        label: 'Shared with ' + friend,
-        extractIds: function (data) { return data.file_ids || []; },
-        onEmpty: function () { if (window.showToast) showToast('No shared photos'); },
-      });
-    });
-  });
 
   /* Face 🔎 — similar faces. Looser 0.3 threshold: same-person crops often land
      ~0.35-0.45, and this is a browse-and-skip queue (restores the reach of the
