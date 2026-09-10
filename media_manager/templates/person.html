@@ -44,6 +44,25 @@
 </div>
 {% endif %}
 
+{% if friends %}
+<div class="section-title" style="margin-bottom:10px;">Friends <span class="sub" style="font-weight:normal;">— seen together most</span></div>
+<div style="display:flex;flex-wrap:wrap;gap:14px;margin-bottom:24px;">
+  {% for fr in friends %}
+  <a href="/person/{{ fr.name | urlencode }}" title="{{ fr.count }} photo(s) together"
+     style="display:flex;flex-direction:column;align-items:center;gap:4px;width:76px;text-decoration:none;">
+    {% if fr.ref %}
+    <img src="/face-crop/{{ fr.ref }}" alt="{{ fr.name }}" loading="lazy"
+         style="width:64px;height:64px;border-radius:50%;object-fit:cover;border:1px solid var(--border,#333);">
+    {% else %}
+    <span style="width:64px;height:64px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:var(--input-bg,#222);border:1px solid var(--border,#333);font-size:24px;">👤</span>
+    {% endif %}
+    <span style="font-size:13px;text-align:center;line-height:1.1;word-break:break-word;color:var(--chip-blue,#8ab4f8);">{{ fr.name }}</span>
+    <span class="sub" style="font-size:11px;">{{ fr.count }} together</span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:10px;">
   <div class="section-title" style="margin-bottom:0;">Photos</div>
   <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">

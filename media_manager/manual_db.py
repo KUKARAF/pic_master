@@ -3006,6 +3006,31 @@ class ManualDB(ThreadLocalDB):
         ''')
         return cur.fetchall()
 
+    def get_cooccurring_identities(self, name, limit=12):
+        """Other people who appear in the SAME photos/videos as `name`, ranked by how
+        many they share — the "friends" of a person. Co-presence counts both a named
+        face on a checksum AND a whole-photo identity assignment (so a video, whose
+        people are credited whole-photo rather than as face crops, still counts), and
+        each shared checksum is counted once. Returns [(identity, shared_count), ...]
+        most-shared first."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            WITH presence AS (
+                SELECT DISTINCT checksum, identity FROM faces
+                WHERE identity IS NOT NULL AND rejected = 0
+                UNION
+                SELECT checksum, identity FROM identity_photo_assignments
+            ),
+            mine AS (SELECT checksum FROM presence WHERE identity = ?)
+            SELECT p.identity, COUNT(DISTINCT p.checksum) AS shared
+            FROM presence p JOIN mine m ON m.checksum = p.checksum
+            WHERE p.identity != ?
+            GROUP BY p.identity
+            ORDER BY shared DESC, p.identity
+            LIMIT ?
+        ''', (name, name, limit))
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
     def get_identity_summary(self):
         """One row per unique identity — (identity, count, last_modified, ref,
         checksum) — for the single unique-faces grid on /faces. count and

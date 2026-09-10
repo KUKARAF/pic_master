@@ -1996,6 +1996,14 @@ def create_app(data_root: str) -> FastAPI:
         message = ''
         tags = []
         sets = []
+        # "Friends": people who co-occur in this person's photos/videos, most-shared
+        # first, each with a representative face crop to click through to.
+        rep_ids = manual.get_representative_face_ids()
+        friends = [
+            {'name': fname, 'count': shared,
+             'ref': f"manual:{rep_ids[fname]}" if fname in rep_ids else None}
+            for fname, shared in manual.get_cooccurring_identities(name, limit=12)
+        ]
         if not checksums:
             message = f'No files found with person "{name}" — run <code>media faces</code> to detect faces first.'
         else:
@@ -2022,6 +2030,7 @@ def create_app(data_root: str) -> FastAPI:
             'message': message,
             'tags': tags,
             'sets': sets,
+            'friends': friends,
             'aliases': manual.get_aliases_for_identity(name),
             'total': len(instances),
             'all_tags': manual.list_all_tags(),
