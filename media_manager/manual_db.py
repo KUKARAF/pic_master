@@ -625,6 +625,18 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_studio_locations_location ON studio_locations (location_id)')
+        # A studio assigned directly to an individual file (photo/video), multi-valued,
+        # exactly like file_locations/file_categories — studios used to be a set-only
+        # attribute (sets.studio_id); this lets an item carry a studio of its own.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_studios (
+                checksum TEXT NOT NULL,
+                studio_id INTEGER NOT NULL REFERENCES studios(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, studio_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_studios_studio ON file_studios (studio_id)')
         if old_overrides_exists:
             cur.execute('''
                 INSERT OR IGNORE INTO file_categories (checksum, category_id, created_at)
@@ -2304,6 +2316,77 @@ class ManualDB(ThreadLocalDB):
             WHERE sl.studio_id = ? ORDER BY l.name
         ''', (studio_id,))
         return [{'id': r[0], 'name': r[1], 'gps_lat': r[2], 'gps_lon': r[3]} for r in cur.fetchall()]
+
+    # --- Studios assigned directly to individual files (mirrors file_locations) ---
+    def create_studio(self, name):
+        """Find-or-create a studio by exact name, returning its id (public, commits;
+        wraps _find_or_create_studio which the set path uses mid-transaction)."""
+        studio_id = self._find_or_create_studio(name.strip())
+        self.conn.commit()
+        return studio_id
+
+    def get_studio(self, studio_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT id, name FROM studios WHERE id = ?', (studio_id,))
+        row = cur.fetchone()
+        return {'id': row[0], 'name': row[1]} if row else None
+
+    def list_all_studios(self):
+        """Every studio (unlike list_studios, which is scoped to studios that have at
+        least one SET for the sets-oriented wall), with its set count and per-file
+        assignment count — feeds the item studio picker so any existing studio,
+        including one only ever assigned to individual items, can be reused."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT st.id AS id, st.name AS name,
+                   (SELECT COUNT(*) FROM sets s WHERE s.studio_id = st.id) AS set_count,
+                   (SELECT COUNT(*) FROM file_studios f WHERE f.studio_id = st.id) AS file_count
+            FROM studios st
+            ORDER BY st.name
+        ''')
+        return cur.fetchall()
+
+    def add_file_studio(self, checksum, studio_id):
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO file_studios (checksum, studio_id, created_at) VALUES (?, ?, ?)',
+                    (checksum, studio_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_file_studio(self, checksum, studio_id):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_studios WHERE checksum = ? AND studio_id = ?', (checksum, studio_id))
+        self.conn.commit()
+
+    def get_studios_for_checksum(self, checksum):
+        """Every studio assigned to this file — [{'id','name'}]."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT st.id, st.name FROM file_studios fs JOIN studios st ON st.id = fs.studio_id
+            WHERE fs.checksum = ? ORDER BY st.name
+        ''', (checksum,))
+        return [{'id': r[0], 'name': r[1]} for r in cur.fetchall()]
+
+    def get_studios_for_checksums(self, checksums):
+        """Batched: {checksum: [{'id','name'}, ...]} (mirrors get_locations_for_checksums)."""
+        if not checksums:
+            return {}
+        cur = self.conn.cursor()
+        result = {}
+        for chunk in self._chunked(checksums):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'''
+                SELECT fs.checksum, st.id, st.name
+                FROM file_studios fs JOIN studios st ON st.id = fs.studio_id
+                WHERE fs.checksum IN ({placeholders}) ORDER BY st.name
+            ''', tuple(chunk))
+            for checksum, sid, name in cur.fetchall():
+                result.setdefault(checksum, []).append({'id': sid, 'name': name})
+        return result
+
+    def get_checksums_for_studio(self, studio_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_studios WHERE studio_id = ?', (studio_id,))
+        return {row[0] for row in cur.fetchall()}
 
     def get_all_category_checksums(self):
         """{category_id: set(checksum), ...} for every manual category assignment,

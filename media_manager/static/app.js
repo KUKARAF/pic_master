@@ -1106,6 +1106,29 @@
         });
       },
     },
+    studio: {
+      title: 'Set studio',
+      placeholder: 'Search or create a studio…',
+      fetchAll: function () { return cachedGetJson('/api/studios'); },
+      label: function (s) { return s.name; },
+      secondary: function (s) {
+        var parts = [];
+        if (s.set_count) parts.push(s.set_count + ' set(s)');
+        if (s.file_count) parts.push(s.file_count + ' item(s)');
+        return parts.join(' · ');
+      },
+      image: null,
+      createFn: function (typedName) {
+        return fetch('/api/studios', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: typedName }),
+        }).then(function (r) {
+          if (!r.ok) throw new Error('Request failed: ' + r.status);
+          return r.json();
+        });
+      },
+    },
     tag: {
       title: 'Search or create a tag',
       placeholder: 'Search or type a tag…',
@@ -1815,6 +1838,7 @@
         var aliasText = (s.aliases || []).map(function (a) { return 'aka ' + a; }).join(' ');
         return [s.name, s.studio || '', peopleText, aliasText].filter(Boolean).join(' — ');
       }, value: function (s) { return String(s.id); }, count: function (s) { return s.image_count || 0; } },
+      { type: 'studio', url: '/api/studios', label: function (s) { return s.name; }, value: function (s) { return String(s.id); }, count: function (s) { return (s.set_count || 0) + (s.file_count || 0); } },
     ];
     return Promise.all(sources.map(function (src) {
       return cachedGetJson(src.url).then(function (data) {
@@ -1848,10 +1872,10 @@
     var highlighted = 0;
     var requestSeq = 0;   // guards against an in-flight grid request resolving out of order
 
-    var FACET_LABELS = { category: 'CAT', location: 'LOC', city: 'CITY', tag: 'TAG', face: 'FACE', set: 'SET', file: 'FILE' };
+    var FACET_LABELS = { category: 'CAT', location: 'LOC', city: 'CITY', tag: 'TAG', face: 'FACE', set: 'SET', studio: 'STUDIO', file: 'FILE' };
     // Section headers for the grouped left-pane suggestions.
-    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', location: 'LOCATIONS', city: 'CITIES', set: 'SETS', file: 'FILES' };
-    var TYPE_ORDER = ['face', 'tag', 'category', 'location', 'city', 'set', 'file'];
+    var TYPE_HEADINGS = { face: 'PEOPLE', tag: 'TAGS', category: 'CATEGORIES', location: 'LOCATIONS', city: 'CITIES', set: 'SETS', studio: 'STUDIOS', file: 'FILES' };
+    var TYPE_ORDER = ['face', 'tag', 'category', 'location', 'city', 'set', 'studio', 'file'];
 
     // Text sort syntax: "field:asc|desc" anywhere in the input is parsed out into a
     // sort chip. Aliases map onto the backend's sort keys.
@@ -4307,6 +4331,110 @@
   if (locationCurrent) locationCurrent.querySelectorAll('[data-location-id]').forEach(wireLocationChip);
   window.openLocationPickerModal = openLocationPickerModal;
 
+  /* Studio assignment — a photo/video can carry any number of studios, mirroring
+     the location flow above (studios used to be a set-only attribute). */
+  const studioCurrent = document.getElementById('studio-current');
+  const studioPickerBtn = document.getElementById('studio-picker-btn');
+
+  function wireStudioChip(span) {
+    const removeBtn = span.querySelector('.studio-remove-btn');
+    if (removeBtn) {
+      removeBtn.addEventListener('click', function () {
+        removeFileStudio(span.dataset.studioId);
+      });
+    }
+  }
+
+  function buildStudioChip(studio) {
+    const span = document.createElement('span');
+    span.className = 'tag-removable';
+    span.style.marginBottom = '4px';
+    span.style.display = 'inline-flex';
+    span.dataset.studioId = studio.id;
+
+    const link = document.createElement('a');
+    link.href = '/search?f=studio:' + studio.id;
+    link.style.color = '#fff';
+    link.textContent = studio.name;
+    span.appendChild(link);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'rm studio-remove-btn';
+    removeBtn.type = 'button';
+    removeBtn.title = 'Remove this studio';
+    removeBtn.textContent = '×';
+    span.appendChild(removeBtn);
+
+    wireStudioChip(span);
+    return span;
+  }
+
+  function renderStudios(studios) {
+    if (!studioCurrent) return;
+    studioCurrent.innerHTML = '';
+    if (!studios || !studios.length) {
+      const span = document.createElement('span');
+      span.className = 'sub';
+      span.textContent = 'No studio.';
+      studioCurrent.appendChild(span);
+      return;
+    }
+    studios.forEach(function (studio) {
+      studioCurrent.appendChild(buildStudioChip(studio));
+    });
+  }
+
+  function appendStudioChip(studio) {
+    if (studioCurrent.children.length === 1 && studioCurrent.firstElementChild.tagName === 'SPAN'
+        && !studioCurrent.firstElementChild.dataset.studioId) {
+      studioCurrent.innerHTML = '';
+    }
+    if (studioCurrent.querySelector('[data-studio-id="' + studio.id + '"]')) return;
+    studioCurrent.appendChild(buildStudioChip(studio));
+  }
+
+  function addFileStudio(studioId) {
+    return fetch('/api/files/' + fileId + '/studios', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ studio_id: studioId }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    });
+  }
+
+  function removeFileStudio(studioId) {
+    fetch('/api/files/' + fileId + '/studios/' + studioId, { method: 'DELETE' })
+      .then(function (r) {
+        if (!r.ok) throw new Error('Request failed: ' + r.status);
+        return r.json();
+      })
+      .then(function () {
+        const chip = studioCurrent.querySelector('[data-studio-id="' + studioId + '"]');
+        if (chip) chip.remove();
+        if (!studioCurrent.children.length) renderStudios([]);
+      })
+      .catch(function (err) {
+        showToast('Failed to remove studio: ' + err.message);
+      });
+  }
+
+  function openStudioPickerModal() {
+    openEntitySearchModal({
+      type: 'studio',
+      onResolved: function (entity) {
+        addFileStudio(entity.id)
+          .then(function () { appendStudioChip({ id: entity.id, name: entity.name }); })
+          .catch(function (err) { showToast('Failed to add studio: ' + err.message); });
+      },
+    });
+  }
+
+  if (studioPickerBtn) studioPickerBtn.addEventListener('click', openStudioPickerModal);
+  if (studioCurrent) studioCurrent.querySelectorAll('[data-studio-id]').forEach(wireStudioChip);
+  window.openStudioPickerModal = openStudioPickerModal;
+
   /* Set assignment — a photo can belong to any number of sets */
   const setCurrent = document.getElementById('set-current');
   const setPickerBtn = document.getElementById('set-picker-btn');
@@ -4942,6 +5070,7 @@
           const action = trigger.dataset.podAction;
           if (action === 'add-category') { closeAllPods(null); openCategoryPickerModal(); return; }
           if (action === 'add-location') { closeAllPods(null); openLocationPickerModal(); return; }
+          if (action === 'add-studio') { closeAllPods(null); openStudioPickerModal(); return; }
           if (action === 'add-set') { closeAllPods(null); openSetPickerModal(); return; }
           pod.__pinned = !pod.__pinned;
           if (pod.__pinned) { closeAllPods(pod); openPod(); }

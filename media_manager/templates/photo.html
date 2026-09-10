@@ -275,6 +275,30 @@
     </div>
   </div>
 
+  <div class="stage-pod" data-pod data-pod-kind="studio">
+    <button type="button" class="stage-pod-btn" id="studio-pod-trigger"{% if not file.studios %} data-pod-action="add-studio" title="Add a studio"{% endif %}>{% if file.studios %}<span class="pod-collapsed-label">🎬 {{ file.studios | map(attribute='name') | join(', ') }}</span>{% else %}＋ Add studio{% endif %}</button>
+    <div class="stage-pod-menu">
+    <!-- Studios — a photo/video can carry any number of studios, mirroring locations
+         (studios used to be a set-only attribute). -->
+    <div class="sidebar-panel">
+      <div class="section-title">Studios</div>
+      <div id="studio-current">
+        {% if file.studios %}
+        {% for st in file.studios %}
+        <span class="tag-removable" data-studio-id="{{ st.id }}" style="margin-bottom:4px;display:inline-flex;">
+          <a href="/search?f=studio:{{ st.id }}">{{ st.name }}</a>
+          <button class="rm studio-remove-btn" type="button" title="Remove this studio">×</button>
+        </span>
+        {% endfor %}
+        {% else %}
+        <span class="sub">No studio.</span>
+        {% endif %}
+      </div>
+      <button type="button" id="studio-picker-btn" class="btn-similar" style="margin-top:8px;font-size:7px;padding:6px 8px;">＋ Add studio</button>
+    </div>
+    </div>
+  </div>
+
   <div class="stage-pod{% if current_sets %} has-sets{% endif %}" data-pod data-pod-kind="set">
     {# Collapsed trigger shows the FIRST set's name (right-aligned in the pill), plus
        a subtle count badge to its LEFT when the photo is in several sets. The name is

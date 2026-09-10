@@ -170,6 +170,12 @@ class LocationBody(BaseModel):
 class LocationAssignBody(BaseModel):
     location_id: int
 
+class StudioAssignBody(BaseModel):
+    # Assign an existing studio by id, or create-and-assign a new one by name
+    # (mirrors SetBody's set_id-or-name shape). At least one must be given.
+    studio_id: Optional[int] = None
+    name: Optional[str] = None
+
 class CaptureFrameIndexBody(BaseModel):
     frame_index: int
 
@@ -1114,6 +1120,16 @@ def create_app(data_root: str) -> FastAPI:
             if v == 'any':
                 return db.get_geotagged_checksums() | manual.get_checksums_with_any_location()
             return set(manual.get_checksums_for_location(int(v)))
+        if t == 'studio':
+            # Items (photos/videos) directly assigned this studio, unioned with the
+            # members of every SET under this studio — so a studio search spans both
+            # the per-item assignments and the older set-level studio.
+            checksums = set(manual.get_checksums_for_studio(int(v)))
+            studio = manual.get_studio(int(v))
+            if studio is not None:
+                for s in manual.list_sets(studio=studio['name']):
+                    checksums |= set(manual.get_files_by_set(s['id'], limit=1000))
+            return checksums
         if t == 'city':
             # value = a GeoNames city id; photos reverse-geocoded to that city (see
             # the 'Match cities' job). Lets you filter by place NAME, not coordinates.
@@ -1698,6 +1714,7 @@ def create_app(data_root: str) -> FastAPI:
         _attach_set_people([current_sets])
         file_info['categories'] = resolve_categories_for_file(manual, db, file_id, checksum)
         file_info['locations'] = manual.get_locations_for_checksum(checksum)
+        file_info['studios'] = manual.get_studios_for_checksum(checksum)
         all_categories = _all_categories_for_nav()
         # Age/gender estimates (experimental — see age_estimator.py) are shown inline
         # next to each face's name, not as a separate section, so merge them directly
@@ -4898,10 +4915,22 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/studios')
     def api_list_studios():
+        """Every studio (id + name + counts) — feeds both the studio-name datalist
+        on the set modals and the per-item studio picker, which assigns by id."""
         return [
-            {'name': r['studio'], 'set_count': r['set_count'], 'image_count': r['image_count']}
-            for r in manual.list_studios()
+            {'id': r['id'], 'name': r['name'], 'set_count': r['set_count'], 'file_count': r['file_count']}
+            for r in manual.list_all_studios()
         ]
+
+    @app.post('/api/studios')
+    def api_create_studio(body: StudioRenameBody):
+        """Find-or-create a studio by name, returning {id, name} — lets the item
+        studio picker create a brand-new studio (mirrors POST /api/locations)."""
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='Studio name must not be empty')
+        studio_id = manual.create_studio(name)
+        return {'id': studio_id, 'name': name}
 
     @app.put('/api/studios/{studio}')
     def api_rename_studio(studio: str, body: StudioRenameBody):
@@ -5840,6 +5869,33 @@ def create_app(data_root: str) -> FastAPI:
     def api_remove_file_location(file_id: int, location_id: int):
         row = _file_or_404(file_id)
         manual.remove_file_location(row['checksum'], location_id)
+        return {'ok': True}
+
+    @app.post('/api/files/{file_id}/studios')
+    def api_add_file_studio(file_id: int, body: StudioAssignBody):
+        """Assign a studio to an individual file — multi-valued, never replaces an
+        existing one (mirrors api_add_file_location). Accepts an existing studio_id
+        or a new studio name to create-and-assign. A captured frame's studio lands
+        on its source video (frame and video are one item)."""
+        row = _file_or_404(file_id)
+        checksum = _canonical_checksum(row['checksum'])
+        if body.studio_id is not None:
+            studio_id = body.studio_id
+        else:
+            name = (body.name or '').strip()
+            if not name:
+                raise HTTPException(status_code=400, detail='Studio name must not be empty')
+            studio_id = manual.create_studio(name)
+        manual.add_file_studio(checksum, studio_id)
+        studio = manual.get_studio(studio_id)
+        if studio is None:
+            raise HTTPException(status_code=404, detail='Studio not found')
+        return {'id': studio['id'], 'name': studio['name']}
+
+    @app.delete('/api/files/{file_id}/studios/{studio_id}')
+    def api_remove_file_studio(file_id: int, studio_id: int):
+        row = _file_or_404(file_id)
+        manual.remove_file_studio(_canonical_checksum(row['checksum']), studio_id)
         return {'ok': True}
 
     @app.post('/api/sets/{set_id}/locations')
