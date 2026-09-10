@@ -2206,6 +2206,16 @@ def create_app(data_root: str) -> FastAPI:
             c['has_age_estimate'] = c['checksum'] in estimated
         return {'cards': page_cards, 'total': len(instances), 'offset': offset, 'limit': limit}
 
+    @app.get('/api/person/{name}/shared-with/{other}')
+    def api_person_shared_with(name: str, other: str):
+        """File ids for the photos/videos that both `name` and `other` appear in —
+        seeds the browsable watch-queue behind the "N together" link in /person's
+        Friends strip. Shared checksums (see ManualDB.get_shared_checksums) are
+        resolved to current file rows; any whose file is gone is skipped."""
+        checksums = manual.get_shared_checksums(name, other)
+        file_ids = [r['id'] for r in db.get_files_by_checksums(checksums)]
+        return {'file_ids': file_ids, 'count': len(file_ids)}
+
     @app.get('/find_all_faces', response_class=HTMLResponse)
     def find_all_faces_page(request: Request):
         """Global unidentified-faces swipe stream (was an inline section on /faces):

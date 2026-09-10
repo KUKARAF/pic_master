@@ -3727,6 +3727,23 @@
       });
   }
 
+  /* "N together" in /person's Friends strip — open the photos/videos this person
+     and the friend both appear in as a browsable watch-queue, starting at the
+     first. Reuses the same openMatchesAsQueue flow as the find-similar buttons. */
+  document.querySelectorAll('.friend-shared-link').forEach(function (el) {
+    el.addEventListener('click', function () {
+      var person = el.dataset.person, friend = el.dataset.friend;
+      if (!person || !friend) return;
+      openMatchesAsQueue({
+        el: el,
+        url: '/api/person/' + encodeURIComponent(person) + '/shared-with/' + encodeURIComponent(friend),
+        label: 'Shared with ' + friend,
+        extractIds: function (data) { return data.file_ids || []; },
+        onEmpty: function () { if (window.showToast) showToast('No shared photos'); },
+      });
+    });
+  });
+
   /* Face 🔎 — similar faces. Looser 0.3 threshold: same-person crops often land
      ~0.35-0.45, and this is a browse-and-skip queue (restores the reach of the
      old "expand similar" slider we removed). */

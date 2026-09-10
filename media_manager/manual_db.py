@@ -3052,6 +3052,27 @@ class ManualDB(ThreadLocalDB):
         ''', (name, name, limit))
         return [(r[0], r[1]) for r in cur.fetchall()]
 
+    def get_shared_checksums(self, name_a, name_b):
+        """Checksums where BOTH `name_a` and `name_b` are present — the photos/videos
+        the two people share, backing the "N together" browse-queue link on /person.
+        Presence mirrors get_cooccurring_identities: a named face on a checksum OR a
+        whole-photo identity assignment (so a video, credited whole-photo rather than
+        as face crops, still counts). Each shared checksum is returned once. Returns
+        checksums; resolve to current file_id/path via Database.get_files_by_checksums."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            WITH presence AS (
+                SELECT DISTINCT checksum, identity FROM faces
+                WHERE identity IS NOT NULL AND rejected = 0
+                UNION
+                SELECT checksum, identity FROM identity_photo_assignments
+            )
+            SELECT DISTINCT a.checksum
+            FROM presence a JOIN presence b ON a.checksum = b.checksum
+            WHERE a.identity = ? AND b.identity = ?
+        ''', (name_a, name_b))
+        return [r[0] for r in cur.fetchall()]
+
     def get_identity_summary(self):
         """One row per unique identity — (identity, count, last_modified, ref,
         checksum) — for the single unique-faces grid on /faces. count and
