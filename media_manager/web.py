@@ -630,8 +630,7 @@ def create_app(data_root: str) -> FastAPI:
     os.makedirs(thumbs_dir, exist_ok=True)
 
     # Import here so the module can be imported without heavy deps loaded
-    from media_manager.database import (
-        Database, FACE_CANDIDATE_FLOOR, FACE_CANDIDATE_K, FACE_NORM_VERSION)
+    from media_manager.database import Database, FACE_NORM_VERSION
     from media_manager.error_log import ErrorLog
     from media_manager.manual_db import ManualDB
 
@@ -2248,7 +2247,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/find_all_faces', response_class=HTMLResponse)
     def find_all_faces_page(request: Request):
         """Global unidentified-face review: for every unnamed face, WHO is this —
-        an A/B pick over that face's own stored candidate ranking (see
+        an A/B pick between the people that face actually resembles (see
         /api/face-review/next), not a yes/no on a single guess."""
         return templates.TemplateResponse(request, 'find_all_faces.html', {
             'all_tags': manual.list_all_tags(),
@@ -2652,10 +2651,9 @@ def create_app(data_root: str) -> FastAPI:
     # live rows-sent + per-kind timings so /stats-style UI can show the ~1 GB transfer.
     imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'total': 0,
                       'seconds': 0.0, 'results': None, 'error': None}
-    # The one face-scoring worker's job state (see rescore_faces): materializes every
-    # face's top-K identities into face_candidates, which is what every review query
-    # reads. 'scored' is how many faces the last run wrote.
-    face_scoring_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'scored': 0}
+    # Precompute each unidentified face's closest known person (for /find_all_faces).
+    # 'scored' is how many faces the last run wrote.
+    face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'scored': 0}
     # Re-normalization backfill: re-embed already-detected faces through the current
     # in-plane rotation pipeline ('changed' = rows actually rewritten).
     renormalize_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'changed': 0}
@@ -3986,52 +3984,41 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/match-faces/start')
     def api_match_faces_start(threshold: float = None, include_trashed: bool = False):
-        """Promote every confidently-matched unnamed face in the library — the
-        library-wide version of the auto-match api_detect_faces already does per photo.
-        `threshold` (cosine, 0..1) overrides the default AUTO_MATCH_THRESHOLD so the
-        /bulk page can dial confidence up or down.
-
-        It owns no ranking: it runs the one scoring worker and then reads the
-        already-materialized best candidate per face above the threshold. Cheaper than
-        the old per-face dot product against the named matrix, and consistent with what
-        review shows by construction — the two used to be able to disagree about who a
-        face is."""
-        from media_manager.manual_db import AUTO_MATCH_THRESHOLD
-
+        """Match every not-yet-named auto-detected face against known identities and
+        promote the confident hits — the library-wide version of the auto-match that
+        api_detect_faces already does per photo. `threshold` (cosine, 0..1) overrides the
+        default AUTO_MATCH_THRESHOLD so the /bulk page can dial confidence up or down.
+        Needs no model: find_matching_identity is a dot-product against the cached
+        named-face matrix, so this is fast and never touches the worker."""
         if match_faces_job['running']:
             return {'started': False, 'message': 'Face matching already running.'}
-        cut = AUTO_MATCH_THRESHOLD if threshold is None else max(0.0, min(1.0, threshold))
-        # A pre-rescore estimate so the ⚡ runner has a bar to draw immediately; the job
-        # replaces it with the exact count once scoring has caught up.
-        match_faces_job.update(running=True, done=0, matched=0, error=None,
-                               total=db.count_unmatched_face_candidates(cut))
+        pool = _drop_trashed(_unpromoted_auto_faces(limit=None), include_trashed, fid_pos=1)
+        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, error=None)
 
         def _run():
             try:
-                # Fresh scores first: a face detected since the last run has no stored
-                # candidates at all, and the incremental path makes this cheap.
-                rescore_faces()
-                pool = _drop_trashed(
-                    db.get_unmatched_face_candidates(cut, db.count_unmatched_face_candidates(cut)),
-                    include_trashed, fid_pos=1)
-                match_faces_job['total'] = len(pool)
+                # One file_id -> checksum lookup per hit is fine (hits are the rare
+                # case); get_file_by_id is a single indexed row read.
                 done = 0
                 matched = 0
-                for face_id, file_id, _path, bbox, _angle, identity, _score in pool:
+                for face_id, file_id, _path, bbox, emb_bytes in pool:
                     done += 1
                     match_faces_job['done'] = done
-                    # One file_id -> checksum lookup per hit is fine (every row here IS
-                    # a hit); get_file_by_id is a single indexed row read.
+                    if not emb_bytes:
+                        continue
+                    name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
+                    if name is None:
+                        continue
                     file_row = db.get_file_by_id(file_id)
                     if file_row is None:
                         continue
-                    emb_bytes = db.get_face_embedding(face_id)
-                    if not emb_bytes:
-                        continue
-                    manual.promote_auto_face(face_id, file_row['checksum'], json.loads(bbox),
-                                             emb_bytes, identity, None, None)
+                    manual.promote_auto_face(
+                        face_id, file_row['checksum'], json.loads(bbox), emb_bytes,
+                        name, None, None)
+                    # Keep media.db's handled mirror in step with the new decision
+                    # (see _confirm_auto_face).
                     db.mark_faces_handled([face_id])
-                    _link_face_match_to_video(file_row['checksum'], identity)
+                    _link_face_match_to_video(file_row['checksum'], name)
                     matched += 1
                     match_faces_job['matched'] = matched
             except Exception as exc:
@@ -6231,25 +6218,41 @@ def create_app(data_root: str) -> FastAPI:
         manual.save_age_estimates(checksum, results, MODEL_ID)
         return {'results': results}
 
-    # Cosine similarity above this, an unidentified face is offered as a match for an
-    # already-known person (embeddings are pre-normalized by InsightFace). It sits
-    # deliberately above database.FACE_CANDIDATE_FLOOR: the table stores a deeper tail
-    # than review wants to be asked about, so the floor is what gets KEPT and this is
-    # what gets SHOWN.
+    # Cosine similarity above this, an unidentified face is suggested as a match
+    # for an already-known person (embeddings are pre-normalized by InsightFace).
     SUGGEST_THRESHOLD = 0.45
 
-    def _stored_suggestions(face_ids):
-        """{face_id: {'name', 'score'}} for faces whose best stored candidate clears
-        SUGGEST_THRESHOLD — one batched read of the materialized top-K, never a matmul
-        (see rescore_faces). Faces with nothing stored are simply absent."""
-        out = {}
-        for face_id, candidates in db.get_candidates_for_faces(face_ids).items():
-            if not candidates:
+    # Below this a name isn't worth showing at all — the per-face candidate lists and
+    # the rival warning stop here instead of padding themselves with everyone in the
+    # library. Deliberately looser than SUGGEST_THRESHOLD: this is what gets LISTED
+    # beside a card, not what gets offered as the card's own answer.
+    CANDIDATE_FLOOR = 0.30
+    # The review UI walks its candidate list one name at a time, so a longer list than
+    # this is never read; it also caps what a `limit` query param can ask for.
+    CANDIDATE_LIST_MAX = 25
+
+    def _suggest_names(unidentified_rows):
+        """Given (face_id, file_id, path, bbox, embedding) rows, return
+        {face_id: {'name': str, 'score': float}} for rows whose embedding is
+        close to an already-named face — lets a repeat appearance of a known
+        person be confirmed with one click instead of retyping their name."""
+        named = manual.get_named_face_embeddings()
+        if not named:
+            return {}
+        import numpy as np
+        names = [n for n, _ in named]
+        matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
+        suggestions = {}
+        for row in unidentified_rows:
+            face_id, emb_bytes = row[0], row[4]
+            if not emb_bytes:
                 continue
-            name, score, _rank = max(candidates, key=lambda c: c[1])
-            if score >= SUGGEST_THRESHOLD:
-                out[face_id] = {'name': name, 'score': round(float(score), 3)}
-        return out
+            vec = np.frombuffer(emb_bytes, dtype=np.float32)
+            scores = matrix.dot(vec)
+            best_idx = int(scores.argmax())
+            if scores[best_idx] >= SUGGEST_THRESHOLD:
+                suggestions[face_id] = {'name': names[best_idx], 'score': round(float(scores[best_idx]), 3)}
+        return suggestions
 
     def _unpromoted_auto_faces(limit=200):
         promoted = manual.get_promoted_source_ids()
@@ -6504,17 +6507,17 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/faces')
     def api_list_faces():
-        """Unnamed auto-detected faces + every known identity, with each face's best
-        stored candidate attached (see _stored_suggestions)."""
+        """Unnamed auto-detected faces + every known identity, each face carrying the
+        closest already-named person when one is close enough (see _suggest_names)."""
         unidentified = _unpromoted_auto_faces(limit=200)
         identities = manual.get_all_identities()
-        candidates = _stored_suggestions([r[0] for r in unidentified])
+        suggestions = _suggest_names(unidentified)
         return {
             'faces': [
                 {
                     'id': f"auto:{r[0]}", 'file_id': r[1], 'path': r[2], 'bbox': r[3],
-                    'candidate': candidates.get(r[0], {}).get('name'),
-                    'candidate_score': candidates.get(r[0], {}).get('score'),
+                    'suggested_name': suggestions.get(r[0], {}).get('name'),
+                    'suggested_score': suggestions.get(r[0], {}).get('score'),
                 }
                 for r in unidentified
             ],
@@ -6555,10 +6558,10 @@ def create_app(data_root: str) -> FastAPI:
                 # differing only by case rather than actually combining them.
                 new_name = variant['identity']
         manual.rename_identity(name, new_name)
-        # The materialized top-K keys its candidates by name, so a rename has to reach
-        # into it too. Renaming the rows in place beats a full rescore that would
-        # compute the exact same scores back.
-        db.rename_face_candidates(name, new_name)
+        # Stored suggestions carry the identity by name, so a rename has to reach into
+        # them too — rewriting those rows beats a full recompute that would produce the
+        # exact same scores back under a new name.
+        db.rename_face_suggestions(name, new_name)
         return {'name': new_name}
 
     @app.get('/api/identities/{name}/aliases')
@@ -6602,11 +6605,6 @@ def create_app(data_root: str) -> FastAPI:
             # must never come back as "unidentified" — so these stay handled; this just
             # keeps the mirror truthful without waiting for the next sync_handled.
             db.mark_faces_handled(handled_ids)
-        if unassigned:
-            # Every row cleared here WAS a reference vector for `name`. Losing a
-            # reference can only LOWER scores, which no incremental merge can express,
-            # so the stored top-K stays optimistic until a full rescore runs.
-            db.bump_scoring_generation()
         return {'unassigned': unassigned}
 
     @app.post('/api/identities/{name}/assign-set')
@@ -6711,13 +6709,10 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/identities/{name}/similar-faces')
     def api_similar_unknown_faces(name: str, threshold: float = SUGGEST_THRESHOLD, limit: int = 20):
-        """The "expand the similar search" control on a person page — and the one
-        face-matching path that deliberately keeps a LIVE full-library scan instead of
-        reading the materialized top-K. It has to: the caller can drop `threshold`
-        below FACE_CANDIDATE_FLOOR, where nothing is stored at all, and the stored
-        top-K deliberately hides a face that K other people match better — which is
-        exactly the face someone digging for a missed appearance is hunting for.
-        Every other ranking in the app goes through rescore_faces."""
+        """The "expand the similar search" control on a person page: a live scan of
+        the still-unnamed pool against this one person's confirmed faces, so the
+        caller can drop `threshold` below what the review stream offers and dig for a
+        missed appearance."""
         threshold = max(0.0, min(1.0, threshold))
         return {'results': _find_similar_unknown_faces(name, threshold, limit=limit)['results']}
 
@@ -6823,23 +6818,21 @@ def create_app(data_root: str) -> FastAPI:
         angle = _norm_angle(float(res.get('angle') or 0.0) - 90.0 * rotate)
         return (emb / norm if norm else emb), angle
 
-    def _identity_candidates(face_ref, rotate=0, limit=FACE_CANDIDATE_K):
+    def _identity_candidates(face_ref, rotate=0, limit=8):
         """The ranked "who is this?" list for ONE face:
         {ref, file_id, rotation, angle, candidates: [{name, score, ref}, ...]}.
 
-        `rotate == 0` on an auto face reads its STORED top-K — the same materialized
-        rows every review query uses, so no matmul runs at all. A non-zero `rotate` has
-        no stored ranking by definition (the stored one belongs to the un-rotated
-        vector), so it re-embeds and ranks live; a manual face has no row in
-        face_candidates (that table keys media.db ids) and ranks live too. Each name
-        carries a representative face ref so the UI can show that person's own crop."""
+        Always live: one vector against manual's cached named-face matrix is a single
+        dot product, so there is nothing a stored ranking could save here — and a
+        non-zero `rotate` has no stored answer by definition, since it re-embeds the
+        face at a different orientation. Each name carries a representative face ref
+        so the UI can show that person's own crop."""
         import numpy as np
         info = _face_row_info(face_ref)
         if info is None:
             raise HTTPException(status_code=404, detail='Face not found')
         file_row, _bbox_json, emb_bytes, stored_rotation, angle = info
-        kind, raw_id = _parse_face_ref(face_ref)
-        limit = max(1, min(limit, FACE_CANDIDATE_K))
+        limit = max(1, min(limit, CANDIDATE_LIST_MAX))
         rotate = (rotate or 0) % 4
         # `rotation` names the orientation this RANKING belongs to, not just the face's
         # saved one — a client that fires a re-rank per rotate keypress needs it to
@@ -6847,32 +6840,20 @@ def create_app(data_root: str) -> FastAPI:
         out = {'ref': face_ref, 'file_id': file_row['id'], 'rotation': rotate or stored_rotation,
                'angle': round(float(angle), 2), 'candidates': []}
 
-        ranked = None
-        if rotate == 0 and kind == 'auto':
-            stored = db.get_candidates_for_faces([raw_id]).get(raw_id, [])
-            ranked = sorted(((identity, float(score)) for identity, score, _rank in stored),
-                            key=lambda c: -c[1])
-        if ranked is None:
-            query = _rotated_face_embedding(face_ref, rotate)[0] if rotate else None
-            if query is None:
-                if not emb_bytes:
-                    return out
-                query = np.frombuffer(emb_bytes, dtype=np.float32)
-            refs = _reference_matrix(manual.get_named_face_embeddings())
-            if refs is None:
+        query = _rotated_face_embedding(face_ref, rotate)[0] if rotate else None
+        if query is None:
+            if not emb_bytes:
                 return out
-            names, starts, matrix = refs
-            # Same reduceat trick the bulk scorer uses, one face wide: collapse each
-            # person's several reference vectors to their best score.
-            best = np.maximum.reduceat(matrix @ query, starts)
-            ranked = sorted(zip(names, (float(v) for v in best)), key=lambda c: -c[1])
-
+            query = np.frombuffer(emb_bytes, dtype=np.float32)
+        identities, matrix = manual.get_named_face_matrix()
+        if not identities or matrix.size == 0 or matrix.shape[1] != query.shape[0]:
+            return out
         reps = manual.get_identity_reference_faces()
         out['candidates'] = [
-            {'name': name, 'score': round(score, 3),
+            {'name': name, 'score': score,
              'ref': None if reps.get(name) is None else 'manual:%d' % reps[name]}
-            for name, score in ranked if score >= FACE_CANDIDATE_FLOOR
-        ][:limit]
+            for name, score in _rank_identities(matrix @ query, identities, limit)
+        ]
         return out
 
     @app.get('/api/faces/{face_id}/suggestions')
@@ -6882,7 +6863,7 @@ def create_app(data_root: str) -> FastAPI:
         return {'suggestions': _identity_candidates(face_id, rotate, limit=5)['candidates']}
 
     @app.get('/api/faces/{face_ref}/candidates')
-    def api_face_candidates(face_ref: str, rotate: int = 0, limit: int = 8):
+    def api_identity_candidates(face_ref: str, rotate: int = 0, limit: int = 8):
         """The identity-review UI's arrow-key candidate list for one face, plus the
         rotation/angle it should render the crop at. `rotate` (0..3 quarter-turns
         clockwise) re-embeds and re-ranks live, so the reviewer can fix an
@@ -6951,242 +6932,45 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     # ------------------------------------------------------------------
-    # Face scoring: the ONE face-vs-people matmul in the app, materialized
-    # into media.db's face_candidates, plus the review streams that read it.
+    # Tinder-style face-suggestion card stack (swipe to confirm/reject)
     # ------------------------------------------------------------------
 
-    # Where the incremental-rescore watermark lives. In media.db rather than in
-    # process memory so restarting the web server doesn't cost a full library
-    # rescore; keyed alongside the generation it was measured at, because a
-    # generation bump is exactly the statement "every stored score is suspect".
-    _WATERMARK_KEY = 'named_watermark'
-    _WATERMARK_GEN_KEY = 'named_watermark_generation'
+    def compute_face_suggestions(progress=None):
+        """Precompute each still-unidentified face's closest known person + score into
+        faces.suggested_identity/suggested_score — chunked + vectorized (one matmul per
+        chunk against the named-face matrix), so /find_all_faces reads the top matches
+        instantly instead of re-scanning ~227k faces on every buffer refill. Only touches
+        faces with a NULL score (new ones); db.clear_face_suggestions() first for a full
+        refresh after the named set changes. Returns how many were scored; 0 if there are
+        no named faces to match against.
 
-    def _named_watermark(generation):
-        """The highest manual-face id that every face has already been scored against,
-        or None when that can't be proven — no run has completed, or the stored
-        watermark belongs to a superseded generation. None means "no incremental
-        shortcut is valid", which callers turn into a full pass."""
-        stored_gen = db.get_scoring_meta(_WATERMARK_GEN_KEY)
-        if stored_gen is None or int(stored_gen) != generation:
-            return None
-        stored = db.get_scoring_meta(_WATERMARK_KEY)
-        return None if stored is None else int(stored)
-
-    def _reference_matrix(named_rows):
-        """Pack [(identity, embedding_bytes, ...), ...] into (identities, group_starts,
-        matrix): matrix[i] is ONE reference vector, rows sorted so all of a person's
-        vectors are contiguous. That contiguity is the point — it lets the scorer
-        collapse R reference columns into P per-identity columns with a single
-        np.maximum.reduceat, instead of a Python group-by per face. None when there's
-        nothing usable to score against."""
+        This is the one direction that earns a precompute: "for each unknown face, who
+        is it?" is the whole pool against every named face. "Which unknown faces are
+        Alice?" is one person wide and is scanned live instead — see
+        _next_face_suggestions' identity_filter branch."""
         import numpy as np
-        rows = sorted((r for r in named_rows if r[1]), key=lambda r: r[0])
-        if not rows:
-            return None
-        dim = len(rows[0][1]) // 4
-        # manual.db already drops empty/wrong-length blobs; this keeps a single odd row
-        # from blowing up the reshape below regardless of who else grows a writer.
-        rows = [r for r in rows if len(r[1]) == dim * 4]
-        matrix = np.frombuffer(b''.join(r[1] for r in rows), dtype=np.float32).reshape(len(rows), dim)
-        names, starts = [], []
-        for i, row in enumerate(rows):
-            if not names or names[-1] != row[0]:
-                names.append(row[0])
-                starts.append(i)
-        return names, np.asarray(starts, dtype=np.intp), matrix
-
-    # The scorer's intermediate is (faces_in_block x reference_vectors) float32, and
-    # the reference count is the number of confirmed FACES, not people — tens of
-    # thousands on a well-labelled library. A fixed 5000-face block therefore silently
-    # scales its own memory with the label count: 5000 x 50k floats is a 1 GB spike,
-    # inside the web process, on the low-RAM host that offloads its models precisely to
-    # avoid that. Size the block against R instead so the intermediate stays bounded.
-    SCORE_BLOCK_CELLS = 25_000_000          # ~100 MB of float32
-    SCORE_BLOCK_MIN, SCORE_BLOCK_MAX = 256, 5000
-
-    def _score_block(refs):
-        rows = max(1, refs[2].shape[0])
-        return max(SCORE_BLOCK_MIN, min(SCORE_BLOCK_MAX, SCORE_BLOCK_CELLS // rows))
-
-    def _top_candidates(cand, refs):
-        """Per-face top-K identities for an (N, D) block of face vectors. One BLAS
-        matmul (which RELEASES the GIL, so a library-wide rescore doesn't stall every
-        other request), reduceat to collapse each person's several reference vectors to
-        their best, then argpartition to pick the K winners without fully sorting all P
-        identities. Returns [[(identity, score), ...], ...] score-descending, floored at
-        FACE_CANDIDATE_FLOOR — an empty list for a face that resembles nobody."""
-        import numpy as np
-        names, starts, matrix = refs
-        per_identity = np.maximum.reduceat(cand @ matrix.T, starts, axis=1)   # N×P
-        k = min(FACE_CANDIDATE_K, per_identity.shape[1])
-        idx = np.argpartition(-per_identity, k - 1, axis=1)[:, :k]
-        vals = np.take_along_axis(per_identity, idx, axis=1)
-        order = np.argsort(-vals, axis=1)
-        idx = np.take_along_axis(idx, order, axis=1)
-        vals = np.take_along_axis(vals, order, axis=1)
-        out = []
-        for r in range(vals.shape[0]):
-            row = []
-            for c in range(k):
-                score = float(vals[r, c])
-                if score < FACE_CANDIDATE_FLOOR:
-                    break      # score-descending, so everything after it is below too
-                row.append((names[int(idx[r, c])], score))
-            out.append(row)
-        return out
-
-    def rescore_faces(progress=None, full=False):
-        """THE single face-vs-people matmul in the app: each face's best
-        FACE_CANDIDATE_K identities, materialized into media.db's face_candidates so
-        that every reader — the global review pool, the per-person stream, the rival
-        warning, the review UI's arrow-key candidate list — is a plain indexed SELECT
-        instead of its own library-wide scan.
-
-        Incremental by default, and that invariant is the whole reason review stays
-        interactive: confirming a face ADDS a reference vector, and an added reference
-        vector can only ever RAISE a face's score for that identity — it can never
-        lower an existing one. So when the named set has only grown since the last
-        completed run (max_named_face_id advanced at an unchanged scoring generation),
-        scoring every face against ONLY the new vectors and merging the result into its
-        stored top-K is EXACTLY equal to a full rescore, for a tiny fraction of the
-        work. Without that, every single confirm would dirty all ~227k faces.
-
-        Anything that can LOWER a stored score — rename onto another person, unassign,
-        re-embed — bumps the scoring generation instead, which forces the full path.
-
-        `progress(done, total)` is called as chunks land; returns how many faces were
-        scored (0 when nobody is named yet, so there is nothing to score against)."""
-        import numpy as np
-        # The pool must never serve a face manual.db already has a decision for, and
-        # this is the one place that reconciles the mirror in bulk: self-healing, so a
-        # crashed request or an out-of-band manual.db edit can't clog review forever.
+        # The pool must never offer a face manual.db already has a decision for, and
+        # this is the one job that walks the whole library: reconcile the handled
+        # mirror in bulk here, so a crashed request or an out-of-band manual.db edit
+        # can't clog review forever. Every inline writer keeps it truthful meanwhile.
         db.sync_handled(manual.get_promoted_source_ids())
-
-        if full:
-            generation, watermark = db.bump_scoring_generation(), None
-        else:
-            generation = db.get_scoring_generation()
-            watermark = _named_watermark(generation)
-            if watermark is None:
-                # No completed run at this generation (fresh DB, or a bump whose run
-                # never finished). A bump makes every face stale again, which is the
-                # full pass we need — and on a never-scored DB (faces.score_version and
-                # the generation both at their initial value) it's the only way any
-                # face is selectable at all.
-                generation = db.bump_scoring_generation()
-        # Read the watermark BEFORE the reference rows: a confirm landing mid-run then
-        # looks "new" to the NEXT run instead of being silently skipped by both.
-        max_named = manual.max_named_face_id()
-
-        full_refs = _reference_matrix(manual.get_named_face_embeddings())
-        if full_refs is None:
+        named = manual.get_named_face_embeddings()
+        if not named:
             return 0
-        incremental = watermark is not None and max_named > watermark
-
-        # Faces never scored at this generation get the full matrix; the incremental
-        # pass then re-visits EVERY face (generation + 1 selects them all, since no face
-        # can carry a score_version above the current generation) to merge in the new
-        # reference vectors. Re-merging a face the first pass just wrote is harmless —
-        # merging a score it already holds is a no-op — so the two passes need no
-        # bookkeeping between them.
-        total = db.count_faces_to_score(generation)
-        if incremental:
-            total += db.count_faces_to_score(generation + 1)
+        names = [n for n, _ in named]
+        named_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])  # K×D
         done = 0
-
-        def _pass(target_generation, refs, merge):
-            nonlocal done
-            for face_ids, vecs in db.iter_faces_to_score(target_generation,
-                                                          chunk=_score_block(refs)):
-                cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)
-                if cand.shape[1] != refs[2].shape[1]:
-                    # Dim mismatch = an embedding from a different model. Write it out
-                    # as "matches nobody" rather than skipping it, so the chunk still
-                    # advances its score_version and the pending count can reach zero.
-                    ranked = [[] for _ in face_ids]
-                else:
-                    ranked = _top_candidates(cand, refs)
-                rows = {face_ids[i]: ranked[i] for i in range(len(face_ids))}
-                if merge:
-                    db.merge_face_candidates(rows, generation)
-                else:
-                    db.replace_face_candidates(rows, generation)
-                done += len(face_ids)
-                if progress:
-                    progress(done, total)
-
-        _pass(generation, full_refs, merge=False)
-        if incremental:
-            new_refs = _reference_matrix(manual.get_named_face_embeddings_since(watermark))
-            if new_refs is not None:
-                _pass(generation + 1, new_refs, merge=True)
-        # Only now, with every face scored against every reference vector up to
-        # max_named, is the watermark true.
-        db.set_scoring_meta(_WATERMARK_KEY, max_named)
-        db.set_scoring_meta(_WATERMARK_GEN_KEY, generation)
+        for face_ids, vecs in db.iter_unsuggested_faces(chunk=5000):
+            cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)  # N×D
+            scores = cand @ named_matrix.T  # N×K — one BLAS matmul, not a Python loop
+            best = scores.argmax(axis=1)
+            best_scores = scores[np.arange(len(face_ids)), best]
+            db.set_face_suggestions([(names[int(best[i])], float(best_scores[i]), face_ids[i])
+                                     for i in range(len(face_ids))])
+            done += len(face_ids)
+            if progress:
+                progress(done)
         return done
-
-    def _faces_pending_scoring():
-        """How many faces the NEXT rescore_faces() run would touch — the live "scoring
-        is stale" signal the review pages key their empty state off (a job's done/total
-        only describe the run that is/was in this process). Mirrors rescore_faces' own
-        arithmetic: with no usable watermark a run bumps the generation, so every face
-        is pending; with one, the not-yet-scored faces are, plus every face again when
-        the named set has grown since."""
-        generation = db.get_scoring_generation()
-        watermark = _named_watermark(generation)
-        if watermark is None:
-            return db.count_faces_to_score(generation + 1)
-        pending = db.count_faces_to_score(generation)
-        if manual.max_named_face_id() > watermark:
-            pending += db.count_faces_to_score(generation + 1)
-        return pending
-
-    # (identity, scoring generation, named-set watermark) already given the one-person
-    # treatment. Without this, an identity whose matches are all filtered out downstream
-    # — every hit on a since-deleted file, or every one already rejected — looks
-    # perpetually unscored to the caller and re-runs a multi-second library scan on
-    # every single buffer refill.
-    _identity_fast_scored = set()
-
-    def score_identity_now(identity):
-        """Score the whole library against ONE person, right now, and store it.
-
-        /find-person/<name> needs one column of the top-K matrix, and waiting for the
-        other thousands is the difference between five seconds and ten minutes: the
-        global pass costs faces x EVERY confirmed face (227k x 50k measured at ~456s),
-        while one person's own vectors are R=50-ish — 3.9s to stream the embeddings
-        plus 0.5s of matmul. Making the page wait on the global run was the reason
-        opening a person's search sat on 'searching' behind a progress bar.
-
-        Merged in WITHOUT advancing score_version: this fills that person's entry in
-        each face's top-K so the page can be served, but every face still owes the
-        global pass before its rivals (and therefore the hide-rivals filter) mean
-        anything. Returns how many faces were scored."""
-        import numpy as np
-        refs = _reference_matrix([(identity, emb) for emb
-                                  in manual.get_embeddings_for_identity(identity)])
-        if refs is None:
-            return 0
-        generation = db.get_scoring_generation()
-        scored = 0
-        for face_ids, vecs in db.iter_unhandled_face_embeddings(chunk=_score_block(refs)):
-            cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)
-            if cand.shape[1] != refs[2].shape[1]:
-                continue
-            best = (cand @ refs[2].T).max(axis=1)
-            rows = {}
-            for i, face_id in enumerate(face_ids):
-                score = float(best[i])
-                # Only rows at or above the floor: a merge that carried sub-floor
-                # entries would push real candidates out of the top-K.
-                if score >= FACE_CANDIDATE_FLOOR:
-                    rows[face_id] = [(identity, score)]
-            if rows:
-                db.merge_face_candidates(rows, generation, advance_version=False)
-            scored += len(face_ids)
-        return scored
 
     # A candidate whose face matches somebody ELSE this much better is a question with
     # a wrong answer ("is this Alice? 0.50" on a face that matches Bob at 0.74), so it
@@ -7194,110 +6978,176 @@ def create_app(data_root: str) -> FastAPI:
     # call and still worth showing.
     RIVAL_MARGIN = 0.02
 
+    def _score_cards_against_named(cards):
+        """(pairs, identities): every card with a usable embedding paired with its row
+        of cosine scores against EVERY named reference face, plus the identity behind
+        each column (manual.get_named_face_matrix is cached and write-invalidated, so
+        this costs no SQL on the hot path).
+
+        One matmul for the whole buffer — tens of faces by R references — which is the
+        reason the rival warning and the candidate lists can be live AND exact: they
+        are only ever asked about the handful of cards actually being shown, never
+        about the library. A card whose blob is missing or came from another model is
+        simply absent from `pairs`; ([], []) when nobody is named yet."""
+        import numpy as np
+        identities, matrix = manual.get_named_face_matrix()
+        if not cards or not identities or matrix.size == 0:
+            return [], []
+        blobs = db.get_embeddings_for_faces([c['face_id'] for c in cards])
+        usable = [c for c in cards
+                  if len(blobs.get(c['face_id'], b'')) == matrix.shape[1] * 4]
+        if not usable:
+            return [], []
+        cand = np.frombuffer(b''.join(blobs[c['face_id']] for c in usable),
+                             dtype=np.float32).reshape(len(usable), matrix.shape[1])
+        return list(zip(usable, cand @ matrix.T)), identities
+
+    def _rank_identities(scores, identities, limit, floor=CANDIDATE_FLOOR):
+        """The best `limit` DISTINCT people for one face's row of per-reference-face
+        scores, as [(name, score), ...] best first. A person owns many reference
+        faces, so the same name recurs down the sorted row and only its first (best)
+        hit counts. The walk stops at `floor`, which also bounds it: everything past
+        the first sub-floor entry is sub-floor too."""
+        import numpy as np
+        ranked, seen = [], set()
+        for j in np.argsort(-scores):
+            score = float(scores[j])
+            if score < floor:
+                break
+            name = identities[j]
+            if name in seen:
+                continue
+            seen.add(name)
+            ranked.append((name, round(score, 3)))
+            if len(ranked) >= limit:
+                break
+        return ranked
+
     def _attach_rivals(cards):
-        """Fill each card's `rival`/`rival_score` from the face's own stored top-K: the
-        best-scoring identity OTHER than the one being offered, or None. The other
-        ranks of the same face already ARE the cross-person competition, so this costs
-        one batched read — which is why storing top-K instead of just the argmax is
-        what finally made this warning possible."""
-        by_face = db.get_candidates_for_faces([c['face_id'] for c in cards])
+        """Fill each card's `rival`/`rival_score`: the best-scoring identity OTHER than
+        the one being offered, or None when nobody else comes near (CANDIDATE_FLOOR).
+        Computed exactly, right here, for just these cards — so the warning works on a
+        library whose suggestions have never been computed at all."""
         for card in cards:
-            rival, rival_score = None, None
-            for identity, score, _rank in by_face.get(card['face_id'], []):
-                if identity == card['identity']:
-                    continue
-                if rival_score is None or score > rival_score:
-                    rival, rival_score = identity, float(score)
-            card['rival'] = rival
-            card['rival_score'] = None if rival_score is None else round(rival_score, 3)
+            card['rival'], card['rival_score'] = None, None
+        pairs, identities = _score_cards_against_named(cards)
+        if not pairs:
+            return cards
+        import numpy as np
+        names = np.asarray(identities)
+        for card, row in pairs:
+            others = names != card['identity']
+            if not others.any():
+                continue
+            j = int(np.argmax(np.where(others, row, -np.inf)))
+            best = float(row[j])
+            if best >= CANDIDATE_FLOOR:
+                card['rival'], card['rival_score'] = str(names[j]), round(best, 3)
         return cards
 
     def _attach_candidate_lists(cards, limit):
-        """Give each card the face's stored top-K as [{name, score, ref}] — the ranked
-        choices the A/B review UI steps through with the arrow keys. One batched top-K
-        read plus one representative-face lookup for the whole buffer, never per card."""
-        by_face = db.get_candidates_for_faces([c['face_id'] for c in cards])
-        reps = manual.get_identity_reference_faces()
+        """Give each card its own ranked [{name, score, ref}] — the choices the A/B
+        review UI steps through with the arrow keys — out of the same one matmul, plus
+        one representative-face lookup for the whole buffer rather than per card."""
         for card in cards:
-            ranked = sorted(by_face.get(card['face_id'], []), key=lambda c: -c[1])[:limit]
+            card['candidates'] = []
+        pairs, identities = _score_cards_against_named(cards)
+        if not pairs:
+            return cards
+        reps = manual.get_identity_reference_faces()
+        for card, row in pairs:
             card['candidates'] = [
-                {'name': identity, 'score': round(float(score), 3),
-                 'ref': None if reps.get(identity) is None else 'manual:%d' % reps[identity]}
-                for identity, score, _rank in ranked
+                {'name': name, 'score': score,
+                 'ref': None if reps.get(name) is None else 'manual:%d' % reps[name]}
+                for name, score in _rank_identities(row, identities, limit)
             ]
         return cards
 
     def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None,
                                 identity_filter=None, avoid_existing=True, hide_rivals=True):
-        """Up to `count` review cards, best score first, read straight out of the
-        materialized top-K — in BOTH modes. `identity_filter` scopes the stream to one
-        person (that person at any rank on a face); without it the stream is the global
-        "closest known person per still-unnamed face" pool (rank 0 only). Neither mode
-        scans the library any more: the per-person mode used to re-score every
-        unpromoted face against that person's embeddings on every single buffer refill.
+        """Up to `count` review cards that clear SUGGEST_THRESHOLD, best score first.
 
-        `exclude_refs` filters out faces already sitting in the client's buffer so a
-        refill never repeats a card still in flight. `bias_identity`/`bias` reorder the
-        result after a decision — more of the same person after a confirm, that person
-        pushed to the back after a reject — a sort tweak, not a ranking model. In
-        `identity_filter` mode every card already carries that one identity, so the
-        bias partition has nothing to partition against and is naturally inert; callers
-        in that mode don't bother passing it.
+        The two modes ask genuinely different questions and are answered differently.
+        `identity_filter` asks "which unknown faces are Alice?" — one person's own
+        confirmed embeddings against the unpromoted pool — and is scanned LIVE on
+        every refill, because one person is a few tens of vectors wide and needs
+        nothing precomputed. Without it the stream is the global "closest known person
+        per still-unnamed face" pool, which IS the pool against everybody, and reads
+        the precomputed suggested_identity/suggested_score (see
+        compute_face_suggestions).
 
-        `avoid_existing` (default True, a UI toggle) deprioritizes rather than excludes
-        faces whose photo already has someone named on it (see
-        _deprioritize_files_with_named_face), so covered photos don't crowd out fresh
-        ones but still surface when nothing else qualifies. `hide_rivals` (default
-        True) drops cards whose face matches somebody else better by RIVAL_MARGIN."""
-        # A generous slice: the exclude set is everything the client already holds and
-        # is filtered here rather than in SQL, so the query has to over-fetch past it.
-        fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
+        `exclude_refs` filters out faces already sitting in the client's buffer (not
+        yet swiped) so a refill never hands back a duplicate card. `bias_identity`/
+        `bias` optionally reorder the result: after a same-face confirm we want more of
+        that same person surfaced next; after a reject we want that identity pushed to
+        the back rather than immediately re-suggested — a simple sort tweak, not a new
+        ranking model. In `identity_filter` mode every card already carries that one
+        identity, which makes the reorder naturally inert (the partition has nothing to
+        partition against); that's expected, so callers in that mode don't bother
+        passing bias params.
+
+        `avoid_existing` (default True — a UI toggle, on by default): faces whose photo
+        already has at least one identified person are deprioritized (see
+        _deprioritize_files_with_named_face) rather than excluded, so already-covered
+        photos don't crowd out fresh ones but can still surface if nothing else clears
+        the threshold. `hide_rivals` (default True) drops cards whose face matches
+        somebody else better by RIVAL_MARGIN."""
         cards = []
-        served_stale = False
-        # Both reads come back score-descending from SQL, so nothing re-sorts here.
-        # `rotation` is always 0: a manual quarter-turn only exists once a face has
-        # been named, which is exactly when it leaves this pool.
+        # `rotation` is always 0 on these: a manual quarter-turn only exists once a
+        # face has been named, which is exactly when it leaves this pool.
         if identity_filter is not None:
-            rows = db.get_face_candidates_for_identity(identity_filter, SUGGEST_THRESHOLD, fetch)
-            token = (identity_filter, db.get_scoring_generation(), manual.max_named_face_id())
-            if not rows and token not in _identity_fast_scored and _faces_pending_scoring():
-                # Stale, not empty. Score this ONE person across the library (seconds)
-                # rather than making them wait on the global pass (minutes) — see
-                # score_identity_now. Done inline because the answer is the response;
-                # the token makes it once per person per named-set change, never once
-                # per refill.
-                _identity_fast_scored.add(token)
-                served_stale = True
-                score_identity_now(identity_filter)
-                rows = db.get_face_candidates_for_identity(identity_filter,
-                                                           SUGGEST_THRESHOLD, fetch)
-            for face_id_, file_id_, _path, _bbox, angle, score, _rank in rows:
-                ref = 'auto:%d' % face_id_
-                if ref in exclude_refs:
+            ref_embeddings = manual.get_embeddings_for_identity(identity_filter)
+            if not ref_embeddings:
+                return []
+            import numpy as np
+            matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
+            for face_id_, file_id_, _path, _bbox, emb_bytes in _unpromoted_auto_faces(limit=None):
+                ref = f"auto:{face_id_}"
+                if ref in exclude_refs or not emb_bytes:
                     continue
-                cards.append({'ref': ref, 'face_id': face_id_, 'file_id': file_id_,
-                              'identity': identity_filter, 'score': round(float(score), 3),
-                              'angle': round(float(angle or 0.0), 2), 'rotation': 0})
+                vec = np.frombuffer(emb_bytes, dtype=np.float32)
+                score = float(matrix.dot(vec).max())
+                if score >= SUGGEST_THRESHOLD:
+                    cards.append({'ref': ref, 'face_id': face_id_, 'file_id': file_id_,
+                                  'identity': identity_filter, 'score': round(score, 3),
+                                  'rotation': 0})
+            cards.sort(key=lambda c: -c['score'])
         else:
-            for face_id_, file_id_, _path, _bbox, angle, identity, score in \
-                    db.get_unmatched_face_candidates(SUGGEST_THRESHOLD, fetch):
-                ref = 'auto:%d' % face_id_
-                if ref in exclude_refs:
+            # A generous slice: the exclude set is everything the client already holds
+            # and is filtered here rather than in SQL, so the query has to over-fetch
+            # past it. Rows arrive score-descending and already exclude faces manual.db
+            # has a decision for (faces.handled) — dropping those in Python AFTER the
+            # LIMIT is what used to filter this pool to permanently empty.
+            fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
+            for face_id_, file_id_, _path, _bbox, sug_identity, sug_score in \
+                    db.get_suggested_unidentified_faces(SUGGEST_THRESHOLD, fetch):
+                ref = f"auto:{face_id_}"
+                if ref in exclude_refs or not sug_identity:
                     continue
                 cards.append({'ref': ref, 'face_id': face_id_, 'file_id': file_id_,
-                              'identity': identity, 'score': round(float(score), 3),
-                              'angle': round(float(angle or 0.0), 2), 'rotation': 0})
+                              'identity': sug_identity, 'score': round(float(sug_score), 3),
+                              'rotation': 0})
 
-        _attach_rivals(cards)
-        if hide_rivals:
-            cards = [c for c in cards
-                     if c['rival_score'] is None or c['rival_score'] < c['score'] + RIVAL_MARGIN]
+        # Order first (both of these are pure reordering and need no rival scores),
+        # THEN buy rivals only for the cards near the front. Attaching them to the
+        # whole over-fetched slice would put a 5000-face matmul on every refill —
+        # the same "compare everything with everyone" mistake, one layer up.
         if avoid_existing:
             cards = _deprioritize_files_with_named_face(cards, 'file_id')
         from media_manager.swipe_support import bias_reorder
         cards = bias_reorder(cards, key_fn=lambda c: c['identity'],
                              bias_key=bias_identity, bias_action=bias)
-        return (_attach_file_meta(_collapse_face_cards_to_video(cards[:count])), served_stale)
+        kept, cursor, block = [], 0, max(count * 3, 30)
+        while len(kept) < count and cursor < len(cards):
+            window = cards[cursor:cursor + block]
+            cursor += len(window)
+            _attach_rivals(window)
+            if hide_rivals:
+                window = [c for c in window
+                          if c['rival_score'] is None
+                          or c['rival_score'] < c['score'] + RIVAL_MARGIN]
+            kept.extend(window)
+        return _attach_file_meta(_collapse_face_cards_to_video(kept[:count]))
 
     @app.get('/swipe')
     def swipe_page_redirect():
@@ -7315,15 +7165,14 @@ def create_app(data_root: str) -> FastAPI:
         confirmed faces, for the person-search page's swipe stack. `hide_rivals`
         is the "don't ask me about faces that match someone else better" toggle."""
         exclude_refs = set(body.exclude)
-        cards, served_stale = _next_face_suggestions(
+        cards = _next_face_suggestions(
             count, exclude_refs, bias_identity or None, bias or None,
             identity_filter=identity or None, avoid_existing=avoid_existing,
             hide_rivals=hide_rivals)
-        # `served_stale` matters as much as emptiness: the per-person fast path hands
-        # back real cards while the GLOBAL top-K is still missing, and rivals live in
-        # the global ranks — so a non-empty response can still be the one that has to
-        # get the full run going.
-        return {'cards': cards, 'scoring': _scoring_state(not cards or served_stale)}
+        # Only the GLOBAL pool may kick a precompute: the person-scoped stream scans
+        # the library against that one person itself, so an empty answer there means
+        # empty, and a library-wide pass would not add a single card to it.
+        return {'cards': cards, 'scoring': _suggest_state(not cards, start=not identity)}
 
     @app.post('/api/face-review/next')
     def api_face_review_next(body: SwipeExcludeBody, count: int = 5, avoid_existing: bool = True,
@@ -7331,98 +7180,97 @@ def create_app(data_root: str) -> FastAPI:
         """Buffer for /find_all_faces' A/B identity review: the best-scoring faces in
         the global pool, each with its OWN ranked candidate list (the arrow-key
         choices) and a representative crop ref per candidate — so the reviewer picks a
-        person instead of answering yes/no to one guess. `remaining` is the true pool
-        size, straight from SQL, so the page reports progress instead of guessing."""
+        person instead of answering yes/no to one guess. The pool's ORDER comes from
+        the precompute; each shown card's list is computed live for just that card
+        (see _attach_candidate_lists). `remaining` is the true pool size, straight
+        from SQL, so the page reports progress instead of guessing."""
         exclude_refs = set(body.exclude)
         fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
         cards = []
-        for face_id_, file_id_, _path, _bbox, angle, _identity, _score in \
-                db.get_unmatched_face_candidates(SUGGEST_THRESHOLD, fetch):
+        for face_id_, file_id_, _path, _bbox, _identity, _score in \
+                db.get_suggested_unidentified_faces(SUGGEST_THRESHOLD, fetch):
             ref = 'auto:%d' % face_id_
             if ref in exclude_refs:
                 continue
             cards.append({'ref': ref, 'face_id': face_id_, 'file_id': file_id_,
-                          'rotation': 0, 'angle': round(float(angle or 0.0), 2)})
+                          'rotation': 0})
         if avoid_existing:
             cards = _deprioritize_files_with_named_face(cards, 'file_id')
         cards = cards[:count]
-        _attach_candidate_lists(cards, max(1, min(candidates, FACE_CANDIDATE_K)))
+        _attach_candidate_lists(cards, max(1, min(candidates, CANDIDATE_LIST_MAX)))
         cards = _attach_file_meta(_collapse_face_cards_to_video(cards))
         return {
             'cards': cards,
-            'remaining': db.count_unmatched_face_candidates(SUGGEST_THRESHOLD),
-            'scoring': _scoring_state(not cards),
+            'remaining': db.count_suggested_unidentified_faces(SUGGEST_THRESHOLD),
+            'scoring': _suggest_state(not cards),
         }
 
-    def _start_face_scoring(full=False):
-        """Kick the background scoring run. Returns False when one is already going,
-        so callers never stack two library-wide matmuls on top of each other."""
-        if face_scoring_job['running']:
+    def _start_face_suggestions(full=False):
+        """Kick the background precompute. Returns False when one is already going, so
+        callers never stack two library-wide passes on top of each other."""
+        if face_suggest_job['running']:
             return False
-        face_scoring_job.update(running=True, done=0, total=0, error=None, scored=0)
+        face_suggest_job.update(running=True, done=0, total=0, error=None, scored=0)
 
         def _run():
-            def _progress(done, total):
-                face_scoring_job['done'] = done
-                face_scoring_job['total'] = total
             try:
-                face_scoring_job['scored'] = rescore_faces(progress=_progress, full=full)
+                if full:
+                    db.clear_face_suggestions()
+                face_suggest_job['total'] = db.count_unsuggested_faces()
+                face_suggest_job['scored'] = compute_face_suggestions(
+                    progress=lambda d: face_suggest_job.__setitem__('done', d))
             except Exception as exc:
-                face_scoring_job['error'] = str(exc)
+                face_suggest_job['error'] = str(exc)
             finally:
-                face_scoring_job['running'] = False
+                face_suggest_job['running'] = False
 
         _spawn_job(_run)
         return True
 
-    def _scoring_state(empty_result):
-        """The scoring state to hang on an otherwise-empty stream response — and, when
-        that emptiness is only staleness, the thing that fixes it.
+    def _suggest_state(empty_result, start=True):
+        """The `scoring` block a stream response carries — and, for the global pool,
+        the thing that fixes an emptiness that is only staleness.
 
-        Every review query reads the materialized top-K, so a face that has never been
-        scored is INVISIBLE to them. Naming somebody is exactly when their rows don't
-        exist yet, so "I named a person, opened their search, got an instant nothing"
-        was the default first experience — a silent failure, because an empty pool and
-        an uncomputed pool look identical from SQL. Nothing else ever triggered a run.
-
-        So: report `pending` (live, job-independent) alongside every empty result, and
-        start a run when there genuinely is stale work. Deliberately gated on the
-        result being EMPTY — a confirm makes pending non-zero on every single refill,
-        and kicking a library-wide rescore each time would thrash for no benefit while
-        the buffer is still serving good cards."""
-        pending = _faces_pending_scoring()
-        if empty_result and pending and not face_scoring_job['running']:
-            _start_face_scoring()
+        The global pool IS the precompute, so a face that has never been scored is
+        invisible to it and an uncomputed pool looks exactly like an exhausted one in
+        SQL. Reporting `pending` (live, and independent of any job — done/total are
+        zero again after a restart) is what tells those two apart; starting a run is
+        what resolves it. Gated on an EMPTY result: naming somebody leaves faces
+        pending on every single refill, and kicking a library-wide pass each time
+        would thrash while the buffer is still serving good cards."""
+        pending = db.count_unsuggested_faces()
+        if start and empty_result and pending and not face_suggest_job['running']:
+            _start_face_suggestions()
         return {
-            'running': face_scoring_job['running'],
+            'running': face_suggest_job['running'],
             'pending': pending,
-            'done': face_scoring_job['done'],
-            'total': face_scoring_job['total'],
-            'error': face_scoring_job['error'],
+            'done': face_suggest_job['done'],
+            'total': face_suggest_job['total'],
+            'error': face_suggest_job['error'],
         }
 
     @app.post('/api/face-scoring/start')
     def api_face_scoring_start(full: bool = False):
-        """Run the one scoring worker in the background: every face's top-K identities
-        into face_candidates, which is what every review query reads. Incremental by
-        default (see rescore_faces); `full=1` bumps the scoring generation first and
-        re-ranks the whole library."""
-        _start_face_scoring(full=full)
+        """Precompute the closest known person for every not-yet-scored unidentified
+        face (populates faces.suggested_*), so /find_all_faces can serve instantly.
+        Background job. `full=1` clears + recomputes everyone (use after naming new
+        people); default only scores faces that have no suggestion yet."""
+        _start_face_suggestions(full=full)
         return {'started': True}
 
     @app.get('/api/face-scoring/status')
     def api_face_scoring_status():
         """`pending` is live and independent of the job: how many faces the NEXT run
-        would touch. It's the only way a review page can tell "scoring never ran" apart
-        from "everything is reviewed" — done/total/scored describe the run in THIS
-        process and are all zero after a restart."""
+        would score. It's the only way a review page can tell "the precompute never
+        ran" apart from "everything is reviewed" — done/total/scored describe the run
+        in THIS process and are all zero after a restart."""
         return {
-            'running': face_scoring_job['running'],
-            'done': face_scoring_job['done'],
-            'total': face_scoring_job['total'],
-            'error': face_scoring_job['error'],
-            'scored': face_scoring_job['scored'],
-            'pending': _faces_pending_scoring(),
+            'running': face_suggest_job['running'],
+            'done': face_suggest_job['done'],
+            'total': face_suggest_job['total'],
+            'error': face_suggest_job['error'],
+            'scored': face_suggest_job['scored'],
+            'pending': db.count_unsuggested_faces(),
         }
 
     def _renormalize_faces():
@@ -7486,7 +7334,7 @@ def create_app(data_root: str) -> FastAPI:
                     new_blobs[row[0]] = blob
                 if updates:
                     db.update_face_normalization(updates)
-                    db.clear_face_candidates_for(changed_ids)
+                    db.clear_face_suggestions_for(changed_ids)
                     # An already-promoted face IS a named reference vector: leaving
                     # manual.db holding the old mis-aligned blob would keep poisoning
                     # every future match, which is the whole reason this job exists.
@@ -7500,9 +7348,10 @@ def create_app(data_root: str) -> FastAPI:
                     db.bump_face_norm_version(unchanged_ids, FACE_NORM_VERSION)
                 renormalize_job['done'] += len(group)
         if refreshed_refs:
-            # Reference vectors changed, and a changed reference can LOWER a stored
-            # score — the one thing an incremental rescore cannot repair.
-            db.bump_scoring_generation()
+            # Reference vectors changed, so every stored suggestion was computed
+            # against a named matrix that no longer exists. Dropping them all is the
+            # only honest answer; the next precompute run fills them back in.
+            db.clear_face_suggestions()
 
     @app.post('/api/faces/renormalize/start')
     def api_renormalize_faces_start(full: bool = False):
@@ -7589,14 +7438,11 @@ def create_app(data_root: str) -> FastAPI:
             return
         # Same face, auto row: give it the corrected vector plus the resulting in-plane
         # angle so ranking and /face-crop both agree with what the user straightened,
-        # then drop its stale top-K so the scoring worker re-ranks it from the good
-        # vector. Stamping the current norm_version also keeps the re-normalization
+        # then drop its stale suggestion so the next precompute re-suggests it from the
+        # good vector. Stamping the current norm_version also keeps the re-normalization
         # backfill from later overwriting a human correction with a machine guess.
         db.update_face_normalization([(emb.tobytes(), angle, FACE_NORM_VERSION, int(source_id))])
-        db.clear_face_candidates_for([int(source_id)])
-        # A named face IS a reference vector, and changing one can LOWER other faces'
-        # stored scores — the one thing an incremental rescore cannot repair.
-        db.bump_scoring_generation()
+        db.clear_face_suggestions_for([int(source_id)])
 
     @app.post('/api/faces/{face_id}/identity')
     def api_assign_identity(face_id: str, body: IdentityBody):

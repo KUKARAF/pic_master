@@ -10,10 +10,10 @@
 // features their meaning on every other page that uses it, so this is its own
 // self-contained module with no dependency on (and no effect on) swipe-core.
 //
-// The face's top-K candidate list comes precomputed from face_candidates (the
-// single scoring worker's materialized output), so cycling identities is free —
-// no server round-trip per arrow key. Only R (rotate) has to re-rank, because a
-// rotated face is a genuinely different embedding.
+// Each card arrives with its ranked candidate list already attached by the server
+// (one matmul over the handful of faces in this buffer, not a precomputed table),
+// so cycling identities with the arrow keys is free — no round-trip per keypress.
+// Only R (rotate) has to re-rank, because a rotated face is a different embedding.
 
 (function () {
   // Kept module-private rather than exported: the page owns exactly one review
@@ -348,9 +348,9 @@
        The old page had one message for every reason the queue could be empty,
        which was actively misleading: "no more suggestions" reads as "you're
        done" when the real cause is that nobody is named yet, or that the
-       scoring worker has never run (in which case face_candidates is empty and
-       NOTHING will ever show up until it does). Each of those needs a different
-       action, so each gets its own copy. */
+       whole-library suggestion pass has never run (this page ranks every unknown
+       face against every known person, and that ranking IS the queue). Each of
+       those needs a different action, so each gets its own copy. */
     function renderEmptyState() {
       emptyEl.innerHTML = '<div class="swipe-empty">Checking why the queue is empty…</div>';
       Promise.all([

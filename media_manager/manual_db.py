@@ -2857,9 +2857,9 @@ class ManualDB(ThreadLocalDB):
     def _usable_embedding_rows(rows, label):
         """Drop face rows whose embedding blob can't take part in a float32 matrix —
         empty, not a whole number of float32s, or a different width than the rows
-        before it — printing each rejection. Rows are (identity, embedding, *extra)
-        and come back unchanged minus the rejects, paired with the dimension they all
-        share (None if nothing survived).
+        before it — printing each rejection. Rows are (identity, embedding) and come
+        back unchanged minus the rejects, paired with the dimension they all share
+        (None if nothing survived).
 
         A single bad row is enough to blow up the reshape for the ENTIRE named set,
         which takes face matching down library-wide; dropping it loudly keeps every
@@ -2896,32 +2896,6 @@ class ManualDB(ThreadLocalDB):
         cur.execute("SELECT identity, embedding FROM faces WHERE identity IS NOT NULL AND rejected = 0")
         kept, _dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_embeddings')
         return kept
-
-    def get_named_face_embeddings_since(self, manual_face_id_exclusive):
-        """Reference faces named after `manual_face_id_exclusive`, as
-        [(identity, embedding_bytes, manual_face_id), ...] ordered by id.
-
-        The incremental rescore's input: ids are monotonic, so "everything above the
-        last watermark" is exactly the vectors that didn't exist at the last scoring
-        run. Scores against only these can be merged into the stored top-K because a
-        new reference vector can only raise a face's score, never lower one."""
-        cur = self.conn.cursor()
-        cur.execute('SELECT identity, embedding, id FROM faces '
-                    'WHERE id > ? AND identity IS NOT NULL AND rejected = 0 ORDER BY id',
-                    (int(manual_face_id_exclusive),))
-        kept, _dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_embeddings_since')
-        return kept
-
-    def max_named_face_id(self):
-        """Highest id in the named reference set (0 when there are none) — the
-        watermark the incremental rescore compares against to decide whether the set
-        merely grew. Deliberately the raw max over the same population
-        get_named_face_embeddings_since walks, so a row dropped for a bad blob still
-        advances the watermark instead of being re-offered forever."""
-        cur = self.conn.cursor()
-        cur.execute('SELECT MAX(id) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
-        row = cur.fetchone()
-        return row[0] or 0
 
     def update_face_embedding(self, manual_face_id, embedding_bytes, rotation=None):
         """Replace a manual row's stored vector (and optionally its rotation) — the

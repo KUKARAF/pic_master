@@ -101,9 +101,10 @@
 {% block scripts %}
 <script src="/static/face-review.js"></script>
 <script>
-/* The review stream is entirely server-ranked (face_candidates, written by the
-   one scoring worker), so this page has no ranking logic of its own — it just
-   mounts the module against the markup above. */
+/* The review stream is entirely server-ranked — this page asks "who is each unknown
+   face?", which is the one question that needs every face compared against every
+   known person, so the ordering comes from the precomputed suggestion pass. No
+   ranking logic here; this just mounts the module against the markup above. */
 window.initFaceReview({
   rootId: 'face-review',
   avoidToggleId: 'faces-avoid-existing-toggle',
