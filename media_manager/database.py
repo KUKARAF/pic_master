@@ -528,7 +528,18 @@ class Database(ThreadLocalDB):
         if 'score_version' not in faces_cols:
             cursor.execute('ALTER TABLE faces ADD COLUMN score_version INTEGER NOT NULL DEFAULT 0')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_norm_version ON faces(norm_version)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_score_version ON faces(score_version)')
+        # The scoring queue is always "real faces below generation N". A plain index on
+        # score_version can't serve that on its own: the sentinel rows written for
+        # faceless files ('[]' bbox, empty blob) have to be excluded, and doing that
+        # with `embedding != x''` forces SQLite to read every 2 KB embedding just to
+        # COUNT — 0.75s per call over a 227k-face library, on a status poll. Folding
+        # the sentinel test into a PARTIAL index makes it an index-only scan (0.02s).
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_faces_score_pending "
+                       "ON faces(score_version) WHERE bbox != '[]'")
+        # Superseded by the partial index above (its only readers are the two scoring
+        # queue queries); keeping both would just cost every face write a second
+        # b-tree update.
+        cursor.execute('DROP INDEX IF EXISTS idx_faces_score_version')
         # The old single precomputed suggestion (suggested_identity/suggested_score) is
         # fully superseded by face_candidates' top-K — no code reads it anymore. Its
         # index goes unconditionally; the columns themselves need SQLite >= 3.35 for
@@ -2139,10 +2150,18 @@ class Database(ThreadLocalDB):
 
     def count_faces_to_score(self, generation) -> int:
         """Size of the scoring worker's queue at `generation` — real faces only
-        (the '[]' sentinel rows that mark a scanned-but-faceless file have no vector)."""
+        (the '[]' sentinel rows that mark a scanned-but-faceless file have no vector).
+
+        Predicated on bbox alone so idx_faces_score_pending can answer it without
+        touching the table: adding `embedding != x''` here would force a read of every
+        2 KB blob in the library (0.75s vs 0.02s at 227k faces) for a count that a
+        status poll asks for repeatedly. Empty blobs are dropped by the iterator, so
+        the count can overstate by however many sentinel-shaped rows exist outside the
+        '[]' convention — always zero in practice, and a slightly high total is a
+        progress-bar rounding error, not a correctness one."""
         cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM faces WHERE score_version < ? "
-                    "AND bbox != '[]' AND embedding != x''", (generation,))
+        cur.execute("SELECT COUNT(*) FROM faces WHERE score_version < ? AND bbox != '[]'",
+                    (generation,))
         return cur.fetchone()[0]
 
     def iter_faces_to_score(self, generation, chunk=5000):
@@ -2155,28 +2174,48 @@ class Database(ThreadLocalDB):
         invalidate, rows can be skipped entirely — a silent, load-dependent loss that
         looks like 'the worker finished but some faces were never scored'.
 
-        Each id batch is re-split to stay under SQLite's bound-parameter cap, which is
-        far below a useful matmul chunk size.
-
-        Rows whose blob doesn't match the first one's length are dropped loudly: the
-        caller infers D from len(packed) // len(ids), so a single odd row would shift
-        every vector in the chunk instead of failing."""
+        `chunk` is chosen by the caller against the reference count, because the score
+        block it produces is chunk x R floats — see the scorer's block sizing."""
         cur = self.conn.cursor()
-        cur.execute("SELECT id FROM faces WHERE score_version < ? "
-                    "AND bbox != '[]' AND embedding != x'' ORDER BY id", (generation,))
-        pending = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT id FROM faces WHERE score_version < ? AND bbox != '[]' ORDER BY id",
+                    (generation,))
+        for ids, blobs in self._stream_embeddings([r[0] for r in cur.fetchall()], chunk):
+            yield ids, blobs
+
+    def iter_unhandled_face_embeddings(self, chunk=5000):
+        """Same stream shape as iter_faces_to_score, but every still-reviewable face
+        regardless of scoring generation — the input to scoring ONE identity against
+        the whole library (see the per-person fast path). Skips faces manual.db already
+        has a decision for, since those can never appear in a review stream anyway."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT id FROM faces WHERE bbox != '[]' AND handled = 0 "
+                    "AND identity IS NULL ORDER BY id")
+        for ids, blobs in self._stream_embeddings([r[0] for r in cur.fetchall()], chunk):
+            yield ids, blobs
+
+    def _stream_embeddings(self, face_ids, chunk):
+        """Fetch embeddings for a snapshotted id list in matmul-sized blocks.
+
+        Each block is re-split to stay under SQLite's bound-parameter cap, which is far
+        below a useful matmul chunk. Empty blobs (and any whose length disagrees with
+        the first real one) are dropped loudly: the caller infers D from
+        len(packed) // len(ids), so one odd row would shift every vector in the block
+        instead of failing."""
+        cur = self.conn.cursor()
         row_nbytes = None
-        for batch in self._chunked(pending, chunk):
+        for batch in self._chunked(face_ids, chunk):
             ids, blobs = [], []
             for sub in self._chunked(batch):
                 placeholders = ','.join('?' for _ in sub)
                 cur.execute(f'SELECT id, embedding FROM faces WHERE id IN ({placeholders}) ORDER BY id',
                             tuple(sub))
                 for face_id, blob in cur.fetchall():
+                    if not blob:
+                        continue          # sentinel-shaped row; nothing to score
                     if row_nbytes is None:
                         row_nbytes = len(blob)
                     if len(blob) != row_nbytes:
-                        print(f"[iter_faces_to_score] dropping face {face_id}: embedding blob "
+                        print(f"[scoring] dropping face {face_id}: embedding blob "
                               f"length {len(blob)} != expected {row_nbytes}")
                         continue
                     ids.append(face_id)
@@ -2184,14 +2223,19 @@ class Database(ThreadLocalDB):
             if ids:
                 yield ids, b''.join(blobs)
 
-    def replace_face_candidates(self, rows, generation):
+    def replace_face_candidates(self, rows, generation, advance_version=True):
         """Write each face's complete top-K, replacing whatever was there.
 
         rows: {face_id: [(identity, score), ...]} already sorted best-first and already
         truncated/floored by the caller; an empty list is meaningful (this face matches
         nobody) and still marks the face scored. Delete + insert + score_version bump
         share one transaction so a crash mid-run can never leave a face marked scored
-        with a half-written candidate list."""
+        with a half-written candidate list.
+
+        `advance_version=False` writes the candidate rows WITHOUT marking the faces
+        scored: the per-person fast path fills in one identity's scores so its page can
+        be served now, but those faces still owe a pass against everybody else before
+        their top-K is complete."""
         if not rows:
             return
         cur = self.conn.cursor()
@@ -2203,12 +2247,13 @@ class Database(ThreadLocalDB):
              for face_id, candidates in rows.items()
              for rank, (identity, score) in enumerate(candidates[:FACE_CANDIDATE_K])]
         )
-        cur.executemany('UPDATE faces SET score_version = ? WHERE id = ?',
-                        [(generation, int(face_id)) for face_id in rows])
+        if advance_version:
+            cur.executemany('UPDATE faces SET score_version = ? WHERE id = ?',
+                            [(generation, int(face_id)) for face_id in rows])
         self.conn.commit()
         self._face_ver += 1
 
-    def merge_face_candidates(self, rows, generation):
+    def merge_face_candidates(self, rows, generation, advance_version=True):
         """Fold scores against NEWLY ADDED reference vectors into the stored top-K.
 
         Adding a reference vector can only ever raise a face's best score for that
@@ -2237,7 +2282,7 @@ class Database(ThreadLocalDB):
             ordered = sorted(best.items(), key=lambda kv: -kv[1])[:FACE_CANDIDATE_K]
             merged[face_id] = [(identity, score) for identity, score in ordered
                                if score >= FACE_CANDIDATE_FLOOR]
-        self.replace_face_candidates(merged, generation)
+        self.replace_face_candidates(merged, generation, advance_version=advance_version)
 
     def _compact_ranks(self, cur, face_ids):
         """Renumber the given faces' candidate rows to a dense 0..n-1 by score DESC.

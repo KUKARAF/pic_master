@@ -6996,6 +6996,19 @@ def create_app(data_root: str) -> FastAPI:
                 starts.append(i)
         return names, np.asarray(starts, dtype=np.intp), matrix
 
+    # The scorer's intermediate is (faces_in_block x reference_vectors) float32, and
+    # the reference count is the number of confirmed FACES, not people — tens of
+    # thousands on a well-labelled library. A fixed 5000-face block therefore silently
+    # scales its own memory with the label count: 5000 x 50k floats is a 1 GB spike,
+    # inside the web process, on the low-RAM host that offloads its models precisely to
+    # avoid that. Size the block against R instead so the intermediate stays bounded.
+    SCORE_BLOCK_CELLS = 25_000_000          # ~100 MB of float32
+    SCORE_BLOCK_MIN, SCORE_BLOCK_MAX = 256, 5000
+
+    def _score_block(refs):
+        rows = max(1, refs[2].shape[0])
+        return max(SCORE_BLOCK_MIN, min(SCORE_BLOCK_MAX, SCORE_BLOCK_CELLS // rows))
+
     def _top_candidates(cand, refs):
         """Per-face top-K identities for an (N, D) block of face vectors. One BLAS
         matmul (which RELEASES the GIL, so a library-wide rescore doesn't stall every
@@ -7084,7 +7097,8 @@ def create_app(data_root: str) -> FastAPI:
 
         def _pass(target_generation, refs, merge):
             nonlocal done
-            for face_ids, vecs in db.iter_faces_to_score(target_generation, chunk=5000):
+            for face_ids, vecs in db.iter_faces_to_score(target_generation,
+                                                          chunk=_score_block(refs)):
                 cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)
                 if cand.shape[1] != refs[2].shape[1]:
                     # Dim mismatch = an embedding from a different model. Write it out
@@ -7128,6 +7142,51 @@ def create_app(data_root: str) -> FastAPI:
         if manual.max_named_face_id() > watermark:
             pending += db.count_faces_to_score(generation + 1)
         return pending
+
+    # (identity, scoring generation, named-set watermark) already given the one-person
+    # treatment. Without this, an identity whose matches are all filtered out downstream
+    # — every hit on a since-deleted file, or every one already rejected — looks
+    # perpetually unscored to the caller and re-runs a multi-second library scan on
+    # every single buffer refill.
+    _identity_fast_scored = set()
+
+    def score_identity_now(identity):
+        """Score the whole library against ONE person, right now, and store it.
+
+        /find-person/<name> needs one column of the top-K matrix, and waiting for the
+        other thousands is the difference between five seconds and ten minutes: the
+        global pass costs faces x EVERY confirmed face (227k x 50k measured at ~456s),
+        while one person's own vectors are R=50-ish — 3.9s to stream the embeddings
+        plus 0.5s of matmul. Making the page wait on the global run was the reason
+        opening a person's search sat on 'searching' behind a progress bar.
+
+        Merged in WITHOUT advancing score_version: this fills that person's entry in
+        each face's top-K so the page can be served, but every face still owes the
+        global pass before its rivals (and therefore the hide-rivals filter) mean
+        anything. Returns how many faces were scored."""
+        import numpy as np
+        refs = _reference_matrix([(identity, emb) for emb
+                                  in manual.get_embeddings_for_identity(identity)])
+        if refs is None:
+            return 0
+        generation = db.get_scoring_generation()
+        scored = 0
+        for face_ids, vecs in db.iter_unhandled_face_embeddings(chunk=_score_block(refs)):
+            cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)
+            if cand.shape[1] != refs[2].shape[1]:
+                continue
+            best = (cand @ refs[2].T).max(axis=1)
+            rows = {}
+            for i, face_id in enumerate(face_ids):
+                score = float(best[i])
+                # Only rows at or above the floor: a merge that carried sub-floor
+                # entries would push real candidates out of the top-K.
+                if score >= FACE_CANDIDATE_FLOOR:
+                    rows[face_id] = [(identity, score)]
+            if rows:
+                db.merge_face_candidates(rows, generation, advance_version=False)
+            scored += len(face_ids)
+        return scored
 
     # A candidate whose face matches somebody ELSE this much better is a question with
     # a wrong answer ("is this Alice? 0.50" on a face that matches Bob at 0.74), so it
@@ -7194,11 +7253,24 @@ def create_app(data_root: str) -> FastAPI:
         # is filtered here rather than in SQL, so the query has to over-fetch past it.
         fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
         cards = []
+        served_stale = False
         # Both reads come back score-descending from SQL, so nothing re-sorts here.
         # `rotation` is always 0: a manual quarter-turn only exists once a face has
         # been named, which is exactly when it leaves this pool.
         if identity_filter is not None:
             rows = db.get_face_candidates_for_identity(identity_filter, SUGGEST_THRESHOLD, fetch)
+            token = (identity_filter, db.get_scoring_generation(), manual.max_named_face_id())
+            if not rows and token not in _identity_fast_scored and _faces_pending_scoring():
+                # Stale, not empty. Score this ONE person across the library (seconds)
+                # rather than making them wait on the global pass (minutes) — see
+                # score_identity_now. Done inline because the answer is the response;
+                # the token makes it once per person per named-set change, never once
+                # per refill.
+                _identity_fast_scored.add(token)
+                served_stale = True
+                score_identity_now(identity_filter)
+                rows = db.get_face_candidates_for_identity(identity_filter,
+                                                           SUGGEST_THRESHOLD, fetch)
             for face_id_, file_id_, _path, _bbox, angle, score, _rank in rows:
                 ref = 'auto:%d' % face_id_
                 if ref in exclude_refs:
@@ -7225,7 +7297,7 @@ def create_app(data_root: str) -> FastAPI:
         from media_manager.swipe_support import bias_reorder
         cards = bias_reorder(cards, key_fn=lambda c: c['identity'],
                              bias_key=bias_identity, bias_action=bias)
-        return _attach_file_meta(_collapse_face_cards_to_video(cards[:count]))
+        return (_attach_file_meta(_collapse_face_cards_to_video(cards[:count])), served_stale)
 
     @app.get('/swipe')
     def swipe_page_redirect():
@@ -7243,10 +7315,15 @@ def create_app(data_root: str) -> FastAPI:
         confirmed faces, for the person-search page's swipe stack. `hide_rivals`
         is the "don't ask me about faces that match someone else better" toggle."""
         exclude_refs = set(body.exclude)
-        cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
-                                        identity_filter=identity or None, avoid_existing=avoid_existing,
-                                        hide_rivals=hide_rivals)
-        return {'cards': cards, 'scoring': _scoring_state(not cards)}
+        cards, served_stale = _next_face_suggestions(
+            count, exclude_refs, bias_identity or None, bias or None,
+            identity_filter=identity or None, avoid_existing=avoid_existing,
+            hide_rivals=hide_rivals)
+        # `served_stale` matters as much as emptiness: the per-person fast path hands
+        # back real cards while the GLOBAL top-K is still missing, and rivals live in
+        # the global ranks — so a non-empty response can still be the one that has to
+        # get the full run going.
+        return {'cards': cards, 'scoring': _scoring_state(not cards or served_stale)}
 
     @app.post('/api/face-review/next')
     def api_face_review_next(body: SwipeExcludeBody, count: int = 5, avoid_existing: bool = True,

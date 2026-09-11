@@ -71,26 +71,31 @@ def run():
         ok = ok and cond
         print(('  PASS  ' if cond else '  FAIL  ') + name + (('   [%s]' % (extra,)) if extra else ''))
 
-    # Nothing has ever been scored: the person's own face is there, but invisible.
+    # Nothing has ever been scored. The per-person fast path must answer anyway:
+    # /find-person needs one column of the top-K, and waiting for the global pass is
+    # minutes on a real library (227k faces x every confirmed face).
     first = _stream(client)
-    check('stale library yields no cards yet', first['cards'] == [])
-    check('the response says WHY it is empty', first['scoring']['pending'] > 0,
-          repr(first['scoring']))
-    check('and starts a scoring run by itself',
-          first['scoring']['running'] or first['scoring']['pending'] > 0,
+    check('a never-scored library still serves the person immediately',
+          len(first['cards']) == 1, '%d cards' % len(first['cards']))
+    if first['cards']:
+        check('and it is the right person at a real score',
+              first['cards'][0]['identity'] == 'Ross' and first['cards'][0]['score'] > 0.9,
+              '%s %.3f' % (first['cards'][0]['identity'], first['cards'][0]['score']))
+    # Serving from the fast path leaves the GLOBAL ranking (and therefore rivals)
+    # still missing, so a non-empty response must ALSO get the full run going.
+    check('the response reports the global ranking as still pending',
+          first['scoring']['pending'] > 0 or first['scoring']['running'],
           repr(first['scoring']))
 
     _settle(client)
 
-    # Same request, no user action in between, now finds the match.
+    # Same request again: now off the stored top-K, and the global pass has completed
+    # on its own with no user action.
     second = _stream(client)
-    check('the same query now returns the match', len(second['cards']) == 1,
-          '%d cards' % len(second['cards']))
-    if second['cards']:
-        check('and it is the right person at a real score',
-              second['cards'][0]['identity'] == 'Ross' and second['cards'][0]['score'] > 0.9,
-              '%s %.3f' % (second['cards'][0]['identity'], second['cards'][0]['score']))
-    check('nothing left pending', second['scoring']['pending'] == 0, repr(second['scoring']))
+    check('the stored path returns the same match once scoring lands',
+          len(second['cards']) == 1, '%d cards' % len(second['cards']))
+    check('the global pass completed unprompted', second['scoring']['pending'] == 0,
+          repr(second['scoring']))
 
     # Genuine exhaustion must still read as empty — the fix must not invent a
     # permanent "still computing" state that never resolves.
