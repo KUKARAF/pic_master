@@ -428,6 +428,26 @@ window.initSwipeStack = function (config) {
       e.preventDefault();
       const fileId = card.file_id != null ? card.file_id : card.id;
       _showFullview('/image/' + fileId, card.bbox);
+    } else if (config.extraKeys && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // Page-specific single-key actions that are none of confirm/reject/skip
+      // — they act on the top card but persist something this engine knows
+      // nothing about, so the page issues the request itself and then drives
+      // the stack through the returned handle (location_detail.html's "s" =
+      // "this photo's whole SET belongs at this location", one keystroke
+      // instead of accepting every photo of the shoot one by one).
+      // Deliberately the last branch of this chain, so no built-in key can
+      // ever be shadowed by a page's map, and gated by the exact same guards
+      // above: an inactive (paused) stack, a keypress inside an input /
+      // textarea / contenteditable, or no top card all skip it, and an open
+      // fullview overlay never reaches here at all (the module-level listener
+      // registered before this one stops propagation to dismiss itself).
+      // Modifier-held combos are left to the browser (Ctrl/⌘+S must still be
+      // "save page", not an adopt).
+      const extra = config.extraKeys[e.key.toLowerCase()];
+      if (typeof extra === 'function') {
+        e.preventDefault();
+        extra(card);
+      }
     }
   });
 
@@ -487,6 +507,19 @@ window.initSwipeStack = function (config) {
       started = true;
       maybeFetchMore();
       render();
+    },
+    // Discard buffered cards a bulk action just answered on the server's behalf.
+    // location_detail's "S" places a photo's whole SET at a location: its siblings
+    // are settled the instant that request returns, but they are already sitting in
+    // this queue and would otherwise still be asked about one by one. Unlike reset()
+    // this keeps `history`, so Ctrl+Z on the action that triggered it still works,
+    // and keeps `known`, so a refill doesn't immediately re-deal them either.
+    drop: (predicate) => {
+      const before = queue.length;
+      queue = queue.filter((card) => !predicate(card));
+      const removed = before - queue.length;
+      if (removed) render();
+      return removed;
     },
   };
 };

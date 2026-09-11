@@ -625,6 +625,22 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_studio_locations_location ON studio_locations (location_id)')
+        # A human-confirmed "this photo was NOT taken at this place" — the negative
+        # counterpart to file_locations, exactly the shape/reasoning of
+        # file_set_exclusions (see its comment above): the location page's
+        # suggestion swipe stack needs somewhere permanent to record a reject, or
+        # the same photo is re-ranked and re-offered on every refill. Scoped
+        # per-location because a photo genuinely belonging to one place says
+        # nothing about another.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS file_location_exclusions (
+                checksum TEXT NOT NULL,
+                location_id INTEGER NOT NULL REFERENCES locations(id) ON DELETE CASCADE,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (checksum, location_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_file_location_exclusions_location ON file_location_exclusions (location_id)')
         # A studio assigned directly to an individual file (photo/video), multi-valued,
         # exactly like file_locations/file_categories — studios used to be a set-only
         # attribute (sets.studio_id); this lets an item carry a studio of its own.
@@ -2283,6 +2299,33 @@ class ManualDB(ThreadLocalDB):
         cur.execute('SELECT DISTINCT checksum FROM file_locations')
         return {row[0] for row in cur.fetchall()}
 
+    def exclude_file_from_location(self, checksum, location_id):
+        """Record a human's 'not this place' decision for this file — the
+        location suggestion stack's reject action. Permanent ground truth for
+        the same reason exclude_file_from_set is: without it a rejected photo
+        keeps clearing the similarity threshold and gets re-offered on every
+        buffer refill, forever."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            INSERT OR IGNORE INTO file_location_exclusions (checksum, location_id, created_at) VALUES (?, ?, ?)
+        ''', (checksum, location_id, int(time.time())))
+        self.conn.commit()
+
+    def remove_location_exclusion(self, checksum, location_id):
+        """Undo a prior exclude_file_from_location call (the reject-swipe's Ctrl+Z)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM file_location_exclusions WHERE checksum = ? AND location_id = ?',
+                    (checksum, location_id))
+        self.conn.commit()
+
+    def get_excluded_checksums_for_location(self, location_id):
+        """Every checksum a human has confirmed does NOT belong at this location —
+        filtered out of future suggestion candidates the same way the location's
+        own file_locations members are."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT checksum FROM file_location_exclusions WHERE location_id = ?', (location_id,))
+        return {row[0] for row in cur.fetchall()}
+
     def add_set_location(self, set_id, location_id):
         cur = self.conn.cursor()
         cur.execute('INSERT OR IGNORE INTO set_locations (set_id, location_id, created_at) VALUES (?, ?, ?)',
@@ -2302,6 +2345,22 @@ class ManualDB(ThreadLocalDB):
             WHERE sl.set_id = ? ORDER BY l.name
         ''', (set_id,))
         return [{'id': r[0], 'name': r[1], 'gps_lat': r[2], 'gps_lon': r[3]} for r in cur.fetchall()]
+
+    def get_checksums_for_sets_at_location(self, location_id):
+        """Every checksum belonging to a SET that is linked to this location.
+        A set_locations link is the "this whole shoot happened here" statement,
+        so its members are already answered for even though no file_locations
+        row exists for them — the location suggestion stack subtracts these from
+        its candidate pool, which is what lets one keystroke settle an entire
+        set instead of writing a per-photo row. Read-only; resolved at query
+        time so adding a photo to a linked set later is covered automatically."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT fs.checksum
+            FROM set_locations sl JOIN file_sets fs ON fs.set_id = sl.set_id
+            WHERE sl.location_id = ?
+        ''', (location_id,))
+        return {row[0] for row in cur.fetchall()}
 
     def add_studio_location(self, studio_id, location_id):
         cur = self.conn.cursor()

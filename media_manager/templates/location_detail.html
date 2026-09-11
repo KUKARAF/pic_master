@@ -50,9 +50,56 @@
   <p>No photos assigned to this location yet. Assign one from a photo's detail page.</p>
 </div>
 {% endif %}
+
+<div class="section-title" style="margin-top:28px;margin-bottom:12px;">
+  Suggested photos for this location
+</div>
+
+{% if files %}
+<p class="sub" style="margin-bottom:10px;">
+  Ranked by visual similarity to the {{ files | length }} photo(s) already here —
+  what the place looks like, not how near its coordinates are.
+</p>
+
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+  <input type="checkbox" id="location-avoid-existing-toggle" checked>
+  Avoid photos that already have a location
+</label>
+<label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+  Keep searching until
+  <input type="range" id="location-buffer-size-slider" min="10" max="200" step="10" value="10">
+  <span id="location-buffer-size-value">10</span>
+  are found
+</label>
+<div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
+  <div class="swipe-page" id="location-swipe-page" style="flex:1;min-width:300px;">
+    <div class="swipe-stack-wrap" id="location-swipe-stack"></div>
+    <div class="swipe-hint">
+      Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←) ·
+      <strong>S</strong> places the top card's whole set here ·
+      <strong>→</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo
+    </div>
+    <!-- Filled in per card by updateAdoptHint() below: naming the actual set
+         is the only way "S" is a safe blind keystroke — a whole shoot lands at
+         this location in one press, so you have to be able to see which one. -->
+    <p class="sub" id="location-adopt-set-hint" style="margin-top:6px;"></p>
+  </div>
+</div>
+{% else %}
+<!-- No centroid without members: the ranking is "looks like the photos already
+     here", so with none there is literally nothing to compare against. Said
+     here rather than left to the stack's own empty state, which would
+     otherwise read as "nothing similar found" after a pointless library scan. -->
+<div class="swipe-empty">
+  This location has no photos yet, so there is nothing to compare against.
+  Assign one photo to it and this stack will rank the rest of the library by
+  visual similarity to it.
+</div>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/swipe-core.js"></script>
 <script>
 (function () {
   const locationId = {{ location.id }};
@@ -120,6 +167,227 @@
         .catch(function(err) { msg.textContent = 'Failed: ' + err.message; });
     });
   }
+})();
+</script>
+
+<script>
+/* Suggested photos for this location — a swipe stack mirroring set_detail.html's,
+   ranked by CLIP similarity to the photos already assigned here (deliberately
+   NOT by GPS distance: two different places can sit metres apart, and a place's
+   look is what actually identifies the rest of its photos). Starts empty and
+   fetches its first batch only once you press the engine's own "Start
+   reviewing" button, so merely opening a location page never kicks off a
+   whole-library scan. */
+(function() {
+  const locationId = {{ location.id }};
+  const locationName = {{ location.name | tojson }};
+  const swipePage = document.getElementById('location-swipe-page');
+  if (!swipePage || !window.initSwipeStack) return;
+
+  let currentThreshold = {{ location_suggest_threshold | default(0.75) }};
+  // Points at whichever initSwipeStack() call is current — the empty state's
+  // "expand similar image search" re-launches the stack at a lower threshold.
+  let stackHandle = null;
+  const adoptHintEl = document.getElementById('location-adopt-set-hint');
+
+  // Refs whose file_location row was already written by the "S" (adopt-set)
+  // path below. Keyed per card ref and cleared as soon as that card's decision
+  // is undone, so a later ordinary confirm on any other card still POSTs
+  // /api/files/{id}/locations exactly as it would have.
+  const adoptedRefs = Object.create(null);
+
+  // Wired once, against a proxy rather than the live handle, because
+  // launchStack() can re-run (threshold expand) while the slider itself is
+  // static page markup — otherwise each relaunch would add another listener.
+  wireBufferSizeSlider({
+    setBufferSize: function(n) { if (stackHandle) stackHandle.setBufferSize(n); },
+  }, 'location-buffer-size-slider', 'location-buffer-size-value');
+
+  function fetchMoreUrl(need) {
+    // Read live on every refill (not captured at launch) so flipping the
+    // toggle takes effect on the next top-up, same as set_detail — no reset,
+    // which would throw away a buffer you are part-way through and re-run the
+    // whole-library scan on a stray click.
+    const avoidToggle = document.getElementById('location-avoid-existing-toggle');
+    return '/api/locations/' + locationId + '/similar-files?threshold=' + currentThreshold +
+      '&limit=' + (need || 10) +
+      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked);
+  }
+
+  function setNames(card) {
+    return ((card && card.sets) || []).map(function(s) { return s.name; });
+  }
+
+  function updateAdoptHint(card) {
+    if (!adoptHintEl) return;
+    const names = setNames(card);
+    if (!card) {
+      adoptHintEl.innerHTML = '';
+    } else if (names.length) {
+      adoptHintEl.innerHTML = '<strong>S</strong> — place the whole set ' +
+        names.map(function(n) { return '“' + escapeHtml(n) + '”'; }).join(' + ') +
+        ' at ' + escapeHtml(locationName) + ' (every photo of the shoot, one keystroke)';
+    } else {
+      adoptHintEl.innerHTML = '<strong>S</strong> — unavailable: this photo is not in a set';
+    }
+  }
+
+  /* "S" = "this photo's SET belongs here". The request is issued here rather
+     than through onConfirm because it is a different write (it links the sets
+     AND assigns this photo), so the stack is only told to move on afterwards —
+     see adoptedRefs for how the follow-up confirm is kept from double-posting. */
+  function adoptSetOfCard(card) {
+    if (!setNames(card).length) {
+      // Never silently swallow the keypress: with no set there is nothing to
+      // adopt, and the fix (↑ to add just this photo) is worth spelling out.
+      if (adoptHintEl) {
+        adoptHintEl.innerHTML = '<strong>This photo is not in a set</strong> — nothing to place. ' +
+          'Use ↑ to add just this photo.';
+        setTimeout(function() {
+          // Restore the per-card hint, but only if this is still the same card
+          // (a swipe in the meantime already re-rendered it for the new top).
+          const top = stackHandle && stackHandle.getTopCard();
+          if (top && top.ref === card.ref) updateAdoptHint(top);
+        }, 2500);
+      }
+      return;
+    }
+    fetch('/api/locations/' + locationId + '/adopt-set', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({file_id: card.id}),
+    })
+      .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function(data) {
+        const adopted = data.sets || [];
+        const names = adopted.map(function(s) { return s.name; });
+        showToast('Placed ' + (names.length ? names.join(', ') : 'set') + ' at ' + locationName);
+        // Recorded before advancing so onConfirm (which runs synchronously
+        // inside decide) suppresses its own POST for this one card; the server
+        // already assigned the photo as part of adopt-set.
+        adoptedRefs[card.ref] = true;
+        if (stackHandle) {
+          stackHandle.decide('confirm');
+          // The rest of that set is settled server-side now, but any of its photos
+          // already in the buffer would still be dealt — asking again about a shoot
+          // that was just placed. Drop them; the next refill excludes them anyway.
+          const adoptedIds = adopted.map(function(s) { return s.id; });
+          stackHandle.drop(function(other) {
+            return (other.sets || []).some(function(s) { return adoptedIds.indexOf(s.id) !== -1; });
+          });
+        }
+      })
+      .catch(function(err) { showToast('Failed to place set: ' + err.message); });
+  }
+
+  function launchStack(initialCards) {
+    const bufferSizeSlider = document.getElementById('location-buffer-size-slider');
+    stackHandle = initSwipeStack({
+      stackElId: 'location-swipe-stack',
+      initialCards: initialCards,
+      bufferSize: bufferSizeSlider ? parseInt(bufferSizeSlider.value, 10) : 10,
+      fetchMoreUrl: function(known, biasKey, biasAction, need) {
+        return fetchMoreUrl(need);
+      },
+      renderCard: function(card) {
+        const name = card.title || card.filename || ('photo #' + card.id);
+        return {
+          imageUrl: '/thumb/' + card.id,
+          questionHtml: 'Add <strong>' + escapeHtml(name) + '</strong> to this location?',
+          scoreText: typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '',
+          metaHtml: swipeCardMeta(card),
+          originalUrl: '/photo/' + card.id,
+        };
+      },
+      onTopCardChange: updateAdoptHint,
+      onConfirm: function(card) {
+        if (adoptedRefs[card.ref]) return null; // adopt-set already assigned it
+        return {
+          url: '/api/files/' + card.id + '/locations',
+          method: 'POST',
+          body: {location_id: locationId},
+        };
+      },
+      onReject: function(card) {
+        // Persisted, unlike a skip: without it the same photo would be
+        // re-ranked and re-offered on every future refill forever.
+        return {
+          url: '/api/files/' + card.id + '/locations/' + locationId + '/exclude',
+          method: 'POST',
+        };
+      },
+      onUndo: function(card, action) {
+        if (action === 'confirm') {
+          if (adoptedRefs[card.ref]) {
+            delete adoptedRefs[card.ref];
+            // Undoes the whole adopt: unlinks those sets from this location
+            // and drops this photo's own assignment again.
+            return {
+              url: '/api/locations/' + locationId + '/adopt-set?file_id=' + card.id,
+              method: 'DELETE',
+            };
+          }
+          return {
+            url: '/api/files/' + card.id + '/locations/' + locationId,
+            method: 'DELETE',
+          };
+        }
+        if (action === 'reject') {
+          return {
+            url: '/api/files/' + card.id + '/locations/' + locationId + '/exclude',
+            method: 'DELETE',
+          };
+        }
+        return null;
+      },
+      // Reached only once a real search has run and found nothing (the engine
+      // shows its own Start button / SEARCHING… state before that), so this is
+      // unambiguously "no more similar photos", never "not compared yet" —
+      // that case can't even get here, the stack isn't built without photos.
+      emptyStateHtml: function(stackEl) {
+        stackEl.innerHTML =
+          '<div class="swipe-empty">' +
+            '<p style="margin-bottom:10px;">No more photos similar to this location at threshold ' + currentThreshold.toFixed(2) + '.</p>' +
+            '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;">' +
+              '<label for="location-swipe-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
+              '<input type="range" id="location-swipe-threshold-slider" min="0.40" max="0.75" step="0.05" value="' + currentThreshold.toFixed(2) + '">' +
+              '<span id="location-swipe-threshold-value" class="sub">' + currentThreshold.toFixed(2) + '</span>' +
+              '<button type="button" id="location-swipe-expand-btn" class="btn-similar" style="font-size:0.85em;">Expand similar image search</button>' +
+            '</div>' +
+          '</div>';
+        const slider = stackEl.querySelector('#location-swipe-threshold-slider');
+        const sliderValue = stackEl.querySelector('#location-swipe-threshold-value');
+        const expandBtn = stackEl.querySelector('#location-swipe-expand-btn');
+        wireLiveLabelSlider(slider, sliderValue);
+        if (expandBtn) {
+          expandBtn.addEventListener('click', function() {
+            currentThreshold = slider ? parseFloat(slider.value) : Math.max(0.4, currentThreshold - 0.1);
+            expandBtn.disabled = true;
+            expandBtn.textContent = 'Searching…';
+            fetchAndLaunch();
+          });
+        }
+      },
+      // The engine only knows confirm/reject/skip; "S" is a third kind of
+      // write (a whole set at once) that it hands straight back to this page.
+      extraKeys: {
+        s: adoptSetOfCard,
+      },
+    });
+  }
+
+  function fetchAndLaunch() {
+    fetch(fetchMoreUrl(10), {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({exclude: []}),
+    })
+      .then(function(r) { return r.ok ? r.json() : {cards: []}; })
+      .then(function(data) { launchStack(data.cards || []); })
+      .catch(function() { launchStack([]); });
+  }
+
+  launchStack([]);
 })();
 </script>
 {% endblock %}

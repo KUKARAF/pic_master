@@ -174,6 +174,11 @@ class LocationBody(BaseModel):
 class LocationAssignBody(BaseModel):
     location_id: int
 
+class AdoptSetBody(BaseModel):
+    """Body for POST /api/locations/{id}/adopt-set — the location swipe stack's
+    `s` key. Identifies the photo whose set(s) should be placed at this location."""
+    file_id: int
+
 class StudioAssignBody(BaseModel):
     # Assign an existing studio by id, or create-and-assign a new one by name
     # (mirrors SetBody's set_id-or-name shape). At least one must be given.
@@ -5177,6 +5182,69 @@ def create_app(data_root: str) -> FastAPI:
             card['ref'] = str(card['id'])
         return cards
 
+    # Same bar as SET_SUGGEST_THRESHOLD and for the same reason: the ranking is
+    # CLIP image-image similarity to photos already placed here, i.e. "this looks
+    # like the same place/shoot", NOT physical distance — locations carry optional
+    # coordinates but most candidates have no EXIF fix at all, so geometry would
+    # rank almost nothing.
+    LOCATION_SUGGEST_THRESHOLD = 0.75
+
+    def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
+                                          avoid_existing=True):
+        """Images not yet at this location whose CLIP embedding is close to the
+        centroid of the ones that are — "photos probably taken at this place".
+        Deliberately the same centroid math as _find_similar_files_for_set (see
+        it for the offset/exclude_ids/avoid_existing semantics, which are
+        identical here) rather than a second, GPS-flavoured ranking: what makes
+        a photo belong to a named place is that it looks like the place.
+
+        `avoid_existing` (default True — a UI toggle) hard-excludes photos that
+        already carry ANY location, so the stack surfaces still-unplaced photos
+        first instead of re-litigating ones already filed somewhere."""
+        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+
+        member_checksums = manual.get_checksums_for_location(location_id)
+        member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
+        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
+
+        centroid = mean_normalized_centroid(member_embeddings)
+        # A location with nothing placed at it yet has nothing to compare against
+        # — no centroid, no suggestions (the page says exactly that).
+        if centroid is None:
+            return []
+
+        excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
+        # Photos whose SET is already linked to this location: pressing `s` on one
+        # card writes a single set_locations row rather than a file_locations row
+        # per member, so this is what stops the rest of that shoot from coming
+        # back around the stack one photo at a time.
+        set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
+
+        candidates = [
+            row for row in db.get_all_embeddings()
+            if row[3] not in member_checksums and row[3] not in excluded_checksum_set
+            and row[3] not in set_settled_checksums
+        ]
+        if not candidates:
+            return []
+        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
+        passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+        if avoid_existing and passing:
+            placed_anywhere = manual.get_checksums_with_any_location()
+            passing = [item for item in passing if item[0][2] not in placed_anywhere]
+        if exclude_ids:
+            passing = [item for item in passing if item[0][0] not in exclude_ids]
+            page = passing[:limit]
+        else:
+            page = passing[offset:offset + limit]
+
+        rows = [(fid, path, True, cs) for (fid, path, cs), _score in page]
+        scores_map = {fid: round(score, 3) for (fid, _path, _cs), score in page}
+        cards = _enrich_rows(rows, scores=scores_map)
+        for card in cards:
+            card['ref'] = str(card['id'])
+        return cards
+
     def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
         set it's not already in by how close the photo's embedding is to that set's
@@ -5942,6 +6010,7 @@ def create_app(data_root: str) -> FastAPI:
             'files': files,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
+            'location_suggest_threshold': LOCATION_SUGGEST_THRESHOLD,
             'sort': sort,
             'order': order,
         })
@@ -5998,6 +6067,72 @@ def create_app(data_root: str) -> FastAPI:
     @app.delete('/api/files/{file_id}/locations/{location_id}')
     def api_remove_file_location(file_id: int, location_id: int):
         row = _file_or_404(file_id)
+        manual.remove_file_location(row['checksum'], location_id)
+        return {'ok': True}
+
+    @app.post('/api/locations/{location_id}/similar-files')
+    def api_similar_files_for_location(location_id: int, body: SwipeExcludeBody,
+                                        threshold: float = LOCATION_SUGGEST_THRESHOLD,
+                                        limit: int = 12, offset: int = 0, avoid_existing: bool = True):
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        threshold = max(0.0, min(1.0, threshold))
+        offset = max(0, offset)
+        exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
+        results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
+                                                    exclude_ids=exclude_ids, avoid_existing=avoid_existing)
+        # Dual key for the same reason api_similar_files_for_set has one: 'cards'
+        # is what swipe-core.js's fetchMoreUrl contract reads.
+        return {'results': results, 'cards': results}
+
+    @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
+    def api_exclude_file_location(file_id: int, location_id: int):
+        """The location suggestion stack's reject action: a permanent 'this photo
+        was not taken here' so it's never suggested for this location again
+        (mirrors api_exclude_from_set)."""
+        row = _file_or_404(file_id)
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        manual.exclude_file_from_location(row['checksum'], location_id)
+        return {'ok': True}
+
+    @app.delete('/api/files/{file_id}/locations/{location_id}/exclude')
+    def api_undo_exclude_file_location(file_id: int, location_id: int):
+        """Undoes a reject made via the location suggestion stack (Ctrl+Z)."""
+        row = _file_or_404(file_id)
+        manual.remove_location_exclusion(row['checksum'], location_id)
+        return {'ok': True}
+
+    @app.post('/api/locations/{location_id}/adopt-set')
+    def api_location_adopt_set(location_id: int, body: AdoptSetBody):
+        """The swipe stack's `s` key — "this photo's whole shoot happened here".
+        Links every set the photo belongs to, to this location (set_locations is
+        first-class and already shown on the set page), which settles the rest of
+        that set in one keystroke instead of a file_locations row per member (see
+        get_checksums_for_sets_at_location). The photo on the card is ALSO
+        assigned directly, so the accept is visible in the location's own photo
+        list rather than silently disappearing from the stack."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        row = _file_or_404(body.file_id)
+        sets = manual.get_sets_for_checksums([row['checksum']]).get(row['checksum'], [])
+        if not sets:
+            raise HTTPException(status_code=400, detail='This photo is not in any set')
+        for s in sets:
+            manual.add_set_location(s['id'], location_id)
+        manual.add_file_location(row['checksum'], location_id)
+        return {'ok': True, 'sets': [{'id': s['id'], 'name': s['name']} for s in sets],
+                'location_id': location_id}
+
+    @app.delete('/api/locations/{location_id}/adopt-set')
+    def api_location_undo_adopt_set(location_id: int, file_id: int):
+        """Undo of the above (Ctrl+Z): unlinks the photo's sets from this location
+        and drops its own assignment, so both writes the `s` key made go away."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        row = _file_or_404(file_id)
+        for s in manual.get_sets_for_checksums([row['checksum']]).get(row['checksum'], []):
+            manual.remove_set_location(s['id'], location_id)
         manual.remove_file_location(row['checksum'], location_id)
         return {'ok': True}
 
