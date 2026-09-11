@@ -4153,6 +4153,26 @@ def create_app(data_root: str) -> FastAPI:
         manual.remove_tag(tag_id)
         return {'tags': _photo_tags(row['checksum'])}
 
+    @app.delete('/api/files/{file_id}/detections')
+    def api_clear_detections(file_id: int):
+        """Clear this photo's auto-detected tag candidates — the gray chips nobody has
+        ruled on yet.
+
+        Explicitly NOT a bulk reject: rejecting writes a negative (and, for a
+        single-box class, a region hard-negative used to train the tag classifier),
+        which asserts "this photo does not contain X". Dismissing a pile of noisy
+        detections asserts nothing of the sort, so this just deletes them.
+
+        Nothing a human touched can be affected: confirmed, hand-typed, rejected and
+        region-located tags are all manual.db file_tags rows, and this only deletes
+        from media.db's detections table."""
+        row = _file_or_404(file_id)
+        removed = db.clear_detections(file_id)
+        negated = manual.get_negated_labels(row['checksum'])
+        return {'removed': removed,
+                'detected_classes': [c for c in db.get_detected_classes(file_id) if c not in negated],
+                'tags': _photo_tags(row['checksum'])}
+
     @app.delete('/api/files/{file_id}/tags-by-label')
     def api_remove_tag_by_label(file_id: int, label: str, polarity: str = 'positive'):
         """Undo a confirm or reject made via the tag-suggestion swipe stream —

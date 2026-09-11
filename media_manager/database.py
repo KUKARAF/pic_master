@@ -1573,6 +1573,40 @@ class Database(ThreadLocalDB):
             )
         self.conn.commit()
 
+    def clear_detections(self, file_id) -> int:
+        """Drop every auto-detected class on a file's PRIMARY frame; returns how many
+        distinct classes went. The "remove all automatic tags" action on /photo.
+
+        Touches only this table, which is the point: everything a human has confirmed,
+        typed, rejected or drawn a box around lives in manual.db's file_tags and is
+        therefore untouchable from here by construction, not by filtering. Frame-scoped
+        detections (frame_index NOT NULL) stay too — they belong to individual video
+        frames reviewed on their own page, so clearing them from here would delete
+        things the user cannot see.
+
+        Keeps the '__indexed__' sentinel (see remove_detection) so `media index` treats
+        the file as done instead of regenerating everything that was just dismissed."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(DISTINCT class_name) FROM detections "
+                       "WHERE file_id = ? AND frame_index IS NULL AND class_name != '__indexed__'",
+                       (file_id,))
+        removed = cursor.fetchone()[0]
+        if not removed:
+            return 0
+        cursor.execute("DELETE FROM detections WHERE file_id = ? AND frame_index IS NULL "
+                       "AND class_name != '__indexed__'", (file_id,))
+        cursor.execute("SELECT COUNT(*) FROM detections "
+                       "WHERE file_id = ? AND frame_index IS NULL AND class_name = '__indexed__'",
+                       (file_id,))
+        if cursor.fetchone()[0] == 0:
+            cursor.execute(
+                "INSERT INTO detections (file_id, class_name, confidence, x1, y1, x2, y2, model, indexed_at) "
+                "VALUES (?, '__indexed__', 0.0, NULL, NULL, NULL, NULL, 'manual-correction', ?)",
+                (file_id, int(time.time()))
+            )
+        self.conn.commit()
+        return removed
+
     def get_undetected_files(self, limit=None):
         """Return (id, path) for files that have no primary (frame_index IS NULL)
         detections row — independent of whether frame-specific rows exist."""

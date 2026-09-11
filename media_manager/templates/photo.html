@@ -209,6 +209,13 @@
         <button type="button" id="tag-negative-btn" title="Mark as NOT in this photo (e.g. a wrong detection)">🚫</button>
       </div>
 
+      <!-- Only offered when there is something to clear. Hidden rather than disabled:
+           a permanently greyed-out button in a pod this dense reads as broken. The JS
+           hides it again once the list is empty. -->
+      <button type="button" id="clear-detected-tags-btn" class="btn-similar"
+              style="margin-top:10px;font-size:7px;padding:6px 8px;{% if not detected_classes %}display:none;{% endif %}"
+              title="Discard every auto-detected tag on this photo. Tags you confirmed, typed, rejected or gave a region are not touched.">🧹 Remove auto tags</button>
+
       {% if file.is_image %}
       <button type="button" id="reindex-tags-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🔄 Reindex tags</button>
       <div id="reindex-tags-status" class="sub" style="display:none;"></div>

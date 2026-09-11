@@ -3405,6 +3405,41 @@
     });
   }
 
+  /* "Remove auto tags" — discard every gray detected candidate on this photo.
+     Deliberately NOT a loop over the reject (×) buttons: reject records a negative
+     ("there is no dog here"), and for a single-box class a region hard-negative that
+     trains the tag classifier. Dismissing detector noise should assert nothing, so it
+     is one DELETE that removes the candidates and writes no opinion. The server only
+     touches media.db detections, so confirmed / typed / rejected / region-located
+     tags cannot be affected. */
+  const clearDetectedBtn = document.getElementById('clear-detected-tags-btn');
+  if (clearDetectedBtn) {
+    clearDetectedBtn.addEventListener('click', function () {
+      const n = (window.DETECTED_CLASSES || []).length;
+      if (!n) return;
+      if (!confirm('Remove ' + n + ' auto-detected tag' + (n === 1 ? '' : 's') +
+                   ' from this photo?\n\nTags you confirmed, added yourself, rejected, ' +
+                   'or gave a region are kept.')) return;
+      clearDetectedBtn.disabled = true;
+      fetch('/api/files/' + fileId + '/detections', { method: 'DELETE' })
+        .then(function (r) {
+          if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
+          return r.json();
+        })
+        .then(function (data) {
+          // renderTags rebuilds the detected chips from this global every time, so it
+          // is the thing that has to be updated — not just the DOM nodes.
+          window.DETECTED_CLASSES = data.detected_classes || [];
+          renderTags(data.tags);
+          clearDetectedBtn.style.display = 'none';
+        })
+        .catch(function (err) {
+          clearDetectedBtn.disabled = false;
+          alert('Could not remove auto tags: ' + err.message);
+        });
+    });
+  }
+
   /* Generic drag-to-draw-a-box-on-the-photo, shared by "Add face" and "Label region" */
   const photoWrap = document.getElementById('photo-image-wrap');
   const photoImg = document.getElementById('photo-image');
