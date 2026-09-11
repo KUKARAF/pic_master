@@ -13,6 +13,14 @@
   Deprioritize photos that already have an identified face
 </label>
 
+<!-- Cross-person competition filter. A face can match Bob at 0.90 and still be
+     offered here as "Is this Alice? 0.50" — with this on, the server drops any
+     candidate whose best OTHER identity beats this one. -->
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="find-person-hide-rivals-toggle" checked>
+  Hide faces that match someone else better
+</label>
+
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Keep searching until
   <input type="range" id="find-person-buffer-size-slider" min="10" max="200" step="10" value="10">
@@ -40,12 +48,21 @@
   <div class="swipe-controls">
     <button type="button" class="swipe-btn swipe-btn-reject" id="find-person-swipe-reject-btn" title="Not same face (↓)">✕</button>
     <button type="button" class="swipe-btn swipe-btn-confirm" id="find-person-swipe-confirm-btn" title="Same face (↑)">✓</button>
+    <button type="button" class="swipe-btn" id="find-person-rotate-btn" title="Rotate this face 90° and re-rank it (R)">↻</button>
   </div>
-  <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←)</div>
+  <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←) · <strong>R</strong> rotates a sideways face and re-ranks it</div>
 </div>
 
 <!-- Calibration swipe UI mounts here (shown while calibrating; main stack hidden). -->
 <div id="calibrate-panel" style="display:none;margin-top:14px;"></div>
+
+<style>
+  /* The rival warning has to compete with the big "Is this Alice?" question
+     right above it — a muted .sub line was too easy to swipe straight past,
+     which is how wrong faces got confirmed in the first place. */
+  .rival-warn { display: block; margin-top: 6px; color: var(--danger); font-size: 0.9em; }
+  .rotate-note { display: block; margin-top: 4px; color: var(--text-muted); font-size: 0.85em; }
+</style>
 {% endblock %}
 
 {% block scripts %}
@@ -96,6 +113,69 @@
 
   const bufferSizeSlider = document.getElementById('find-person-buffer-size-slider');
 
+  /* Cross-person competition. Every card now carries the best-scoring identity
+     OTHER than this one from the same face's stored top-K (`rival`/`rival_score`).
+     A face that matches Bob at 0.74 while being offered as Alice at 0.51 is the
+     single biggest source of wrong confirms here, so it is said out loud on the
+     card — and it hard-blocks auto-approve below. One definition of "better
+     rival", used by both, so the warning and the block can never disagree. */
+  function hasBetterRival(card) {
+    return !!card && card.rival_score != null && card.rival_score > card.score;
+  }
+
+  function rivalWarnHtml(card) {
+    if (!hasBetterRival(card)) return '';
+    return '<span class="rival-warn">⚠ closer match: ' + escapeHtml(card.rival) +
+           ' (' + card.rival_score.toFixed(2) + ')</span>';
+  }
+
+  /* Quarter-turns the user has applied to the face on screen. Lives on the card
+     object itself (the engine hands the same object to renderCard/onConfirm/
+     history), so a rotation survives re-renders and undo without this page
+     keeping a parallel map keyed by ref. */
+  function cardRotate(card) {
+    return card && card.rotate != null ? card.rotate : (card ? (card.rotation || 0) : 0);
+  }
+
+  // /face-crop already serves the face at its stored rotation, so the CSS turn is
+  // the delta from there — same reasoning as app.js's face-naming preview.
+  function rotateDelta(card) {
+    return ((cardRotate(card) - (card.rotation || 0)) % 4 + 4) % 4;
+  }
+
+  function rotateNoteHtml(card) {
+    const delta = rotateDelta(card);
+    return delta ? '<span class="rotate-note">rotated ' + (delta * 90) + '° — saved with the confirm</span>' : '';
+  }
+
+  function questionHtmlFor(card) {
+    return 'Is this <strong>' + escapeHtml(personName) + '</strong>?' +
+           rivalWarnHtml(card) + rotateNoteHtml(card);
+  }
+
+  function scoreTextFor(card) {
+    return 'match score ' + card.score.toFixed(2);
+  }
+
+  /* Repaint the on-screen top card in place. Needed because a rotation re-ranks
+     the face server-side (new score, new rival, new rotation angle) and the engine
+     has no "re-render the current card" hook — nor should it, since nothing else
+     mutates a card after it is dealt. */
+  function paintTopCard(card) {
+    if (!card) return;
+    const el = document.querySelector('#find-person-swipe-stack .swipe-card[data-ref="' + CSS.escape(card.ref) + '"]');
+    if (!el) return;
+    const q = el.querySelector('.swipe-card-question');
+    const s = el.querySelector('.swipe-card-score');
+    const img = el.querySelector('img');
+    if (q) q.innerHTML = questionHtmlFor(card);
+    if (s) s.textContent = scoreTextFor(card);
+    if (img) {
+      img.style.transition = 'transform .15s ease';
+      img.style.transform = 'rotate(' + (rotateDelta(card) * 90) + 'deg)';
+    }
+  }
+
   /* Auto-approve above threshold: whenever the top card's own match score clears the
      configured threshold, confirm it immediately and silently — no countdown, no
      "about to approve X" preview. Each confirm re-renders the next card, which re-arms
@@ -117,6 +197,10 @@
   function armAutoApprove(card) {
     cancelAutoApprove();
     if (!autoApproveToggle.checked || !card) return;
+    // Never silently confirm a face that matches someone else better: an unattended
+    // auto-approve is exactly where a rival match does its damage, because nobody
+    // is looking at the warning. Such a card stops the run and waits for a human.
+    if (hasBetterRival(card)) return;
     const threshold = parseFloat(autoApproveThresholdInput.value);
     if (!isFinite(threshold) || card.score < threshold) return;
     autoApproveHandle = setTimeout(function () {
@@ -137,6 +221,16 @@
     armAutoApprove(stack.getTopCard());
   });
 
+  /* Flipping "hide faces that match someone else better" has to bite immediately.
+     The toggle is only read inside fetchMoreUrl, so without this the change would
+     not show up until the buffer happened to drain ten cards later — the user
+     flips it, nothing moves, and they reasonably conclude it does nothing.
+     reset() re-asks the server from scratch under the new filter. */
+  document.getElementById('find-person-hide-rivals-toggle').addEventListener('change', function () {
+    cancelAutoApprove();
+    stack.reset();
+  });
+
   const stack = window.initSwipeStack({
     stackElId: 'find-person-swipe-stack',
     confirmBtnId: 'find-person-swipe-confirm-btn',
@@ -145,24 +239,32 @@
     initialCards: [],
     fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
       const avoidToggle = document.getElementById('find-person-avoid-existing-toggle');
+      const hideRivals = document.getElementById('find-person-hide-rivals-toggle');
       const params = new URLSearchParams({
         count: String(need || 10),
         identity: personName,
         avoid_existing: String(!avoidToggle || avoidToggle.checked),
+        hide_rivals: String(!hideRivals || hideRivals.checked),
       });
       return '/api/face-suggestions/next?' + params.toString();
     },
     renderCard: function(card) {
       return {
         imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
-        questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
-        scoreText: 'match score ' + card.score.toFixed(2),
+        questionHtml: questionHtmlFor(card),
+        scoreText: scoreTextFor(card),
         metaHtml: swipeCardMeta(card),
         originalUrl: '/photo/' + card.file_id,
       };
     },
     onConfirm: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
+      // `rotate` rides along so a face the user had to straighten here is stored
+      // with the corrected embedding instead of the scrambled one that was ranked.
+      return {
+        url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity',
+        method: 'POST',
+        body: { name: personName, rotate: cardRotate(card) },
+      };
     },
     onReject: function(card) {
       return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/reject', method: 'POST' };
@@ -171,6 +273,9 @@
       return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/decision', method: 'DELETE' };
     },
     onTopCardChange: function(card) {
+      // Fires on every render, so it is also what re-applies a rotation (and its
+      // re-ranked score) after a refill repaints the stack.
+      paintTopCard(card);
       armAutoApprove(card);
     },
     emptyStateHtml: function(stackEl) {
@@ -191,6 +296,69 @@
   });
 
   wireBufferSizeSlider(stack, 'find-person-buffer-size-slider', 'find-person-buffer-size-value');
+
+  /* R — straighten a sideways/upside-down face right here. This is the fix the
+     user previously had to go do by hand on /photo: the detector mis-aligned the
+     face, so its stored embedding (and therefore the score on this card) is
+     garbage. Rotating re-embeds and re-ranks LIVE via /api/faces/{ref}/candidates,
+     so the score, the rival warning and the eventual confirm all describe the
+     corrected face. cancelAutoApprove() first: the pre-rotation score must never
+     fire a confirm while the re-rank is in flight. */
+  function rotateTopCard() {
+    if (!stack.isActive()) return;          // calibration stack owns input
+    const card = stack.getTopCard();
+    if (!card) return;
+    cancelAutoApprove();
+    card.rotate = (cardRotate(card) + 1) % 4;
+    paintTopCard(card);
+    const el = document.querySelector('#find-person-swipe-stack .swipe-card[data-ref="' + CSS.escape(card.ref) + '"]');
+    const scoreEl = el ? el.querySelector('.swipe-card-score') : null;
+    if (scoreEl) scoreEl.textContent = 're-ranking rotated face…';
+    fetch('/api/faces/' + encodeURIComponent(card.ref) + '/candidates?rotate=' + card.rotate + '&limit=8')
+      .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function (data) {
+        // The rotated ranking is a full top-K over everyone, so this person's own
+        // score is whichever entry carries their name (absent = they dropped out
+        // of the top-K entirely, i.e. 0 for the purposes of this card), and the
+        // rival is the best entry that is someone else.
+        const list = data.candidates || [];
+        let mine = 0, rival = null, rivalScore = null;
+        list.forEach(function (c) {
+          if (c.name === personName) { mine = c.score; }
+          else if (rivalScore == null || c.score > rivalScore) { rival = c.name; rivalScore = c.score; }
+        });
+        // Drop a stale response: either the user has moved on, or they pressed R
+        // again and this ranking describes an orientation the face is no longer at
+        // (the endpoint echoes the orientation its ranking belongs to in `rotation`).
+        if (stack.getTopCard() !== card) return;
+        if (data.rotation != null && data.rotation !== card.rotate) return;
+        card.score = mine;
+        card.rival = rival;
+        card.rival_score = rivalScore;
+        paintTopCard(card);
+        armAutoApprove(card);
+      })
+      .catch(function (err) {
+        paintTopCard(card);
+        showToast('Re-rank failed: ' + err.message);
+      });
+  }
+
+  const rotateBtn = document.getElementById('find-person-rotate-btn');
+  if (rotateBtn) rotateBtn.addEventListener('click', rotateTopCard);
+
+  document.addEventListener('keydown', function (e) {
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if (e.key.toLowerCase() !== 'r') return;
+    // Same guards swipe-core applies to its own keys: never steal a keystroke
+    // from a text field or from the modal stacked on top of this page.
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    const modal = document.getElementById('modal-overlay');
+    if (modal && modal.style.display !== 'none' && modal.style.display !== '') return;
+    e.preventDefault();
+    rotateTopCard();
+  });
 
   /* Calibrate & auto-add: binary-search the safe confidence threshold by reviewing
      a small batch (5) of borderline faces per round — the SAME Tinder cards as the

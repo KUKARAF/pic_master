@@ -509,6 +509,7 @@ class RemoteFaceDetector:
                     # whole response buffer for the lifetime of the embedding.
                     "embedding": np.frombuffer(face["embedding"], dtype=np.float32).copy(),
                     "det_score": float(face["det_score"]),
+                    "angle": float(face.get("angle") or 0.0),
                 })
             results.append((path, faces, resp.get("error")))
         return results
@@ -527,7 +528,48 @@ class RemoteFaceDetector:
             "bbox": resp["bbox"],
             "embedding": np.frombuffer(resp["embedding"], dtype=np.float32).copy(),
             "det_score": float(resp["det_score"]),
+            "angle": float(resp.get("angle") or 0.0),
         }
+
+    def normalize_faces(self, img, faces):
+        """Remote twin of :meth:`face_detector.FaceDetector.normalize_faces` — same
+        length and order as `faces`, input dicts untouched. The image rides as
+        encoded bytes exactly like embed_bbox's, since the worker needs the decoded
+        array rather than a file on disk."""
+        image_bytes = cv2.imencode('.png', img)[1].tobytes()
+        payload = []
+        for face in faces:
+            emb = face.get("embedding")
+            payload.append({
+                "bbox": [float(v) for v in face["bbox"]],
+                "embedding": (np.asarray(emb, dtype=np.float32).tobytes()
+                              if emb is not None else b""),
+                "det_score": float(face.get("det_score") or 0.0),
+                "angle": float(face.get("angle") or 0.0),
+            })
+        self.client.record("normalize_faces", f"<{len(payload)} faces>")
+        resp = self.client.request(
+            worker_protocol.PATH_NORMALIZE_FACES,
+            {"name": "<image>", "image": image_bytes, "faces": payload},
+        )
+        if resp.get("error"):
+            raise WorkerError(resp["error"])
+        out = []
+        for face in (resp.get("faces") or []):
+            emb = face.get("embedding")
+            out.append({
+                "bbox": [float(v) for v in face["bbox"]],
+                "embedding": (np.frombuffer(emb, dtype=np.float32).copy()
+                              if emb else None),
+                "det_score": float(face["det_score"]),
+                "angle": float(face.get("angle") or 0.0),
+            })
+        if len(out) != len(faces):
+            # The caller maps results back to DB rows by position; a truncated reply
+            # would silently write one face's vector onto another's row.
+            raise WorkerError(
+                f"normalize_faces returned {len(out)} faces for {len(faces)} sent")
+        return out
 
     @staticmethod
     def model_id(*args, **kwargs) -> str:

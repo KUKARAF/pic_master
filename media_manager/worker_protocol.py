@@ -19,6 +19,11 @@ ASPECT = "worker"
 PATH_PING = "ping"
 PATH_DETECT_FACES = "detect_faces"
 PATH_EMBED_BBOX = "embed_bbox"
+# Re-run in-plane rotation normalization on faces ALREADY stored in the host's DB
+# (the renormalization backfill). Stateless like the ops above, but the request
+# carries the existing face dicts so the worker can apply the margin guardrails
+# against the scores the host already has.
+PATH_NORMALIZE_FACES = "normalize_faces"
 PATH_EMBED_IMAGE = "embed_image"
 PATH_EMBED_TEXT = "embed_text"
 PATH_DETECT_OBJECTS = "detect_objects"
@@ -49,6 +54,7 @@ ALL_PATHS = [
     PATH_PATTERN,
     PATH_DETECT_FACES,
     PATH_EMBED_BBOX,
+    PATH_NORMALIZE_FACES,
     PATH_EMBED_IMAGE,
     PATH_EMBED_TEXT,
     PATH_DETECT_OBJECTS,
@@ -81,14 +87,26 @@ ALL_PATHS = [
 #     req:  {"name": <str basename>, "image": <bytes: encoded image>}
 #     resp: {"faces": [{"bbox": [x1, y1, x2, y2] (floats),
 #                       "embedding": <bytes: float32 (512,)>,
-#                       "det_score": <float>}],
+#                       "det_score": <float>,
+#                       "angle": <float>}],   # in-plane roll, CW from upright,
+#                                             # (-180, 180]; 0.0 = upright
 #            "error": <None|str>}
 #
 #   PATH_EMBED_BBOX
 #     req:  {"name": <str>, "image": <bytes: encoded image>,
 #            "bbox": [x1, y1, x2, y2], "pad_ratio": <float>}
 #     resp: {"bbox": [<floats>]|None, "embedding": <bytes: float32 (512,)>,
-#            "det_score": <float>, "error": <None|str>}
+#            "det_score": <float>, "angle": <float>, "error": <None|str>}
+#
+#   PATH_NORMALIZE_FACES
+#     req:  {"name": <str>, "image": <bytes: encoded image>,
+#            "faces": [{"bbox": [x1, y1, x2, y2],
+#                       "embedding": <bytes: float32 (512,)>,
+#                       "det_score": <float>, "angle": <float>}, ...]}
+#     resp: {"faces": [ <same shape as the request's faces> ],  # SAME length and
+#                       # order as the request: the caller maps them back to its
+#                       # own DB rows positionally
+#            "error": <None|str>}
 #
 #   PATH_EMBED_IMAGE
 #     req:  {"name": <str>, "image": <bytes: encoded image>}

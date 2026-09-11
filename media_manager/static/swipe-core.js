@@ -474,5 +474,19 @@ window.initSwipeStack = function (config) {
       started = true;
       render();
     },
+    // reset() is load()'s "start over from the server" sibling: same clearing, but the
+    // refetch is kicked off BEFORE the re-render so `fetching` is already true and the
+    // user sees SEARCHING… instead of a flash of the page's "nothing found" empty state
+    // (see the call-order note in renderEmptyState). Used when a filter that lives in
+    // fetchMoreUrl changes — find_person.html's "hide faces that match someone else
+    // better" toggle would otherwise not visibly do anything until the buffer drained.
+    reset: () => {
+      queue = [];
+      known.clear();
+      history.length = 0;
+      started = true;
+      maybeFetchMore();
+      render();
+    },
   };
 };

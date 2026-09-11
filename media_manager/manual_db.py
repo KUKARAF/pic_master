@@ -2435,7 +2435,7 @@ class ManualDB(ThreadLocalDB):
         return cur.lastrowid
 
     def promote_auto_face(self, source_face_id, checksum, bbox, embedding_bytes, identity,
-                           image_width, image_height, frame_index=None):
+                           image_width, image_height, frame_index=None, rotation=0):
         """Naming an auto-detected face copies it into manual.db (upsert, keyed on source_face_id
         so renaming the same auto-detected face twice doesn't create a duplicate row). Clears
         any prior rejection — naming a face after all is a stronger, more recent signal.
@@ -2450,17 +2450,25 @@ class ManualDB(ThreadLocalDB):
         "manual:<new_id>" — anything keyed to the old ref (namely a saved age/gender
         estimate, see face_age_estimates) would otherwise silently stop showing up
         the moment someone names the face, so carry it forward here rather than
-        leaving it orphaned under a ref nothing displays anymore."""
+        leaving it orphaned under a ref nothing displays anymore.
+
+        `rotation` (quarter-turns clockwise) is recorded at insert time because a
+        confirm that carries a rotation also carries the embedding computed at that
+        orientation — writing the two together keeps a row from ever existing with a
+        rotated vector and an unrotated rotation, which is what a follow-up
+        set_face_rotation UPDATE would briefly allow. The upsert branch overwrites it
+        too: re-confirming the same face at a new angle is the newer decision."""
         x1, y1, x2, y2 = bbox
         cur = self.conn.cursor()
         cur.execute('''
             INSERT INTO faces (checksum, identity, x1,y1,x2,y2, embedding, bbox_source, source_face_id,
-                                image_width, image_height, rejected, created_at, frame_index)
-            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?)
+                                image_width, image_height, rejected, created_at, frame_index, rotation)
+            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?, ?)
             ON CONFLICT(source_face_id) WHERE source_face_id IS NOT NULL
-                DO UPDATE SET identity=excluded.identity, rejected=0
+                DO UPDATE SET identity=excluded.identity, rejected=0,
+                              embedding=excluded.embedding, rotation=excluded.rotation
         ''', (checksum, identity, x1, y1, x2, y2, embedding_bytes, source_face_id,
-              image_width, image_height, int(time.time()), frame_index))
+              image_width, image_height, int(time.time()), frame_index, int(rotation) % 4))
         cur.execute('SELECT id FROM faces WHERE source_face_id = ?', (source_face_id,))
         new_id = cur.fetchone()[0]
 
@@ -2845,11 +2853,126 @@ class ManualDB(ThreadLocalDB):
         ''')
         return cur.fetchall()
 
+    @staticmethod
+    def _usable_embedding_rows(rows, label):
+        """Drop face rows whose embedding blob can't take part in a float32 matrix —
+        empty, not a whole number of float32s, or a different width than the rows
+        before it — printing each rejection. Rows are (identity, embedding, *extra)
+        and come back unchanged minus the rejects, paired with the dimension they all
+        share (None if nothing survived).
+
+        A single bad row is enough to blow up the reshape for the ENTIRE named set,
+        which takes face matching down library-wide; dropping it loudly keeps every
+        other reference face usable. Shared rather than duplicated so the plain list
+        accessors and the cached matrix can never disagree about which reference faces
+        exist — a mismatch there means scores computed against a set the caller thinks
+        it enumerated."""
+        kept = []
+        dim = None
+        for row in rows:
+            identity, blob = row[0], row[1]
+            if not blob:
+                print(f"WARNING: {label} dropping face for identity {identity!r} — "
+                      f"empty embedding blob")
+                continue
+            if len(blob) % 4 != 0:
+                print(f"WARNING: {label} dropping face for identity {identity!r} — "
+                      f"embedding blob length {len(blob)} not a multiple of 4 (not float32)")
+                continue
+            row_dim = len(blob) // 4
+            if dim is None:
+                dim = row_dim
+            elif row_dim != dim:
+                print(f"WARNING: {label} dropping face for identity {identity!r} — "
+                      f"embedding dim {row_dim} != expected {dim}")
+                continue
+            kept.append(row)
+        return kept, dim
+
     def get_named_face_embeddings(self):
-        """Return [(identity, embedding_bytes), ...] for faces a human has named."""
+        """Return [(identity, embedding_bytes), ...] for faces a human has named,
+        filtered to blobs that can actually be stacked (see _usable_embedding_rows)."""
         cur = self.conn.cursor()
         cur.execute("SELECT identity, embedding FROM faces WHERE identity IS NOT NULL AND rejected = 0")
-        return cur.fetchall()
+        kept, _dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_embeddings')
+        return kept
+
+    def get_named_face_embeddings_since(self, manual_face_id_exclusive):
+        """Reference faces named after `manual_face_id_exclusive`, as
+        [(identity, embedding_bytes, manual_face_id), ...] ordered by id.
+
+        The incremental rescore's input: ids are monotonic, so "everything above the
+        last watermark" is exactly the vectors that didn't exist at the last scoring
+        run. Scores against only these can be merged into the stored top-K because a
+        new reference vector can only raise a face's score, never lower one."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT identity, embedding, id FROM faces '
+                    'WHERE id > ? AND identity IS NOT NULL AND rejected = 0 ORDER BY id',
+                    (int(manual_face_id_exclusive),))
+        kept, _dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_embeddings_since')
+        return kept
+
+    def max_named_face_id(self):
+        """Highest id in the named reference set (0 when there are none) — the
+        watermark the incremental rescore compares against to decide whether the set
+        merely grew. Deliberately the raw max over the same population
+        get_named_face_embeddings_since walks, so a row dropped for a bad blob still
+        advances the watermark instead of being re-offered forever."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT MAX(id) FROM faces WHERE identity IS NOT NULL AND rejected = 0')
+        row = cur.fetchone()
+        return row[0] or 0
+
+    def update_face_embedding(self, manual_face_id, embedding_bytes, rotation=None):
+        """Replace a manual row's stored vector (and optionally its rotation) — the
+        renormalization backfill refreshing a promoted face. rotation=None leaves the
+        existing value alone, since a backfill that only re-derives the embedding must
+        not silently undo a human's manual quarter-turn. Invalidates the cached named
+        matrix like every other embedding write: a stale cache here means matching
+        against vectors that no longer exist on disk."""
+        cur = self.conn.cursor()
+        if rotation is None:
+            cur.execute('UPDATE faces SET embedding = ? WHERE id = ?',
+                        (embedding_bytes, manual_face_id))
+        else:
+            cur.execute('UPDATE faces SET embedding = ?, rotation = ? WHERE id = ?',
+                        (embedding_bytes, int(rotation) % 4, manual_face_id))
+        self.conn.commit()
+        self._face_ver += 1
+
+    def get_manual_ids_by_source(self, source_ids):
+        """{source_face_id: manual_faces.id} for the given media.db face ids that have
+        a manual row. Lets a caller holding auto: refs reach the manual rows in one
+        batched lookup instead of a query per face (the renormalization backfill needs
+        exactly this to push corrected vectors through to promoted faces)."""
+        result = {}
+        ids = [int(i) for i in source_ids]
+        if not ids:
+            return result
+        cur = self.conn.cursor()
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'SELECT source_face_id, id FROM faces '
+                        f'WHERE source_face_id IN ({placeholders})', tuple(chunk))
+            for source_face_id, manual_id in cur.fetchall():
+                result[source_face_id] = manual_id
+        return result
+
+    def get_identity_reference_faces(self):
+        """{identity: representative manual face id} — one crop per person to show
+        beside their name in the review UI's candidate list. A favorited face wins
+        (that is what favoriting a face is FOR), otherwise the oldest one, so the
+        representative is stable across sessions instead of drifting as faces are
+        added."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT identity, id FROM faces "
+                    "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x'' "
+                    "ORDER BY identity, favorite DESC, id")
+        result = {}
+        for identity, face_id in cur.fetchall():
+            if identity not in result:
+                result[identity] = face_id
+        return result
 
     def get_named_face_embeddings_with_ids(self):
         """Like get_named_face_embeddings but includes each face's id, so a caller can
@@ -2883,35 +3006,14 @@ class ManualDB(ThreadLocalDB):
                 "SELECT identity, embedding FROM faces "
                 "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''"
             )
-            rows = cur.fetchall()
+            rows, dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_matrix')
 
-            identities = []
-            blobs = []
-            dim = None
-            for identity, blob in rows:
-                if not blob:
-                    print(f"WARNING: get_named_face_matrix dropping face for identity "
-                          f"{identity!r} — empty embedding blob")
-                    continue
-                if len(blob) % 4 != 0:
-                    print(f"WARNING: get_named_face_matrix dropping face for identity "
-                          f"{identity!r} — embedding blob length {len(blob)} not a "
-                          f"multiple of 4 (not float32)")
-                    continue
-                row_dim = len(blob) // 4
-                if dim is None:
-                    dim = row_dim
-                elif row_dim != dim:
-                    print(f"WARNING: get_named_face_matrix dropping face for identity "
-                          f"{identity!r} — embedding dim {row_dim} != expected {dim}")
-                    continue
-                identities.append(identity)
-                blobs.append(blob)
-
-            if not blobs:
+            if not rows:
                 result = ([], np.empty((0, 0), dtype=np.float32))
             else:
-                matrix = np.frombuffer(b''.join(blobs), dtype=np.float32).reshape(len(blobs), dim)
+                identities = [r[0] for r in rows]
+                matrix = np.frombuffer(b''.join(r[1] for r in rows),
+                                       dtype=np.float32).reshape(len(rows), dim)
                 result = (identities, matrix)
 
             self._named_matrix_cache = (self._face_ver, result)

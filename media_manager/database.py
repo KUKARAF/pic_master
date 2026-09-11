@@ -7,6 +7,20 @@ import threading
 import time
 
 
+# Version of the face normalization pipeline (in-plane rotation recovery + aligned
+# re-embedding) that produced a faces row. Bumping it re-queues the whole library for
+# the renormalization backfill, which is the only way an already-detected face ever
+# gets a corrected embedding — detection itself never revisits a scanned file.
+FACE_NORM_VERSION = 1
+# How many distinct identities the scoring worker keeps per face. The ranks below 0 are
+# what makes cross-person competition a lookup instead of a rescan (rank 1 is the rival
+# warning), so this is a UI list length as much as a storage bound.
+FACE_CANDIDATE_K = 8
+# Scores below this are noise for review purposes and are not stored at all; the
+# deliberate "expand similar search" deep dig scans live, below the floor.
+FACE_CANDIDATE_FLOOR = 0.30
+
+
 class ThreadLocalDB:
     """One sqlite connection per thread, opened lazily via the `conn` property.
 
@@ -318,16 +332,63 @@ class Database(ThreadLocalDB):
         ''')
         # Faces table: InsightFace detections + ArcFace embeddings. frame_index: same
         # NULL-means-primary-frame convention as detections.
+        # angle: the face's in-plane roll AS IT SITS IN THE IMAGE, degrees clockwise
+        # from upright (0 = upright/uncorrected); rotate the crop counter-clockwise by
+        # `angle` to view it upright. norm_version: which normalization pipeline
+        # produced `embedding` (see FACE_NORM_VERSION). handled: 1 when manual.db
+        # already holds a decision for this face — a denormalized mirror of
+        # manual.get_promoted_source_ids() (see sync_handled), because the two
+        # databases can't be JOINed and filtering decided faces out in Python *after*
+        # the SQL LIMIT is what silently emptied the old review pool. score_version:
+        # the scoring generation this face's face_candidates rows were computed at.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS faces (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id     INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                bbox        TEXT NOT NULL,
-                embedding   BLOB NOT NULL,
-                det_score   REAL NOT NULL,
-                identity    TEXT,
-                indexed_at  INTEGER NOT NULL,
-                frame_index INTEGER
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id       INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                bbox          TEXT NOT NULL,
+                embedding     BLOB NOT NULL,
+                det_score     REAL NOT NULL,
+                identity      TEXT,
+                indexed_at    INTEGER NOT NULL,
+                frame_index   INTEGER,
+                angle         REAL NOT NULL DEFAULT 0,
+                norm_version  INTEGER NOT NULL DEFAULT 0,
+                handled       INTEGER NOT NULL DEFAULT 0,
+                score_version INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
+        # Materialized top-K "who could this be" per face — the single output of the
+        # scoring worker and the input to every ranking read in the app: the global
+        # review pool (rank = 0), the per-person stream (filter by identity), and the
+        # rival warning (the other ranks of the same face ARE the rivals). Keeping K
+        # identities instead of just the argmax is what turns cross-person competition
+        # from a live full-library matmul per buffer refill into an index lookup.
+        # WITHOUT ROWID: the row is barely wider than its own primary key and is always
+        # reached through it, so the rowid indirection would be pure overhead on a
+        # table of ~K rows per face across a few hundred thousand faces.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS face_candidates (
+                face_id  INTEGER NOT NULL REFERENCES faces(id) ON DELETE CASCADE,
+                rank     INTEGER NOT NULL,
+                identity TEXT    NOT NULL,
+                score    REAL    NOT NULL,
+                PRIMARY KEY (face_id, rank)
+            ) WITHOUT ROWID
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_face_cand_identity '
+                       'ON face_candidates(identity, score DESC)')
+        # Partial index over best-match rows only: the global review pool orders the
+        # entire library by score DESC and takes one page, so without it every refill
+        # would sort all ~K-per-face rows. Partial keeps it ~1/K the size and lets the
+        # planner satisfy both the rank = 0 filter and the ORDER BY from the index.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_face_cand_best '
+                       'ON face_candidates(score DESC) WHERE rank = 0')
+        # Scoring generation counter. media.db has no general-purpose key/value table,
+        # so this one is scoped to face scoring rather than pretending to be global.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS face_scoring_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
             )
         ''')
         # Body embeddings table: CLIP vectors of person crops, for find-by-body
@@ -454,16 +515,32 @@ class Database(ThreadLocalDB):
         faces_cols = {row[1] for row in cursor.execute('PRAGMA table_info(faces)')}
         if 'frame_index' not in faces_cols:
             cursor.execute('ALTER TABLE faces ADD COLUMN frame_index INTEGER')
-        # Precomputed "closest known person" for an unidentified face (identity IS NULL):
-        # the /find_all_faces review reads the top-scoring ones instead of re-scanning
-        # every unidentified face against the named-face matrix on each buffer refill
-        # (see compute_face_suggestions). NULL score = not computed yet.
-        if 'suggested_identity' not in faces_cols:
-            cursor.execute('ALTER TABLE faces ADD COLUMN suggested_identity TEXT')
-        if 'suggested_score' not in faces_cols:
-            cursor.execute('ALTER TABLE faces ADD COLUMN suggested_score REAL')
-            cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_suggested '
-                           'ON faces(suggested_score) WHERE identity IS NULL')
+        # Face normalization / review bookkeeping, all additive with a constant default
+        # so existing rows get a correct value in place (see the faces CREATE TABLE for
+        # what each column means). norm_version and score_version are each a worker's
+        # entire work queue — "< the current version" — so both get an index.
+        if 'angle' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN angle REAL NOT NULL DEFAULT 0')
+        if 'norm_version' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN norm_version INTEGER NOT NULL DEFAULT 0')
+        if 'handled' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN handled INTEGER NOT NULL DEFAULT 0')
+        if 'score_version' not in faces_cols:
+            cursor.execute('ALTER TABLE faces ADD COLUMN score_version INTEGER NOT NULL DEFAULT 0')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_norm_version ON faces(norm_version)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_score_version ON faces(score_version)')
+        # The old single precomputed suggestion (suggested_identity/suggested_score) is
+        # fully superseded by face_candidates' top-K — no code reads it anymore. Its
+        # index goes unconditionally; the columns themselves need SQLite >= 3.35 for
+        # DROP COLUMN, and on an older build we leave the dead data in place rather
+        # than rewriting a multi-hundred-thousand-row table to reclaim two columns
+        # nothing can reach. (DROP INDEX must come first: SQLite refuses to drop a
+        # column an index still references.)
+        cursor.execute('DROP INDEX IF EXISTS idx_faces_suggested')
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            for dead_col in ('suggested_identity', 'suggested_score'):
+                if dead_col in faces_cols:
+                    cursor.execute('ALTER TABLE faces DROP COLUMN ' + dead_col)
 
         # embeddings' PK changed shape (file_id -> (file_id, frame_index)), which SQLite
         # can't ALTER in place — rebuild the table if it's still the old single-column-PK
@@ -1737,6 +1814,10 @@ class Database(ThreadLocalDB):
             cursor.execute('SELECT COUNT(*) FROM file_paths WHERE file_id = ?', (file_id,))
             if cursor.fetchone()[0] > 0:
                 continue  # still tracked at another path (a duplicate) — keep its content row
+            # face_candidates hangs off faces.id, not file_id, so it can't join the
+            # loop below and has to be swept first — while the faces rows still exist.
+            cursor.execute('DELETE FROM face_candidates WHERE face_id IN '
+                           '(SELECT id FROM faces WHERE file_id = ?)', (file_id,))
             for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings', 'tile_embeddings', 'file_category_matches'):
                 cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
@@ -1764,40 +1845,56 @@ class Database(ThreadLocalDB):
     def insert_faces(self, file_id: int, faces: list, model: str) -> None:
         """Upsert primary-frame face rows for a file (the batch `media faces` CLI
         path — always writes frame_index=NULL).
-        faces: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray, 'det_score': float}
+        faces: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray, 'det_score':
+        float, 'angle': float} — 'angle' is the detector's recovered in-plane roll
+        (degrees clockwise from upright) and is absent on faces that needed no
+        rotation correction, hence the .get default.
         Always writes at least one sentinel row so the file is never re-queued.
         The DELETE is scoped to frame_index IS NULL so re-running this never wipes
         out frame-specific rows written by the per-image 'scan all frames' action."""
         import json
         cursor = self.conn.cursor()
+        # No FK enforcement in this process (see remove_paths_under), so the top-K rows
+        # of the faces we are about to replace have to be swept by hand or they'd
+        # outlive their face and resurface attached to a recycled id.
+        cursor.execute('DELETE FROM face_candidates WHERE face_id IN '
+                       '(SELECT id FROM faces WHERE file_id = ? AND frame_index IS NULL)', (file_id,))
         cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         now = int(time.time())
         if not faces:
             cursor.execute(
-                'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at) VALUES (?,?,?,?,?,?)',
-                (file_id, '[]', b'', 0.0, '__indexed__', now)
+                'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at, '
+                'angle, norm_version) VALUES (?,?,?,?,?,?,?,?)',
+                (file_id, '[]', b'', 0.0, '__indexed__', now, 0.0, FACE_NORM_VERSION)
             )
         else:
             for face in faces:
                 cursor.execute(
-                    'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at) VALUES (?,?,?,?,?,?)',
-                    (file_id, json.dumps(face['bbox']), face['embedding'].tobytes(), face['det_score'], None, now)
+                    'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at, '
+                    'angle, norm_version) VALUES (?,?,?,?,?,?,?,?)',
+                    (file_id, json.dumps(face['bbox']), face['embedding'].tobytes(), face['det_score'],
+                     None, now, float(face.get('angle', 0.0)), FACE_NORM_VERSION)
                 )
         self.conn.commit()
         self._face_ver += 1  # invalidate cached face-embeddings matrix
 
-    def add_manual_face(self, file_id, bbox, embedding_bytes, det_score, frame_index=None) -> int:
+    def add_manual_face(self, file_id, bbox, embedding_bytes, det_score, frame_index=None,
+                        angle=0.0) -> int:
         """Insert a single manually-added (or per-frame auto-detected) face row
         without deleting existing rows for this file (unlike insert_faces, which is
         destructive and is used only by the batch `media faces` CLI command).
         frame_index=None means a normal whole-file/primary-frame face; a value means
-        this face was found at that specific frame of an animated file."""
+        this face was found at that specific frame of an animated file.
+        `angle` is the same clockwise-from-upright roll insert_faces stores; the
+        embedding passed in must already be the one computed at that orientation,
+        which is why the row counts as normalized at the current version."""
         import json
         cursor = self.conn.cursor()
         cursor.execute(
-            'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at, frame_index) '
-            'VALUES (?,?,?,?,?,?,?)',
-            (file_id, json.dumps(bbox), embedding_bytes, det_score, None, int(time.time()), frame_index)
+            'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at, '
+            'frame_index, angle, norm_version) VALUES (?,?,?,?,?,?,?,?,?)',
+            (file_id, json.dumps(bbox), embedding_bytes, det_score, None, int(time.time()),
+             frame_index, float(angle), FACE_NORM_VERSION)
         )
         self.conn.commit()
         self._face_ver += 1  # invalidate cached face-embeddings matrix
@@ -1835,10 +1932,13 @@ class Database(ThreadLocalDB):
     def get_faces_for_file(self, file_id: int) -> list:
         """Return all non-sentinel face rows for a file (excludes embedding blob),
         primary and frame-specific alike — the photo page shows everything found for
-        this file, with a frame badge on rows where frame_index is not null."""
+        this file, with a frame badge on rows where frame_index is not null. `angle`
+        rides along (appended last, so positional readers are unaffected) because the
+        overlay has to render each box at the orientation the face was embedded at,
+        and this is the page's only source of auto-detected face rows."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, bbox, det_score, identity, frame_index FROM faces "
+            "SELECT id, bbox, det_score, identity, frame_index, angle FROM faces "
             "WHERE file_id = ? AND (identity IS NULL OR identity != '__indexed__') ORDER BY det_score DESC",
             (file_id,)
         )
@@ -1910,12 +2010,6 @@ class Database(ThreadLocalDB):
             self._face_cache = (ver, result)
             return result
 
-    def assign_identity(self, face_id: int, name: str) -> None:
-        """Set identity = name for a single face row."""
-        cursor = self.conn.cursor()
-        cursor.execute('UPDATE faces SET identity = ? WHERE id = ?', (name.strip(), face_id))
-        self.conn.commit()
-
     def get_files_by_face_identity(self, name: str, limit: int = 100) -> list:
         """Return (file_id, path) for files containing a face with given identity (case-insensitive)."""
         cursor = self.conn.cursor()
@@ -1955,59 +2049,442 @@ class Database(ThreadLocalDB):
         ''')
         return cursor.fetchall()
 
-    # --- Precomputed face suggestions (see web.py compute_face_suggestions) --------
+    # ------------------------------------------------------------------
+    # Face scoring: generation counter, the handled mirror, and the worker's
+    # work queue. Everything here feeds or drains face_candidates.
+    # ------------------------------------------------------------------
 
-    def count_unsuggested_faces(self):
-        """How many unidentified faces still need a suggestion computed (NULL score)."""
+    def get_scoring_generation(self) -> int:
+        """Current scoring generation. A face is stale exactly when its score_version
+        is below this, so the counter starts at 1 rather than 0 — otherwise a brand new
+        face (score_version defaulting to 0) would already look scored."""
         cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM faces WHERE identity IS NULL "
-                    "AND suggested_score IS NULL AND embedding != x''")
+        cur.execute("SELECT value FROM face_scoring_meta WHERE key = 'generation'")
+        row = cur.fetchone()
+        return int(row[0]) if row else 1
+
+    def bump_scoring_generation(self) -> int:
+        """Invalidate every face's top-K at once and return the new generation.
+
+        Used when existing reference vectors CHANGE meaning — a rename, a deleted
+        identity, a re-embedded face — because those can lower a stored score, which
+        an incremental merge (which only ever raises) cannot express. Merely adding a
+        new named face does not need this; see merge_face_candidates."""
+        cur = self.conn.cursor()
+        cur.execute("INSERT INTO face_scoring_meta (key, value) VALUES ('generation', '2') "
+                    "ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)")
+        self.conn.commit()
+        return self.get_scoring_generation()
+
+    def get_scoring_meta(self, key, default=None):
+        """Read a scoring-worker bookkeeping value (raw TEXT, or `default` if unset).
+        The incremental rescore needs its 'how far had we got' watermark to survive a
+        restart — held in-process it would turn every web restart into a full
+        library-wide rescore."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT value FROM face_scoring_meta WHERE key = ?', (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+    def set_scoring_meta(self, key, value):
+        """Upsert a scoring-worker bookkeeping value; stored as TEXT so one table can
+        hold counters and watermarks alike without a type column."""
+        cur = self.conn.cursor()
+        cur.execute('INSERT INTO face_scoring_meta (key, value) VALUES (?, ?) '
+                    'ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+                    (key, str(value)))
+        self.conn.commit()
+
+    def mark_faces_handled(self, face_ids, handled=1) -> int:
+        """Flag/unflag faces as already decided in manual.db. Returns rows changed.
+        Called on every confirm/reject/undo so the review pool reacts immediately
+        instead of waiting for the next full sync_handled reconcile."""
+        ids = [int(i) for i in face_ids]
+        if not ids:
+            return 0
+        cur = self.conn.cursor()
+        changed = 0
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'UPDATE faces SET handled = ? WHERE id IN ({placeholders}) AND handled != ?',
+                        tuple([int(handled)] + list(chunk) + [int(handled)]))
+            changed += cur.rowcount
+        self.conn.commit()
+        return changed
+
+    def sync_handled(self, promoted_ids) -> int:
+        """Reconcile the whole handled column against manual.db's promoted set in one
+        pass, and return how many rows changed.
+
+        manual.db lives in a different file, so 'has this face been decided?' can't be
+        a JOIN; it has to be mirrored. Doing that per id would be hundreds of thousands
+        of statements, so the set is materialised into a TEMP table (INTEGER PRIMARY KEY
+        = its own index) and reconciled with two set-based UPDATEs. Self-healing in both
+        directions: an undone decision clears the flag again, so a missed
+        mark_faces_handled call can never permanently hide a face."""
+        cur = self.conn.cursor()
+        cur.execute('DROP TABLE IF EXISTS temp._handled_sync')
+        cur.execute('CREATE TEMP TABLE _handled_sync (face_id INTEGER PRIMARY KEY)')
+        cur.executemany('INSERT OR IGNORE INTO _handled_sync (face_id) VALUES (?)',
+                        [(int(i),) for i in promoted_ids])
+        cur.execute('UPDATE faces SET handled = 1 '
+                    'WHERE handled = 0 AND id IN (SELECT face_id FROM _handled_sync)')
+        changed = cur.rowcount
+        cur.execute('UPDATE faces SET handled = 0 '
+                    'WHERE handled = 1 AND id NOT IN (SELECT face_id FROM _handled_sync)')
+        changed += cur.rowcount
+        self.conn.commit()
+        cur.execute('DROP TABLE temp._handled_sync')
+        return changed
+
+    def count_faces_to_score(self, generation) -> int:
+        """Size of the scoring worker's queue at `generation` — real faces only
+        (the '[]' sentinel rows that mark a scanned-but-faceless file have no vector)."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM faces WHERE score_version < ? "
+                    "AND bbox != '[]' AND embedding != x''", (generation,))
         return cur.fetchone()[0]
 
-    def iter_unsuggested_faces(self, chunk=5000):
-        """Stream (face_ids: list[int], vecs: bytes) chunks of unidentified faces whose
-        suggestion hasn't been computed yet — for the chunked, vectorized
-        compute_face_suggestions (never materializes all ~227k face embeddings at once)."""
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, embedding FROM faces WHERE identity IS NULL "
-                    "AND suggested_score IS NULL AND embedding != x'' ORDER BY id")
-        while True:
-            rows = cur.fetchmany(chunk)
-            if not rows:
-                break
-            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
+    def iter_faces_to_score(self, generation, chunk=5000):
+        """Stream (face_ids: list[int], packed_embeddings: bytes) for every face still
+        below `generation`, for the chunked matmul in rescore_faces.
 
-    def set_face_suggestions(self, updates):
-        """Batch-write precomputed (suggested_identity, suggested_score) — updates is a
-        list of (identity, score, face_id) tuples."""
+        The id list is SNAPSHOTTED up front and rows are then fetched by id, rather
+        than streamed from one long-lived cursor. The caller UPDATEs score_version and
+        COMMITs between chunks; with an open cursor over a predicate those same writes
+        invalidate, rows can be skipped entirely — a silent, load-dependent loss that
+        looks like 'the worker finished but some faces were never scored'.
+
+        Each id batch is re-split to stay under SQLite's bound-parameter cap, which is
+        far below a useful matmul chunk size.
+
+        Rows whose blob doesn't match the first one's length are dropped loudly: the
+        caller infers D from len(packed) // len(ids), so a single odd row would shift
+        every vector in the chunk instead of failing."""
         cur = self.conn.cursor()
-        cur.executemany('UPDATE faces SET suggested_identity = ?, suggested_score = ? WHERE id = ?',
-                        updates)
+        cur.execute("SELECT id FROM faces WHERE score_version < ? "
+                    "AND bbox != '[]' AND embedding != x'' ORDER BY id", (generation,))
+        pending = [r[0] for r in cur.fetchall()]
+        row_nbytes = None
+        for batch in self._chunked(pending, chunk):
+            ids, blobs = [], []
+            for sub in self._chunked(batch):
+                placeholders = ','.join('?' for _ in sub)
+                cur.execute(f'SELECT id, embedding FROM faces WHERE id IN ({placeholders}) ORDER BY id',
+                            tuple(sub))
+                for face_id, blob in cur.fetchall():
+                    if row_nbytes is None:
+                        row_nbytes = len(blob)
+                    if len(blob) != row_nbytes:
+                        print(f"[iter_faces_to_score] dropping face {face_id}: embedding blob "
+                              f"length {len(blob)} != expected {row_nbytes}")
+                        continue
+                    ids.append(face_id)
+                    blobs.append(blob)
+            if ids:
+                yield ids, b''.join(blobs)
+
+    def replace_face_candidates(self, rows, generation):
+        """Write each face's complete top-K, replacing whatever was there.
+
+        rows: {face_id: [(identity, score), ...]} already sorted best-first and already
+        truncated/floored by the caller; an empty list is meaningful (this face matches
+        nobody) and still marks the face scored. Delete + insert + score_version bump
+        share one transaction so a crash mid-run can never leave a face marked scored
+        with a half-written candidate list."""
+        if not rows:
+            return
+        cur = self.conn.cursor()
+        face_ids = [(int(face_id),) for face_id in rows]
+        cur.executemany('DELETE FROM face_candidates WHERE face_id = ?', face_ids)
+        cur.executemany(
+            'INSERT INTO face_candidates (face_id, rank, identity, score) VALUES (?,?,?,?)',
+            [(int(face_id), rank, identity, float(score))
+             for face_id, candidates in rows.items()
+             for rank, (identity, score) in enumerate(candidates[:FACE_CANDIDATE_K])]
+        )
+        cur.executemany('UPDATE faces SET score_version = ? WHERE id = ?',
+                        [(generation, int(face_id)) for face_id in rows])
         self.conn.commit()
+        self._face_ver += 1
 
-    def clear_face_suggestions(self):
-        """Reset all unidentified faces' suggestions (NULL) so the next compute recomputes
-        everyone — used after the named-people set changes."""
+    def merge_face_candidates(self, rows, generation):
+        """Fold scores against NEWLY ADDED reference vectors into the stored top-K.
+
+        Adding a reference vector can only ever raise a face's best score for that
+        identity, never lower anyone's, so unioning the new scores over the existing
+        list and re-truncating is exactly equal to a full rescore — at the cost of one
+        matmul against the handful of new vectors instead of against every named face.
+        Same {face_id: [(identity, score), ...]} shape as replace_face_candidates."""
+        if not rows:
+            return
         cur = self.conn.cursor()
-        cur.execute('UPDATE faces SET suggested_identity = NULL, suggested_score = NULL '
-                    'WHERE identity IS NULL')
-        self.conn.commit()
+        existing = {}
+        for sub in self._chunked([int(face_id) for face_id in rows]):
+            placeholders = ','.join('?' for _ in sub)
+            cur.execute(f'SELECT face_id, identity, score FROM face_candidates '
+                        f'WHERE face_id IN ({placeholders})', tuple(sub))
+            for face_id, identity, score in cur.fetchall():
+                per_face = existing.setdefault(face_id, {})
+                if score > per_face.get(identity, -1.0):
+                    per_face[identity] = score
+        merged = {}
+        for face_id, candidates in rows.items():
+            best = dict(existing.get(int(face_id), {}))
+            for identity, score in candidates:
+                if float(score) > best.get(identity, -1.0):
+                    best[identity] = float(score)
+            ordered = sorted(best.items(), key=lambda kv: -kv[1])[:FACE_CANDIDATE_K]
+            merged[face_id] = [(identity, score) for identity, score in ordered
+                               if score >= FACE_CANDIDATE_FLOOR]
+        self.replace_face_candidates(merged, generation)
 
-    def get_suggested_unidentified_faces(self, threshold, limit):
-        """Top unidentified faces by precomputed suggested_score (>= threshold), best
-        first — the /find_all_faces review pool. Returns (face_id, file_id, path, bbox,
-        suggested_identity, suggested_score). Caller drops promoted / already-buffered
-        refs. Instant vs the old per-refill full-library scan."""
+    def _compact_ranks(self, cur, face_ids):
+        """Renumber the given faces' candidate rows to a dense 0..n-1 by score DESC.
+
+        Deleting or renaming an identity punches a hole in a face's rank sequence, and
+        if the hole was rank 0 the face silently vanishes from the global review pool —
+        that query is driven entirely by the `rank = 0` partial index. Delete-and-
+        reinsert rather than UPDATE because rank is half the primary key, so shifting
+        rows down would collide with the rows not yet shifted."""
+        for face_id in face_ids:
+            cur.execute('SELECT identity, score FROM face_candidates WHERE face_id = ? '
+                        'ORDER BY score DESC, rank', (face_id,))
+            ordered = cur.fetchall()
+            cur.execute('DELETE FROM face_candidates WHERE face_id = ?', (face_id,))
+            cur.executemany(
+                'INSERT INTO face_candidates (face_id, rank, identity, score) VALUES (?,?,?,?)',
+                [(face_id, rank, identity, score) for rank, (identity, score) in enumerate(ordered)]
+            )
+
+    def rename_face_candidates(self, old_name, new_name) -> int:
+        """Carry a person's stored candidacies over to their new name. Returns rows
+        renamed.
+
+        A face can already list BOTH names (two people who look alike, one of whom
+        turns out to be the other), and identity is not unique within a face's top-K by
+        construction — so those faces are collapsed to the better-scoring of the two
+        entries and re-ranked. Note this does NOT change what the scores mean, so it
+        needs no generation bump; the caller bumps only when vectors move."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT face_id FROM face_candidates WHERE identity = ? '
+                    'INTERSECT SELECT face_id FROM face_candidates WHERE identity = ?',
+                    (old_name, new_name))
+        collided = [r[0] for r in cur.fetchall()]
+        cur.execute('UPDATE face_candidates SET identity = ? WHERE identity = ?',
+                    (new_name, old_name))
+        renamed = cur.rowcount
+        if collided:
+            cur.execute(
+                'DELETE FROM face_candidates WHERE identity = ? AND EXISTS ('
+                '  SELECT 1 FROM face_candidates o'
+                '  WHERE o.face_id = face_candidates.face_id AND o.identity = face_candidates.identity'
+                '    AND (o.score > face_candidates.score'
+                '         OR (o.score = face_candidates.score AND o.rank < face_candidates.rank)))',
+                (new_name,)
+            )
+            self._compact_ranks(cur, collided)
+        self.conn.commit()
+        self._face_ver += 1
+        return renamed
+
+    def delete_face_candidates_for_identity(self, name) -> int:
+        """Drop every candidacy for a deleted person. Returns rows removed. The faces
+        that lose a row are re-ranked so the next-best identity becomes their rank 0 —
+        they should now surface in review as that person, not disappear."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT DISTINCT face_id FROM face_candidates WHERE identity = ?', (name,))
+        affected = [r[0] for r in cur.fetchall()]
+        cur.execute('DELETE FROM face_candidates WHERE identity = ?', (name,))
+        removed = cur.rowcount
+        self._compact_ranks(cur, affected)
+        self.conn.commit()
+        self._face_ver += 1
+        return removed
+
+    def clear_face_candidates_for(self, face_ids):
+        """Throw away specific faces' top-K and re-queue them for the scoring worker.
+        Resetting score_version to 0 is the whole point: a face whose embedding just
+        changed (manual rotation, renormalization backfill) must be re-ranked, and
+        leaving it at the current generation would mean it never is."""
+        ids = [int(i) for i in face_ids]
+        if not ids:
+            return
+        cur = self.conn.cursor()
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'DELETE FROM face_candidates WHERE face_id IN ({placeholders})', tuple(chunk))
+            cur.execute(f'UPDATE faces SET score_version = 0 WHERE id IN ({placeholders})', tuple(chunk))
+        self.conn.commit()
+        self._face_ver += 1
+
+    # --- The two read queries over face_candidates --------------------------------
+    #
+    # Both use CROSS JOIN purely to pin the join order: SQLite treats it as "keep this
+    # table as the outer loop" rather than as a different join. Without it, and with no
+    # ANALYZE stats in this DB, the planner drives Q1 off faces and probes
+    # face_candidates by primary key — measured at 159 ms vs 0.6 ms for one 20-row page
+    # over 60k faces, because that plan reads every unhandled face before it can sort.
+    # Pinned, the ORDER BY falls straight out of the index and paging cost tracks the
+    # offset instead of the library size. Verified with EXPLAIN QUERY PLAN: Q1 uses
+    # idx_face_cand_best, Q2 the covering idx_face_cand_identity. (The one remaining
+    # "USE TEMP B-TREE FOR ORDER BY" in those plans belongs to files_with_path's own
+    # correlated subquery — it is there with the ORDER BY removed too.)
+
+    def get_unmatched_face_candidates(self, threshold, limit, offset=0):
+        """Q1, the global review pool: best-guess-per-face across the whole library,
+        strongest first. Returns [(face_id, file_id, path, bbox, angle, identity,
+        score)].
+
+        Only rank 0 participates, so each face appears once under whoever it looks
+        most like — that IS the cross-person competition the old per-person stream
+        lacked. handled = 0 excludes faces manual.db has already decided (the filter
+        that used to run in Python after the LIMIT and emptied the pool), and the
+        LIMIT/OFFSET paginate exactly because the filtering is all in SQL."""
         cur = self.conn.cursor()
         cur.execute('''
-            SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.suggested_identity, fa.suggested_score
-            FROM faces fa
+            SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.angle, fc.identity, fc.score
+            FROM face_candidates fc
+            CROSS JOIN faces fa ON fa.id = fc.face_id
             JOIN files_with_path f ON f.id = fa.file_id
-            WHERE fa.identity IS NULL AND fa.suggested_score >= ?
-            ORDER BY fa.suggested_score DESC
-            LIMIT ?
-        ''', (threshold, limit))
+            WHERE fc.rank = 0 AND fa.handled = 0 AND fa.identity IS NULL AND fc.score >= ?
+            ORDER BY fc.score DESC
+            LIMIT ? OFFSET ?
+        ''', (threshold, limit, offset))
         return cur.fetchall()
+
+    def count_unmatched_face_candidates(self, threshold) -> int:
+        """How many faces Q1 has left — the review UI's 'remaining' counter. Skips the
+        files_with_path join: a count doesn't need the path, and that view resolves the
+        primary path with a correlated subquery per row."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT COUNT(*)
+            FROM face_candidates fc
+            CROSS JOIN faces fa ON fa.id = fc.face_id
+            WHERE fc.rank = 0 AND fa.handled = 0 AND fa.identity IS NULL AND fc.score >= ?
+        ''', (threshold,))
+        return cur.fetchone()[0]
+
+    def get_face_candidates_for_identity(self, identity, threshold, limit, offset=0):
+        """Q2, the per-person stream: every undecided face that lists `identity` at ANY
+        rank, strongest first. Returns [(face_id, file_id, path, bbox, angle, score,
+        rank)].
+
+        rank comes back so the caller can tell 'this is who the face looks most like'
+        (rank 0) from 'this person is a runner-up here' (rank > 0) and warn about the
+        rival accordingly. Replaces a live scan of every unpromoted face in the library
+        on every buffer refill."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.angle, fc.score, fc.rank
+            FROM face_candidates fc
+            CROSS JOIN faces fa ON fa.id = fc.face_id
+            JOIN files_with_path f ON f.id = fa.file_id
+            WHERE fc.identity = ? AND fa.handled = 0 AND fa.identity IS NULL AND fc.score >= ?
+            ORDER BY fc.score DESC
+            LIMIT ? OFFSET ?
+        ''', (identity, threshold, limit, offset))
+        return cur.fetchall()
+
+    def count_face_candidates_for_identity(self, identity, threshold) -> int:
+        """Q2's total, for the per-person stream's remaining counter."""
+        cur = self.conn.cursor()
+        cur.execute('''
+            SELECT COUNT(*)
+            FROM face_candidates fc
+            CROSS JOIN faces fa ON fa.id = fc.face_id
+            WHERE fc.identity = ? AND fa.handled = 0 AND fa.identity IS NULL AND fc.score >= ?
+        ''', (identity, threshold))
+        return cur.fetchone()[0]
+
+    def get_candidates_for_faces(self, face_ids):
+        """{face_id: [(identity, score, rank), ...]} best-first, for specific faces.
+        Backs both the rival warning (rank 1 when the card shows rank 0) and the review
+        UI's arrow-key list, so it returns the full stored top-K, not just the best."""
+        result = {}
+        ids = [int(i) for i in face_ids]
+        if not ids:
+            return result
+        cur = self.conn.cursor()
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'SELECT face_id, identity, score, rank FROM face_candidates '
+                        f'WHERE face_id IN ({placeholders}) ORDER BY face_id, rank', tuple(chunk))
+            for face_id, identity, score, rank in cur.fetchall():
+                result.setdefault(face_id, []).append((identity, score, rank))
+        return result
+
+    # --- Re-normalization backfill ------------------------------------------------
+
+    def count_unnormalized_faces(self) -> int:
+        """Faces whose embedding predates the current normalization pipeline. Sentinel
+        rows ('[]' bbox, no vector) are not faces and never need normalizing."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM faces WHERE norm_version < ? AND bbox != '[]'",
+                    (FACE_NORM_VERSION,))
+        return cur.fetchone()[0]
+
+    def iter_unnormalized_faces(self, chunk=200):
+        """Yield lists of (face_id, file_id, path, bbox, embedding, det_score, angle),
+        batched by FILE so every face of a file arrives in the same list.
+
+        Decoding the source image dominates the cost of renormalization, so the job
+        must be able to load each image once and hand the detector all of that file's
+        faces together — which is also what normalize_faces expects. `chunk` therefore
+        counts files, not faces, and is capped at the bound-parameter limit; a file's
+        already-current faces come along too (they cost nothing extra once the image is
+        decoded and keep the detector's view of the image complete). The file id list
+        is snapshotted first for the same reason as iter_faces_to_score: the caller
+        writes to these rows as it goes."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT file_id FROM faces WHERE norm_version < ? AND bbox != '[]' "
+                    "ORDER BY file_id", (FACE_NORM_VERSION,))
+        file_ids = [r[0] for r in cur.fetchall()]
+        for batch in self._chunked(file_ids, min(chunk, 500)):
+            placeholders = ','.join('?' for _ in batch)
+            cur.execute(f'''
+                SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.embedding, fa.det_score, fa.angle
+                FROM faces fa
+                JOIN files_with_path f ON f.id = fa.file_id
+                WHERE fa.file_id IN ({placeholders}) AND fa.bbox != '[]'
+                ORDER BY fa.file_id, fa.id
+            ''', tuple(batch))
+            rows = cur.fetchall()
+            if rows:
+                yield rows
+
+    def update_face_normalization(self, rows):
+        """Write corrected embeddings back: rows = [(embedding_bytes, angle,
+        norm_version, face_id)]. This is the one place a detected face's vector ever
+        changes after insert, so the cached face matrix must be rebuilt — and the
+        caller must also clear these faces' candidates, since every stored score was
+        computed from the old vector."""
+        if not rows:
+            return
+        cur = self.conn.cursor()
+        cur.executemany('UPDATE faces SET embedding = ?, angle = ?, norm_version = ? WHERE id = ?',
+                        rows)
+        self.conn.commit()
+        self._face_ver += 1
+
+    def bump_face_norm_version(self, face_ids, version):
+        """Stamp faces as normalized at `version` without touching their vectors — for
+        faces the backfill examined and left unchanged, so they don't come back next
+        run. face_ids=None means every real face row, which is how a forced full
+        re-normalization resets the queue (bump_face_norm_version(None, 0))."""
+        cur = self.conn.cursor()
+        if face_ids is None:
+            cur.execute("UPDATE faces SET norm_version = ? WHERE bbox != '[]'", (version,))
+        else:
+            ids = [int(i) for i in face_ids]
+            if not ids:
+                return
+            for chunk in self._chunked(ids):
+                placeholders = ','.join('?' for _ in chunk)
+                cur.execute(f'UPDATE faces SET norm_version = ? WHERE id IN ({placeholders})',
+                            tuple([version] + list(chunk)))
+        self.conn.commit()
 
     def get_all_identities(self) -> list:
         """Return [(identity, count)] ordered by count DESC, excluding sentinels and NULL."""
@@ -2449,6 +2926,8 @@ class Database(ThreadLocalDB):
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM detections WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         if not skip_faces:
+            cursor.execute('DELETE FROM face_candidates WHERE face_id IN '
+                           '(SELECT id FROM faces WHERE file_id = ? AND frame_index IS NULL)', (file_id,))
             cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))

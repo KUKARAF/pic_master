@@ -216,6 +216,7 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
                 "bbox": [float(v) for v in face["bbox"]],
                 "embedding": face["embedding"].astype(np.float32).tobytes(),
                 "det_score": float(face["det_score"]),
+                "angle": float(face.get("angle", 0.0)),
             })
         summary = f"{len(out_faces)} faces" if error is None else f"err={error}"
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> {summary}",
@@ -248,6 +249,7 @@ def handle_embed_bbox(path, data, request_id, link_id, remote_identity, requeste
             "bbox": d["bbox"],
             "embedding": d["embedding"].astype(np.float32).tobytes(),
             "det_score": float(d["det_score"]),
+            "angle": float(d.get("angle", 0.0)),
             "error": None,
         }
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BBOX} ({name}) -> "
@@ -258,7 +260,57 @@ def handle_embed_bbox(path, data, request_id, link_id, remote_identity, requeste
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BBOX} ({name}) -> ERROR {e}",
               flush=True)
         return worker_protocol.pack({
-            "bbox": None, "embedding": None, "det_score": 0.0, "error": str(e)})
+            "bbox": None, "embedding": None, "det_score": 0.0, "angle": 0.0,
+            "error": str(e)})
+
+
+def handle_normalize_faces(path, data, request_id, link_id, remote_identity, requested_at):
+    """Re-run in-plane rotation normalization on faces the host already has rows
+    for. Same image transport as embed_bbox (encoded bytes straight into
+    cv2.imdecode) because the detector needs the decoded array, not a file; the
+    reply keeps the request's face order so the host can map results to DB rows
+    positionally."""
+    name = None
+    try:
+        import cv2
+        req = worker_protocol.unpack(data)
+        name = req.get("name")
+        img = cv2.imdecode(np.frombuffer(req["image"], np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("cv2.imdecode returned None (undecodable image bytes)")
+        faces = []
+        for face in (req.get("faces") or []):
+            emb = face.get("embedding")
+            faces.append({
+                "bbox": [float(v) for v in face["bbox"]],
+                "embedding": (np.frombuffer(emb, dtype=np.float32).copy()
+                              if emb else None),
+                "det_score": float(face.get("det_score") or 0.0),
+                "angle": float(face.get("angle") or 0.0),
+            })
+        with models.lock:
+            out = models.get_face_detector().normalize_faces(img, faces)
+        out_faces = []
+        changed = 0
+        for i, face in enumerate(out):
+            emb = face.get("embedding")
+            out_faces.append({
+                "bbox": [float(v) for v in face["bbox"]],
+                "embedding": (emb.astype(np.float32).tobytes()
+                              if emb is not None else b""),
+                "det_score": float(face["det_score"]),
+                "angle": float(face.get("angle", 0.0)),
+            })
+            if face.get("angle", 0.0) != faces[i]["angle"]:
+                changed += 1
+        print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> "
+              f"{len(out_faces)} faces, {changed} re-angled", flush=True)
+        return worker_protocol.pack({"faces": out_faces, "error": None})
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> ERROR {e}",
+              flush=True)
+        return worker_protocol.pack({"faces": [], "error": str(e)})
 
 
 def handle_embed_image(path, data, request_id, link_id, remote_identity, requested_at):
@@ -873,6 +925,7 @@ HANDLERS = {
     worker_protocol.PATH_PATTERN: handle_pattern,
     worker_protocol.PATH_DETECT_FACES: handle_detect_faces,
     worker_protocol.PATH_EMBED_BBOX: handle_embed_bbox,
+    worker_protocol.PATH_NORMALIZE_FACES: handle_normalize_faces,
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
     worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,

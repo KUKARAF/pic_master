@@ -41,6 +41,22 @@
               data-status="/api/estimate-age/status">🎂 Estimate ages (named faces)</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
+    <div class="bulk-action-row" style="margin-top:12px;">
+      <button type="button" class="bulk-action-btn" data-start="/api/faces/renormalize/start"
+              data-status="/api/faces/renormalize/status" data-count="changed"
+              data-count-label="re-embedded">🧭 Repair rotated faces (re-embed)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <p class="sub" style="margin:6px 2px 0;">
+      <strong>Run this once after upgrading.</strong> Faces that were sideways or upside-down in the
+      photo were detected with mis-aligned landmarks, so the face vector stored for them is
+      scrambled — that is why such a face never matched the right person no matter how many times
+      you confirmed them. This job re-opens each already-detected face, works out its in-plane
+      rotation, and re-embeds it upright. It only touches faces stored before the fix (newly
+      detected faces are already correct), and it changes no boxes, names or decisions — only the
+      vectors used for matching. Re-run “🤝 Auto-match” (or face scoring on
+      <a href="/find_all_faces">Review faces</a>) afterwards so the repaired faces get re-ranked.
+    </p>
   </section>
 
   <section class="bulk-section">

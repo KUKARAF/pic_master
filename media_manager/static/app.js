@@ -81,11 +81,14 @@
       return e < 90 ? e + 's' : Math.floor(e / 60) + 'm ' + (e % 60) + 's';
     }
     // `rate` (items/sec, from the client-side EMA) is passed only while running.
-    function fmt(d, countKey, rate) {
+    // countLabel names what the job's own counter counts — "matched" for the
+    // face/video matchers, but e.g. "re-embedded" for the rotation-repair
+    // backfill, where "matched" would describe nothing that job does.
+    function fmt(d, countKey, rate, countLabel) {
       if (d.error) return 'error: ' + d.error;
       var doneN = d.done || 0, total = d.total || 0;
       var s = doneN.toLocaleString() + '/' + total.toLocaleString();
-      if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' matched';
+      if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' ' + (countLabel || 'matched');
       if (rate && rate > 0) s += ' · ~' + Math.round(rate * 60) + '/min';
       // ETA: prefer a server-provided estimate (e.g. the imdb index load),
       // else derive from the smoothed rate. Only shown when finite and work remains.
@@ -97,6 +100,7 @@
     document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
       var statusEl = btn.parentElement.querySelector('[data-role="status"]');
       var countKey = btn.dataset.count || null;
+      var countLabel = btn.dataset.countLabel || null;
 
       // Forget throughput samples so a (re)start or finish begins a fresh EMA.
       function resetRate() { delete btn._emaRate; delete btn._lastDone; delete btn._lastT; }
@@ -122,8 +126,8 @@
         fetch(btn.dataset.status)
           .then(function (r) { return r.json(); })
           .then(function (d) {
-            if (d.running) { statusEl.textContent = fmt(d, countKey, tickRate(d.done || 0)); setTimeout(poll, 1500); return; }
-            statusEl.textContent = d.error ? ('error: ' + d.error) : ('done · ' + fmt(d, countKey));
+            if (d.running) { statusEl.textContent = fmt(d, countKey, tickRate(d.done || 0), countLabel); setTimeout(poll, 1500); return; }
+            statusEl.textContent = d.error ? ('error: ' + d.error) : ('done · ' + fmt(d, countKey, null, countLabel));
             done();
           })
           .catch(function (err) { statusEl.textContent = 'poll failed: ' + err.message; done(); });
@@ -631,6 +635,7 @@
       embed_image: 'CLIP embed',
       embed_text: 'text embed',
       detect_objects: 'object detect',
+      normalize_faces: 'face rotation fix',
     };
 
     function setBadge(cls, text, title) {
