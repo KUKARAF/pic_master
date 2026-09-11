@@ -231,6 +231,13 @@
     stack.reset();
   });
 
+  /* Empty-state bookkeeping (see emptyStateHtml below). `emptyStateSeq` lets a
+     superseded poll loop stand down instead of fighting a newer render for the
+     stack element; `scoringSettledRetry` makes the "scoring just finished, re-ask
+     the stream" retry fire exactly once per stale→settled transition. */
+  let emptyStateSeq = 0;
+  let scoringSettledRetry = false;
+
   const stack = window.initSwipeStack({
     stackElId: 'find-person-swipe-stack',
     confirmBtnId: 'find-person-swipe-confirm-btn',
@@ -278,20 +285,68 @@
       paintTopCard(card);
       armAutoApprove(card);
     },
+    /* Three genuinely different situations used to render as one sentence, and the
+       wrong one: every review query reads the precomputed top-K, so a library whose
+       faces have never been scored looks EXACTLY like a library with no matches —
+       instantly, with no search having happened. Naming somebody and immediately
+       searching for them is precisely that case, so the first thing you saw was "no
+       similar faces" over a library full of them. Ask the scorer before claiming
+       there is nothing; the server already kicked a run off when it handed us the
+       empty result, so this only has to show it and re-ask once it lands. */
     emptyStateHtml: function(stackEl) {
-      stackEl.innerHTML =
-        '<div class="alert" id="similar-empty-state">' +
-          '<p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>' +
-          '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
-            '<label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
-            '<input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">' +
-            '<span id="similar-threshold-value" class="sub">0.30</span>' +
-            '<button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>' +
+      // Every render calls this, so a stale poll loop must stand down rather than
+      // race the new one for stackEl.innerHTML.
+      const seq = ++emptyStateSeq;
+      const live = function () { return seq === emptyStateSeq; };
+
+      function showNoMatches() {
+        if (!live()) return;
+        stackEl.innerHTML =
+          '<div class="alert" id="similar-empty-state">' +
+            '<p style="margin-bottom:10px;">No similar unidentified faces found at the default threshold.</p>' +
+            '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">' +
+              '<label for="similar-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
+              '<input type="range" id="similar-threshold-slider" min="0.10" max="0.45" step="0.05" value="0.30">' +
+              '<span id="similar-threshold-value" class="sub">0.30</span>' +
+              '<button type="button" id="expand-similar-btn" class="btn-similar" style="font-size:0.85em;">Expand similar face search</button>' +
+            '</div>' +
+            '<div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>' +
           '</div>' +
-          '<div id="expand-similar-status" class="sub" style="margin-top:8px;display:none;"></div>' +
-        '</div>' +
-        '<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>';
-      wireExpandSimilarSearch();
+          '<div class="grid" id="similar-unknown-grid" style="margin-top:16px;"></div>';
+        wireExpandSimilarSearch();
+      }
+
+      function poll() {
+        if (!live()) return;
+        fetch('/api/face-scoring/status').then(function (r) { return r.json(); }).then(function (s) {
+          if (!live()) return;
+          if (s.error) {
+            stackEl.innerHTML = '<div class="alert">Match scoring failed: ' +
+                                escapeHtml(String(s.error)) + '</div>';
+            return;
+          }
+          if (s.running || s.pending) {
+            scoringSettledRetry = false;   // arm one retry for when this run lands
+            const total = s.total || s.pending || 0;
+            stackEl.innerHTML =
+              '<div class="swipe-empty swipe-searching">Scoring faces against everyone' +
+              (total ? ' — ' + (s.done || 0) + '/' + total : '') +
+              '<span class="dot">.</span><span class="dot">.</span><span class="dot">.</span></div>';
+            setTimeout(poll, 1000);
+            return;
+          }
+          // Settled. The stream was asked BEFORE this run finished (a small library
+          // finishes between the empty response and the first poll), so its emptiness
+          // proves nothing yet — re-ask exactly once before believing it.
+          if (!scoringSettledRetry) {
+            scoringSettledRetry = true;
+            stack.reset();
+            return;
+          }
+          showNoMatches();
+        }).catch(showNoMatches);
+      }
+      poll();
     },
   });
 

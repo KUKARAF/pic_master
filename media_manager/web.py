@@ -7246,7 +7246,7 @@ def create_app(data_root: str) -> FastAPI:
         cards = _next_face_suggestions(count, exclude_refs, bias_identity or None, bias or None,
                                         identity_filter=identity or None, avoid_existing=avoid_existing,
                                         hide_rivals=hide_rivals)
-        return {'cards': cards}
+        return {'cards': cards, 'scoring': _scoring_state(not cards)}
 
     @app.post('/api/face-review/next')
     def api_face_review_next(body: SwipeExcludeBody, count: int = 5, avoid_existing: bool = True,
@@ -7270,19 +7270,18 @@ def create_app(data_root: str) -> FastAPI:
             cards = _deprioritize_files_with_named_face(cards, 'file_id')
         cards = cards[:count]
         _attach_candidate_lists(cards, max(1, min(candidates, FACE_CANDIDATE_K)))
+        cards = _attach_file_meta(_collapse_face_cards_to_video(cards))
         return {
-            'cards': _attach_file_meta(_collapse_face_cards_to_video(cards)),
+            'cards': cards,
             'remaining': db.count_unmatched_face_candidates(SUGGEST_THRESHOLD),
+            'scoring': _scoring_state(not cards),
         }
 
-    @app.post('/api/face-scoring/start')
-    def api_face_scoring_start(full: bool = False):
-        """Run the one scoring worker in the background: every face's top-K identities
-        into face_candidates, which is what every review query reads. Incremental by
-        default (see rescore_faces); `full=1` bumps the scoring generation first and
-        re-ranks the whole library."""
+    def _start_face_scoring(full=False):
+        """Kick the background scoring run. Returns False when one is already going,
+        so callers never stack two library-wide matmuls on top of each other."""
         if face_scoring_job['running']:
-            return {'started': True}
+            return False
         face_scoring_job.update(running=True, done=0, total=0, error=None, scored=0)
 
         def _run():
@@ -7297,6 +7296,41 @@ def create_app(data_root: str) -> FastAPI:
                 face_scoring_job['running'] = False
 
         _spawn_job(_run)
+        return True
+
+    def _scoring_state(empty_result):
+        """The scoring state to hang on an otherwise-empty stream response — and, when
+        that emptiness is only staleness, the thing that fixes it.
+
+        Every review query reads the materialized top-K, so a face that has never been
+        scored is INVISIBLE to them. Naming somebody is exactly when their rows don't
+        exist yet, so "I named a person, opened their search, got an instant nothing"
+        was the default first experience — a silent failure, because an empty pool and
+        an uncomputed pool look identical from SQL. Nothing else ever triggered a run.
+
+        So: report `pending` (live, job-independent) alongside every empty result, and
+        start a run when there genuinely is stale work. Deliberately gated on the
+        result being EMPTY — a confirm makes pending non-zero on every single refill,
+        and kicking a library-wide rescore each time would thrash for no benefit while
+        the buffer is still serving good cards."""
+        pending = _faces_pending_scoring()
+        if empty_result and pending and not face_scoring_job['running']:
+            _start_face_scoring()
+        return {
+            'running': face_scoring_job['running'],
+            'pending': pending,
+            'done': face_scoring_job['done'],
+            'total': face_scoring_job['total'],
+            'error': face_scoring_job['error'],
+        }
+
+    @app.post('/api/face-scoring/start')
+    def api_face_scoring_start(full: bool = False):
+        """Run the one scoring worker in the background: every face's top-K identities
+        into face_candidates, which is what every review query reads. Incremental by
+        default (see rescore_faces); `full=1` bumps the scoring generation first and
+        re-ranks the whole library."""
+        _start_face_scoring(full=full)
         return {'started': True}
 
     @app.get('/api/face-scoring/status')
