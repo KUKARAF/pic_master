@@ -19,6 +19,13 @@ import json
 import os
 import sys
 
+# torch >= 2.6 — required for Intel Arc Battlemage (B70) XPU support — defaults
+# torch.load to weights_only=True, which the old ultralytics/MiVOLO checkpoints
+# aren't written for and fail to load under. Force the pre-2.6 behavior BEFORE
+# torch is imported anywhere below so both the YOLO person detector and the
+# MiVOLO weights still load. Harmless on the old CPU-only torch (ignored there).
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 # Person (body) detection — plain YOLOv8 person class, not YOLO-World; this is a
 # different, much smaller model than this app's main object detector and is only
 # ever loaded in this isolated process.
@@ -64,11 +71,17 @@ def match_face_to_body(face_bbox, person_bboxes):
     return None
 
 
-def detect_person_boxes(image):
+def detect_person_boxes(image, device=None):
     from ultralytics import YOLO
 
     model = YOLO(PERSON_MODEL_NAME)
-    result = model.predict(image, classes=[PERSON_CLASS_ID], conf=PERSON_CONF_THRESHOLD, verbose=False)[0]
+    # device (e.g. 'xpu' for the Arc GPU) is threaded in from run(); None keeps
+    # ultralytics' own auto-selection. Only inject it when set so behavior is
+    # unchanged on CPU-only setups.
+    predict_kwargs = dict(classes=[PERSON_CLASS_ID], conf=PERSON_CONF_THRESHOLD, verbose=False)
+    if device is not None:
+        predict_kwargs['device'] = device
+    result = model.predict(image, **predict_kwargs)[0]
     boxes = []
     for box in result.boxes:
         x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -160,7 +173,13 @@ def run(image_path, faces):
     if image is None:
         raise RuntimeError(f"Could not read image: {image_path}")
 
-    person_boxes = detect_person_boxes(image)
+    # Pick the device this venv can actually use (see _pick_device) once, up front,
+    # so BOTH the YOLO person detector and the MiVOLO model run on it (e.g. the Arc
+    # GPU via 'xpu'). A model and its input tensors must share a device or torch
+    # raises, so the same `dev` is reused for model.to()/inputs below.
+    dev = _pick_device(torch)
+
+    person_boxes = detect_person_boxes(image, device=dev)
 
     face_crops = []
     body_crops = []
@@ -184,12 +203,9 @@ def run(image_path, faces):
     model = AutoModelForImageClassification.from_pretrained(MODEL_REPO, trust_remote_code=True, dtype=torch.float32)
     processor = AutoImageProcessor.from_pretrained(MODEL_REPO, trust_remote_code=True)
     model.eval()
-
-    # Pick the device this venv can actually use (see _pick_device) and move the
-    # model onto it once. The per-face pixel_values tensors are moved to the same
-    # device just before each forward pass below — model and inputs must share a
-    # device or torch raises.
-    dev = _pick_device(torch)
+    # Move the MiVOLO model onto the device chosen above. The per-face
+    # pixel_values tensors are moved to the same device just before each forward
+    # pass below.
     model.to(dev)
 
     results = []

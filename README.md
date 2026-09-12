@@ -32,11 +32,16 @@ running on CPU). Out of the box `requirements.txt` pins CPU `onnxruntime` and a
 CPU/CUDA `torch`. To actually use a GPU:
 
 - **NVIDIA (CUDA):** swap `onnxruntime` → `onnxruntime-gpu`; install a CUDA `torch`.
-- **Intel Arc (XPU):** swap `onnxruntime` → `onnxruntime-openvino`, and install the
-  XPU build of torch (`pip install torch --index-url
-  https://download.pytorch.org/whl/xpu`) on a host with the Intel GPU runtime
-  (kernel i915/xe + Level-Zero + compute-runtime). CLIP, YOLO-World and (in its
-  own venv) MiVOLO then run on the Arc GPU; InsightFace faces run via OpenVINO.
+- **Intel Arc (XPU), incl. Arc Pro B70 / Battlemage:** swap `onnxruntime` →
+  `onnxruntime-openvino`, and install the XPU build of torch (`pip install torch
+  --index-url https://download.pytorch.org/whl/xpu`) on a host with the Intel GPU
+  runtime (kernel i915/xe + Level-Zero + compute-runtime). CLIP and YOLO-World run
+  on the Arc GPU; InsightFace faces run via OpenVINO. Age/gender (MiVOLO) runs in
+  its own isolated venv, which `media age-setup` builds with `torch==2.7.1+xpu`
+  (Battlemage needs torch ≥ 2.6, so the age venv no longer uses the old 2.5.1) —
+  this bump is **unvalidated against MiVOLO's model build**, so verify age
+  estimation on the GPU box after `age-setup`; if MiVOLO breaks, pin a compatible
+  `timm` in `requirements-age-estimator.txt`.
 
 All device selection funnels through `media_manager/compute.py`.
 

@@ -41,6 +41,11 @@ _AGE_VENV_PYTHON_SERIES = "3.12"
 # into the venv and build mivolo against the venv itself (no build isolation).
 _BUILD_SETUPTOOLS_PIN = "setuptools<81"
 
+# The +xpu torch/torchvision wheels (for the Intel Arc B70) are published only on
+# PyTorch's XPU index, not PyPI — passed as --extra-index-url so those two pins
+# resolve there while transformers/mivolo/etc. still come from PyPI.
+_TORCH_XPU_INDEX = "https://download.pytorch.org/whl/xpu"
+
 # Written into the venv after a fully successful install; its absence means a
 # previous age-setup run died partway (venv exists, packages don't) and the venv
 # should be rebuilt rather than reported as already set up.
@@ -125,6 +130,9 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
         subprocess.run(
             [uv, "pip", "install", "--python", str(python),
              "--no-build-isolation-package", "mivolo",
+             # torch/torchvision are pinned as +xpu (Intel Arc B70) and only exist
+             # on the PyTorch XPU index; everything else resolves from PyPI.
+             "--extra-index-url", _TORCH_XPU_INDEX,
              "-r", str(_REQUIREMENTS_FILE)],
             check=True,
         )
@@ -148,6 +156,8 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
         # from wheels, and mivolo's build needs are covered by the setuptools above.
         subprocess.run(
             [str(python), "-m", "pip", "install", "--no-build-isolation",
+             # +xpu torch/torchvision (Intel Arc B70) live on the PyTorch XPU index.
+             "--extra-index-url", _TORCH_XPU_INDEX,
              "-r", str(_REQUIREMENTS_FILE)],
             check=True,
         )

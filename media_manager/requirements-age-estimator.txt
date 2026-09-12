@@ -12,19 +12,27 @@
 #   uv venv --python 3.12 .age-venv
 #   uv pip install --python .age-venv/bin/python 'setuptools<81' wheel
 #   uv pip install --python .age-venv/bin/python --no-build-isolation-package mivolo \
+#       --extra-index-url https://download.pytorch.org/whl/xpu \
 #       -r media_manager/requirements-age-estimator.txt
-# Python 3.12 because the pinned torch==2.5.1 has no wheels for 3.14+; the
-# setuptools<81 + no-build-isolation dance because MiVOLO's setup.py imports
-# pkg_resources, which modern setuptools no longer ships.
+# Python 3.12 because these torch wheels have no 3.14+ builds; the setuptools<81 +
+# no-build-isolation dance because MiVOLO's setup.py imports pkg_resources, which
+# modern setuptools no longer ships.
 #
-# torch/torchvision are pinned older than the main app's versions because MiVOLO's
-# own model-construction code (mivolo.model.create_timm_model) fails to import
-# against current timm, and current torch defaults torch.load's weights_only=True
-# in a way old ultralytics (which MiVOLO pins) wasn't updated to handle. Pinning an
-# older, matched torch/torchvision pair sidesteps both issues without touching any
-# security default.
-torch==2.5.1
-torchvision==0.20.1
+# torch/torchvision: the +xpu builds so MiVOLO runs on the Intel Arc (B70,
+# Battlemage) GPU. Battlemage needs torch >= 2.6 for XPU (2.5.x's XPU runtime
+# doesn't cover it), so we can't use the older 2.5.1 that MiVOLO nominally
+# prefers. These come from the PyTorch XPU index (see setup_age_venv in
+# age_estimator.py, which adds --extra-index-url https://download.pytorch.org/whl/xpu).
+# Two torch>=2.6 gotchas MiVOLO/old-ultralytics hit, and how they're handled:
+#   * torch.load now defaults weights_only=True → age_estimator_worker.py sets
+#     TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 before importing torch to restore the old
+#     behavior for the pinned checkpoints.
+#   * mivolo.model.create_timm_model can break against a too-new timm — MiVOLO's
+#     own pin is relied on; if it ever fails, pin a compatible timm here.
+# NOTE: this torch bump for B70 is unverified against MiVOLO's model build — needs
+# a validation run on the GPU box (see README's Intel Arc note).
+torch==2.7.1+xpu
+torchvision==0.22.1+xpu
 opencv-python
 numpy
 transformers
