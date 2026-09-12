@@ -50,20 +50,34 @@ def top_k_indices(scores, k=None):
     return part[np.argsort(scores[part])[::-1]]
 
 
-def rank_matrix(centroid, matrix, k=None):
+def rank_matrix(centroid, matrix, k=None, gpu_key=None, gpu_version=None):
     """Dot a pre-built [N, D] float32 matrix against `centroid`, returning
     (indices, scores) for the top-k rows descending. Vectorized end-to-end
     (BLAS dot + argpartition) — the path that keeps the GIL free. Assumes rows
     are already unit-normalized; only the centroid is normalized by callers as
-    needed."""
+    needed.
+
+    Optional GPU fast-path: when BOTH gpu_key and gpu_version are provided, the
+    scoring dot is offloaded to gpu_search.matvec, which keeps `matrix` resident
+    in VRAM under that key/version (the caller's write-invalidation counter) and
+    uploads only the centroid. If there's no usable GPU, matvec returns None and
+    we fall through to the identical numpy dot — so the default path (no key)
+    and every off-GPU run are byte-for-byte unchanged."""
     if matrix.shape[0] == 0:
         return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
-    scores = matrix.dot(np.asarray(centroid, dtype=np.float32))
+    centroid = np.asarray(centroid, dtype=np.float32)
+    scores = None
+    if gpu_key is not None and gpu_version is not None:
+        from . import gpu_search
+        scores = gpu_search.matvec(gpu_key, gpu_version, matrix, centroid)
+    if scores is None:
+        scores = matrix.dot(centroid)  # numpy fallback (CPU / no key) — unchanged path
     idx = top_k_indices(scores, k)
     return idx, scores[idx]
 
 
-def rank_by_similarity(centroid, candidates, embedding_index=2, k=None):
+def rank_by_similarity(centroid, candidates, embedding_index=2, k=None,
+                       gpu_key=None, gpu_version=None):
     """candidates: rows containing embedding bytes at embedding_index (matches
     the shape of db.get_all_embeddings()/get_embeddings_for_files() rows).
     Returns [(candidate, score), ...] sorted descending; pass k to get only the
@@ -78,5 +92,10 @@ def rank_by_similarity(centroid, candidates, embedding_index=2, k=None):
     matrix = np.frombuffer(
         b''.join(c[embedding_index] for c in candidates), dtype=np.float32
     ).reshape(len(candidates), -1)
-    idx, scores = rank_matrix(centroid, matrix, k=k)
+    # gpu_key/gpu_version forwarded to rank_matrix. NOTE: this matrix is rebuilt
+    # per call from `candidates`, so only pass a GPU key whose version genuinely
+    # identifies THESE bytes — a resident tensor keyed by a stale version would
+    # score the wrong rows. Default (no key) is the unchanged numpy path.
+    idx, scores = rank_matrix(centroid, matrix, k=k,
+                              gpu_key=gpu_key, gpu_version=gpu_version)
     return [(candidates[i], float(scores[j])) for j, i in enumerate(idx)]

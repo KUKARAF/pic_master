@@ -35,6 +35,10 @@ def verify_image(path):
 def verify_video(path):
     """Return (healthy, message)."""
     try:
+        # Deliberately NOT routed through video_decode.open_capture: a corruption probe
+        # needs deterministic software decode. HW decoders (VAAPI/QSV) may mask or
+        # differently surface corruption, and this path's whole job is to detect broken
+        # files — so it must use the plain, predictable FFmpeg software decoder.
         cap = cv2.VideoCapture(str(path))
         # release() inside finally so an un-openable/corrupt file (isOpened() False but
         # a partial FFmpeg handle held) never leaks its fd on the early return.

@@ -83,8 +83,11 @@ def extract_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
         damaged and the caller should mark it so.
     """
     import cv2  # heavy; imported lazily like the thumbnail path does
+    from . import video_decode
     frames = []
-    cap = cv2.VideoCapture(abs_path)
+    # Route through video_decode so the Arc media engine (VAAPI/QSV) does the decode
+    # when available, with a loud software fallback otherwise.
+    cap = video_decode.open_capture(abs_path)
     try:
         if not cap.isOpened():
             return frames, False
@@ -103,6 +106,7 @@ def extract_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
             if frame is None:
                 all_ok = False
                 continue
+            # JPEG encode stays on the CPU by choice: HW JPEG encode via cv2 isn't portable.
             ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             if not ok2:
                 all_ok = False
@@ -122,7 +126,9 @@ def iter_video_frames_sampled(abs_path, target_fps=1.0, max_frames=3600):
     Same fd-safe `try/finally: cap.release()` as extract_video_frames — the caller must
     exhaust it or close it (a for-loop does both on normal/exception exit)."""
     import cv2  # heavy; lazy like the rest of this module
-    cap = cv2.VideoCapture(abs_path)
+    from . import video_decode
+    # Route through video_decode for GPU (VAAPI/QSV) decode with loud software fallback.
+    cap = video_decode.open_capture(abs_path)
     try:
         if not cap.isOpened():
             return
@@ -138,6 +144,7 @@ def iter_video_frames_sampled(abs_path, target_fps=1.0, max_frames=3600):
                 ok, frame = cap.read()
                 if not ok or frame is None:
                     continue
+                # JPEG encode stays on the CPU by choice: HW JPEG encode via cv2 isn't portable.
                 ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                 if not ok2:
                     continue
@@ -151,6 +158,7 @@ def iter_video_frames_sampled(abs_path, target_fps=1.0, max_frames=3600):
                 if not ok or frame is None:
                     break
                 if idx % step == 0:
+                    # JPEG encode stays on the CPU by choice: HW JPEG encode via cv2 isn't portable.
                     ok2, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
                     if ok2:
                         count += 1

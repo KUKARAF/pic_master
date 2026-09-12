@@ -3052,6 +3052,27 @@ class ManualDB(ThreadLocalDB):
             self._named_matrix_cache = (self._face_ver, result)
             return result
 
+    def score_named_faces(self, query):
+        """Cosine-score the cached K×D named-reference matrix against `query`,
+        returning a float32 [K] scores array aligned row-for-row with
+        get_named_face_matrix()'s `identities` list. GPU fast-path: keep the
+        matrix resident in VRAM (keyed by 'named_faces' + self._face_ver — the
+        SAME counter get_named_face_matrix invalidates its numpy cache on, so
+        residency is never stale) and upload just the query. On CPU / no GPU,
+        gpu_search.matvec returns None and we fall back to the identical numpy
+        dot, so auto-matching stays byte-identical off-GPU. Empty (nobody named
+        yet) → empty array. `query` may be any array-like of the embedding dim."""
+        import numpy as np
+        from media_manager import gpu_search
+        _identities, matrix = self.get_named_face_matrix()
+        q = np.asarray(query, dtype=np.float32)
+        if matrix.shape[0] == 0:
+            return np.empty(0, dtype=np.float32)
+        scores = gpu_search.matvec('named_faces', self._face_ver, matrix, q)
+        if scores is None:
+            scores = matrix.dot(q)  # numpy fallback (CPU / no-GPU) — unchanged path
+        return scores
+
     def get_all_faces_matrix(self):
         """Cached, write-invalidated counterpart to get_all_faces_with_embedding:
         returns (face_ids: np.ndarray[int64], checksums: list[str],
@@ -3128,7 +3149,9 @@ class ManualDB(ThreadLocalDB):
         if matrix.shape[0] == 0:
             return None, None
         query = np.frombuffer(embedding_bytes, dtype=np.float32)
-        scores = matrix.dot(query)
+        # GPU fast-path (resident named-face matrix) with an automatic numpy
+        # fallback baked into score_named_faces — `scores` is aligned to `names`.
+        scores = self.score_named_faces(query)
         best_idx = int(scores.argmax())
         if scores[best_idx] >= threshold:
             return names[best_idx], float(scores[best_idx])

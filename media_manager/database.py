@@ -1051,6 +1051,44 @@ class Database(ThreadLocalDB):
             self._emb_cache = (ver, result)
             return result
 
+    def score_embeddings(self, query):
+        """Cosine-score the whole-image CLIP matrix against `query`, returning a
+        float32 [N] scores array aligned row-for-row with get_embeddings_matrix()
+        (same file_ids/checksums order). GPU fast-path: keep the [N, D] matrix
+        resident in VRAM (keyed by 'emb' + self._emb_ver, the same counter that
+        invalidates the numpy cache) and upload just the query. On CPU — or any
+        machine without a usable GPU — gpu_search.matvec returns None and we fall
+        back to the exact numpy BLAS dot used everywhere else, so behavior is
+        byte-identical off-GPU. `query` may be any array-like of the embedding
+        dim; empty library → empty array (mirrors the callers' shape guard)."""
+        import numpy as np
+        from . import gpu_search
+        _file_ids, _checksums, matrix = self.get_embeddings_matrix()
+        q = np.asarray(query, dtype=np.float32)
+        if matrix.shape[0] == 0:
+            return np.empty(0, dtype=np.float32)
+        scores = gpu_search.matvec('emb', self._emb_ver, matrix, q)
+        if scores is None:
+            scores = matrix.dot(q)  # numpy fallback (CPU / no-GPU) — unchanged path
+        return scores
+
+    def score_all_faces(self, query):
+        """Cosine-score every non-sentinel face embedding against `query`,
+        returning a float32 [N] scores array aligned with get_face_embeddings_matrix()
+        (same face_ids/file_ids order). GPU fast-path keeps the [N, D] face matrix
+        resident (keyed by 'all_faces' + self._face_ver); numpy fallback otherwise.
+        Empty → empty array."""
+        import numpy as np
+        from . import gpu_search
+        _face_ids, _file_ids, matrix = self.get_face_embeddings_matrix()
+        q = np.asarray(query, dtype=np.float32)
+        if matrix.shape[0] == 0:
+            return np.empty(0, dtype=np.float32)
+        scores = gpu_search.matvec('all_faces', self._face_ver, matrix, q)
+        if scores is None:
+            scores = matrix.dot(q)  # numpy fallback (CPU / no-GPU) — unchanged path
+        return scores
+
     def get_embeddings_for_files(self, file_ids):
         """Return [(file_id, embedding_bytes), ...] for a specific set of files'
         primary embeddings — used to build a representative CLIP vector for e.g.

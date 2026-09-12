@@ -1918,6 +1918,19 @@
     });
   };
 
+  /* Generic "add file X to category Y" — the category twin of assignFileToSet,
+     used by the photo page's "Add queue to category" flow. */
+  window.assignFileToCategory = function (fileIdToAssign, categoryId) {
+    return fetch('/api/files/' + fileIdToAssign + '/categories', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ category_id: categoryId }),
+    }).then(function (r) {
+      if (!r.ok) throw new Error('Request failed: ' + r.status);
+      return r.json();
+    });
+  };
+
   /* Shared "is the user typing somewhere" guard for page-global keyboard
      shortcuts (search palette's "/", photo viewer's arrow keys). */
   function isTypingTarget(el) {
@@ -2692,8 +2705,9 @@
     // the footer button) sends the picked items to a chosen set.
     let selectMode = false;
     let targetSet = null;
+    let targetCategory = null;    // set when the queue targets a category instead of a set
     const picked = new Set();     // queue indices chosen for the set
-    const alreadyIn = new Set();  // queue indices already in the target set (greyed, unselectable)
+    const alreadyIn = new Set();  // queue indices already in the target set/category (greyed, unselectable)
     let rangeAnchor = null;       // anchor index for Shift range-select
 
     function goTo(id) {
@@ -2840,14 +2854,21 @@
     function updateFooter() {
       if (!overlay || !overlay.commitBtn) return;
       const n = picked.size;
+      const target = targetSet || targetCategory;
       overlay.commitBtn.textContent = 'Add ' + n + ' item' + (n === 1 ? '' : 's') +
-        ' to ' + (targetSet ? targetSet.name : '');
+        ' to ' + (target ? target.name : '');
       overlay.commitBtn.disabled = n === 0;
     }
 
     function commitSelection() {
-      if (!selectMode || !targetSet || picked.size === 0) return;
+      const target = targetSet || targetCategory;
+      if (!selectMode || !target || picked.size === 0) return;
       const queue = window.__photoQueue;
+      // Per-file assign bound to whichever target is active — set or category.
+      // Same signature/return/error shape either way (see assignFileTo*).
+      const assignOne = targetSet
+        ? function (id) { return window.assignFileToSet(id, targetSet.id); }
+        : function (id) { return window.assignFileToCategory(id, targetCategory.id); };
       // Map picked indices -> file ids, deduped (a queue can repeat a file id,
       // e.g. multiple face matches in one photo).
       const ids = Array.from(new Set(
@@ -2862,7 +2883,7 @@
       let added = 0, firstErr = null;
       ids.reduce(function (chain, id) {
         return chain.then(function () {
-          return window.assignFileToSet(id, targetSet.id)
+          return assignOne(id)
             .then(function () { added++; })
             .catch(function (err) { if (!firstErr) firstErr = err; });
         });
@@ -2873,7 +2894,7 @@
           showToast('Added ' + added + ' of ' + ids.length + ' — failed: ' + firstErr.message);
         } else {
           closeGrid();
-          showToast('Added ' + added + ' item' + (added === 1 ? '' : 's') + ' to "' + targetSet.name + '".');
+          showToast('Added ' + added + ' item' + (added === 1 ? '' : 's') + ' to "' + target.name + '".');
         }
       });
     }
@@ -2884,6 +2905,7 @@
       opts = opts || {};
       selectMode = !!opts.selectMode;
       targetSet = opts.set || null;
+      targetCategory = opts.category || null;
       picked.clear();
       alreadyIn.clear();
       rangeAnchor = null;
@@ -2893,9 +2915,13 @@
       overlay.el.classList.add('open');
       photoGridOpen = true;
 
-      // In select mode, grey out (but still show) items already in the set.
-      if (selectMode && targetSet) {
-        fetch('/api/sets/' + targetSet.id + '/file-ids')
+      // In select mode, grey out (but still show) items already in the target.
+      // Same membership shape for both endpoints: { file_ids: [...] }.
+      const memberUrl = targetSet ? ('/api/sets/' + targetSet.id + '/file-ids')
+        : targetCategory ? ('/api/categories/' + targetCategory.id + '/file-ids')
+        : null;
+      if (selectMode && memberUrl) {
+        fetch(memberUrl)
           .then(function (r) { return r.ok ? r.json() : { file_ids: [] }; })
           .then(function (data) {
             const member = new Set(data.file_ids || []);
@@ -2920,6 +2946,9 @@
 
     // Opened by the sidebar's "Add queue to set" button after a set is picked.
     window.openQueueSelectGrid = function (set) { openGrid({ selectMode: true, set: set }); };
+
+    // Opened by the sidebar's "Add queue to category" button after a category is picked.
+    window.openQueueCategoryGrid = function (category) { openGrid({ selectMode: true, category: category }); };
 
     function moveAndMaybeRange(delta, shift) {
       if (shift && rangeAnchor === null) rangeAnchor = selectedIndex;
@@ -4754,6 +4783,23 @@
     if (setPickerBtn) setPickerBtn.textContent = '＋ Add this to set';
     setPickerQueueBtn.style.display = '';
     setPickerQueueBtn.addEventListener('click', addQueueToSet);
+  }
+
+  // Same split for categories: "Add this to category" (this photo) + "Add queue
+  // to category" (pick/create a category, then curate which queue items to add
+  // in the space-grid overlay). Reuses the single-file category picker's
+  // entity-search path so create-if-missing works for free.
+  const categoryPickerQueueBtn = document.getElementById('category-picker-queue-btn');
+  function addQueueToCategory() {
+    openEntitySearchModal({
+      type: 'category',
+      onResolved: function (cat) { window.openQueueCategoryGrid(cat); },
+    });
+  }
+  if (categoryPickerQueueBtn && photoQueue && photoQueue.ids.length > 1) {
+    if (categoryPickerBtn) categoryPickerBtn.textContent = '＋ Add this to category';
+    categoryPickerQueueBtn.style.display = '';
+    categoryPickerQueueBtn.addEventListener('click', addQueueToCategory);
   }
 
   // The Set pod trigger. When there are no sets yet it's a direct "＋ Add set"

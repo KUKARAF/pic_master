@@ -275,15 +275,17 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
 
 
 def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
-    """Poster-frame thumbnail for a video: grab a frame with OpenCV (the same
-    decoder broken_finder.verify_video uses), then reuse the image thumbnail's
-    resize-to-400px + atomic-JPEG-save tail. Seeks ~1s in so the poster isn't a
-    black/leading frame, falling back to frame 0. Returns (success, message) with
-    the same shape as _make_thumbnail so serve_thumb treats them identically."""
+    """Poster-frame thumbnail for a video: grab a frame with OpenCV (via
+    video_decode, so the Arc media engine decodes it when available — unlike
+    broken_finder, which stays on software decode on purpose), then reuse the image
+    thumbnail's resize-to-400px + atomic-JPEG-save tail. Seeks ~1s in so the poster
+    isn't a black/leading frame, falling back to frame 0. Returns (success, message)
+    with the same shape as _make_thumbnail so serve_thumb treats them identically."""
     import cv2
     from PIL import Image as PILImage
+    from . import video_decode
     try:
-        cap = cv2.VideoCapture(src_path)
+        cap = video_decode.open_capture(src_path)
         # isOpened() check lives INSIDE the try so the finally always releases: FFmpeg
         # can partially open a corrupt file (grabs the fd, then fails), leaving
         # isOpened() False with a handle still held — returning before release() there
@@ -1660,7 +1662,7 @@ def create_app(data_root: str) -> FastAPI:
                 query = np.frombuffer(emb, dtype=np.float32)
                 file_ids, _cksums, matrix = db.get_embeddings_matrix()  # cached
                 if matrix.shape[0]:
-                    scores = matrix.dot(query)
+                    scores = db.score_embeddings(query)  # GPU-resident matmul when available
                     for i in top_k_indices(scores, min(matrix.shape[0], 40)):
                         fid = int(file_ids[i])
                         if fid == int(body.value):
@@ -2366,7 +2368,9 @@ def create_app(data_root: str) -> FastAPI:
                 # threadpool, ratcheted RSS via glibc arena retention (the "leak").
                 file_ids, checksums, matrix = db.get_embeddings_matrix()
                 if matrix.shape[0]:
-                    scores = matrix.dot(query_emb)
+                    # GPU-resident matmul when a GPU is present (matrix cached in
+                    # VRAM, only the query uploaded); byte-identical numpy dot on CPU.
+                    scores = db.score_embeddings(query_emb)
                     k = min(matrix.shape[0], 21)  # 20 results + room to drop self
                     ranked = []  # (file_id, checksum, score)
                     for i in top_k_indices(scores, k):
@@ -2420,7 +2424,7 @@ def create_app(data_root: str) -> FastAPI:
         file_ids, _checksums, matrix = db.get_embeddings_matrix()
         if matrix.shape[0] == 0:
             return {'results': []}
-        scores = matrix.dot(query_emb)
+        scores = db.score_embeddings(query_emb)  # GPU-resident matmul when available
         k = min(matrix.shape[0], max(1, limit) + 1)  # +1 to absorb self-match
         results = []
         for i in top_k_indices(scores, k):
@@ -2479,7 +2483,7 @@ def create_app(data_root: str) -> FastAPI:
         file_ids, _checksums, matrix = db.get_embeddings_matrix()
         if matrix.shape[0] == 0:
             return {'mode': 'whole', 'results': []}
-        scores = matrix.dot(query)
+        scores = db.score_embeddings(query)  # GPU-resident matmul when available
         results = []
         for i in top_k_indices(scores, min(matrix.shape[0], max(1, limit) + 1)):
             fid = int(file_ids[i])
@@ -5489,6 +5493,22 @@ def create_app(data_root: str) -> FastAPI:
         rows = db.get_files_by_checksums(checksums)
         return {'file_ids': [r['id'] for r in rows]}
 
+    @app.get('/api/categories/{category_id}/file-ids')
+    def api_category_file_ids(category_id: int):
+        """Current manually-assigned member file ids of a category. Used by the
+        photo viewer's "Add queue to category" grid to grey out (but still show)
+        queue items already in the target category — the category mirror of
+        api_set_file_ids. Membership is checksum-keyed in manual.db, resolved to
+        live file ids via media.db. Only MANUAL assignments count here (like set
+        membership); ML auto-matches are a read-side concern and aren't treated as
+        "in" the category for this grey-out. Same {'file_ids': [...]} shape as the
+        set endpoint so the overlay reuses the same parsing."""
+        if manual.get_category(category_id) is None:
+            raise HTTPException(status_code=404, detail='Category not found')
+        checksums = manual.get_all_category_checksums().get(category_id, set())
+        rows = db.get_files_by_checksums(list(checksums))
+        return {'file_ids': [r['id'] for r in rows]}
+
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
@@ -7011,7 +7031,7 @@ def create_app(data_root: str) -> FastAPI:
         out['candidates'] = [
             {'name': name, 'score': score,
              'ref': None if reps.get(name) is None else 'manual:%d' % reps[name]}
-            for name, score in _rank_identities(matrix @ query, identities, limit)
+            for name, score in _rank_identities(manual.score_named_faces(query), identities, limit)
         ]
         return out
 
@@ -7118,10 +7138,15 @@ def create_app(data_root: str) -> FastAPI:
             return 0
         names = [n for n, _ in named]
         named_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])  # K×D
+        from media_manager import gpu_search
         done = 0
         for face_ids, vecs in db.iter_unsuggested_faces(chunk=5000):
             cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)  # N×D
-            scores = cand @ named_matrix.T  # N×K — one BLAS matmul, not a Python loop
+            # Offline batch scan: run the N×K matmul on the GPU when available (both
+            # operands uploaded per chunk, amortized over the whole run), else CPU BLAS.
+            scores = gpu_search.gemm(cand, named_matrix.T)
+            if scores is None:
+                scores = cand @ named_matrix.T  # one BLAS matmul, not a Python loop
             best = scores.argmax(axis=1)
             best_scores = scores[np.arange(len(face_ids)), best]
             db.set_face_suggestions([(names[int(best[i])], float(best_scores[i]), face_ids[i])

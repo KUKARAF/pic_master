@@ -339,12 +339,19 @@ class PCNDetector:
 
     def __init__(self, model_dir=None):
         import onnxruntime as ort
+        from .. import compute
         d = model_dir or os.path.dirname(os.path.abspath(__file__))
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)
+        # Route through the central provider pick so PCN rides the same accelerator
+        # as InsightFace (OpenVINO GPU on Intel Arc, CUDA on NVIDIA) rather than the
+        # old hardcoded CPU-only list. Tiny cascade nets, so the win is small — this
+        # is mostly for consistency; the intra_op thread tuning above is harmless
+        # (simply ignored) when a GPU provider binds.
+        providers = compute.onnx_providers()
         self.nets = [
             ort.InferenceSession(os.path.join(d, f'pcn{i}.onnx'),
-                                 sess_options=so, providers=['CPUExecutionProvider'])
+                                 sess_options=so, providers=providers)
             for i in (1, 2, 3)
         ]
 
