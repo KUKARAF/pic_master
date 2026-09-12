@@ -71,15 +71,18 @@ def match_face_to_body(face_bbox, person_bboxes):
     return None
 
 
-def detect_person_boxes(image):
+def load_person_detector():
+    """Load the YOLOv8n person detector once (the daemon reuses it across every
+    request — see serve()). Stays on CPU on purpose: MiVOLO pins an OLD ultralytics
+    whose select_device() doesn't understand 'xpu' (it treats any non-cpu/non-cuda
+    string as a CUDA request and raises "Invalid CUDA 'device=xpu'"), and it's a
+    tiny model — only the MiVOLO transformer runs on the Arc GPU."""
     from ultralytics import YOLO
+    return YOLO(PERSON_MODEL_NAME)
 
-    # NOTE: no device= here on purpose. MiVOLO pins an OLD ultralytics whose
-    # select_device() doesn't understand 'xpu' — it treats any non-cpu/non-cuda
-    # string as a CUDA request and raises ("Invalid CUDA 'device=xpu'"). This is a
-    # tiny yolov8n run a handful of times per photo, so it stays on ultralytics'
-    # default (CPU here); only the MiVOLO transformer runs on the Arc GPU (run()).
-    model = YOLO(PERSON_MODEL_NAME)
+
+def detect_person_boxes(model, image):
+    # No device= (see load_person_detector): old ultralytics rejects 'xpu'.
     result = model.predict(image, classes=[PERSON_CLASS_ID], conf=PERSON_CONF_THRESHOLD, verbose=False)[0]
     boxes = []
     for box in result.boxes:
@@ -163,23 +166,50 @@ def _pick_device(torch):
     return "cpu"
 
 
-def run(image_path, faces):
-    import cv2
+def load_models():
+    """Load MiVOLO (config/model/processor, moved onto the chosen device) AND the
+    YOLOv8n person detector ONCE, returning a dict for infer() to reuse.
+
+    This is the expensive step — model deserialize (~200 MB) + XPU context init +
+    host→GPU upload, ~1 s. The persistent daemon (serve()) pays it exactly once
+    for its whole life instead of once per image, which is the entire point of the
+    daemon: bulk age estimation was reloading all of this for EVERY photo."""
     import torch
     from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
+
+    # Device for MiVOLO (the heavy transformer): the Arc GPU via 'xpu' when
+    # available. The person detector stays on CPU (see load_person_detector). A
+    # model and its input tensors must share a device or torch raises, so this
+    # `dev` is reused for model.to()/inputs in infer().
+    dev = _pick_device(torch)
+    config = AutoConfig.from_pretrained(MODEL_REPO, trust_remote_code=True)
+    model = AutoModelForImageClassification.from_pretrained(
+        MODEL_REPO, trust_remote_code=True, dtype=torch.float32)
+    processor = AutoImageProcessor.from_pretrained(MODEL_REPO, trust_remote_code=True)
+    model.eval()
+    model.to(dev)
+    person = load_person_detector()
+    return {"torch": torch, "config": config, "model": model,
+            "processor": processor, "dev": dev, "person": person}
+
+
+def infer(models, image_path, faces):
+    """Age/gender for one image's faces, using already-loaded `models` (from
+    load_models()). This is the only per-request work — everything heavy already
+    happened once at load time."""
+    import cv2
+
+    torch = models["torch"]
+    config = models["config"]
+    model = models["model"]
+    processor = models["processor"]
+    dev = models["dev"]
 
     image = cv2.imread(image_path)
     if image is None:
         raise RuntimeError(f"Could not read image: {image_path}")
 
-    # Device for MiVOLO (the heavy transformer): the Arc GPU via 'xpu' when
-    # available. The tiny person detector below deliberately stays on CPU — the
-    # MiVOLO-pinned ultralytics is too old to accept device='xpu' (see
-    # detect_person_boxes). A model and its input tensors must share a device or
-    # torch raises, so `dev` is reused for model.to()/inputs below.
-    dev = _pick_device(torch)
-
-    person_boxes = detect_person_boxes(image)
+    person_boxes = detect_person_boxes(models["person"], image)
 
     face_crops = []
     body_crops = []
@@ -198,15 +228,6 @@ def run(image_path, faces):
         refs.append(face["face_ref"])
         face_crops.append(face_crop_img)
         body_crops.append(body_crop_img)
-
-    config = AutoConfig.from_pretrained(MODEL_REPO, trust_remote_code=True)
-    model = AutoModelForImageClassification.from_pretrained(MODEL_REPO, trust_remote_code=True, dtype=torch.float32)
-    processor = AutoImageProcessor.from_pretrained(MODEL_REPO, trust_remote_code=True)
-    model.eval()
-    # Move the MiVOLO model onto the device chosen above. The per-face
-    # pixel_values tensors are moved to the same device just before each forward
-    # pass below.
-    model.to(dev)
 
     results = []
     # One at a time rather than batched: crops vary in whether a body is present, and
@@ -232,6 +253,53 @@ def run(image_path, faces):
     return results
 
 
+def run(image_path, faces):
+    """One-shot path (legacy / no --serve): load models, then infer once. Kept so a
+    direct `python age_estimator_worker.py` still works; the fast path is serve()."""
+    return infer(load_models(), image_path, faces)
+
+
+def serve():
+    """Persistent daemon: load models ONCE, then answer newline-delimited JSON
+    requests on stdin with newline-delimited JSON responses on stdout until EOF.
+
+    age_estimator.py spawns this with --serve and reuses it for the whole run, so
+    the ~1 s model load + XPU init is amortized across all images instead of paid
+    per image (the old spawn-per-call cost ~1.25 s/face, essentially all reload).
+
+    Protocol: one request object per line in — {"image_path": str, "faces": [...]};
+    one response object per line out — {"results": [...]} or {"error": str}. ONLY
+    responses are ever written to the real stdout; all model-load chatter,
+    warnings, and tracebacks go to stderr so they can neither corrupt the pipe
+    protocol nor be silently swallowed."""
+    real_out = sys.stdout
+    # Keep the protocol channel clean: point stdout at stderr so any stray print
+    # (during load or inference) can't land between response lines. Responses are
+    # written to the saved `real_out` explicitly.
+    sys.stdout = sys.stderr
+
+    models = load_models()
+    print("[age_worker] daemon ready — models resident, serving requests.",
+          file=sys.stderr, flush=True)
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:  # EOF: the parent closed our stdin (worker exited) — shut down.
+            break
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+            resp = {"results": infer(models, req["image_path"], req["faces"])}
+        except Exception as exc:  # noqa: BLE001 - report per-request, keep serving
+            import traceback
+            traceback.print_exc()
+            resp = {"error": str(exc)}
+        real_out.write(json.dumps(resp) + "\n")
+        real_out.flush()
+
+
 def main():
     try:
         payload = json.loads(sys.stdin.read())
@@ -243,4 +311,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # --serve = long-lived daemon (the fast path the worker uses); otherwise the
+    # legacy one-shot: read a single request from stdin, print one response.
+    if "--serve" in sys.argv[1:]:
+        serve()
+    else:
+        main()

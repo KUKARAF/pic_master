@@ -12,9 +12,12 @@ file + age_estimator_worker.py, drop the `.age-venv` directory, remove the one w
 endpoint + lazy accessor and the one photo.html section — nothing else in the app
 imports or depends on any of it.
 """
+import atexit
 import json
 import os
+import queue
 import subprocess
+import threading
 from pathlib import Path
 
 MODEL_ID = "mivolo"
@@ -179,7 +182,75 @@ class AgeGenderEstimator:
                 "app's object detector), or point MEDIA_AGE_VENV_PYTHON at an existing "
                 "isolated venv's python executable."
             )
+        # Persistent daemon state. The worker is spawned ONCE (lazily, on the first
+        # estimate) and reused: a fresh process per image reloaded ~200 MB of model
+        # and re-initialised the GPU every time, making bulk estimation load-bound
+        # (~1.25 s/face, almost all overhead) rather than inference-bound. One
+        # estimator is cached per worker (worker_server._get_age_estimator), so the
+        # daemon lives for the worker's lifetime and the model loads once.
+        self._proc = None
+        self._responses = None          # queue.Queue fed by a reader thread
+        self._lock = threading.Lock()   # serialize requests over the one pipe
+        atexit.register(self._shutdown)
 
+    # -- daemon lifecycle -----------------------------------------------------
+    def _ensure_daemon(self):
+        """Start the ``--serve`` daemon if it isn't running (first call, or after a
+        crash). stderr is INHERITED (not piped) so the daemon's model-load notes,
+        warnings and tracebacks land in the worker log and can never deadlock on a
+        full pipe. The worker inherits our os.environ (incl. MEDIA_DEVICE) — the
+        only channel the isolated venv learns the requested backend on."""
+        if self._proc is not None and self._proc.poll() is None:
+            return
+        self._proc = subprocess.Popen(
+            [str(self.venv_python), str(_WORKER_SCRIPT), "--serve"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+            text=True, bufsize=1,
+        )
+        self._responses = queue.Queue()
+        # Reader thread drains stdout so a slow consumer never blocks the daemon;
+        # each thread writes only to the queue it was handed, so a respawn's fresh
+        # queue can't be polluted by an old daemon's late/None line.
+        threading.Thread(target=self._read_loop,
+                         args=(self._proc, self._responses), daemon=True).start()
+
+    @staticmethod
+    def _read_loop(proc, responses):
+        """Push the daemon's stdout lines onto `responses`; a trailing None marks
+        the stream closed (daemon exited)."""
+        try:
+            for line in proc.stdout:
+                responses.put(line)
+        finally:
+            responses.put(None)
+
+    def _kill(self):
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self._proc = None
+        self._responses = None
+
+    def _shutdown(self):
+        """atexit hook: close stdin (daemon sees EOF and exits cleanly) and reap it.
+        Best-effort — swallowing here is fine because it only runs at interpreter
+        exit, and the OS reclaims the child regardless."""
+        proc, self._proc = self._proc, None
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    # -- request / response ---------------------------------------------------
     def estimate(self, image_path: str, faces: list) -> list:
         """faces: [{'ref': ..., 'bbox': [x1,y1,x2,y2], ...}, ...] — the same shape
         web.py's _combined_faces_for_file already returns. Returns
@@ -188,40 +259,45 @@ class AgeGenderEstimator:
         null age/gender rather than dropped from the list)."""
         if not faces:
             return []
-
         payload = {
             "image_path": image_path,
             "faces": [{"face_ref": f["ref"], "bbox": f["bbox"]} for f in faces],
         }
+        with self._lock:  # one shared pipe → one request in flight at a time
+            return self._request(payload, allow_respawn=True)
+
+    def _request(self, payload, allow_respawn):
+        self._ensure_daemon()
         try:
-            # No env= is passed, so the worker inherits our full os.environ —
-            # including MEDIA_DEVICE, which its self-contained _pick_device() reads
-            # to choose a torch device. The worker lives in the isolated .age-venv
-            # and can't import media_manager.compute, so MEDIA_DEVICE (inherited
-            # here) is the only channel by which it learns the requested backend.
-            proc = subprocess.run(
-                [str(self.venv_python), str(_WORKER_SCRIPT)],
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
-                timeout=ESTIMATE_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired:
+            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError):
+            # Daemon died before/while we wrote. Respawn once and retry; else fail.
+            self._kill()
+            if allow_respawn:
+                return self._request(payload, allow_respawn=False)
+            raise RuntimeError("Age estimator daemon is not accepting input")
+
+        try:
+            line = self._responses.get(timeout=ESTIMATE_TIMEOUT_SECONDS)
+        except queue.Empty:
+            # Wedged on this image — kill so a late reply can't desync the next
+            # request, and fail loudly (the bulk job logs it and moves on to the
+            # next image; the daemon is respawned on the following call).
+            self._kill()
             raise RuntimeError(f"Age estimation timed out after {ESTIMATE_TIMEOUT_SECONDS}s")
 
-        if not proc.stdout:
-            raise RuntimeError(f"Age estimator produced no output (exit {proc.returncode}): {proc.stderr[-2000:]}")
+        if line is None:
+            # stdout closed → the daemon exited (e.g. crashed during model load).
+            self._kill()
+            if allow_respawn:
+                return self._request(payload, allow_respawn=False)
+            raise RuntimeError("Age estimator daemon exited without responding")
 
-        # The worker's own final json.dump is always the last line it prints — anything
-        # before that (e.g. a one-time "downloading yolov8n.pt..." notice on first run)
-        # is noise from a third-party library, not something we control the format of.
-        last_line = proc.stdout.strip().splitlines()[-1]
         try:
-            data = json.loads(last_line)
+            data = json.loads(line)
         except json.JSONDecodeError:
-            raise RuntimeError(f"Age estimator returned invalid output: {proc.stdout[-2000:]}")
-
+            raise RuntimeError(f"Age estimator returned invalid output: {line[-2000:]}")
         if "error" in data:
             raise RuntimeError(f"Age estimator failed: {data['error']}")
-
         return data["results"]
