@@ -71,17 +71,16 @@ def match_face_to_body(face_bbox, person_bboxes):
     return None
 
 
-def detect_person_boxes(image, device=None):
+def detect_person_boxes(image):
     from ultralytics import YOLO
 
+    # NOTE: no device= here on purpose. MiVOLO pins an OLD ultralytics whose
+    # select_device() doesn't understand 'xpu' — it treats any non-cpu/non-cuda
+    # string as a CUDA request and raises ("Invalid CUDA 'device=xpu'"). This is a
+    # tiny yolov8n run a handful of times per photo, so it stays on ultralytics'
+    # default (CPU here); only the MiVOLO transformer runs on the Arc GPU (run()).
     model = YOLO(PERSON_MODEL_NAME)
-    # device (e.g. 'xpu' for the Arc GPU) is threaded in from run(); None keeps
-    # ultralytics' own auto-selection. Only inject it when set so behavior is
-    # unchanged on CPU-only setups.
-    predict_kwargs = dict(classes=[PERSON_CLASS_ID], conf=PERSON_CONF_THRESHOLD, verbose=False)
-    if device is not None:
-        predict_kwargs['device'] = device
-    result = model.predict(image, **predict_kwargs)[0]
+    result = model.predict(image, classes=[PERSON_CLASS_ID], conf=PERSON_CONF_THRESHOLD, verbose=False)[0]
     boxes = []
     for box in result.boxes:
         x1, y1, x2, y2 = box.xyxy[0].tolist()
@@ -173,13 +172,14 @@ def run(image_path, faces):
     if image is None:
         raise RuntimeError(f"Could not read image: {image_path}")
 
-    # Pick the device this venv can actually use (see _pick_device) once, up front,
-    # so BOTH the YOLO person detector and the MiVOLO model run on it (e.g. the Arc
-    # GPU via 'xpu'). A model and its input tensors must share a device or torch
-    # raises, so the same `dev` is reused for model.to()/inputs below.
+    # Device for MiVOLO (the heavy transformer): the Arc GPU via 'xpu' when
+    # available. The tiny person detector below deliberately stays on CPU — the
+    # MiVOLO-pinned ultralytics is too old to accept device='xpu' (see
+    # detect_person_boxes). A model and its input tensors must share a device or
+    # torch raises, so `dev` is reused for model.to()/inputs below.
     dev = _pick_device(torch)
 
-    person_boxes = detect_person_boxes(image, device=dev)
+    person_boxes = detect_person_boxes(image)
 
     face_crops = []
     body_crops = []
