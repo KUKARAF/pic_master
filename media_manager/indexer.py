@@ -11,9 +11,15 @@ from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
 class CLIPIndexer:
     def __init__(self, model_name='ViT-B-32', pretrained='openai'):
         self.model_name = f"{model_name}/{pretrained}"
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # Central device pick: cuda -> xpu (Intel Arc) -> mps -> cpu, overridable
+        # with MEDIA_DEVICE. Was hardcoded 'cuda if torch.cuda.is_available() else
+        # cpu', which silently left an Intel GPU idle. Downstream .to(self.device)
+        # calls (embed batches, text tokens) inherit whatever we pick here.
+        from . import compute
+        self.device = compute.torch_device()
         model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         self.model = model.to(self.device).eval()
+        print(f"[clip] device={self.device}", flush=True)
         self.preprocess = preprocess
         self.tokenizer = open_clip.get_tokenizer(model_name)
 

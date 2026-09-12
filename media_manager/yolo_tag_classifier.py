@@ -32,7 +32,7 @@ class TrainingCancelled(Exception):
     cancel_cb, so it never fires there)."""
 
 
-def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None, cancel_cb=None):
+def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None, cancel_cb=None, device=None):
     """Run the ultralytics YOLO-World fine-tune over a PREBUILT dataset dir
     (images/{train,val} + labels/{train,val}, referenced by data_yaml_path),
     copy the resulting best.pt into out_dir, and return
@@ -42,7 +42,15 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
     training logic exists once. ``progress_cb(current_epoch, total_epochs)`` is
     called at each epoch end; ``cancel_cb() -> bool``, when it returns True,
     aborts the run (raises :class:`TrainingCancelled`). Both are optional — the
-    local trainer passes only progress_cb."""
+    local trainer passes only progress_cb.
+
+    ``device`` (compute.ultralytics_device()'s value: 0 for cuda, or
+    'xpu'/'mps'/'cpu') selects the training backend; None (the default) omits the
+    kwarg entirely so ultralytics keeps its own auto-selection. Note: XPU training
+    through ultralytics needs a recent ultralytics + torch-xpu — if the installed
+    versions don't support it, model.train(device='xpu') raises loudly, which is
+    acceptable per this project's no-silent-failures rule (better than silently
+    falling back to CPU and running an order of magnitude slower unnoticed)."""
     from media_manager.detector import WEIGHTS_DIR
     from ultralytics import YOLOWorld
 
@@ -60,8 +68,13 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
             progress_cb(trainer.epoch + 1, epochs)
     model.add_callback('on_train_epoch_end', _on_epoch_end)
 
-    results = model.train(data=data_yaml_path, epochs=epochs, imgsz=640,
-                          project=out_dir, name='run', exist_ok=True)
+    # When device is None, omit the kwarg so ultralytics keeps its own auto
+    # device selection; only override it when the caller resolved an explicit one.
+    train_kwargs = dict(data=data_yaml_path, epochs=epochs, imgsz=640,
+                        project=out_dir, name='run', exist_ok=True)
+    if device is not None:
+        train_kwargs['device'] = device
+    results = model.train(**train_kwargs)
 
     run_dir = getattr(results, 'save_dir', os.path.join(out_dir, 'run'))
     best_src = os.path.join(run_dir, 'weights', 'best.pt')
@@ -78,10 +91,11 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
     return {'held_out_map': held_out_map, 'best_path': best_dst}
 
 
-def train_for_tag(data_root, tag_label):
+def train_for_tag(data_root, tag_label, device=None):
     """Core trainable entry point. Never raises: any failure is caught and
     recorded in metadata.json as status='failed' — see clip_tag_classifier's
-    train_for_tag for the identical reasoning."""
+    train_for_tag for the identical reasoning. ``device`` is threaded down to
+    train_from_dataset (None = ultralytics auto-selects)."""
     out_dir = classifier_dir(data_root, tag_label, 'yolo_model')
     os.makedirs(out_dir, exist_ok=True)
     pid = os.getpid()
@@ -89,14 +103,14 @@ def train_for_tag(data_root, tag_label):
     write_status(out_dir, status='running', pid=pid, started_at=started_at)
 
     try:
-        _train(data_root, tag_label, out_dir, pid, started_at)
+        _train(data_root, tag_label, out_dir, pid, started_at, device=device)
     except Exception as exc:
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
         raise
 
 
-def _train(data_root, tag_label, out_dir, pid, started_at):
+def _train(data_root, tag_label, out_dir, pid, started_at, device=None):
     from media_manager.database import Database
     from media_manager.manual_db import ManualDB
 
@@ -203,7 +217,7 @@ def _train(data_root, tag_label, out_dir, pid, started_at):
             current_epoch=current_epoch, total_epochs=total_epochs,
         )
 
-    res = train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=_progress)
+    res = train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=_progress, device=device)
 
     write_status(
         out_dir, status='done', trained_at=int(time.time()),
@@ -221,6 +235,21 @@ def main():
 
     out_dir = classifier_dir(args.data_root, args.tag, 'yolo_model')
     os.makedirs(out_dir, exist_ok=True)
+
+    # This subprocess runs in the MAIN venv, so it can import the central device
+    # selector. Resolve the ultralytics device= value here (0 for cuda, else
+    # 'xpu'/'mps'/'cpu'). Device selection must never crash a training run: if
+    # compute can't be imported/resolved for any reason we warn loudly to stderr
+    # (per the no-silent-failures rule) and fall back to device=None, letting
+    # ultralytics keep its own auto-selection rather than aborting the whole job.
+    device = None
+    try:
+        from . import compute
+        device = compute.ultralytics_device()
+    except Exception as exc:  # noqa: BLE001 - device pick must not sink training
+        print(f"[yolo_tag_classifier] could not resolve compute device "
+              f"({exc!r}) — letting ultralytics auto-select.", file=sys.stderr)
+
     log_path = os.path.join(out_dir, 'train.log')
     # buffering=1 (line-buffered): a redirected file defaults to fully
     # block-buffered, meaning the train-log viewer would show nothing until
@@ -229,7 +258,7 @@ def main():
     with open(log_path, 'w', buffering=1) as log_file:
         sys.stdout = log_file
         sys.stderr = log_file
-        train_for_tag(args.data_root, args.tag)
+        train_for_tag(args.data_root, args.tag, device=device)
 
 
 if __name__ == '__main__':

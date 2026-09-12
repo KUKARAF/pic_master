@@ -38,6 +38,61 @@ def _ensure_self_signed_cert(media_dir, host):
     return certfile, keyfile
 
 
+def _spawn_colocated_worker(preload=False):
+    """Start a `media worker` child for `media web --with-worker` and point this
+    process at it — returns the child Popen.
+
+    Co-located, the web process and the worker reach each other over the local
+    RNS *shared instance* (no TCP interface, no worker.json). We give the child a
+    persisted identity file so its RNS destination hash is deterministic, compute
+    that hash here WITHOUT initialising RNS (RNS.Destination.hash is a pure
+    function of identity + app/aspect), and inject it via the MEDIA_WORKER_ADDR /
+    MEDIA_WORKER_ENABLED env vars that worker_config.load() reads over worker.json.
+    Setting it BEFORE create_app() means the web process treats the worker as
+    configured from the first request and never builds a local model (the whole
+    point of the offload — avoids the low-RAM OOM). No silent failures: any
+    problem spawning is raised, not swallowed."""
+    import RNS
+    from . import worker_server, worker_protocol
+
+    identity_file = worker_server.DEFAULT_IDENTITY_FILE
+    identity = worker_server._load_or_create_identity(identity_file)
+    address = RNS.Destination.hash(
+        identity, worker_protocol.APP_NAME, worker_protocol.ASPECT).hex()
+
+    os.environ['MEDIA_WORKER_ADDR'] = address
+    os.environ['MEDIA_WORKER_ENABLED'] = '1'
+
+    # Reuse THIS interpreter + the module entrypoint so the child runs in the same
+    # venv. --identity-file pins the address we just computed; a short announce
+    # interval makes the green Worker badge appear quickly on the co-located box.
+    argv = [sys.executable, '-m', 'media_manager.media', 'worker',
+            '--identity-file', identity_file, '--announce-interval', '20']
+    if preload:
+        argv.append('--preload')
+    # start_new_session=True isolates the child from uvicorn's own SIGINT/SIGTERM
+    # handling so we control its shutdown explicitly in _stop_colocated_worker.
+    child = subprocess.Popen(argv, start_new_session=True)
+    print(f"[web] spawned co-located worker (pid {child.pid}, address {address}); "
+          f"offloading enabled over the local RNS shared instance.", flush=True)
+    return child
+
+
+def _stop_colocated_worker(child):
+    """Shut the co-located worker child down gracefully. SIGTERM first (the worker
+    installs a handler that unwinds its loop cleanly, letting torch/ultralytics
+    release handles); escalate to SIGKILL only if it doesn't exit in time."""
+    if child is None or child.poll() is not None:
+        return
+    print("[web] stopping co-located worker...", flush=True)
+    child.terminate()
+    try:
+        child.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("[web] worker did not exit in 10s; killing.", file=sys.stderr)
+        child.kill()
+
+
 def main():
     parser = argparse.ArgumentParser(description='Media manager - like git for your media files')
     parser.add_argument('--strict', action='store_true', default=True,
@@ -287,6 +342,16 @@ def main():
                               'RAM multiplies by worker count — the top cause of web-server OOM. '
                               'Raise it only if you offload ML to a `media worker` (so the web '
                               'process stays model-free) and need more request concurrency.')
+    web_cmd.add_argument('--with-worker', action='store_true',
+                         help='Also spawn and manage a co-located `media worker` as a child '
+                              'process, auto-connecting to it over the local RNS shared instance '
+                              '(no worker-connect / worker.json needed). The child is shut down '
+                              'when the web server exits. Use on a single beefy box that runs both '
+                              'roles; needs the RNS shared instance (the default — do not set '
+                              'share_instance = No). Combine with --preload-worker to load models up front.')
+    web_cmd.add_argument('--preload-worker', action='store_true',
+                         help='With --with-worker: start the child worker with --preload so all '
+                              'models load at boot instead of on first request.')
 
     worker_cmd = sub.add_parser('worker',
                                 help='Run the Reticulum media worker server (heavy ML offload target)')
@@ -716,10 +781,18 @@ def main():
         except ImportError as exc:
             print(f"ERROR: could not import web module: {exc}", file=sys.stderr)
             return 1
+        # Spawn the co-located worker BEFORE create_app so the worker address is
+        # in the env when the web process builds its worker client (see
+        # _spawn_colocated_worker) — otherwise a first request in the startup
+        # window could build a local model instead of offloading.
+        worker_child = None
+        if args.with_worker:
+            worker_child = _spawn_colocated_worker(preload=args.preload_worker)
         try:
             app = create_app(data_root)
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
+            _stop_colocated_worker(worker_child)
             return 1
         host = args.host_pos or args.host
         ssl_kwargs = {}
@@ -732,20 +805,27 @@ def main():
                 ssl_kwargs = {'ssl_certfile': certfile, 'ssl_keyfile': keyfile}
                 scheme = 'https'
         print(f"Starting media gallery at {scheme}://{host}:{args.port}/")
-        if args.workers > 1:
-            # uvicorn's multi-worker mode spawns separate processes that each
-            # need to independently construct the app, so it needs an import
-            # string/factory rather than the already-built `app` object above
-            # (kept and used above only to surface a clean pending-migration
-            # error before committing to spawning workers — see create_app's
-            # RuntimeError check). data_root travels to each worker via env
-            # var since create_app_from_env is called with no arguments.
-            os.environ['MEDIA_WEB_DATA_ROOT'] = data_root
-            print(f"Running with {args.workers} worker processes.")
-            uvicorn.run('media_manager.web:create_app_from_env', factory=True,
-                        host=host, port=args.port, workers=args.workers, **ssl_kwargs)
-        else:
-            uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
+        try:
+            if args.workers > 1:
+                # uvicorn's multi-worker mode spawns separate processes that each
+                # need to independently construct the app, so it needs an import
+                # string/factory rather than the already-built `app` object above
+                # (kept and used above only to surface a clean pending-migration
+                # error before committing to spawning workers — see create_app's
+                # RuntimeError check). data_root travels to each worker via env
+                # var since create_app_from_env is called with no arguments.
+                # (--with-worker's MEDIA_WORKER_* env vars are inherited by those
+                # workers too, so all of them offload to the single child worker.)
+                os.environ['MEDIA_WEB_DATA_ROOT'] = data_root
+                print(f"Running with {args.workers} worker processes.")
+                uvicorn.run('media_manager.web:create_app_from_env', factory=True,
+                            host=host, port=args.port, workers=args.workers, **ssl_kwargs)
+            else:
+                uvicorn.run(app, host=host, port=args.port, **ssl_kwargs)
+        finally:
+            # uvicorn.run returns when the server stops (Ctrl-C / SIGTERM), so this
+            # is the natural place to tear the co-located worker down with it.
+            _stop_colocated_worker(worker_child)
         return 0
 
     elif args.cmd == 'worker':

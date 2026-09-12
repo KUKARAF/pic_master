@@ -4773,10 +4773,14 @@ def create_app(data_root: str) -> FastAPI:
             else:
                 try:
                     from ultralytics import YOLOWorld
+                    from . import compute
                     model = YOLOWorld(checkpoint)
                     # Batched in one call (not one predict() per image) — batching
-                    # amortizes real per-call model overhead.
-                    results_list = model.predict(list(path_by_file_id.values()), verbose=False)
+                    # amortizes real per-call model overhead. device= routes this
+                    # local-fallback path onto the same accelerator (Intel Arc etc.)
+                    # the worker would use.
+                    results_list = model.predict(list(path_by_file_id.values()), verbose=False,
+                                                 device=compute.ultralytics_device())
                 except Exception:
                     # Loud, not silent — a bad/incompatible checkpoint or a
                     # transient inference failure should show up in the server

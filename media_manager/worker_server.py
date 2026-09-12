@@ -34,6 +34,7 @@ import numpy as np
 import RNS
 
 from . import worker_protocol
+from . import compute
 
 
 DEFAULT_IDENTITY_FILE = os.path.expanduser('~/.config/media_manager/worker_identity')
@@ -798,7 +799,8 @@ def handle_tag_detect(path, data, request_id, link_id, remote_identity, requeste
         tmp = _write_temp(req['image'], name)
         with models.lock:
             model = _get_tag_model(slug, checkpoint)
-            results = model.predict(tmp, conf=conf, verbose=False)
+            results = model.predict(tmp, conf=conf, verbose=False,
+                                    device=compute.ultralytics_device())
         detections = _parse_yolo_results(results)
         print(f"[worker] handled {worker_protocol.PATH_TAG_DETECT} ({slug}/{name}) -> "
               f"{len(detections)} detections", flush=True)
@@ -980,10 +982,20 @@ def _load_or_create_identity(identity_file):
 def run(identity_file=None, config_dir=None, announce_interval=300, preload=False):
     """Start the media worker server: init RNS, register handlers, announce,
     and loop announcing every ``announce_interval`` seconds until Ctrl-C."""
+    # Treat SIGTERM like Ctrl-C so a parent that spawned us (e.g. `media web
+    # --with-worker`) can shut us down gracefully with terminate() — the loop
+    # below already unwinds cleanly on KeyboardInterrupt, letting torch/ultralytics
+    # release handles instead of dying mid-inference.
+    import signal
+    def _sigterm(signum, frame):
+        raise KeyboardInterrupt()
+    signal.signal(signal.SIGTERM, _sigterm)
+
     RNS.Reticulum(config_dir)
 
     identity = _load_or_create_identity(identity_file)
     dest = build_destination(identity)
+    print(f"[worker] compute: {compute.describe()}", flush=True)
 
     print("", flush=True)
     print("=" * 64, flush=True)

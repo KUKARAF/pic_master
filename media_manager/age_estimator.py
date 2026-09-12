@@ -184,6 +184,11 @@ class AgeGenderEstimator:
             "faces": [{"face_ref": f["ref"], "bbox": f["bbox"]} for f in faces],
         }
         try:
+            # No env= is passed, so the worker inherits our full os.environ —
+            # including MEDIA_DEVICE, which its self-contained _pick_device() reads
+            # to choose a torch device. The worker lives in the isolated .age-venv
+            # and can't import media_manager.compute, so MEDIA_DEVICE (inherited
+            # here) is the only channel by which it learns the requested backend.
             proc = subprocess.run(
                 [str(self.venv_python), str(_WORKER_SCRIPT)],
                 input=json.dumps(payload),

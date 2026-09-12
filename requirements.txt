@@ -8,7 +8,12 @@ uvicorn[standard]
 jinja2
 python-multipart
 insightface
-# swap onnxruntime for onnxruntime-gpu for CUDA acceleration
+# GPU: device is auto-picked (cuda -> xpu[Intel Arc] -> mps -> cpu), overridable
+# with MEDIA_DEVICE=cuda|xpu|mps|cpu. For NVIDIA, swap onnxruntime for
+# onnxruntime-gpu. For Intel Arc (xpu), swap it for onnxruntime-openvino AND
+# install the XPU build of torch (pip install torch --index-url
+# https://download.pytorch.org/whl/xpu) on a host with the Intel GPU runtime
+# (Level-Zero + compute-runtime). See media_manager/compute.py.
 onnxruntime
 open_clip_torch
 torch

@@ -16,6 +16,7 @@ A face with no usable estimate (e.g. inference failed for just that one crop) st
 appears in "results" with age/gender set to null, rather than being dropped silently.
 """
 import json
+import os
 import sys
 
 # Person (body) detection — plain YOLOv8 person class, not YOLO-World; this is a
@@ -85,6 +86,71 @@ def crop(image, bbox):
     return image[y1:y2, x1:x2]
 
 
+def _pick_device(torch):
+    """Choose a torch device string ('cuda'|'xpu'|'mps'|'cpu') for THIS venv.
+
+    Deliberately duplicates the logic in media_manager/compute.py: this worker
+    runs in the isolated .age-venv, which pins torch==2.5.1 and does NOT have the
+    main package on its path, so it cannot `from media_manager import compute`
+    (same precedent as this file's other duplicated helpers, e.g. the person
+    detector living here instead of reusing detector.py). The channel from the
+    parent is the inherited MEDIA_DEVICE env var (see age_estimator.py).
+
+    Per the project's no-silent-failures rule: if a backend is requested or probed
+    but isn't actually usable in this venv's torch, we print a loud one-line note
+    to stderr and drop to CPU (visibly), never quietly. Since .age-venv pins torch
+    2.5.1 without IPEX, 'xpu' will usually be unavailable here and this correctly
+    falls back to CPU with a visible note — that is expected, not a bug."""
+    want = os.environ.get("MEDIA_DEVICE", "").strip().lower()
+
+    def _xpu_ok():
+        # Native XPU (torch>=2.5) needs no IPEX, but older Intel stacks only
+        # register the 'xpu' backend after importing IPEX — try it, guarded.
+        try:
+            import intel_extension_for_pytorch  # noqa: F401
+        except Exception:
+            pass
+        return hasattr(torch, "xpu") and torch.xpu.is_available()
+
+    def _mps_ok():
+        return bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
+
+    if want:
+        if want not in ("cuda", "xpu", "mps", "cpu"):
+            print(f"[age_worker] MEDIA_DEVICE={want!r} is not one of "
+                  f"cuda|xpu|mps|cpu — using CPU.", file=sys.stderr)
+            return "cpu"
+        if want == "cuda":
+            if torch.cuda.is_available():
+                return "cuda"
+            print("[age_worker] MEDIA_DEVICE=cuda but torch.cuda.is_available() "
+                  "is False in .age-venv — using CPU.", file=sys.stderr)
+            return "cpu"
+        if want == "xpu":
+            if _xpu_ok():
+                return "xpu"
+            print("[age_worker] MEDIA_DEVICE=xpu but torch.xpu is unavailable in "
+                  ".age-venv (its pinned torch==2.5.1 has no IPEX/XPU build) — "
+                  "using CPU.", file=sys.stderr)
+            return "cpu"
+        if want == "mps":
+            if _mps_ok():
+                return "mps"
+            print("[age_worker] MEDIA_DEVICE=mps but torch's MPS backend is "
+                  "unavailable in .age-venv — using CPU.", file=sys.stderr)
+            return "cpu"
+        return "cpu"
+
+    # No MEDIA_DEVICE set: auto-probe cuda -> xpu -> cpu. mps is skipped unless
+    # explicitly requested (matches compute.py's cautious auto-order intent for
+    # this always-headless worker).
+    if torch.cuda.is_available():
+        return "cuda"
+    if _xpu_ok():
+        return "xpu"
+    return "cpu"
+
+
 def run(image_path, faces):
     import cv2
     import torch
@@ -119,6 +185,13 @@ def run(image_path, faces):
     processor = AutoImageProcessor.from_pretrained(MODEL_REPO, trust_remote_code=True)
     model.eval()
 
+    # Pick the device this venv can actually use (see _pick_device) and move the
+    # model onto it once. The per-face pixel_values tensors are moved to the same
+    # device just before each forward pass below — model and inputs must share a
+    # device or torch raises.
+    dev = _pick_device(torch)
+    model.to(dev)
+
     results = []
     # One at a time rather than batched: crops vary in whether a body is present, and
     # keeping the per-face try/except means one bad crop can't take out the whole
@@ -128,8 +201,10 @@ def run(image_path, faces):
             results.append({"face_ref": face_ref, "age": None, "gender": None})
             continue
         try:
-            faces_input = processor(images=[face_crop_img])["pixel_values"]
-            body_input = processor(images=[body_crop_img])["pixel_values"]
+            # processor(...)["pixel_values"] is a tensor; move it onto the same
+            # device as the model (a no-op when dev == 'cpu').
+            faces_input = processor(images=[face_crop_img])["pixel_values"].to(dev)
+            body_input = processor(images=[body_crop_img])["pixel_values"].to(dev)
             with torch.no_grad():
                 output = model(faces_input=faces_input, body_input=body_input)
             age = round(output.age_output[0].item(), 1)

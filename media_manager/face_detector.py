@@ -162,15 +162,25 @@ def _inflate_square(bbox, pad_ratio):
 
 
 class FaceDetector:
-    def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=0):
+    def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=None):
         from insightface.app import FaceAnalysis
+        from . import compute
         self.det_thresh = det_thresh
         self._model_name = model_name
-        self.app = FaceAnalysis(
-            name=model_name,
-            providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
-        )
+        # Central onnxruntime provider pick: CUDA (NVIDIA), OpenVINO GPU (Intel
+        # Arc), else CPU — was a hardcoded ['CUDAExecutionProvider', 'CPU...']
+        # list that silently ran on CPU on any non-NVIDIA box. FaceAnalysis wants
+        # a name list plus an aligned provider_options list (not the (name, opts)
+        # tuples a raw InferenceSession takes), so compute splits them for us.
+        providers, provider_options = compute.insightface_providers()
+        if ctx_id is None:
+            ctx_id = compute.insightface_ctx_id()
+        fa_kwargs = {'name': model_name, 'providers': providers}
+        if provider_options is not None:
+            fa_kwargs['provider_options'] = provider_options
+        self.app = FaceAnalysis(**fa_kwargs)
         self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
+        print(f"[faces] providers={providers} ctx_id={ctx_id}", flush=True)
         self._pcn = None
         self._pcn_failed = False
 

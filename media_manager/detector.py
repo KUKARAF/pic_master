@@ -74,15 +74,21 @@ WEIGHTS_DIR = os.path.expanduser('~/.cache/media_manager/weights')
 
 
 class YOLOWorldDetector:
-    def __init__(self, model_size='s', conf_threshold=0.15, vocab_path=None, vocab=None):
+    def __init__(self, model_size='s', conf_threshold=0.15, vocab_path=None, vocab=None,
+                 device=None):
         from ultralytics import YOLOWorld as _YOLOWorld
+        from . import compute
         self.conf_threshold = conf_threshold
         self._model_size = model_size
+        # ultralytics auto-picks CUDA-or-CPU; give it our central device so an
+        # Intel Arc GPU ('xpu') is used too. Threaded into every .predict() below.
+        self.device = device if device is not None else compute.ultralytics_device()
         self.vocab = vocab if vocab is not None else load_vocab_from_file(vocab_path)
         os.makedirs(WEIGHTS_DIR, exist_ok=True)
         weights_path = os.path.join(WEIGHTS_DIR, f'yolov8{model_size}-worldv2.pt')
         self.model = _YOLOWorld(weights_path)
         self.model.set_classes(self.vocab)
+        print(f"[yolo-world] device={self.device}", flush=True)
 
     def set_vocab(self, vocab):
         """Update classes on the already-loaded model — cheap (re-embeds the class
@@ -106,7 +112,8 @@ class YOLOWorldDetector:
                 results_out.append((path, [], "unsupported extension"))
                 continue
             try:
-                results = self.model.predict(path, conf=self.conf_threshold, verbose=False)
+                results = self.model.predict(path, conf=self.conf_threshold, verbose=False,
+                                             device=self.device)
                 detections = []
                 for r in results:
                     for box in r.boxes:

@@ -25,8 +25,20 @@ pip install -e .
 This installs the `media` CLI. Model weights (YOLO, CLIP, InsightFace) are
 downloaded automatically on first use.
 
-GPU note: `requirements.txt` pins `onnxruntime` (CPU). Swap in
-`onnxruntime-gpu` for CUDA-accelerated face detection.
+GPU note: the compute device is auto-selected — **CUDA → XPU (Intel Arc) → MPS →
+CPU** — and can be forced with the `MEDIA_DEVICE=cuda|xpu|mps|cpu` env var (it
+fails loudly if you name a backend that isn't usable, rather than silently
+running on CPU). Out of the box `requirements.txt` pins CPU `onnxruntime` and a
+CPU/CUDA `torch`. To actually use a GPU:
+
+- **NVIDIA (CUDA):** swap `onnxruntime` → `onnxruntime-gpu`; install a CUDA `torch`.
+- **Intel Arc (XPU):** swap `onnxruntime` → `onnxruntime-openvino`, and install the
+  XPU build of torch (`pip install torch --index-url
+  https://download.pytorch.org/whl/xpu`) on a host with the Intel GPU runtime
+  (kernel i915/xe + Level-Zero + compute-runtime). CLIP, YOLO-World and (in its
+  own venv) MiVOLO then run on the Arc GPU; InsightFace faces run via OpenVINO.
+
+All device selection funnels through `media_manager/compute.py`.
 
 ## Quick Start
 
@@ -112,6 +124,23 @@ to it — each dispatch is logged
 (`[worker] outsourced …`) and shown in the web UI's worker badge. For the
 *inference* offloads the host transparently falls back to running locally if the
 worker is unreachable; **training does not fall back** — see below.
+
+### Single box, both roles: `media web --with-worker`
+
+If one machine runs *both* the web UI and the worker, you don't need any of the
+RNS TCP setup or `worker-connect` below. Just:
+
+```bash
+media web --with-worker            # add --preload-worker to load models at boot
+```
+
+This spawns `media worker` as a child process, auto-connects to it over the
+local RNS **shared instance** (so keep the default `share_instance` — don't set
+it to `No`), and shuts the worker down when the web server exits. It's mainly a
+way to keep heavy models out of the web process's own address space on a single
+box; if you don't care about that, plain `media web` runs every model in-process
+and needs no worker at all. The cross-machine setup below is only for running the
+worker on a *separate* beefier host.
 
 Only the *models* run remotely; your media files never need to live on the
 worker (images are streamed to it per request). Results come back as embeddings
