@@ -100,6 +100,53 @@ def build_workflow(template: dict, first_image: str, last_image: str, params: di
     return wf
 
 
+def order_by_similarity(items):
+    """Order morph inputs so consecutive FLF2V pairs are as visually close as
+    possible — the whole reason a morph looks continuous instead of jumpy.
+
+    Start with the alphabetically-first member (a stable, predictable anchor), then
+    greedily append the most CLIP-similar remaining member at each step (a
+    nearest-neighbour chain). `items` is a list of dicts, each
+    {'name': str, 'path': str, 'embedding': bytes|None}. Members with no embedding
+    can't be placed by similarity, so they're appended at the end in name order.
+    Returns the same dicts, reordered (does not mutate the input list)."""
+    import numpy as np
+    by_name = lambda it: (it.get('name') or '').lower()
+    if len(items) <= 2:
+        return sorted(items, key=by_name)
+
+    # Normalise each embedding once; index-keyed so we keep dict identity.
+    vecs = {}
+    for i, it in enumerate(items):
+        blob = it.get('embedding')
+        if not blob:
+            continue
+        v = np.frombuffer(blob, dtype=np.float32)
+        norm = np.linalg.norm(v)
+        if norm:
+            vecs[i] = v / norm
+
+    embedded = sorted((i for i in range(len(items)) if i in vecs),
+                      key=lambda i: by_name(items[i]))
+    unembedded = sorted((i for i in range(len(items)) if i not in vecs),
+                        key=lambda i: by_name(items[i]))
+    if len(embedded) <= 1:
+        # Not enough vectors to chain — fall back to a plain alphabetical order.
+        return sorted(items, key=by_name)
+
+    remaining = embedded[:]
+    ordered = [remaining.pop(0)]  # alphabetically-first embedded member = the anchor
+    while remaining:
+        cur = vecs[ordered[-1]]
+        best_j, best_s = 0, -2.0
+        for j, idx in enumerate(remaining):
+            s = float(cur.dot(vecs[idx]))
+            if s > best_s:
+                best_s, best_j = s, j
+        ordered.append(remaining.pop(best_j))
+    return [items[i] for i in ordered + unembedded]
+
+
 def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
                    data_root=None, fps=16, params=None, progress=None):
     """Generate a morph video across ordered set members with Wan FLF2V per pair.

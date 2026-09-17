@@ -5558,13 +5558,21 @@ def create_app(data_root: str) -> FastAPI:
         checksums = manual.get_files_by_set(set_id, limit=limit, manual_order=True)
         ai = db.get_all_ai_generated_checksums()  # never morph AI output back in
         checksums = [c for c in checksums if c not in ai]
-        paths = []
-        for r in db.get_files_by_checksums(checksums):
+        rows = db.get_files_by_checksums(checksums)
+        emb_map = dict(db.get_embeddings_for_files([r['id'] for r in rows]))
+        members = []
+        for r in rows:
             ap = _live_abs_path(r['id'], r['path'])
             if ap:
-                paths.append(ap)
-        if len(paths) < 2:
+                members.append({'name': os.path.basename(r['path']), 'path': ap,
+                                'embedding': emb_map.get(r['id'])})
+        if len(members) < 2:
             return {'started': False, 'message': 'Need at least 2 member images on disk.'}
+        # Order for a smooth morph: alphabetically-first member, then a greedy CLIP
+        # nearest-neighbour chain — consecutive FLF2V pairs are then as visually close
+        # as possible, instead of the set's arbitrary manual order.
+        members = set_video.order_by_similarity(members)
+        paths = [m['path'] for m in members]
         gen = ComfyUIClient()
         if not gen.is_available():
             return {'started': False,

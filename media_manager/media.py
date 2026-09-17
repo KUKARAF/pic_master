@@ -625,7 +625,7 @@ def main():
                 print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
                 m.close(); sys.exit(1)
             ai = m.db.get_all_ai_generated_checksums()  # never morph AI output back in
-            paths = []
+            members = []
             for checksum in m.manual.get_files_by_set(row['id'], limit=args.limit):
                 if checksum in ai:
                     continue
@@ -633,11 +633,16 @@ def main():
                 if fr is not None:
                     ap = os.path.join(m.data_root, fr['path'])
                     if os.path.isfile(ap):
-                        paths.append(ap)
-            if len(paths) < 2:
+                        members.append({'name': os.path.basename(fr['path']), 'path': ap,
+                                        'embedding': m.db.get_embedding(fr['id'])})
+            if len(members) < 2:
                 print("ERROR: need at least 2 readable member images to morph",
                       file=sys.stderr)
                 m.close(); sys.exit(1)
+            # Same smooth-morph ordering as the web path: alphabetically-first member,
+            # then a greedy CLIP nearest-neighbour chain.
+            members = set_video.order_by_similarity(members)
+            paths = [mm['path'] for mm in members]
             out = set_render.output_path(m.data_root, args.name, 'morph', 'mp4')
             try:
                 set_video.morph_from_set(
