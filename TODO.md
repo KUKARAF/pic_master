@@ -48,6 +48,27 @@
 - Command-line interface
 - Web interface (optional)
 
+## Optional / Nice-to-have
+
+### IPEX (Intel Extension for PyTorch) — optional Arc GPU speedup
+Not required. The Intel Arc (B70 / Battlemage) path runs on **native** torch XPU
+(`torch==2.7.1+xpu`) — CLIP, YOLO-World and MiVOLO all work on the GPU without it,
+and faces run via onnxruntime OpenVINO. `compute.py` and `age_estimator_worker.py`
+already do a *guarded, optional* `import intel_extension_for_pytorch` (used if
+present, silently skipped if not), so nothing breaks by leaving it out.
+
+Add it only if a specific model is too slow or throws an "operation not
+implemented for XPU" error. If/when we do:
+- Install `intel-extension-for-pytorch` **version-matched to torch 2.7.1**
+  (verify the exact `+xpu` version + Intel index URL first — don't guess the pin,
+  same trap as the torch/torchvision mismatch) into the relevant venv(s):
+  the main app venv and/or the isolated `.age-venv` (bake into
+  `requirements-age-estimator.txt` + `setup_age_venv`'s `--extra-index-url`).
+- For an actual speedup (beyond just being importable) wrap the torch models in
+  `ipex.optimize(model)` — CLIP in `indexer.py`, MiVOLO in
+  `age_estimator_worker.py`. Note this can change numerics slightly, so validate
+  on the GPU box.
+
 ## Development Notes
 - Use SQLite for initial database implementation
 - Focus on performance for large media collections
