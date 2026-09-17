@@ -850,11 +850,14 @@ input[type="range"] { accent-color: var(--accent); }
 }
 
 /* Permanent-delete control — ONLY rendered on AI-generated cards (the one class
-   the app truly deletes). Hover-revealed, top-right, distinct from the AI badge. */
+   the app truly deletes). Top-LEFT, tucked just under the AI badge: the top-right
+   corner is the star/heart's (z-index:2) and this was being painted behind the
+   star. Always visible (not hover-only) so it's discoverable in the AI tab and on
+   touch; the click still goes through a confirm() before anything is deleted. */
 .card .ai-delete-btn {
   position: absolute;
-  right: 8px;
-  top: 8px;
+  left: 8px;
+  top: 40px;
   width: 28px;
   height: 28px;
   border: none;
@@ -866,10 +869,12 @@ input[type="range"] { accent-color: var(--accent); }
   display: flex;
   align-items: center;
   justify-content: center;
-  opacity: 0;
+  z-index: 3;
+  opacity: 0.9;
   transition: opacity 0.12s ease;
 }
 .card:hover .ai-delete-btn { opacity: 1; }
+.ai-delete-btn:hover { background: rgba(220, 40, 40, 0.95); }
 
 .card img {
   width: 100%;

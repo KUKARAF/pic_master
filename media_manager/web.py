@@ -5437,6 +5437,11 @@ def create_app(data_root: str) -> FastAPI:
         set_ids = None
         if ids:
             set_ids = {int(s) for s in ids.split(',') if s.strip().isdigit()}
+        # Self-heal frames captured before embed-at-capture existed: without an
+        # embedding _find_best_sets_for_file can only return [] ("No likely sets").
+        # Embed on demand here (once) so opening the set picker on an old frame works.
+        if db.get_embedding(file_id) is None:
+            _ensure_file_embedding(file_id, _live_abs_path(file_id, row['path']))
         return {'results': _find_best_sets_for_file(file_id, row['checksum'],
                                                     limit=max(1, min(limit, 24)), set_ids=set_ids)}
 
@@ -8208,6 +8213,27 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='No scan job found for this file')
         return job
 
+    def _ensure_file_embedding(file_id, abs_path):
+        """Compute + store the frame_index=0 CLIP embedding for a file that has none.
+        Heals captured stills saved before embed-at-capture existed (a video's frame
+        had no embedding, so similar-search and "Likely sets" came up empty on it).
+        Best-effort — a failure must never break the caller — so it logs loudly and
+        returns False. Returns True if an embedding exists afterward. Idempotent."""
+        if db.get_embedding(file_id) is not None:
+            return True
+        if abs_path is None or not os.path.isfile(abs_path):
+            return False
+        try:
+            indexer = _get_clip_indexer()
+            embs, embed_failed = indexer.embed_images([abs_path])
+            if not embed_failed and len(embs) > 0:
+                db.insert_embedding(file_id, embs[0].tobytes(), indexer.model_id(), frame_index=0)
+                return True
+            errors.log(abs_path, f'ensure-embedding failed: {embed_failed}')
+        except Exception as exc:
+            errors.log(abs_path, f'ensure-embedding error: {exc}')
+        return False
+
     def _save_captured_still(parent_row, jpeg_bytes: bytes, time_ms: int):
         """Persist `jpeg_bytes` (a captured frame) as a hidden, real image file under
         captured_frames/ and link it back to `parent_row`'s content at `time_ms`.
@@ -8226,6 +8252,12 @@ def create_app(data_root: str) -> FastAPI:
                                      modified_time=int(os.path.getmtime(abs_path)))
         db.set_file_hidden(new_id, True)   # commits (also persists the upsert above)
         manual.add_frame_capture(checksum, parent_row['checksum'], time_ms)
+        # Embed the still (frame_index 0) so it's first-class for CLIP. Videos aren't
+        # CLIP-embedded themselves — their captured stills are meant to carry that —
+        # but nothing here ever computed one, so a video's frame had no embedding and
+        # everything embedding-backed (similar-search, "Likely sets" suggestions) came
+        # up empty on it.
+        _ensure_file_embedding(new_id, abs_path)
         return new_id
 
     @app.post('/api/files/{file_id}/capture-frame')
