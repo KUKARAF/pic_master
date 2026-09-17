@@ -75,6 +75,37 @@ def save_image_with_provenance(img, out_path, origin="ai"):
     return out_path
 
 
+def register_generated_file(db, manual, data_root, abs_path, *, set_id=None,
+                            kind="morph", origin="ai", model=None,
+                            media_type=None, params=None):
+    """Make a just-produced file under generated/ a first-class (but flagged)
+    library entry so it can be a set member and get thumbnails/cards:
+      * hash it (streamed xxhash — no loading a big mp4 into memory);
+      * add it to the files table via upsert_file_path, then mark it hidden=1
+        (keeps it out of the normal gallery/feeds) and ai_generated=1 (AI badge + /ai);
+      * assign it to its source set (so it shows in that set's grid);
+      * record it in the generated_artifacts provenance registry.
+    Returns (file_id, checksum, artifact_id)."""
+    import xxhash
+    rel_path = os.path.relpath(abs_path, data_root)
+    h = xxhash.xxh64()
+    with open(abs_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    checksum = h.hexdigest()
+    file_id = db.upsert_file_path(rel_path, checksum,
+                                  size=os.path.getsize(abs_path),
+                                  modified_time=int(os.path.getmtime(abs_path)))
+    db.set_file_hidden(file_id, True)
+    db.set_file_ai_generated(file_id, True)
+    if set_id is not None:
+        manual.assign_file_to_set(checksum, set_id)
+    artifact_id = manual.add_generated_artifact(
+        kind=kind, origin=origin, path=rel_path, set_id=set_id,
+        media_type=media_type, model=model, params=params)
+    return file_id, checksum, artifact_id
+
+
 def ffmpeg_available() -> bool:
     return bool(shutil.which("ffmpeg"))
 

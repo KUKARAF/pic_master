@@ -819,6 +819,7 @@ def create_app(data_root: str) -> FastAPI:
         identities_map = _people_with_ages(manual.get_identities_for_checksums(checksums))
         category_map = resolve_categories_for_checksums(manual, db, [(row[0], row[3]) for row in rows])
         trashed = manual.get_trashed_checksums(checksums)  # mark, don't hide — see card badge
+        ai_generated = db.get_ai_generated_checksums(checksums)  # AI badge, same idea
         result = []
         for row in rows:
             file_id = row[0]
@@ -840,6 +841,7 @@ def create_app(data_root: str) -> FastAPI:
                 'people': _people_not_in_sets(identities_map.get(checksum, []), card_sets),
                 'categories': category_map.get(checksum, []),
                 'trashed': checksum in trashed,
+                'ai_generated': checksum in ai_generated,
             }
             if scores is not None and file_id in scores:
                 card['score'] = scores[file_id]
@@ -1527,6 +1529,18 @@ def create_app(data_root: str) -> FastAPI:
         files = _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
         return templates.TemplateResponse(request, 'browse.html', {
             'title': titles[kind], 'files': files, 'kind': kind,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/ai', response_class=HTMLResponse)
+    def ai_page(request: Request, limit: int = 500):
+        """All AI-generated items (morph videos now, generated images later), newest
+        first — kept out of the normal gallery but collected here, each AI-badged."""
+        rows = db.get_ai_generated_files(limit=limit)  # (id, path, has_embedding, checksum)
+        files = _enrich_rows(rows)
+        return templates.TemplateResponse(request, 'ai.html', {
+            'title': '🤖 AI-generated', 'files': files,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
@@ -5470,10 +5484,12 @@ def create_app(data_root: str) -> FastAPI:
                     paths, out, gen=gen, data_root=data_root, fps=fps,
                     params={'prompt': prompt, 'frames': frames},
                     progress=lambda d, t: generate_video_job.update(done=d, total=t))
-                rel = os.path.relpath(out, data_root)
-                aid = manual.add_generated_artifact(
-                    kind='morph', origin='ai', path=rel, set_id=set_id,
-                    media_type='video/mp4', model='wan2.2-flf2v',
+                # Register the morph as a first-class (hidden + ai_generated) file,
+                # add it to its source set, and record provenance — all in one call.
+                _fid, _ck, aid = set_render.register_generated_file(
+                    db, manual, data_root, out, set_id=set_id,
+                    kind='morph', origin='ai', media_type='video/mp4',
+                    model='wan2.2-flf2v',
                     params={'members': len(paths), 'fps': fps, 'prompt': prompt})
                 generate_video_job['artifact_id'] = aid
             except Exception as exc:

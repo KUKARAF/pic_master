@@ -68,6 +68,7 @@
     <img src="{{ img_src or ('/thumb/' ~ f.id) }}" alt="{{ f.filename }}" loading="lazy">
     {% if f.is_video %}<span class="video-badge" title="Video">▶</span>{% endif %}
     {% if f.trashed %}<span class="trash-badge" title="In trash">🗑</span>{% endif %}
+    {% if f.ai_generated %}<span class="ai-badge" title="AI-generated">AI</span>{% endif %}
   </a>
 
   <a class="star-btn"

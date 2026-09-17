@@ -635,13 +635,14 @@ def main():
             except (GenServiceUnavailable, GenServiceError) as exc:
                 print(f"ERROR: video generation failed — {exc}", file=sys.stderr)
                 m.close(); sys.exit(1)
-            rel = os.path.relpath(out, m.data_root)
-            m.manual.add_generated_artifact(
-                kind='morph', origin='ai', path=rel, set_id=row['id'],
-                media_type='video/mp4', model='wan2.2-flf2v',
+            _fid, _ck, _aid = set_render.register_generated_file(
+                m.db, m.manual, m.data_root, out, set_id=row['id'],
+                kind='morph', origin='ai', media_type='video/mp4',
+                model='wan2.2-flf2v',
                 params={'members': len(paths), 'fps': args.fps, 'prompt': args.prompt})
+            rel = os.path.relpath(out, m.data_root)
             print(f"Generated morph video: {rel} "
-                  f"(from {len(paths)} members; recorded in generated_artifacts, origin=ai)")
+                  f"(added to set '{args.name}', flagged AI, in the /ai tab)")
         m.close()
         return 0
 

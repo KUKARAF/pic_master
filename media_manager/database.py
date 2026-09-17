@@ -176,6 +176,12 @@ class Database(ThreadLocalDB):
         # a first-class file everywhere else (photo view, thumbnails, face search).
         if 'hidden' not in files_cols:
             cursor.execute('ALTER TABLE files ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
+        # ai_generated: this file was synthesized by the app (a set morph video, and
+        # later generated images), not a real photo. Kept hidden=1 so it stays out of
+        # the normal gallery/feeds, but flagged here so it gets an "AI" badge on its
+        # cards and shows up on the /ai page. See set_render.register_generated_file.
+        if 'ai_generated' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN ai_generated INTEGER NOT NULL DEFAULT 0')
         # view_count / last_viewed_at: how many times /photo/{id} has been opened, and
         # when last. Drives the home "Needs attention" section's least-viewed-first
         # ordering (see get_least_viewed_files + web.py increment_view_count hook).
@@ -595,6 +601,43 @@ class Database(ThreadLocalDB):
         cursor = self.conn.cursor()
         cursor.execute('UPDATE files SET hidden = ? WHERE id = ?', (1 if hidden else 0, file_id))
         self.conn.commit()
+
+    def set_file_ai_generated(self, file_id, ai_generated=True):
+        """Flag content as app-synthesized (AI). Drives the AI badge + /ai page.
+        Commits (also persists any pending upsert_file_path)."""
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE files SET ai_generated = ? WHERE id = ?',
+                       (1 if ai_generated else 0, file_id))
+        self.conn.commit()
+
+    def get_ai_generated_files(self, limit=500):
+        """(id, path, has_embedding, checksum) rows for AI-generated files, newest
+        first — feeds _enrich_rows directly (same shape as the gallery listing).
+        Not filtered by hidden (AI files are hidden=1 by design)."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT f.id, f.path,
+                   CASE WHEN e.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_embedding,
+                   f.checksum
+            FROM files_with_path f
+            LEFT JOIN embeddings e ON e.file_id = f.id
+            WHERE f.ai_generated = 1
+            ORDER BY f.first_seen DESC, f.id DESC
+            LIMIT ?
+        ''', (limit,))
+        return cursor.fetchall()
+
+    def get_ai_generated_checksums(self, checksums):
+        """Subset of `checksums` that are AI-generated — batched flag lookup for
+        card enrichment (mirrors manual.get_trashed_checksums)."""
+        if not checksums:
+            return set()
+        placeholders = ','.join('?' * len(checksums))
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f'SELECT checksum FROM files WHERE ai_generated = 1 AND checksum IN ({placeholders})',
+            list(checksums))
+        return {row[0] for row in cursor.fetchall()}
 
     def increment_view_count(self, file_id):
         """Record one more open of this photo's /photo page — bumps view_count and

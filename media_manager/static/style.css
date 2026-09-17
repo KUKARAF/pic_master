@@ -830,6 +830,25 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
+/* AI-generated content is flagged (not hidden) with a top-left badge, so a
+   synthesized morph/image is unmistakable wherever it appears (its set, /ai). */
+.card .ai-badge {
+  position: absolute;
+  left: 8px;
+  top: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: rgba(124, 58, 237, 0.85);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  pointer-events: none;
+}
+
 .card img {
   width: 100%;
   aspect-ratio: 1;
