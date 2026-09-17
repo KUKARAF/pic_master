@@ -254,6 +254,15 @@ def main():
     set_genvideo.add_argument('--frames', type=int, default=49,
                               help='Frames generated per image pair (default: 49)')
 
+    set_genimage = set_sub.add_parser(
+        'generate-image',
+        help='Generate a new image FROM a set (ComfyUI; needs the B70 gen service)')
+    set_genimage.add_argument('name', help='Set name')
+    set_genimage.add_argument('--studio', default=None, help='Studio name (optional)')
+    set_genimage.add_argument('--limit', type=int, default=8,
+                              help='Max member images to feed the workflow (default: 8)')
+    set_genimage.add_argument('--prompt', default='', help='Optional prompt')
+
     # media dir2set <path> [<path> ...] - the common "this whole folder is one
     # set" workflow (a studio shoot, an event, a trip) in one command:
     # scans/imports each folder like `media add`, creates a set named after
@@ -615,8 +624,11 @@ def main():
             if row is None:
                 print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
                 m.close(); sys.exit(1)
+            ai = m.db.get_all_ai_generated_checksums()  # never morph AI output back in
             paths = []
             for checksum in m.manual.get_files_by_set(row['id'], limit=args.limit):
+                if checksum in ai:
+                    continue
                 fr = m.db.get_file_by_checksum(checksum)
                 if fr is not None:
                     ap = os.path.join(m.data_root, fr['path'])
@@ -642,6 +654,41 @@ def main():
                 params={'members': len(paths), 'fps': args.fps, 'prompt': args.prompt})
             rel = os.path.relpath(out, m.data_root)
             print(f"Generated morph video: {rel} "
+                  f"(added to set '{args.name}', flagged AI, in the /ai tab)")
+
+        elif args.set_cmd == 'generate-image':
+            from . import set_image, set_render
+            from .gen_service import GenServiceUnavailable, GenServiceError
+            row = m.manual.find_set(args.name, args.studio)
+            if row is None:
+                print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
+                m.close(); sys.exit(1)
+            ai = m.db.get_all_ai_generated_checksums()
+            paths = []
+            for checksum in m.manual.get_files_by_set(row['id'], limit=args.limit):
+                if checksum in ai:
+                    continue
+                fr = m.db.get_file_by_checksum(checksum)
+                if fr is not None:
+                    ap = os.path.join(m.data_root, fr['path'])
+                    if os.path.isfile(ap):
+                        paths.append(ap)
+            if not paths:
+                print("ERROR: need at least one member image on disk", file=sys.stderr)
+                m.close(); sys.exit(1)
+            out = set_render.output_path(m.data_root, args.name, 'image', 'jpg')
+            try:
+                set_image.image_from_set(paths, out, data_root=m.data_root,
+                                         params={'prompt': args.prompt})
+            except (GenServiceUnavailable, GenServiceError) as exc:
+                print(f"ERROR: image generation failed — {exc}", file=sys.stderr)
+                m.close(); sys.exit(1)
+            set_render.register_generated_file(
+                m.db, m.manual, m.data_root, out, set_id=row['id'], kind='image',
+                origin='ai', media_type='image/jpeg', model='comfyui-image',
+                params={'members': len(paths), 'prompt': args.prompt})
+            rel = os.path.relpath(out, m.data_root)
+            print(f"Generated image: {rel} "
                   f"(added to set '{args.name}', flagged AI, in the /ai tab)")
         m.close()
         return 0

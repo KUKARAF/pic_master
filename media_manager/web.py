@@ -2692,6 +2692,9 @@ def create_app(data_root: str) -> FastAPI:
     # 'done'/'total' are FLF2V pairs completed; 'artifact_id' is set on success.
     generate_video_job = {'running': False, 'set_id': None, 'done': 0, 'total': 0,
                           'error': None, 'artifact_id': None}
+    # Set → a new generated image (ComfyUI image workflow). One at a time.
+    generate_image_job = {'running': False, 'set_id': None, 'error': None,
+                          'artifact_id': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -5462,6 +5465,8 @@ def create_app(data_root: str) -> FastAPI:
         if generate_video_job['running']:
             return {'started': False, 'message': 'A video is already being generated.'}
         checksums = manual.get_files_by_set(set_id, limit=limit, manual_order=True)
+        ai = db.get_all_ai_generated_checksums()  # never morph AI output back in
+        checksums = [c for c in checksums if c not in ai]
         paths = []
         for r in db.get_files_by_checksums(checksums):
             ap = _live_abs_path(r['id'], r['path'])
@@ -5510,6 +5515,63 @@ def create_app(data_root: str) -> FastAPI:
             'busy_other': j['running'] and not mine,
             'done': j['done'] if mine else 0,
             'total': j['total'] if mine else 0,
+            'error': j['error'] if mine else None,
+            'artifact_id': j['artifact_id'] if mine else None,
+        }
+
+    @app.post('/api/sets/{set_id}/generate-image')
+    def api_set_generate_image(set_id: int, prompt: str = '', limit: int = 8):
+        """Generate a new image from the set (ComfyUI image workflow) on the GPU box.
+        Async; poll .../generate-image/status. Result → generated/ + the AI tab."""
+        from . import set_image, set_render
+        from .gen_service import ComfyUIClient
+        set_row = manual.get_set(set_id)
+        if set_row is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        if generate_image_job['running']:
+            return {'started': False, 'message': 'An image is already being generated.'}
+        checksums = manual.get_files_by_set(set_id, limit=limit, manual_order=True)
+        ai = db.get_all_ai_generated_checksums()  # don't feed AI output back in
+        checksums = [c for c in checksums if c not in ai]
+        paths = []
+        for r in db.get_files_by_checksums(checksums):
+            ap = _live_abs_path(r['id'], r['path'])
+            if ap:
+                paths.append(ap)
+        if not paths:
+            return {'started': False, 'message': 'Need at least one member image on disk.'}
+        gen = ComfyUIClient()
+        if not gen.is_available():
+            return {'started': False,
+                    'message': f'Generation service not reachable at {gen.base_url}. '
+                               'Start the ComfyUI service on the GPU box.'}
+        out = set_render.output_path(data_root, set_row['name'], 'image', 'jpg')
+        generate_image_job.update(running=True, set_id=set_id, error=None, artifact_id=None)
+
+        def _run():
+            try:
+                set_image.image_from_set(paths, out, gen=gen, data_root=data_root,
+                                         params={'prompt': prompt})
+                _fid, _ck, aid = set_render.register_generated_file(
+                    db, manual, data_root, out, set_id=set_id, kind='image',
+                    origin='ai', media_type='image/jpeg', model='comfyui-image',
+                    params={'members': len(paths), 'prompt': prompt})
+                generate_image_job['artifact_id'] = aid
+            except Exception as exc:
+                generate_image_job['error'] = str(exc)
+            finally:
+                generate_image_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True}
+
+    @app.get('/api/sets/{set_id}/generate-image/status')
+    def api_set_generate_image_status(set_id: int):
+        j = generate_image_job
+        mine = (j['set_id'] == set_id)
+        return {
+            'running': j['running'] and mine,
+            'busy_other': j['running'] and not mine,
             'error': j['error'] if mine else None,
             'artifact_id': j['artifact_id'] if mine else None,
         }
@@ -6010,7 +6072,11 @@ def create_app(data_root: str) -> FastAPI:
         if cat is None:
             return []
 
-        example_checksums = manual.get_example_checksums_for_category(category_id)
+        # AI-generated media is never used to train/rank a category (no synthetic
+        # feedback loops) — dropped from both the examples and the candidate pool.
+        ai_all = db.get_all_ai_generated_checksums()
+        example_checksums = [c for c in manual.get_example_checksums_for_category(category_id)
+                             if c not in ai_all]
         example_ids = [r['id'] for r in db.get_files_by_checksums(example_checksums)]
         example_embeddings = [e for _fid, e in db.get_embeddings_for_files(example_ids)]
         # Down-swiped (excluded) items don't just get hidden from the queue — they
@@ -6033,6 +6099,7 @@ def create_app(data_root: str) -> FastAPI:
         filtered = [
             c for c in all_candidates
             if c[3] not in already_has_this and c[3] not in rejected_for_this
+            and c[3] not in ai_all
             and f"file:{c[0]}" not in exclude_refs
         ]
         ranked = rank_by_similarity(centroid, filtered, embedding_index=2)

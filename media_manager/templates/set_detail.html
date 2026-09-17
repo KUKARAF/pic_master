@@ -13,6 +13,7 @@
     <button type="button" id="set-edit-btn" class="heart-btn-inline" title="Rename set">✏️</button>
     <button type="button" id="set-add-folder-btn" class="heart-btn-inline" title="Add all photos under a folder">📁</button>
     <button type="button" id="set-genvideo-btn" class="heart-btn-inline" title="Generate a morph video from this set (AI)">🎬</button>
+    <button type="button" id="set-genimage-btn" class="heart-btn-inline" title="Generate an image from this set (AI)">🖼️</button>
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>
   </h1>
   {{ macros.set_meta_line(set) }}
@@ -269,6 +270,70 @@
           setGenVideoBtn.disabled = true;
           setGenVideoBtn.textContent = '🎬 …';
           vidPoll = setInterval(pollVideo, 3000);
+        }
+      }).catch(function() {});
+  }
+
+  const setGenImageBtn = document.getElementById('set-genimage-btn');
+  if (setGenImageBtn) {
+    let imgPoll = null;
+    function pollImage() {
+      fetch('/api/sets/' + setId + '/generate-image/status')
+        .then(function(r) { return r.json(); })
+        .then(function(s) {
+          if (s.running) { setGenImageBtn.textContent = '🖼️ …'; return; }
+          if (imgPoll) { clearInterval(imgPoll); imgPoll = null; }
+          setGenImageBtn.textContent = '🖼️';
+          setGenImageBtn.disabled = false;
+          if (s.error) showToast('Image generation failed: ' + s.error);
+          else if (s.artifact_id) {
+            showToast('AI image ready.');
+            window.open('/generated/' + s.artifact_id, '_blank');
+          }
+        })
+        .catch(function() {
+          if (imgPoll) { clearInterval(imgPoll); imgPoll = null; }
+          setGenImageBtn.disabled = false; setGenImageBtn.textContent = '🖼️';
+        });
+    }
+    setGenImageBtn.addEventListener('click', function() {
+      openModal('Generate image', function(box) {
+        const p = document.createElement('p');
+        p.style.marginTop = '0';
+        p.textContent = 'Generates a new AI image from this set’s photos (ComfyUI, on ' +
+          'the GPU box). Saved to the generated/ folder, added to this set, and marked AI.';
+        box.appendChild(p);
+        const promptInput = document.createElement('input');
+        promptInput.type = 'text';
+        promptInput.placeholder = 'Optional prompt…';
+        promptInput.style.width = '100%'; promptInput.style.marginBottom = '8px';
+        box.appendChild(promptInput);
+        const go = document.createElement('button');
+        go.type = 'button'; go.textContent = 'Generate';
+        go.addEventListener('click', function() {
+          const qs = new URLSearchParams({ prompt: promptInput.value || '' });
+          fetch('/api/sets/' + setId + '/generate-image?' + qs.toString(), { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+              if (!res.started) { showToast(res.message || 'Could not start generation.'); return; }
+              if (window.closeModal) window.closeModal();
+              setGenImageBtn.disabled = true;
+              setGenImageBtn.textContent = '🖼️ …';
+              showToast('Generating image… runs on the GPU box.');
+              if (!imgPoll) imgPoll = setInterval(pollImage, 3000);
+            })
+            .catch(function(err) { showToast('Failed to start: ' + err.message); });
+        });
+        box.appendChild(go);
+      });
+    });
+    fetch('/api/sets/' + setId + '/generate-image/status')
+      .then(function(r) { return r.json(); })
+      .then(function(s) {
+        if (s.running) {
+          setGenImageBtn.disabled = true;
+          setGenImageBtn.textContent = '🖼️ …';
+          imgPoll = setInterval(pollImage, 3000);
         }
       }).catch(function() {});
   }

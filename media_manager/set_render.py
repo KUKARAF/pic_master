@@ -100,6 +100,10 @@ def register_generated_file(db, manual, data_root, abs_path, *, set_id=None,
     db.set_file_ai_generated(file_id, True)
     if set_id is not None:
         manual.assign_file_to_set(checksum, set_id)
+    # Put every generated item in the "AI" category (find-or-create). This is the
+    # single label the rest of the app uses to keep synthetic media OUT of AI
+    # generation inputs and model training — no feedback loops / model collapse.
+    manual.add_file_category(checksum, manual.create_category("AI"))
     artifact_id = manual.add_generated_artifact(
         kind=kind, origin=origin, path=rel_path, set_id=set_id,
         media_type=media_type, model=model, params=params)

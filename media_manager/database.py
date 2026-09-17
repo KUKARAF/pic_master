@@ -627,6 +627,13 @@ class Database(ThreadLocalDB):
         ''', (limit,))
         return cursor.fetchall()
 
+    def get_all_ai_generated_checksums(self):
+        """Every AI-generated checksum (small set) — used to EXCLUDE synthetic media
+        from AI-generation inputs and model training (no feedback loops)."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT checksum FROM files WHERE ai_generated = 1')
+        return {row[0] for row in cursor.fetchall()}
+
     def get_ai_generated_checksums(self, checksums):
         """Subset of `checksums` that are AI-generated — batched flag lookup for
         card enrichment (mirrors manual.get_trashed_checksums)."""

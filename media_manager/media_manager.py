@@ -369,11 +369,16 @@ class MediaManager:
         if not categories:
             return 0, 0, 0
 
+        # AI-generated media never trains a category or gets auto-matched (no
+        # synthetic feedback loops) — excluded from examples and candidates below.
+        ai_all = self.db.get_all_ai_generated_checksums()
+
         category_centroids = []  # [(name, temperature, centroid_vector)]
         category_examples = {}
         category_rejections = {}
         for cat in categories:
-            example_checksums = self.manual.get_example_checksums_for_category(cat['id'])
+            example_checksums = [c for c in self.manual.get_example_checksums_for_category(cat['id'])
+                                 if c not in ai_all]
             category_examples[cat['name']] = set(example_checksums)
             rejected = self.manual.get_excluded_checksums_for_category(cat['id'])
             category_rejections[cat['name']] = rejected
@@ -401,6 +406,8 @@ class MediaManager:
 
         considered = matched = skipped = 0
         for file_id, emb, checksum in candidates:
+            if checksum in ai_all:   # never auto-classify AI-generated media
+                continue
             considered += 1
             vec = np.frombuffer(emb, dtype=np.float32)
             file_matches = []
