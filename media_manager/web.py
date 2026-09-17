@@ -5497,8 +5497,12 @@ def create_app(data_root: str) -> FastAPI:
                     model='wan2.2-flf2v',
                     params={'members': len(paths), 'fps': fps, 'prompt': prompt})
                 generate_video_job['artifact_id'] = aid
+                print(f"[web] set {set_id} morph video done: {out} (artifact {aid})", flush=True)
             except Exception as exc:
+                import traceback
+                traceback.print_exc()
                 generate_video_job['error'] = str(exc)
+                print(f"[web] set {set_id} video generation FAILED: {exc}", flush=True)
             finally:
                 generate_video_job['running'] = False
 
@@ -5557,8 +5561,12 @@ def create_app(data_root: str) -> FastAPI:
                     origin='ai', media_type='image/jpeg', model='comfyui-image',
                     params={'members': len(paths), 'prompt': prompt})
                 generate_image_job['artifact_id'] = aid
+                print(f"[web] set {set_id} image done: {out} (artifact {aid})", flush=True)
             except Exception as exc:
+                import traceback
+                traceback.print_exc()
                 generate_image_job['error'] = str(exc)
+                print(f"[web] set {set_id} image generation FAILED: {exc}", flush=True)
             finally:
                 generate_image_job['running'] = False
 
