@@ -38,50 +38,37 @@ def _ensure_self_signed_cert(media_dir, host):
     return certfile, keyfile
 
 
-def _spawn_colocated_worker(preload=False):
-    """Start a `media worker` child for `media web --with-worker` and point this
-    process at it — returns the child Popen.
+def _spawn_colocated_worker(port, preload=False):
+    """Start a `media worker` HTTP child for `media web --with-worker` and point
+    this process at it — returns the child Popen.
 
-    Co-located, the web process and the worker reach each other over the local
-    RNS *shared instance* (no TCP interface, no worker.json). We give the child a
-    persisted identity file so its RNS destination hash is deterministic, compute
-    that hash here WITHOUT initialising RNS (RNS.Destination.hash is a pure
-    function of identity + app/aspect), and inject it via the MEDIA_WORKER_ADDR /
-    MEDIA_WORKER_ENABLED env vars that worker_config.load() reads over worker.json.
-    Setting it BEFORE create_app() means the web process treats the worker as
-    configured from the first request and never builds a local model (the whole
-    point of the offload — avoids the low-RAM OOM). No silent failures: any
-    problem spawning is raised, not swallowed."""
-    import RNS
-    from . import worker_server, worker_protocol
-
-    identity_file = worker_server.DEFAULT_IDENTITY_FILE
-    identity = worker_server._load_or_create_identity(identity_file)
-    address = RNS.Destination.hash(
-        identity, worker_protocol.APP_NAME, worker_protocol.ASPECT).hex()
-
-    os.environ['MEDIA_WORKER_ADDR'] = address
+    Co-located, the worker is just a local HTTP service on loopback. We spawn it on
+    127.0.0.1:<port> and inject MEDIA_WORKER_ADDR (its URL) + MEDIA_WORKER_ENABLED
+    into the environment, which worker_config.load() reads over worker.json. Setting
+    it BEFORE create_app() means the web process treats the worker as configured
+    from the first request and never builds a local model (the whole point of the
+    offload — avoids the low-RAM OOM). No silent failures: a failed spawn raises."""
+    url = f"http://127.0.0.1:{port}"
+    os.environ['MEDIA_WORKER_ADDR'] = url
     os.environ['MEDIA_WORKER_ENABLED'] = '1'
 
     # Reuse THIS interpreter + the module entrypoint so the child runs in the same
-    # venv. --identity-file pins the address we just computed; a short announce
-    # interval makes the green Worker badge appear quickly on the co-located box.
+    # venv. start_new_session=True isolates the child from uvicorn's own
+    # SIGINT/SIGTERM handling so we control its shutdown in _stop_colocated_worker.
     argv = [sys.executable, '-m', 'media_manager.media', 'worker',
-            '--identity-file', identity_file, '--announce-interval', '20']
+            '--host', '127.0.0.1', '--port', str(port)]
     if preload:
         argv.append('--preload')
-    # start_new_session=True isolates the child from uvicorn's own SIGINT/SIGTERM
-    # handling so we control its shutdown explicitly in _stop_colocated_worker.
     child = subprocess.Popen(argv, start_new_session=True)
-    print(f"[web] spawned co-located worker (pid {child.pid}, address {address}); "
-          f"offloading enabled over the local RNS shared instance.", flush=True)
+    print(f"[web] spawned co-located worker (pid {child.pid}) at {url}; "
+          f"offloading enabled.", flush=True)
     return child
 
 
 def _stop_colocated_worker(child):
-    """Shut the co-located worker child down gracefully. SIGTERM first (the worker
-    installs a handler that unwinds its loop cleanly, letting torch/ultralytics
-    release handles); escalate to SIGKILL only if it doesn't exit in time."""
+    """Shut the co-located worker child down gracefully. SIGTERM first (uvicorn
+    unwinds cleanly, letting torch/ultralytics release handles); escalate to
+    SIGKILL only if it doesn't exit in time."""
     if child is None or child.poll() is not None:
         return
     print("[web] stopping co-located worker...", flush=True)
@@ -343,31 +330,33 @@ def main():
                               'Raise it only if you offload ML to a `media worker` (so the web '
                               'process stays model-free) and need more request concurrency.')
     web_cmd.add_argument('--with-worker', action='store_true',
-                         help='Also spawn and manage a co-located `media worker` as a child '
-                              'process, auto-connecting to it over the local RNS shared instance '
-                              '(no worker-connect / worker.json needed). The child is shut down '
-                              'when the web server exits. Use on a single beefy box that runs both '
-                              'roles; needs the RNS shared instance (the default — do not set '
-                              'share_instance = No). Combine with --preload-worker to load models up front.')
+                         help='Also spawn and manage a co-located `media worker` HTTP service as a '
+                              'child process on 127.0.0.1 and auto-connect to it (no worker-connect '
+                              '/ worker.json needed). The child is shut down when the web server '
+                              'exits. Use on a single beefy box that runs both roles. Combine with '
+                              '--preload-worker to load models up front.')
     web_cmd.add_argument('--preload-worker', action='store_true',
                          help='With --with-worker: start the child worker with --preload so all '
                               'models load at boot instead of on first request.')
+    web_cmd.add_argument('--worker-port', type=int, default=4243,
+                         help='With --with-worker: loopback port for the co-located worker '
+                              '(default: 4243).')
 
     worker_cmd = sub.add_parser('worker',
-                                help='Run the Reticulum media worker server (heavy ML offload target)')
-    worker_cmd.add_argument('--identity-file', default=None,
-                            help='Path to the RNS identity file (default: '
-                                 '~/.config/media_manager/worker_identity)')
-    worker_cmd.add_argument('--config-dir', default=None,
-                            help='RNS config directory (default: RNS default)')
-    worker_cmd.add_argument('--announce-interval', type=int, default=300,
-                            help='Seconds between destination announces (default: 300)')
+                                help='Run the media worker HTTP service (heavy ML offload target)')
+    worker_cmd.add_argument('--host', default='127.0.0.1',
+                            help='Host/IP to bind the worker HTTP service to (default: 127.0.0.1; '
+                                 'use 0.0.0.0 to accept connections from other machines)')
+    worker_cmd.add_argument('--port', type=int, default=4243,
+                            help='Port to listen on (default: 4243)')
     worker_cmd.add_argument('--preload', action='store_true',
                             help='Load all ML models up front instead of lazily on first request')
 
     worker_connect_cmd = sub.add_parser('worker-connect',
                                         help='Point this host at a media worker to offload heavy ML')
-    worker_connect_cmd.add_argument('address', help='Worker RNS destination hash (hex)')
+    worker_connect_cmd.add_argument('address',
+                                    help='Worker base URL, e.g. http://192.168.1.66:4243 '
+                                         '(a bare host:port is assumed http://)')
     worker_connect_cmd.add_argument('--disable', action='store_true',
                                     help='Save the address but leave offloading disabled')
 
@@ -787,7 +776,7 @@ def main():
         # window could build a local model instead of offloading.
         worker_child = None
         if args.with_worker:
-            worker_child = _spawn_colocated_worker(preload=args.preload_worker)
+            worker_child = _spawn_colocated_worker(args.worker_port, preload=args.preload_worker)
         try:
             app = create_app(data_root)
         except RuntimeError as exc:
@@ -830,19 +819,18 @@ def main():
 
     elif args.cmd == 'worker':
         from .worker_server import run as worker_run
-        worker_run(identity_file=args.identity_file, config_dir=args.config_dir,
-                   announce_interval=args.announce_interval, preload=args.preload)
+        worker_run(host=args.host, port=args.port, preload=args.preload)
         return 0
 
     elif args.cmd == 'worker-connect':
         from . import worker_config
-        # Validate the address is well-formed before saving (raises loudly on
-        # bad input — no silent acceptance of a garbage hash).
-        worker_config.address_hash_bytes(args.address)
+        # Normalize/validate the URL before saving (raises loudly on bad input —
+        # no silent acceptance of a garbage address).
+        url = worker_config.normalize_url(args.address)
         m = MediaManager()
-        path = worker_config.save(m.data_root, args.address, enabled=not args.disable)
+        path = worker_config.save(m.data_root, url, enabled=not args.disable)
         state = 'disabled' if args.disable else 'enabled'
-        print(f"Saved worker config to {path} (address={args.address}, offloading {state})")
+        print(f"Saved worker config to {path} (address={url}, offloading {state})")
         return 0
 
     else:

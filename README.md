@@ -80,8 +80,8 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media geo fetch-cities` | Download the offline GeoNames city database for reverse-geocoding |
 | `media set create/ls/assign/files` | Manage named sets (e.g. a studio shoot) |
 | `media web` | Launch the FastAPI gallery UI |
-| `media worker` | Run the remote ML-offload worker on a beefy machine (see below) |
-| `media worker-connect <hash>` | Point this host at a worker to offload heavy ML |
+| `media worker` | Run the ML-offload worker HTTP service on a beefy machine (see below) |
+| `media worker-connect <url>` | Point this host at a worker (base URL) to offload heavy ML |
 
 ## Optional: offline city names (reverse-geocoding)
 
@@ -120,119 +120,76 @@ you built yourself, set `MEDIA_AGE_VENV_PYTHON` to its python executable; a
 repo checkout's `.age-venv` is also still picked up automatically for
 development. Everything else works fine without this step.
 
-## Optional: remote ML worker (offload heavy models over Reticulum)
+## Optional: ML worker (offload heavy models to a local HTTP service)
 
 Face detection/embedding, CLIP, and YOLO-World are memory-hungry. On a
 low-RAM host (or one running the web UI with multiple workers) they can OOM. The
-`media worker` command runs those models on a **separate, beefier machine** and
-the host offloads to it over [Reticulum](https://reticulum.network/) (RNS, an
-encrypted networking stack). When a worker is reachable, `media faces` /
-`media index` / `media embed` / `media bodies`, the web reindex/embed/face
-endpoints, find-by-body, **per-tag classifier training** (the CLIP and
-YOLO-World "Train" buttons), **and age/gender estimation** all send their work
-to it — each dispatch is logged
-(`[worker] outsourced …`) and shown in the web UI's worker badge. For the
-*inference* offloads the host transparently falls back to running locally if the
-worker is unreachable; **training does not fall back** — see below.
+`media worker` command runs those models as a small **HTTP service** — on the
+same box or a separate, beefier one — and the host offloads to it. When a worker
+is reachable, `media faces` / `media index` / `media embed` / `media bodies`, the
+web reindex/embed/face endpoints, find-by-body, **per-tag classifier training**
+(the CLIP and YOLO-World "Train" buttons), **and age/gender estimation** all send
+their work to it — each dispatch is logged (`[worker] outsourced …`) and shown in
+the web UI's worker badge. For the *inference* offloads the host transparently
+falls back to running locally if the worker is unreachable; **training and
+age/gender do not fall back** — see below.
+
+The transport is plain HTTP with msgpack payloads (`worker_protocol.py`): the
+worker is a FastAPI/uvicorn service exposing one `POST /<op>` route per operation
+and the host is a `requests` client (`worker_client.py`); discovery is just the
+worker's base URL. It's unencrypted, so on anything but a trusted LAN put it
+behind Tailscale/WireGuard rather than exposing the port.
 
 ### Single box, both roles: `media web --with-worker`
 
-If one machine runs *both* the web UI and the worker, you don't need any of the
-RNS TCP setup or `worker-connect` below. Just:
+If one machine runs *both* the web UI and the worker, you don't need any config —
+no `worker-connect`, no `worker.json`:
 
 ```bash
 media web --with-worker            # add --preload-worker to load models at boot
 ```
 
-This spawns `media worker` as a child process, auto-connects to it over the
-local RNS **shared instance** (so keep the default `share_instance` — don't set
-it to `No`), and shuts the worker down when the web server exits. It's mainly a
-way to keep heavy models out of the web process's own address space on a single
-box; if you don't care about that, plain `media web` runs every model in-process
-and needs no worker at all. The cross-machine setup below is only for running the
-worker on a *separate* beefier host.
+This spawns `media worker` as a child HTTP service on `127.0.0.1:4243` (override
+with `--worker-port`), points the web process at it, and shuts it down when the
+web server exits. It's mainly a way to keep heavy models out of the web process's
+own address space on a single box; if you don't care about that, plain `media web`
+runs every model in-process and needs no worker at all. The cross-machine setup
+below is only for running the worker on a *separate* beefier host.
 
 Only the *models* run remotely; your media files never need to live on the
 worker (images are streamed to it per request). Results come back as embeddings
 and are written to the host's `.media/` database exactly as if computed locally.
 
-### 1. Install the package on both machines
+### Cross-machine: worker on a separate box
 
-Install `media` (this package) on the host and the worker the same way. The
-worker also needs the ML dependencies (they ship in `requirements.txt`); use a
-Python with wheels for your ML stack (3.11/3.12 are safe — very new interpreters
-may lack torch/onnxruntime wheels).
+**1. Install the package on both machines.** The worker also needs the ML
+dependencies (they ship in `requirements.txt`); use a Python with wheels for your
+ML stack (3.11/3.12 are safe). For GPU acceleration on the worker, see the GPU
+note near the top of this README.
 
-### 2. Give both machines a Reticulum path to each other
-
-The two machines must share a Reticulum network. The simplest reliable setup is
-an explicit TCP link: run a **TCP server** interface on the worker and a **TCP
-client** interface on the host. Create `~/.reticulum/config` on each:
-
-**Worker** (`~/.reticulum/config`):
-
-```ini
-[reticulum]
-  enable_transport = No
-  share_instance = No
-
-[interfaces]
-  [[TCP Server Interface]]
-    type = TCPServerInterface
-    interface_enabled = yes
-    listen_ip = 0.0.0.0
-    listen_port = 4242
-```
-
-**Host** (`~/.reticulum/config`) — point `target_host` at the worker's IP:
-
-```ini
-[reticulum]
-  enable_transport = No
-  share_instance = No
-
-[interfaces]
-  [[Worker link]]
-    type = TCPClientInterface
-    interface_enabled = yes
-    target_host = 192.168.1.66
-    target_port = 4242
-```
-
-Make sure the worker's port (4242 here) is reachable from the host (open it in
-any firewall). On a single flat LAN you can instead rely on Reticulum's default
-`AutoInterface` (no IPs needed), but an explicit TCP interface is more
-predictable — especially on a machine with many virtual/bridge interfaces (e.g.
-a Docker host), where AutoInterface gets noisy.
-
-### 3. Start the worker
-
-On the worker machine:
+**2. Start the worker, bound so the host can reach it:**
 
 ```bash
-media worker            # add --preload to load all models at startup
+media worker --host 0.0.0.0 --port 4243     # add --preload to load models at startup
 ```
 
-It prints its **destination address** (a hex hash) and keeps running, announcing
-itself periodically. The address is stable across restarts (the worker persists
-its identity under `~/.config/media_manager/`). Leave it running (in tmux/screen,
-or `nohup media worker &`).
+It prints its URL and serves until Ctrl-C. Leave it running (tmux/screen, a
+systemd unit, or `nohup media worker --host 0.0.0.0 &`). Make sure the port is
+reachable from the host; on anything but a trusted LAN put it behind
+Tailscale/WireGuard rather than exposing it directly.
 
-### 4. Point the host at the worker
-
-On the host, inside your media repo:
+**3. Point the host at the worker** — inside your media repo:
 
 ```bash
-media worker-connect <hex-address-from-step-3>
+media worker-connect http://<worker-ip>:4243
 ```
 
 This writes `.media/worker.json`. From now on `media` commands and the web UI
-offload to the worker. You can also set `MEDIA_WORKER_ADDR` /
+offload to the worker. You can also set `MEDIA_WORKER_ADDR` (a URL) /
 `MEDIA_WORKER_ENABLED` as environment variables instead of the file, and
-`media worker-connect <hash> --disable` saves the address but turns offloading
-off.
+`media worker-connect <url> --disable` saves the address but turns offloading off.
 
-### 5. Per-tag classifier training on the worker
+### Per-tag classifier training on the worker
 
 When a worker is configured, clicking **Train** on a tag trains its CLIP linear
 classifier and/or YOLO-World fine-tune **on the worker**, not the host — the
@@ -251,7 +208,7 @@ metadata/status the UI already polls). Two things to know:
   rather than falling back to training on the (low-RAM) host. Start the worker,
   then retry.
 
-### 6. Age/gender estimation on the worker
+### Age/gender estimation on the worker
 
 Age/gender (MiVOLO) is also offloaded when a worker is configured — the
 `/person/` "🎂 Estimate all" button and the per-photo estimate run on the
@@ -281,9 +238,9 @@ media_manager/
 ├── face_detector.py      # InsightFace detection + embeddings
 ├── exif_reader.py        # EXIF capture time + GPS
 ├── age_estimator.py      # MiVOLO client (isolated-venv subprocess)
-├── worker_server.py      # `media worker` — remote ML-offload server (Reticulum)
-├── worker_client.py      # host-side client + drop-in Remote* model proxies
-├── worker_protocol.py    # shared RNS wire contract
+├── worker_server.py      # `media worker` — ML-offload HTTP service (FastAPI/uvicorn)
+├── worker_client.py      # host-side HTTP client + drop-in Remote* model proxies
+├── worker_protocol.py    # shared wire contract (paths + msgpack pack/unpack)
 ├── worker_config.py      # .media/worker.json + MEDIA_WORKER_* env
 ├── web.py                # FastAPI gallery
 ├── templates/, static/   # Web UI assets

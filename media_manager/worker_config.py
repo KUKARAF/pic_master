@@ -1,12 +1,15 @@
 """Resolve the media-worker connection config.
 
 The worker config lives at ``<data_root>/.media/worker.json`` (alongside
-media.db / error.db). It records the RNS destination *address* (hex hash) of the
-worker to offload heavy ML to, and whether offloading is *enabled*.
+media.db / error.db). It records the *address* of the worker to offload heavy ML
+to — a base URL like ``http://127.0.0.1:4243`` (the worker is a small local HTTP
+service) — and whether offloading is *enabled*. The key is still named
+``address`` for backwards compatibility with readers (web status endpoint, the
+client), it just holds a URL now instead of the old RNS destination hash.
 
 Resolution order is env-overrides-file so a deployment can point at a different
 worker without editing the repo:
-    MEDIA_WORKER_ADDR    overrides the address
+    MEDIA_WORKER_ADDR    overrides the address (a URL)
     MEDIA_WORKER_ENABLED overrides the enabled flag
 
 Per this project's "no silent failures" rule, a present-but-corrupt worker.json
@@ -66,7 +69,7 @@ def save(data_root: str, address: str, enabled: bool = True) -> str:
     """
     path = config_path(data_root)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {'address': address, 'enabled': bool(enabled)}
+    payload = {'address': normalize_url(address), 'enabled': bool(enabled)}
     tmp = path + '.tmp'
     with open(tmp, 'w') as f:
         json.dump(payload, f, indent=2)
@@ -74,19 +77,20 @@ def save(data_root: str, address: str, enabled: bool = True) -> str:
     return path
 
 
-def address_hash_bytes(address: str) -> bytes:
-    """Convert a hex RNS destination-hash string to raw bytes.
+def normalize_url(address: str) -> str:
+    """Validate/normalize a worker address into a base URL.
 
-    RNS destination hashes are 16 bytes (32 hex chars). Raises ValueError with a
-    helpful message if the string is not valid hex or not the expected length.
-    """
-    try:
-        raw = bytes.fromhex(address)
-    except (ValueError, TypeError) as e:
+    Accepts a full URL (``http://host:port``) or a bare ``host:port`` (in which
+    case ``http://`` is assumed), and strips any trailing slash. Raises
+    ValueError on an empty/obviously-bad value (no silent failures)."""
+    if not address or not str(address).strip():
+        raise ValueError("Worker address is empty; expected a URL like http://host:port")
+    addr = str(address).strip()
+    if '://' not in addr:
+        addr = 'http://' + addr
+    scheme = addr.split('://', 1)[0].lower()
+    if scheme not in ('http', 'https'):
         raise ValueError(
-            f"Worker address {address!r} is not a valid hex string: {e}") from e
-    if len(raw) != 16:
-        raise ValueError(
-            f"Worker address {address!r} must be 16 bytes (32 hex chars), "
-            f"got {len(raw)} bytes")
-    return raw
+            f"Worker address {address!r} must be an http(s) URL (or host:port), "
+            f"got scheme {scheme!r}")
+    return addr.rstrip('/')

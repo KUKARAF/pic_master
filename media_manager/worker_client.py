@@ -1,20 +1,20 @@
-"""Reticulum media-worker offload — CLIENT side.
+"""Media-worker offload — CLIENT side.
 
 Offloads the heavy ML (face detection/embedding, CLIP image/text embedding,
-YOLO-World object detection) to a remote *worker* reached over Reticulum, so a
+YOLO-World object detection) to a *worker* reached over plain HTTP, so a
 low-powered machine can index a library without carrying torch/insightface/YOLO
-itself. The wire contract lives in :mod:`worker_protocol`; the connection config
-(worker address + enabled flag) in :mod:`worker_config`.
+itself. The wire contract lives in :mod:`worker_protocol` (msgpack dicts sent as
+``POST /<path>``); the connection config (worker base URL + enabled flag) in
+:mod:`worker_config`.
 
 This module provides:
 
-* :class:`WorkerClient` — a per-``data_root`` singleton that owns the RNS
-  instance + link and serializes requests to the worker.
+* :class:`WorkerClient` — a per-``data_root`` singleton that owns an HTTP session
+  and serializes requests to the worker.
 * ``Remote*`` proxy classes that are DROP-IN replacements for
   ``FaceDetector`` / ``CLIPIndexer`` / ``YOLOWorldDetector`` — same method
   signatures, same return *types* (numpy float32 arrays of the same shape, same
-  tuple/dict shapes) so the DB-writing code downstream is unchanged. On a
-  per-item request failure they FALL BACK to the real local model for that item.
+  tuple/dict shapes) so the DB-writing code downstream is unchanged.
 
 Per this project's "no silent failures" rule, every fallback logs a warning
 explaining *why* it fell back; nothing is swallowed quietly.
@@ -29,24 +29,27 @@ import collections
 import numpy as np
 import cv2
 
-import RNS
+import requests
 
 from . import worker_protocol
 from . import worker_config
 
 
 class WorkerUnavailable(Exception):
-    """The worker could not be reached (no path, no identity, link/ping failed)."""
+    """The worker could not be reached (connection refused, DNS/route failure,
+    or ping failed) — i.e. no HTTP service answering at the configured URL."""
 
 
 class WorkerError(Exception):
-    """A request to the worker failed at transport level (timeout / failed_callback)."""
+    """A request reached the worker's HTTP service but failed at transport level
+    (read timeout, non-200 status, or an undecodable body)."""
 
 
-# Poll intervals / timeouts for link establishment (seconds).
-_PATH_TIMEOUT = 8.0
-_LINK_TIMEOUT = 8.0
-_POLL_INTERVAL = 0.1
+# TCP connect timeout (seconds) — how long to wait to establish the HTTP
+# connection before declaring the worker unreachable. Kept short so a
+# configured-but-down worker fails fast rather than stalling a web request. (The
+# per-request READ timeout is passed separately by each caller.)
+_CONNECT_TIMEOUT = 8.0
 _AVAIL_TTL = 15.0
 # The availability probe (is_available) uses much shorter timeouts than a real
 # request: it is a liveness check, often driven by a UI poll, and must degrade
@@ -78,8 +81,7 @@ class WorkerClient:
 
     def __init__(self, data_root: str):
         self.data_root = data_root
-        self.reticulum = None
-        self._link = None
+        self._session = None
         self._lock = threading.Lock()
 
         # Availability cache: (bool_result, expiry_ts). TTL-bounded so is_available()
@@ -97,91 +99,16 @@ class WorkerClient:
         self._activity = collections.deque(maxlen=100)
         self._activity_counter = 0
 
-    # -- RNS lifecycle ------------------------------------------------------
+    # -- HTTP session -------------------------------------------------------
 
-    def _ensure_rns(self):
-        """Lazily obtain the process's Reticulum instance exactly once.
-
-        A process may only init RNS once — ``RNS.Reticulum(None)`` raises OSError
-        if an instance is already running in this process. So reuse a running
-        instance via ``get_instance()`` (returns None when none is running) and
-        only construct one when there isn't one yet.
-        """
+    def _ensure_session(self):
+        """Lazily create the shared ``requests.Session`` (connection pooling +
+        keep-alive). One outstanding request at a time is guaranteed by
+        ``self._lock`` in :meth:`_request_once`, so a single session is fine."""
         with self._lock:
-            if self.reticulum is None:
-                self.reticulum = RNS.Reticulum.get_instance() or RNS.Reticulum(None)
-        return self.reticulum
-
-    @staticmethod
-    def _safe_teardown(link):
-        """Tear down an RNS link, swallowing any error. An abandoned link stays
-        registered with RNS and holds resources (file descriptors) until torn down,
-        so every path that replaces/drops ``self._link`` must call this first — a
-        flaky worker otherwise leaks one link per failed attempt until the process
-        runs out of FDs. Cleanup must never mask the original failure, hence best-effort."""
-        if link is None:
-            return
-        try:
-            link.teardown()
-        except Exception:
-            pass
-
-    def _ensure_link(self, address, path_timeout=_PATH_TIMEOUT, link_timeout=_LINK_TIMEOUT):
-        """Return an ACTIVE link to the worker, (re)establishing it if needed.
-
-        Must be called with an initialised RNS. Guarded by ``self._lock`` — callers
-        that already hold the lock (like :meth:`request`) invoke ``_ensure_link_locked``.
-        """
-        with self._lock:
-            return self._ensure_link_locked(address, path_timeout, link_timeout)
-
-    def _ensure_link_locked(self, address, path_timeout=_PATH_TIMEOUT, link_timeout=_LINK_TIMEOUT):
-        """Link establishment core; assumes ``self._lock`` is already held."""
-        if self._link is not None and self._link.status == RNS.Link.ACTIVE:
-            return self._link
-        # A stale/half-open link left behind (a failed request, or a probe that never
-        # activated) must be torn down, not just dropped — see _safe_teardown.
-        if self._link is not None:
-            self._safe_teardown(self._link)
-            self._link = None
-
-        dest_hash = worker_config.address_hash_bytes(address)
-
-        # Ensure we know a network path to the destination.
-        if not RNS.Transport.has_path(dest_hash):
-            RNS.Transport.request_path(dest_hash)
-            deadline = time.time() + path_timeout
-            while not RNS.Transport.has_path(dest_hash):
-                if time.time() > deadline:
-                    raise WorkerUnavailable(
-                        f"no path to worker {address[:8]} after {path_timeout}s")
-                time.sleep(_POLL_INTERVAL)
-
-        server_identity = RNS.Identity.recall(dest_hash)
-        if server_identity is None:
-            raise WorkerUnavailable(
-                f"could not recall identity for worker {address[:8]}")
-
-        dest = RNS.Destination(
-            server_identity,
-            RNS.Destination.OUT,
-            RNS.Destination.SINGLE,
-            worker_protocol.APP_NAME,
-            worker_protocol.ASPECT,
-        )
-
-        link = RNS.Link(dest)
-        deadline = time.time() + link_timeout
-        while link.status != RNS.Link.ACTIVE:
-            if time.time() > deadline:
-                self._safe_teardown(link)  # don't leak a link that never activated
-                raise WorkerUnavailable(
-                    f"link to worker {address[:8]} not active after {link_timeout}s "
-                    f"(status={link.status})")
-            time.sleep(_POLL_INTERVAL)
-
-        self._link = link
-        return link
+            if self._session is None:
+                self._session = requests.Session()
+        return self._session
 
     def _load_cfg(self):
         """Return the worker config (address/enabled), cached for ~_AVAIL_TTL so a
@@ -211,7 +138,7 @@ class WorkerClient:
         if not address:
             raise WorkerUnavailable("no worker address configured")
 
-        self._ensure_rns()
+        self._ensure_session()
 
         last_exc = None
         for attempt in range(retries + 1):
@@ -219,9 +146,6 @@ class WorkerClient:
                 return self._request_once(path, req_dict, timeout)
             except (WorkerUnavailable, WorkerError) as exc:
                 last_exc = exc
-                with self._lock:
-                    self._safe_teardown(self._link)  # tear down before dropping — don't leak it
-                    self._link = None  # force a fresh link on the next attempt
                 if attempt < retries:
                     _warn(f"worker request {path!r} failed ({exc}); "
                           f"retry {attempt + 1}/{retries}")
@@ -229,42 +153,37 @@ class WorkerClient:
         raise last_exc
 
     def _request_once(self, path: str, req_dict: dict, timeout: float) -> dict:
-        address = self.address()
+        base = worker_config.normalize_url(self.address())
+        url = f"{base}/{path}"
+        # One request at a time (matches the old single-link semantics and keeps
+        # the worker's single-process model lock from being fought over).
         with self._lock:
-            link = self._ensure_link_locked(address)
+            try:
+                resp = self._session.post(
+                    url,
+                    data=worker_protocol.pack(req_dict),
+                    headers={"Content-Type": "application/msgpack"},
+                    # (connect, read): fail fast if the worker isn't listening,
+                    # but allow the full per-call budget for the model to run.
+                    timeout=(min(_CONNECT_TIMEOUT, timeout), timeout),
+                )
+            except requests.exceptions.Timeout as exc:
+                raise WorkerError(f"worker request {path!r} timed out after {timeout}s") from exc
+            except requests.exceptions.RequestException as exc:
+                # connection refused / DNS / route → the worker isn't reachable.
+                raise WorkerUnavailable(f"cannot reach worker at {base} ({exc})") from exc
 
-            done = threading.Event()
-            holder = {"response": None, "failed": False}
-
-            def cb(request_receipt):
-                holder["response"] = request_receipt.response
-                done.set()
-
-            def fcb(request_receipt):
-                holder["failed"] = True
-                done.set()
-
-            link.request(
-                path,
-                data=worker_protocol.pack(req_dict),
-                response_callback=cb,
-                failed_callback=fcb,
-                timeout=timeout,
-            )
-
-            # Wait slightly longer than the request timeout so RNS's own timeout
-            # (which fires failed_callback) wins the race and gives a clear reason.
-            if not done.wait(timeout + 5):
-                raise WorkerError(f"worker request {path!r} timed out after {timeout}s")
-
-            if holder["failed"]:
-                raise WorkerError(f"worker request {path!r} failed (failed_callback)")
-
-            response_bytes = holder["response"]
-            if response_bytes is None:
-                raise WorkerError(f"worker request {path!r} returned no response")
-
-        return worker_protocol.unpack(response_bytes)
+        if resp.status_code == 404:
+            raise WorkerError(f"worker has no handler for {path!r} (HTTP 404)")
+        if resp.status_code != 200:
+            raise WorkerError(
+                f"worker request {path!r} failed: HTTP {resp.status_code} "
+                f"{resp.text[:200]!r}")
+        try:
+            return worker_protocol.unpack(resp.content)
+        except Exception as exc:
+            raise WorkerError(
+                f"worker request {path!r} returned an undecodable body ({exc})") from exc
 
     # -- Availability -------------------------------------------------------
 
@@ -288,11 +207,11 @@ class WorkerClient:
         else:
             self._lock.release()  # was only probing for contention
             try:
-                self._ensure_rns()
-                # Short timeouts: a liveness probe must fail fast when the worker
-                # is down rather than stalling the caller for the full request budget.
-                self._ensure_link(cfg["address"],
-                                  path_timeout=_PROBE_TIMEOUT, link_timeout=_PROBE_TIMEOUT)
+                # Short read timeout: a liveness probe must fail fast when the
+                # worker is down rather than stalling the caller for a full budget.
+                # (A refused connection returns instantly; the connect timeout in
+                # _request_once caps the wait when the host is unreachable.)
+                self._ensure_session()
                 resp = self.request(worker_protocol.PATH_PING, {},
                                     timeout=_PROBE_PING_TIMEOUT, retries=0)
                 result = resp.get("ok") is True
@@ -331,8 +250,8 @@ class WorkerClient:
         return resp["job_id"]
 
     def train_add(self, job_id: str, kind: str, batch: list) -> int:
-        # A batch of (downscaled) images can be a few MB — RNS ships it as a
-        # segmented Resource, so allow a generous upload window.
+        # A batch of (downscaled) images can be a few MB — one HTTP POST body, so
+        # allow a generous upload/read window.
         resp = self.request(
             worker_protocol.PATH_TRAIN_ADD,
             {"job_id": job_id, "kind": kind, "batch": batch},
@@ -401,8 +320,8 @@ class WorkerClient:
     # -- imdb: resident search index ---------------------------------------
     # The host (remote_index_builder.py) streams a matrix to the worker in bounded
     # chunks so neither side ever holds the whole ~1 GB blob. Control messages are
-    # small; each chunk is a few tens of MB (RNS ships it as a segmented Resource),
-    # so allow a generous per-chunk timeout.
+    # small; each chunk is a few tens of MB (one HTTP POST body), so allow a
+    # generous per-chunk timeout.
 
     def imdb_build_begin(self, kind: str, dim: int, total_rows=None) -> None:
         resp = self.request(worker_protocol.PATH_IMDB_BUILD_BEGIN,

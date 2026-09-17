@@ -17,5 +17,8 @@ insightface
 onnxruntime
 open_clip_torch
 torch
-# Reticulum stack for the `media worker` remote-offload feature (worker_*.py)
-rns
+# The `media worker` offload feature (worker_*.py): the worker is a local HTTP
+# service (FastAPI/uvicorn, above) and the client talks to it with `requests`;
+# both sides serialize msgpack dicts (raw bytes / float32 embeddings round-trip).
+msgpack
+requests

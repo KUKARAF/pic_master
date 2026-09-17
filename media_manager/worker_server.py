@@ -31,13 +31,10 @@ import collections
 
 import numpy as np
 
-import RNS
-
 from . import worker_protocol
 from . import compute
 
 
-DEFAULT_IDENTITY_FILE = os.path.expanduser('~/.config/media_manager/worker_identity')
 DEFAULT_CONF_THRESHOLD = 0.15
 
 
@@ -147,10 +144,10 @@ def _cleanup(path):
 
 
 # ---------------------------------------------------------------------------
-# Request handlers. RNS calls these with the 6-parameter response_generator
-# signature confirmed against the installed RNS 1.4.2:
-#     response_generator(path, data, request_id, link_id, remote_identity,
-#                        requested_at) -> bytes
+# Request handlers. build_app() dispatches each POST /<op> to the matching entry
+# here via the 6-parameter signature these have always had (only `data` is used;
+# the trailing four are legacy transport metadata, passed as None over HTTP):
+#     handler(path, data, request_id, link_id, remote_identity, requested_at) -> bytes
 # `data` is the raw bytes the client packed with worker_protocol.pack().
 # Each returns worker_protocol.pack(resp_dict) (bytes).
 # ---------------------------------------------------------------------------
@@ -945,90 +942,85 @@ HANDLERS = {
 }
 
 
-def build_destination(identity):
-    """Build the IN/SINGLE worker destination with all request handlers
-    registered. Shared by run() and the loopback smoke test."""
-    dest = RNS.Destination(
-        identity,
-        RNS.Destination.IN,
-        RNS.Destination.SINGLE,
-        worker_protocol.APP_NAME,
-        worker_protocol.ASPECT,
-    )
-    # Auto-prove inbound links so clients can establish them without an
-    # app-level proof callback.
-    dest.set_proof_strategy(RNS.Destination.PROVE_ALL)
-    for path, handler in HANDLERS.items():
-        dest.register_request_handler(
-            path, response_generator=handler, allow=RNS.Destination.ALLOW_ALL)
-    return dest
+def build_app():
+    """Build the worker's FastAPI app: one ``POST /<op>`` route per protocol path.
+
+    Each route reads the raw msgpack request body and calls the matching entry in
+    :data:`HANDLERS` — the exact same ``(path, data, request_id, link_id,
+    remote_identity, requested_at) -> packed_bytes`` functions the RNS transport
+    used (only ``data`` is read; the rest are passed as ``None``). The handler
+    already catches its own errors and returns a packed dict with an ``error``
+    field, so every route returns HTTP 200 with a packed body — transport failures
+    (connection/timeout) are the client's job to distinguish, not our status code.
+    Blocking model work runs in a threadpool so the event loop stays free and the
+    process-wide ``models.lock`` still serializes actual inference."""
+    from fastapi import FastAPI, Request, Response
+    from starlette.concurrency import run_in_threadpool
+
+    app = FastAPI(title="media worker")
+
+    @app.post("/{op}")
+    async def dispatch(op: str, request: Request):
+        handler = HANDLERS.get(op)
+        if handler is None:
+            return Response(status_code=404, content=b"unknown op")
+        body = await request.body()
+        packed = await run_in_threadpool(handler, op, body, None, None, None, None)
+        return Response(content=packed, media_type="application/msgpack")
+
+    return app
 
 
-def _load_or_create_identity(identity_file):
-    path = identity_file or DEFAULT_IDENTITY_FILE
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path):
-        print(f"[worker] loading identity from {path}", flush=True)
-        identity = RNS.Identity.from_file(path)
-        if identity is None:
-            raise ValueError(f"Failed to load RNS identity from {path}")
-        return identity
-    print(f"[worker] creating new identity at {path}", flush=True)
-    identity = RNS.Identity()
-    identity.to_file(path)
-    return identity
-
-
-def run(identity_file=None, config_dir=None, announce_interval=300, preload=False):
-    """Start the media worker server: init RNS, register handlers, announce,
-    and loop announcing every ``announce_interval`` seconds until Ctrl-C."""
-    # Treat SIGTERM like Ctrl-C so a parent that spawned us (e.g. `media web
-    # --with-worker`) can shut us down gracefully with terminate() — the loop
-    # below already unwinds cleanly on KeyboardInterrupt, letting torch/ultralytics
-    # release handles instead of dying mid-inference.
+def run(host="127.0.0.1", port=4243, preload=False):
+    """Start the media worker as a local HTTP service (uvicorn), exposing one
+    ``POST`` route per protocol path. Serves until Ctrl-C / SIGTERM."""
+    # Treat SIGTERM like Ctrl-C during the pre-serve window (uvicorn installs its
+    # own signal handlers once it's running) so a parent that spawned us
+    # (`media web --with-worker`) can always shut us down cleanly.
     import signal
     def _sigterm(signum, frame):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, _sigterm)
 
-    RNS.Reticulum(config_dir)
-
-    identity = _load_or_create_identity(identity_file)
-    dest = build_destination(identity)
     print(f"[worker] compute: {compute.describe()}", flush=True)
 
-    print("", flush=True)
-    print("=" * 64, flush=True)
-    print("  media worker is online", flush=True)
-    print(f"  destination : {RNS.prettyhexrep(dest.hash)}", flush=True)
-    print(f"  address     : {dest.hash.hex()}", flush=True)
-    print("", flush=True)
-    print("  On the host, run:", flush=True)
-    print(f"    media worker-connect {dest.hash.hex()}", flush=True)
-    print("=" * 64, flush=True)
-    print("", flush=True)
-
     if preload:
-        print("[worker] preloading all models...", flush=True)
-        with models.lock:
-            models.get_face_detector()
-            models.get_clip_indexer()
-            models.get_object_detector()
-        print("[worker] preload complete.", flush=True)
+        # Preload in the BACKGROUND so the HTTP server binds immediately (ping
+        # answers right away, the web badge goes green) and — crucially — a model
+        # that fails to load logs loudly but does NOT take the whole worker down.
+        # (A blocking preload that crashed on one model is exactly what made the
+        # old worker die before it could serve anything.)
+        def _preload():
+            for name, getter in (("FaceDetector", models.get_face_detector),
+                                  ("CLIPIndexer", models.get_clip_indexer),
+                                  ("YOLOWorldDetector", models.get_object_detector)):
+                try:
+                    print(f"[worker] preloading {name}...", flush=True)
+                    with models.lock:
+                        getter()
+                except Exception:
+                    traceback.print_exc()
+                    print(f"[worker] preload of {name} FAILED; continuing without it "
+                          f"(its requests will error until it loads).", flush=True)
+            print("[worker] preload finished.", flush=True)
+        threading.Thread(target=_preload, name="preload", daemon=True).start()
 
-    dest.announce()
-    print(f"[worker] announced; re-announcing every {announce_interval}s. Ctrl-C to stop.",
-          flush=True)
+    app = build_app()
+    base = f"http://{host}:{port}"
+    print("", flush=True)
+    print("=" * 64, flush=True)
+    print("  media worker is online (HTTP)", flush=True)
+    print(f"  url : {base}", flush=True)
+    print("", flush=True)
+    print("  On the host (only needed cross-machine — `media web --with-worker`", flush=True)
+    print("  wires this up automatically), run:", flush=True)
+    print(f"    media worker-connect {base}", flush=True)
+    print("=" * 64, flush=True)
+    print("", flush=True)
 
+    import uvicorn
     try:
-        while True:
-            # Sleep in small increments so Ctrl-C is responsive.
-            slept = 0.0
-            while slept < announce_interval:
-                time.sleep(1.0)
-                slept += 1.0
-            dest.announce()
-            print("[worker] re-announced.", flush=True)
+        uvicorn.run(app, host=host, port=port, log_level="warning")
     except KeyboardInterrupt:
-        print("\n[worker] shutting down.", flush=True)
-        return
+        pass
+    print("[worker] shutting down.", flush=True)

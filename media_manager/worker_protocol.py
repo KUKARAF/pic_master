@@ -1,21 +1,20 @@
-"""Shared Reticulum (RNS) media-worker offload protocol.
+"""Shared media-worker offload protocol.
 
 This module is the single source of truth for the wire contract between the
 media-worker *server* (which runs the heavy ML: face/body/CLIP/YOLO) and the
-*client* that offloads work to it over Reticulum. Both sides import this module
-so the destination naming, request paths, and (de)serialization stay in lockstep.
+*client* that offloads work to it. Both sides import this module so the request
+paths and (de)serialization stay in lockstep.
 
-The worker is reached as an RNS destination with app name ``media_manager`` and
-aspect ``worker``. Requests are dispatched by the path constants below; payloads
-are packed with the umsgpack bundled inside RNS so no extra dependency is needed
-and raw ``bytes`` (image data, float32 embeddings) survive the round trip intact.
+Transport is plain HTTP: the worker is a small local FastAPI/uvicorn service and
+each path below is a ``POST /<path>`` route. Payloads are msgpack — one packed
+dict per request, one per response — because it round-trips raw ``bytes`` (image
+data, float32 embeddings) intact without a schema. (This used to ride over
+Reticulum with the umsgpack vendored inside RNS; the wire dicts are identical, so
+only the codec import and the transport changed.)
 """
-from RNS.vendor import umsgpack
+import msgpack
 
-APP_NAME = "media_manager"
-ASPECT = "worker"
-
-# RNS request handler paths.
+# Request handler paths (HTTP route names).
 PATH_PING = "ping"
 PATH_DETECT_FACES = "detect_faces"
 PATH_EMBED_BBOX = "embed_bbox"
@@ -207,10 +206,16 @@ ALL_PATHS = [
 
 
 def pack(obj) -> bytes:
-    """Serialize a Python object to msgpack bytes for the wire."""
-    return umsgpack.packb(obj)
+    """Serialize a Python object to msgpack bytes for the wire.
+
+    ``use_bin_type=True`` keeps raw ``bytes`` (image data, float32 embeddings)
+    encoded as msgpack bin rather than str, so they round-trip byte-for-byte."""
+    return msgpack.packb(obj, use_bin_type=True)
 
 
 def unpack(data: bytes):
-    """Deserialize msgpack bytes received off the wire back to Python objects."""
-    return umsgpack.unpackb(data)
+    """Deserialize msgpack bytes received off the wire back to Python objects.
+
+    ``raw=False`` decodes msgpack str to ``str`` (bin stays ``bytes``);
+    ``strict_map_key=False`` tolerates non-str dict keys."""
+    return msgpack.unpackb(data, raw=False, strict_map_key=False)
