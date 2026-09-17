@@ -59,7 +59,7 @@
    behavior everywhere else. add_to_set renders the same "＋ Add" button the
    set-detail suggestions grid uses (no set id needed on the button — the
    page's own wireAddButton/setId closure wires any .add-to-set-btn it finds). #}
-{% macro card(f, selectable=False, img_src=None, star_href=None, star_title=None, star_icon='⭐', add_to_set=False, reorder=False) %}
+{% macro card(f, selectable=False, img_src=None, star_href=None, star_title=None, star_icon='⭐', add_to_set=False, reorder=False, allow_delete=False) %}
 <div class="card" data-file-id="{{ f.id }}">
   {% if selectable %}
   <input type="checkbox" class="card-select-checkbox" data-file-id="{{ f.id }}">
@@ -79,8 +79,10 @@
           data-file-id="{{ f.id }}" data-fav-count="{{ f.favorite or 0 }}"
           title="Favorite this photo (right-click to lower)">{% if f.favorite %}♥ {{ f.favorite }}{% else %}♡{% endif %}</button>
 
-  {% if f.ai_generated %}
-  {# AI items are the only class that can be permanently deleted (real photos use trash). #}
+  {% if allow_delete and f.ai_generated %}
+  {# Permanent delete is offered ONLY on the /ai page (allow_delete), and only for
+     AI items — the one class the app truly deletes. Real photos use reversible trash
+     and never show this; AI items shown in other grids don't either. #}
   <button type="button" class="ai-delete-btn" data-file-id="{{ f.id }}"
           title="Delete this AI item permanently">🗑</button>
   {% endif %}

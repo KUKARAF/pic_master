@@ -850,31 +850,31 @@ input[type="range"] { accent-color: var(--accent); }
 }
 
 /* Permanent-delete control — ONLY rendered on AI-generated cards (the one class
-   the app truly deletes). Top-LEFT, tucked just under the AI badge: the top-right
-   corner is the star/heart's (z-index:2) and this was being painted behind the
-   star. Always visible (not hover-only) so it's discoverable in the AI tab and on
-   touch; the click still goes through a confirm() before anything is deleted. */
+   the app truly deletes). A third square button in the top-right cluster, matching
+   .star-btn / .heart-btn (was a round button stacked behind the star, unclickable).
+   Sits left of the heart (right:74) with the same z-index; the click still goes
+   through a confirm() before anything is deleted. */
 .card .ai-delete-btn {
   position: absolute;
-  left: 8px;
-  top: 40px;
+  top: 6px;
+  right: 74px;
+  background: rgba(7, 11, 7, .75);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
   width: 28px;
   height: 28px;
-  border: none;
-  border-radius: 50%;
-  background: rgba(180, 30, 30, 0.85);
-  color: #fff;
-  font-size: 13px;
-  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 3;
-  opacity: 0.9;
-  transition: opacity 0.12s ease;
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--danger);
+  opacity: 0;
+  transition: opacity .15s;
+  z-index: 2;
 }
 .card:hover .ai-delete-btn { opacity: 1; }
-.ai-delete-btn:hover { background: rgba(220, 40, 40, 0.95); }
+.ai-delete-btn:hover { border-color: var(--danger); }
 
 .card img {
   width: 100%;

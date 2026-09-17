@@ -12,7 +12,7 @@
 {% if files %}
 <div class="grid" data-queue-source="{{ title }}">
   {% for f in files %}
-  {{ macros.card(f) }}
+  {{ macros.card(f, allow_delete=True) }}
   {% endfor %}
 </div>
 {% else %}
