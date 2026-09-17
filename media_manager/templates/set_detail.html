@@ -218,12 +218,12 @@
             return;
           }
           if (vidPoll) { clearInterval(vidPoll); vidPoll = null; }
-          setGenVideoBtn.textContent = '🎬';
-          setGenVideoBtn.disabled = false;
-          if (s.error) showToast('Video generation failed: ' + s.error);
-          else if (s.artifact_id) {
-            showToast('Morph video ready.');
-            window.open('/generated/' + s.artifact_id, '_blank');
+          if (s.error) {
+            setGenVideoBtn.textContent = '🎬';
+            setGenVideoBtn.disabled = false;
+            showToast('Video generation failed: ' + s.error);
+          } else {
+            window.location.reload();  // the new morph is now a member of this set
           }
         })
         .catch(function() {
@@ -283,12 +283,12 @@
         .then(function(s) {
           if (s.running) { setGenImageBtn.textContent = '🖼️ …'; return; }
           if (imgPoll) { clearInterval(imgPoll); imgPoll = null; }
-          setGenImageBtn.textContent = '🖼️';
-          setGenImageBtn.disabled = false;
-          if (s.error) showToast('Image generation failed: ' + s.error);
-          else if (s.artifact_id) {
-            showToast('AI image ready.');
-            window.open('/generated/' + s.artifact_id, '_blank');
+          if (s.error) {
+            setGenImageBtn.textContent = '🖼️';
+            setGenImageBtn.disabled = false;
+            showToast('Image generation failed: ' + s.error);
+          } else {
+            window.location.reload();  // the new image is now a member of this set
           }
         })
         .catch(function() {
