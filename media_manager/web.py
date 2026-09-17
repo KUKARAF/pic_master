@@ -2674,6 +2674,10 @@ def create_app(data_root: str) -> FastAPI:
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
     broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
     pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Set → morph video (Wan FLF2V). One generation at a time (heavy, minutes/clip);
+    # 'done'/'total' are FLF2V pairs completed; 'artifact_id' is set on success.
+    generate_video_job = {'running': False, 'set_id': None, 'done': 0, 'total': 0,
+                          'error': None, 'artifact_id': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -5429,6 +5433,90 @@ def create_app(data_root: str) -> FastAPI:
             'sort': sort,
             'order': order,
         })
+
+    @app.post('/api/sets/{set_id}/generate-video')
+    def api_set_generate_video(set_id: int, prompt: str = '', fps: int = 16,
+                               frames: int = 49, limit: int = 20):
+        """Generate a morph video from the set (Wan FLF2V between consecutive
+        members) on the GPU box. Async; poll .../generate-video/status. Output is
+        written under generated/ and recorded in generated_artifacts (origin=ai)."""
+        from . import set_video, set_render
+        from .gen_service import ComfyUIClient
+        set_row = manual.get_set(set_id)
+        if set_row is None:
+            raise HTTPException(status_code=404, detail='Set not found')
+        if generate_video_job['running']:
+            return {'started': False, 'message': 'A video is already being generated.'}
+        checksums = manual.get_files_by_set(set_id, limit=limit, manual_order=True)
+        paths = []
+        for r in db.get_files_by_checksums(checksums):
+            ap = _live_abs_path(r['id'], r['path'])
+            if ap:
+                paths.append(ap)
+        if len(paths) < 2:
+            return {'started': False, 'message': 'Need at least 2 member images on disk.'}
+        gen = ComfyUIClient()
+        if not gen.is_available():
+            return {'started': False,
+                    'message': f'Generation service not reachable at {gen.base_url}. '
+                               'Start the ComfyUI (llm-scaler) service on the GPU box.'}
+        out = set_render.output_path(data_root, set_row['name'], 'morph', 'mp4')
+        generate_video_job.update(running=True, set_id=set_id, done=0,
+                                  total=len(paths) - 1, error=None, artifact_id=None)
+
+        def _run():
+            try:
+                set_video.morph_from_set(
+                    paths, out, gen=gen, data_root=data_root, fps=fps,
+                    params={'prompt': prompt, 'frames': frames},
+                    progress=lambda d, t: generate_video_job.update(done=d, total=t))
+                rel = os.path.relpath(out, data_root)
+                aid = manual.add_generated_artifact(
+                    kind='morph', origin='ai', path=rel, set_id=set_id,
+                    media_type='video/mp4', model='wan2.2-flf2v',
+                    params={'members': len(paths), 'fps': fps, 'prompt': prompt})
+                generate_video_job['artifact_id'] = aid
+            except Exception as exc:
+                generate_video_job['error'] = str(exc)
+            finally:
+                generate_video_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': generate_video_job['total']}
+
+    @app.get('/api/sets/{set_id}/generate-video/status')
+    def api_set_generate_video_status(set_id: int):
+        j = generate_video_job
+        # artifact_id/error only apply to THIS set's most recent run.
+        mine = (j['set_id'] == set_id)
+        return {
+            'running': j['running'] and mine,
+            'busy_other': j['running'] and not mine,
+            'done': j['done'] if mine else 0,
+            'total': j['total'] if mine else 0,
+            'error': j['error'] if mine else None,
+            'artifact_id': j['artifact_id'] if mine else None,
+        }
+
+    @app.get('/api/sets/{set_id}/generated')
+    def api_set_generated(set_id: int):
+        """Prior generated artifacts for this set (newest first)."""
+        arts = manual.list_generated_artifacts(set_id=set_id)
+        return {'artifacts': [{'id': a['id'], 'kind': a['kind'], 'origin': a['origin'],
+                               'media_type': a['media_type'], 'created_at': a['created_at'],
+                               'url': f'/generated/{a["id"]}'} for a in arts]}
+
+    @app.get('/generated/{artifact_id}')
+    def serve_generated(artifact_id: int):
+        """Serve a generated file (kept under generated/, out of the library)."""
+        art = manual.get_generated_artifact(artifact_id)
+        if art is None:
+            raise HTTPException(status_code=404, detail='Generated artifact not found')
+        abs_path = os.path.join(data_root, art['path'])
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='Generated file missing on disk')
+        media_type = VIDEO_MIME_TYPES.get(os.path.splitext(abs_path)[1].lower())
+        return FileResponse(abs_path, media_type=media_type, headers=IMMUTABLE_CACHE_HEADERS)
 
     def _files_under_folder(folder_path):
         """Resolve a folder path (as sent by the add-folder endpoints / the /files

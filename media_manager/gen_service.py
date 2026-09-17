@@ -30,8 +30,13 @@ class GenServiceError(Exception):
     """The service was reached but a request/workflow failed."""
 
 
+# ComfyUI's default port; co-located on the B70 this "just works" with no export.
+# Set MEDIA_GEN_SERVICE_URL only to point at a different host/port.
+DEFAULT_SERVICE_URL = "http://127.0.0.1:8188"
+
+
 def service_url():
-    return (os.environ.get("MEDIA_GEN_SERVICE_URL") or "").strip().rstrip("/") or None
+    return (os.environ.get("MEDIA_GEN_SERVICE_URL") or DEFAULT_SERVICE_URL).strip().rstrip("/")
 
 
 class ComfyUIClient:

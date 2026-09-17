@@ -629,7 +629,7 @@ def main():
             out = set_render.output_path(m.data_root, args.name, 'morph', 'mp4')
             try:
                 set_video.morph_from_set(
-                    paths, out, fps=args.fps,
+                    paths, out, data_root=m.data_root, fps=args.fps,
                     params={'prompt': args.prompt, 'frames': args.frames},
                     progress=lambda d, t: print(f"  FLF2V pair {d}/{t}", flush=True))
             except (GenServiceUnavailable, GenServiceError) as exc:

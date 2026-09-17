@@ -242,19 +242,28 @@ clips are concatenated into the final morph. Runs via a **ComfyUI (Intel
 experimental Arc stack. RIFE was declined.
 
 **B70 deploy prerequisites** (documented, not automatable from the app): run the
-llm-scaler ComfyUI-XPU container, download the Wan 2.2 FLF2V models, import the
-FLF2V API-format workflow template, and point `MEDIA_GEN_SERVICE_URL` at it.
+llm-scaler ComfyUI-XPU container and download the Wan 2.2 FLF2V models, then drop
+the ComfyUI **API-format** FLF2V workflow at `<library>/.media/flf2v.api.json`
+(with the `__FIRST_IMAGE__ / __LAST_IMAGE__ / __PROMPT__ / __FRAMES__ / __SEED__`
+placeholders). No env vars are required in the co-located case — `MEDIA_GEN_SERVICE_URL`
+defaults to `http://127.0.0.1:8188` and the workflow path defaults to that
+`.media/` location; set the env vars only to override (different host/port or
+workflow file).
 
 ## Status
 
 - [x] Support layer: `generated/` excluded from scans (fast_scan/scanner);
       `generated_artifacts` registry (manual.db) with `origin` (composite|ai);
       provenance-mark helpers (EXIF/PNG-text + ffmpeg `-metadata`) in `set_render.py`
+- [x] Video morph (Wan FLF2V) app-side integration — `gen_service.py` (ComfyUI
+      client), `set_video.morph_from_set` (per-pair FLF2V → assemble), `media set
+      generate-video` CLI, and the **set view**: 🎬 button in `set_detail.html`,
+      `POST /api/sets/{id}/generate-video` (async, `_spawn_job`) + `/status` +
+      `/api/sets/{id}/generated` + `GET /generated/{artifact_id}`. Verified against
+      a mock ComfyUI; the real Wan model runs on the **B70 box**.
 - [ ] Images — face-swap (`inswapper`, reuse InsightFace) then InstantID/Qwen via
       OpenVINO/ComfyUI (**B70 box**)
-- [ ] Video — frame-morph between set items: RIFE interpolation and/or Wan FLF2V,
-      assembled to mp4 w/ B70 hardware encode (**B70 box**) — *pending engine choice*
-- [ ] `generated/` UI: `/generated` view + "AI" badge (copy the trash-badge pattern)
+- [ ] `/generated` gallery page + "AI" badge on cards (copy the trash-badge pattern)
 - [ ] Per-set LoRA training (**B70 box**)
 
 _Dropped: the slideshow / Ken Burns / collage / contact-sheet composites — not the

@@ -23,14 +23,24 @@ from . import set_render
 from .gen_service import ComfyUIClient, GenServiceUnavailable, GenServiceError
 
 
-def load_workflow_template(path=None) -> dict:
-    path = path or os.environ.get("MEDIA_FLF2V_WORKFLOW")
-    if not path or not os.path.isfile(path):
-        raise GenServiceUnavailable(
-            "FLF2V workflow template not configured — set MEDIA_FLF2V_WORKFLOW to the "
-            "ComfyUI API-format workflow JSON (finalized on the B70)")
-    with open(path) as f:
-        return json.load(f)
+# Default location for the workflow, so no env var is needed: drop the ComfyUI
+# API-format FLF2V graph here and it's picked up automatically.
+DEFAULT_WORKFLOW_RELPATH = os.path.join(".media", "flf2v.api.json")
+
+
+def load_workflow_template(path=None, data_root=None) -> dict:
+    """Resolve the FLF2V workflow JSON: explicit path → MEDIA_FLF2V_WORKFLOW →
+    <data_root>/.media/flf2v.api.json. Raises with guidance if none exists."""
+    candidates = [path, os.environ.get("MEDIA_FLF2V_WORKFLOW")]
+    if data_root:
+        candidates.append(os.path.join(data_root, DEFAULT_WORKFLOW_RELPATH))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            with open(c) as f:
+                return json.load(f)
+    raise GenServiceUnavailable(
+        "FLF2V workflow not found — put the ComfyUI API-format workflow at "
+        f"<library>/{DEFAULT_WORKFLOW_RELPATH} (or set MEDIA_FLF2V_WORKFLOW)")
 
 
 def fill_template(template: dict, first_image: str, last_image: str, params: dict) -> dict:
@@ -50,12 +60,12 @@ def fill_template(template: dict, first_image: str, last_image: str, params: dic
 
 
 def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
-                   fps=16, params=None, progress=None):
+                   data_root=None, fps=16, params=None, progress=None):
     """Generate a morph video across ordered set members with Wan FLF2V per pair.
 
     `gen` is a ComfyUIClient (injected for testing); `progress(done, total)` is an
-    optional callback. Requires a configured/reachable gen service. Returns
-    out_path. Raises GenServiceUnavailable/GenServiceError (no local fallback)."""
+    optional callback. Requires a reachable gen service. Returns out_path. Raises
+    GenServiceUnavailable/GenServiceError (no local fallback)."""
     params = params or {}
     imgs = [p for p in member_paths if p and os.path.isfile(p)]
     if len(imgs) < 2:
@@ -64,7 +74,7 @@ def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
     gen = gen or ComfyUIClient()
     if not gen.is_configured():
         raise GenServiceUnavailable("no generation service configured (MEDIA_GEN_SERVICE_URL)")
-    template = load_workflow_template(workflow_template)
+    template = load_workflow_template(workflow_template, data_root)
 
     n_pairs = len(imgs) - 1
     frame_dir = tempfile.mkdtemp(prefix="pm_morph_")

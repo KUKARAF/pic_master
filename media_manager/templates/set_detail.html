@@ -12,6 +12,7 @@
             title="Favorite this set (right-click to lower)">{% if set.favorite %}♥ {{ set.favorite }}{% else %}♡{% endif %}</button>
     <button type="button" id="set-edit-btn" class="heart-btn-inline" title="Rename set">✏️</button>
     <button type="button" id="set-add-folder-btn" class="heart-btn-inline" title="Add all photos under a folder">📁</button>
+    <button type="button" id="set-genvideo-btn" class="heart-btn-inline" title="Generate a morph video from this set (AI)">🎬</button>
     <button type="button" id="set-delete-btn" class="heart-btn-inline" title="Delete set">🗑️</button>
   </h1>
   {{ macros.set_meta_line(set) }}
@@ -202,6 +203,74 @@
         .then(function() { window.location.href = '/sets'; })
         .catch(function(err) { showToast('Failed to delete set: ' + err.message); });
     });
+  }
+
+  const setGenVideoBtn = document.getElementById('set-genvideo-btn');
+  if (setGenVideoBtn) {
+    let vidPoll = null;
+    function pollVideo() {
+      fetch('/api/sets/' + setId + '/generate-video/status')
+        .then(function(r) { return r.json(); })
+        .then(function(s) {
+          if (s.running) {
+            setGenVideoBtn.textContent = '🎬 ' + s.done + '/' + s.total;
+            return;
+          }
+          if (vidPoll) { clearInterval(vidPoll); vidPoll = null; }
+          setGenVideoBtn.textContent = '🎬';
+          setGenVideoBtn.disabled = false;
+          if (s.error) showToast('Video generation failed: ' + s.error);
+          else if (s.artifact_id) {
+            showToast('Morph video ready.');
+            window.open('/generated/' + s.artifact_id, '_blank');
+          }
+        })
+        .catch(function() {
+          if (vidPoll) { clearInterval(vidPoll); vidPoll = null; }
+          setGenVideoBtn.disabled = false; setGenVideoBtn.textContent = '🎬';
+        });
+    }
+    setGenVideoBtn.addEventListener('click', function() {
+      openModal('Generate morph video', function(box) {
+        const p = document.createElement('p');
+        p.style.marginTop = '0';
+        p.textContent = 'Generates an AI morph video between this set’s photos ' +
+          '(Wan FLF2V, on the GPU box). Saved to the generated/ folder and marked AI.';
+        box.appendChild(p);
+        const promptInput = document.createElement('input');
+        promptInput.type = 'text';
+        promptInput.placeholder = 'Optional motion prompt (e.g. "slow dolly")…';
+        promptInput.style.width = '100%'; promptInput.style.marginBottom = '8px';
+        box.appendChild(promptInput);
+        const go = document.createElement('button');
+        go.type = 'button'; go.textContent = 'Generate';
+        go.addEventListener('click', function() {
+          const qs = new URLSearchParams({ prompt: promptInput.value || '' });
+          fetch('/api/sets/' + setId + '/generate-video?' + qs.toString(), { method: 'POST' })
+            .then(function(r) { return r.json(); })
+            .then(function(res) {
+              if (!res.started) { showToast(res.message || 'Could not start generation.'); return; }
+              if (window.closeModal) window.closeModal();
+              setGenVideoBtn.disabled = true;
+              setGenVideoBtn.textContent = '🎬 …';
+              showToast('Generating morph video… runs on the GPU box, can take minutes.');
+              if (!vidPoll) vidPoll = setInterval(pollVideo, 3000);
+            })
+            .catch(function(err) { showToast('Failed to start: ' + err.message); });
+        });
+        box.appendChild(go);
+      });
+    });
+    // Resume the progress indicator if a generation for this set is already running.
+    fetch('/api/sets/' + setId + '/generate-video/status')
+      .then(function(r) { return r.json(); })
+      .then(function(s) {
+        if (s.running) {
+          setGenVideoBtn.disabled = true;
+          setGenVideoBtn.textContent = '🎬 …';
+          vidPoll = setInterval(pollVideo, 3000);
+        }
+      }).catch(function() {});
   }
 
   const setEditBtn = document.getElementById('set-edit-btn');
