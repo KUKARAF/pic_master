@@ -66,8 +66,10 @@
             title="Favorite (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
   </div>
 
-  <!-- bottom-left: generate a new AI image/video from this photo -->
-  <div class="stage-chrome stage-bottom-left">
+  <!-- bottom-left: generate a new AI image/video from this photo. Its own anchor
+       (stage-generate) so it floats just ABOVE the "Find similar" pod, which also
+       lives bottom-left — sharing stage-bottom-left would stack them and bury this. -->
+  <div class="stage-chrome stage-generate">
     <button type="button" id="photo-generate-btn" class="stage-btn stage-btn-accent"
             title="Generate a new AI image or video from this photo">🙌</button>
   </div>

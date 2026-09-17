@@ -1366,6 +1366,9 @@ input[type="range"] { accent-color: var(--accent); }
 .stage-top-right { top: 14px; right: 14px; }
 .stage-bottom-left { bottom: 14px; left: 14px; }
 .stage-bottom-center { bottom: 14px; left: 50%; transform: translateX(-50%); align-items: center; }
+/* Sits above the bottom-left "Find similar" pod (also anchored bottom-left) so the
+   two don't overlap; higher z-index keeps the 🙌 clickable over any pod chrome. */
+.stage-generate { bottom: 64px; left: 14px; z-index: 13; }
 #frame-stepper input[type="range"] { accent-color: var(--accent); vertical-align: middle; }
 
 .stage-btn,
