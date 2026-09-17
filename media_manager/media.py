@@ -242,6 +242,18 @@ def main():
     set_files.add_argument('--studio', default=None, help='Studio name (optional)')
     set_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
 
+    set_genvideo = set_sub.add_parser(
+        'generate-video',
+        help='Generate a morph video FROM a set (Wan FLF2V; needs the B70 gen service)')
+    set_genvideo.add_argument('name', help='Set name')
+    set_genvideo.add_argument('--studio', default=None, help='Studio name (optional)')
+    set_genvideo.add_argument('--limit', type=int, default=20,
+                              help='Max member images to morph across (default: 20)')
+    set_genvideo.add_argument('--fps', type=int, default=16, help='Output frame rate')
+    set_genvideo.add_argument('--prompt', default='', help='Optional motion prompt for FLF2V')
+    set_genvideo.add_argument('--frames', type=int, default=49,
+                              help='Frames generated per image pair (default: 49)')
+
     # media dir2set <path> [<path> ...] - the common "this whole folder is one
     # set" workflow (a studio shoot, an event, a trip) in one command:
     # scans/imports each folder like `media add`, creates a set named after
@@ -595,6 +607,41 @@ def main():
                 file_row = m.db.get_file_by_checksum(checksum)
                 if file_row is not None:
                     print(file_row['path'])
+
+        elif args.set_cmd == 'generate-video':
+            from . import set_video, set_render
+            from .gen_service import GenServiceUnavailable, GenServiceError
+            row = m.manual.find_set(args.name, args.studio)
+            if row is None:
+                print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
+                m.close(); sys.exit(1)
+            paths = []
+            for checksum in m.manual.get_files_by_set(row['id'], limit=args.limit):
+                fr = m.db.get_file_by_checksum(checksum)
+                if fr is not None:
+                    ap = os.path.join(m.data_root, fr['path'])
+                    if os.path.isfile(ap):
+                        paths.append(ap)
+            if len(paths) < 2:
+                print("ERROR: need at least 2 readable member images to morph",
+                      file=sys.stderr)
+                m.close(); sys.exit(1)
+            out = set_render.output_path(m.data_root, args.name, 'morph', 'mp4')
+            try:
+                set_video.morph_from_set(
+                    paths, out, fps=args.fps,
+                    params={'prompt': args.prompt, 'frames': args.frames},
+                    progress=lambda d, t: print(f"  FLF2V pair {d}/{t}", flush=True))
+            except (GenServiceUnavailable, GenServiceError) as exc:
+                print(f"ERROR: video generation failed — {exc}", file=sys.stderr)
+                m.close(); sys.exit(1)
+            rel = os.path.relpath(out, m.data_root)
+            m.manual.add_generated_artifact(
+                kind='morph', origin='ai', path=rel, set_id=row['id'],
+                media_type='video/mp4', model='wan2.2-flf2v',
+                params={'members': len(paths), 'fps': args.fps, 'prompt': args.prompt})
+            print(f"Generated morph video: {rel} "
+                  f"(from {len(paths)} members; recorded in generated_artifacts, origin=ai)")
         m.close()
         return 0
 

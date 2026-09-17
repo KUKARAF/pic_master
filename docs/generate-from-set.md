@@ -177,39 +177,33 @@ stills + crossfades). The set's images are the keyframes; the engine invents/der
 the frames between each consecutive pair, then all frames are assembled to mp4
 (hardware-encoded on the B70).
 
-**Chosen stack (independent of the photo stack), all on the B70 — two engine
-options (see the open question in the status section):**
-- **Frame interpolation — RIFE / FILM.** Treat consecutive set members as
-  keyframes and interpolate N in-between frames per pair (`rife-ncnn-vulkan` runs
-  on Arc via Vulkan; FILM is heavier/CUDA-leaning — prefer RIFE). Cheap, fast,
-  fully local on the card. Between *similar* shots it's a smooth morph; between
-  *dissimilar* shots it warps/ghosts (often the desired surreal morph). This is
-  the most literal "extrapolate frames between items."
-- **Generative keyframe→keyframe — Wan 2.2 FLF2V.** Give it two set members as
-  first/last frame; it *generates* a coherent motion path of real synthesized
-  in-between frames (not a pixel warp), via the Intel `llm-scaler` ComfyUI-XPU
-  container. Best realism; heavy (minutes/clip); experimental Arc stack. LTX-2
-  (OpenVINO GenAI) is the option for animating a single still.
-- **Assembly:** the interpolated/generated frames → mp4 via ffmpeg with **VAAPI
-  hardware HEVC/AV1 encode on the B70** (software fallback). Output → `generated/…`,
-  `origin=ai-generated` + provenance. (RIFE-only morph could be argued as
-  `composite`, but it synthesizes frames, so mark it `ai` to be safe/honest.)
+**Engine — Wan 2.2 FLF2V (generative), on the B70 via ComfyUI:**
+- **Per-pair generation.** Order the set members, then for each consecutive pair
+  (A→B, B→C, …) send the two images to **Wan 2.2 FLF2V** (first-frame/last-frame)
+  and let it *generate* the in-between frames — real synthesized motion, not a
+  pixel warp. Runs in the Intel `llm-scaler` ComfyUI-XPU container.
+- **Transport.** The app calls ComfyUI over HTTP (`gen_service.py`): upload the
+  two frames, submit the FLF2V workflow (a template with the two image inputs +
+  params substituted), poll to completion, fetch the output clip/frames.
+- **Assembly.** Concatenate the per-pair clips (or their frames via
+  `set_render.frames_to_video`) into the final morph, ffmpeg-encoded with **VAAPI
+  hardware HEVC on the B70** (software fallback). Output → `generated/…`,
+  `origin=ai` + provenance (`model=wan2.2-flf2v`).
 
-**Why this stack:** video's reliable Arc path is RIFE (Vulkan) for interpolation
-and the `llm-scaler` container for FLF2V — *not* the diffusers image path. Kept
-deliberately separate from the photo stack.
+**Why:** FLF2V is the "best results" morph (true generated motion). It's a
+different stack from the image path on purpose — a ComfyUI service on the B70,
+not the OpenVINO diffusers path.
 
-**Surface:** `POST /api/sets/{id}/generate-video` (kind = morph-interp |
-morph-flf2v | animate), async job with progress polling (reuse the
-pattern-index/train job pattern), result → `generated/`; a "Generate video"
-control in `set_detail.html`; a `media set generate-video` CLI.
+**Surface:** `POST /api/sets/{id}/generate-video` (async job w/ progress polling,
+reusing the pattern-index/train job pattern), result → `generated/`; a "Generate
+video" control in `set_detail.html`; a `media set generate-video` CLI.
 
-**Effort:** RIFE-morph Med (assemble a pluggable frame pipeline + the RIFE binary
-on the box); FLF2V High (bleeding-edge Arc video stack, minutes/clip).
+**Effort:** High — the app-side integration (service client + morph pipeline) is
+buildable/testable now; the B70 side (container + Wan models + workflow) is a
+documented deploy step, and generation is minutes/clip.
 
-**Risks:** RIFE across dissimilar keyframes ghosts (feature or bug depending on
-intent); FLF2V on Battlemage is genuinely experimental (fp64 nodes, kernel
-compiles) — budget failures.
+**Risks:** FLF2V on Battlemage is genuinely experimental (fp64 nodes, kernel
+compiles) — budget failures; identity can drift across a long morph chain.
 
 ---
 
@@ -237,15 +231,19 @@ compiles) — budget failures.
   audit-log who generated what. Decide policy before enabling Phase 2 on
   person-sets.
 
-## Open question (video engine)
+## Decided: video engine = Wan 2.2 FLF2V (2026-09-17)
 
-"Extrapolate frames between items" can mean two different builds — decide before
-implementing Plan B:
-- **RIFE/FILM interpolation** — morphs the *real* photos into each other (cheaper,
-  runs on Arc via Vulkan, ghosts on dissimilar shots).
-- **Wan 2.2 FLF2V** — *generates* new motion between two keyframes (best realism,
-  heavy, experimental Arc stack).
-- Or **both** (RIFE as the fast default, FLF2V as the quality option).
+The morph is built with **generative** motion, not classical interpolation: for
+each consecutive pair of set members (A→B, B→C, …), **Wan 2.2 FLF2V** is given the
+two images as first/last frame and generates the in-between frames; the per-pair
+clips are concatenated into the final morph. Runs via a **ComfyUI (Intel
+`llm-scaler`) service on the B70**; the app talks to it over HTTP (see
+`gen_service.py`). Highest realism, accepted trade-offs: minutes/clip and an
+experimental Arc stack. RIFE was declined.
+
+**B70 deploy prerequisites** (documented, not automatable from the app): run the
+llm-scaler ComfyUI-XPU container, download the Wan 2.2 FLF2V models, import the
+FLF2V API-format workflow template, and point `MEDIA_GEN_SERVICE_URL` at it.
 
 ## Status
 
