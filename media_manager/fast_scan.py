@@ -86,6 +86,12 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         # (as hidden files) — skip so a re-scan never re-adds them as normal photos.
         if rel_path == 'captured_frames' or rel_path.startswith('captured_frames/'):
             continue
+        # generated/ holds app-produced artifacts (collages, slideshows, and later
+        # AI-generated images/video). They are deliberately kept OUT of the library —
+        # tracked separately in manual.db's generated_artifacts registry and browsed
+        # from their own view — so a scan must never fold them back in as originals.
+        if rel_path == 'generated' or rel_path.startswith('generated/'):
+            continue
         # respect .mediaignore
         if rules.is_ignored(rel_path):
             continue

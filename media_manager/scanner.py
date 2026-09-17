@@ -14,8 +14,9 @@ class FileScanner:
 
     def scan_directory(self, root_path, recursive=True):
         for dirpath, dirnames, filenames in os.walk(root_path):
-            # .media/ holds our own cache/db files — never walk into it.
-            dirnames[:] = [d for d in dirnames if d != '.media']
+            # .media/ = our cache/db; generated/ = app-produced artifacts kept out of
+            # the library (see fast_scan) — never walk into either.
+            dirnames[:] = [d for d in dirnames if d not in ('.media', 'generated')]
             for filename in filenames:
                 full_path = os.path.join(dirpath, filename)
                 self._process_file(full_path)

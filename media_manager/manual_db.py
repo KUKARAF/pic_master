@@ -10,6 +10,7 @@ the one thing that's actually stable: the same photo bytes always hash the same 
 so a tag/face/set-membership recorded against a checksum stays correctly attached to
 that photo forever, independent of anything that ever happens to media.db."""
 import os
+import json
 import shutil
 import sqlite3
 import threading
@@ -270,6 +271,26 @@ class ManualDB(ThreadLocalDB):
                 kept_checksum TEXT,
                 source_file_id INTEGER,
                 note TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        # generated_artifacts: images/videos this app produced FROM a set (collages,
+        # slideshows, and later AI-generated media). Kept out of the `files` library
+        # (their `path` is under generated/, which scans skip) and recorded here so
+        # they can be listed/browsed and, crucially, labelled by `origin`:
+        #   'composite' = real photos stitched (NOT AI)   'ai' = model-synthesized.
+        # `kind` = collage|slideshow|... ; `params` = JSON (model, seed, prompt, ...)
+        # for reproducibility. `path` is relative to data_root.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS generated_artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                set_id INTEGER,
+                kind TEXT NOT NULL,
+                origin TEXT NOT NULL,
+                path TEXT NOT NULL,
+                media_type TEXT,
+                model TEXT,
+                params TEXT,
                 created_at INTEGER NOT NULL
             )
         ''')
@@ -1090,6 +1111,44 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('SELECT 1 FROM file_favorites WHERE checksum = ?', (checksum,))
         return cur.fetchone() is not None
+
+    # --- generated artifacts (set → new image/video, kept out of the library) --------
+    def add_generated_artifact(self, kind, origin, path, set_id=None,
+                               media_type=None, model=None, params=None):
+        """Record an artifact this app produced from a set. `path` is relative to
+        data_root (under generated/). `origin` is 'composite' (real photos) or 'ai'
+        (model-synthesized). `params` may be a dict (JSON-encoded here) for repro.
+        Returns the new row id."""
+        if origin not in ('composite', 'ai'):
+            raise ValueError(f"origin must be 'composite' or 'ai', got {origin!r}")
+        if isinstance(params, (dict, list)):
+            params = json.dumps(params)
+        cur = self.conn.cursor()
+        cur.execute(
+            '''INSERT INTO generated_artifacts
+                   (set_id, kind, origin, path, media_type, model, params, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+            (set_id, kind, origin, path, media_type, model, params, int(time.time()))
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def list_generated_artifacts(self, set_id=None, limit=200):
+        """Newest-first list of generated artifacts, optionally scoped to one set."""
+        cur = self.conn.cursor()
+        if set_id is None:
+            cur.execute('SELECT * FROM generated_artifacts ORDER BY created_at DESC, id DESC '
+                        'LIMIT ?', (limit,))
+        else:
+            cur.execute('SELECT * FROM generated_artifacts WHERE set_id = ? '
+                        'ORDER BY created_at DESC, id DESC LIMIT ?', (set_id, limit))
+        return [dict(r) for r in cur.fetchall()]
+
+    def get_generated_artifact(self, artifact_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM generated_artifacts WHERE id = ?', (artifact_id,))
+        row = cur.fetchone()
+        return dict(row) if row else None
 
     # --- trash (soft-delete holding area; no bytes/labels are removed here) -----------
     def add_to_trash(self, checksum, reason=None, kept_checksum=None,
