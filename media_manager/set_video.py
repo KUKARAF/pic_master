@@ -43,20 +43,61 @@ def load_workflow_template(path=None, data_root=None) -> dict:
         f"<library>/{DEFAULT_WORKFLOW_RELPATH} (or set MEDIA_FLF2V_WORKFLOW)")
 
 
-def fill_template(template: dict, first_image: str, last_image: str, params: dict) -> dict:
-    """Substitute the two uploaded image names + params into the workflow template
-    (string replacement so it's agnostic to the exact node layout)."""
-    s = json.dumps(template)
-    repl = {
-        "__FIRST_IMAGE__": first_image,
-        "__LAST_IMAGE__": last_image,
-        "__PROMPT__": str(params.get("prompt", "")),
-        "__FRAMES__": str(params.get("frames", 49)),
-        "__SEED__": str(params.get("seed", 0)),
-    }
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    return json.loads(s)
+def build_workflow(template: dict, first_image: str, last_image: str, params: dict) -> dict:
+    """Return a copy of the workflow with this pair's two frames (and prompt) filled in.
+
+    No hand-editing required: just "Save (API Format)" from ComfyUI and drop the
+    file in. We AUTO-DETECT the inputs to fill:
+      * the two ``LoadImage`` nodes (lowest node-id = first frame, next = last)
+        get their ``image`` set to the uploaded names;
+      * if a motion prompt was given, the positive ``CLIPTextEncode`` (a node
+        whose title contains "pos", else the only CLIPTextEncode) gets its ``text``.
+    Everything else (steps, frame count, seed, sampler) is whatever you baked into
+    the graph in ComfyUI.
+
+    Advanced/opt-in: if the exported JSON contains the tokens ``__FIRST_IMAGE__`` /
+    ``__LAST_IMAGE__`` / ``__PROMPT__`` / ``__FRAMES__`` / ``__SEED__``, we
+    string-substitute those instead (full manual control)."""
+    raw = json.dumps(template)
+    if "__FIRST_IMAGE__" in raw or "__LAST_IMAGE__" in raw:
+        for token, value in (("__FIRST_IMAGE__", first_image),
+                             ("__LAST_IMAGE__", last_image),
+                             ("__PROMPT__", str(params.get("prompt", ""))),
+                             ("__FRAMES__", str(params.get("frames", 49))),
+                             ("__SEED__", str(params.get("seed", 0)))):
+            raw = raw.replace(token, value)
+        return json.loads(raw)
+
+    wf = json.loads(raw)  # deep copy
+
+    def nodes_of(class_type):
+        got = [(nid, n) for nid, n in wf.items()
+               if isinstance(n, dict) and n.get("class_type") == class_type]
+        # ascending node id (numeric when possible) so "first"/"last" are stable
+        return sorted(got, key=lambda kv: (len(kv[0]), kv[0]))
+
+    loads = nodes_of("LoadImage")
+    if len(loads) < 2:
+        raise GenServiceError(
+            f"FLF2V workflow needs two LoadImage nodes (first & last frame); found "
+            f"{len(loads)}. Use two LoadImage nodes, or add __FIRST_IMAGE__/"
+            f"__LAST_IMAGE__ tokens for manual control.")
+    loads[0][1].setdefault("inputs", {})["image"] = first_image
+    loads[1][1].setdefault("inputs", {})["image"] = last_image
+
+    prompt = params.get("prompt")
+    if prompt:
+        encoders = nodes_of("CLIPTextEncode")
+        target = None
+        for _nid, n in encoders:
+            if "pos" in (n.get("_meta", {}) or {}).get("title", "").lower():
+                target = n
+                break
+        if target is None and len(encoders) == 1:
+            target = encoders[0][1]
+        if target is not None and "text" in target.get("inputs", {}):
+            target["inputs"]["text"] = prompt
+    return wf
 
 
 def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
@@ -90,7 +131,7 @@ def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
             with open(imgs[i + 1], "rb") as fb:
                 last_name, _ = gen.upload_image(fb.read(),
                                                 f"morph_{i}_b{os.path.splitext(imgs[i + 1])[1] or '.png'}")
-            workflow = fill_template(template, first_name, last_name, params)
+            workflow = build_workflow(template, first_name, last_name, params)
             outputs = gen.run_workflow(workflow, timeout=params.get("timeout", 1800))
             files = ComfyUIClient.collect_outputs(outputs)
             if not files:

@@ -242,13 +242,17 @@ clips are concatenated into the final morph. Runs via a **ComfyUI (Intel
 experimental Arc stack. RIFE was declined.
 
 **B70 deploy prerequisites** (documented, not automatable from the app): run the
-llm-scaler ComfyUI-XPU container and download the Wan 2.2 FLF2V models, then drop
-the ComfyUI **API-format** FLF2V workflow at `<library>/.media/flf2v.api.json`
-(with the `__FIRST_IMAGE__ / __LAST_IMAGE__ / __PROMPT__ / __FRAMES__ / __SEED__`
-placeholders). No env vars are required in the co-located case — `MEDIA_GEN_SERVICE_URL`
-defaults to `http://127.0.0.1:8188` and the workflow path defaults to that
-`.media/` location; set the env vars only to override (different host/port or
-workflow file).
+llm-scaler ComfyUI-XPU container and download the Wan 2.2 FLF2V models, then in
+ComfyUI build a Wan FLF2V graph (two `LoadImage` nodes = first/last frame, a
+positive prompt, a `SaveImage` output), **Save (API Format)**, and drop that JSON
+at `<library>/.media/flf2v.api.json`. **No JSON editing:** the app auto-detects
+the two `LoadImage` nodes (lowest id = first frame) and the positive
+`CLIPTextEncode`, and fills them per pair — you keep whatever steps/frames/seed
+you baked into the graph. (Advanced: if you'd rather wire the inputs by hand, put
+`__FIRST_IMAGE__ / __LAST_IMAGE__ / __PROMPT__ / __FRAMES__ / __SEED__` tokens in
+the JSON and those are substituted instead.) No env vars needed co-located —
+`MEDIA_GEN_SERVICE_URL` defaults to `http://127.0.0.1:8188` and the workflow to
+that `.media/` path; set them only to override.
 
 ## Status
 
