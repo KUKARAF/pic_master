@@ -363,7 +363,7 @@ class MediaManager:
         matched zero categories this run.
         """
         import numpy as np
-        from .similarity import mean_normalized_centroid
+        from .similarity import mean_normalized_centroid, adjusted_centroid
 
         categories = self.manual.list_categories()
         if not categories:
@@ -375,11 +375,18 @@ class MediaManager:
         for cat in categories:
             example_checksums = self.manual.get_example_checksums_for_category(cat['id'])
             category_examples[cat['name']] = set(example_checksums)
-            category_rejections[cat['name']] = self.manual.get_excluded_checksums_for_category(cat['id'])
+            rejected = self.manual.get_excluded_checksums_for_category(cat['id'])
+            category_rejections[cat['name']] = rejected
             example_ids = [r['id'] for r in self.db.get_files_by_checksums(example_checksums)]
-            centroid = mean_normalized_centroid(
-                [e for _fid, e in self.db.get_embeddings_for_files(example_ids)]
-            )
+            example_embeddings = [e for _fid, e in self.db.get_embeddings_for_files(example_ids)]
+            # Excluded (down-swiped) items steer the centroid away from their look
+            # (Rocchio), so auto-match surfaces fewer like them — not just a skip.
+            if rejected:
+                rej_ids = [r['id'] for r in self.db.get_files_by_checksums(list(rejected))]
+                rej_embeddings = [e for _fid, e in self.db.get_embeddings_for_files(rej_ids)]
+                centroid = adjusted_centroid(example_embeddings, rej_embeddings)
+            else:
+                centroid = mean_normalized_centroid(example_embeddings)
             if centroid is not None:
                 category_centroids.append((cat['name'], cat['temperature'], centroid))
         if not category_centroids:

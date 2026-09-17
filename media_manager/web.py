@@ -5986,7 +5986,8 @@ def create_app(data_root: str) -> FastAPI:
         offered here: auto-matches are provisional machine guesses, not human
         decisions, and confirming here always writes a manual assignment that
         outranks any auto-match per category_resolver.py's precedence rules."""
-        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
+        from media_manager.similarity import (mean_normalized_centroid, adjusted_centroid,
+                                               rank_by_similarity)
         from media_manager.swipe_support import bias_reorder
 
         cat = manual.get_category(category_id)
@@ -5995,15 +5996,23 @@ def create_app(data_root: str) -> FastAPI:
 
         example_checksums = manual.get_example_checksums_for_category(category_id)
         example_ids = [r['id'] for r in db.get_files_by_checksums(example_checksums)]
-        centroid = mean_normalized_centroid(
-            [e for _fid, e in db.get_embeddings_for_files(example_ids)]
-        )
+        example_embeddings = [e for _fid, e in db.get_embeddings_for_files(example_ids)]
+        # Down-swiped (excluded) items don't just get hidden from the queue — they
+        # steer the centroid AWAY from their look (Rocchio-style adjusted_centroid,
+        # the same one the set-similarity feature uses), so visually-similar photos
+        # rank lower and the review surfaces fewer like the ones you rejected.
+        rejected_for_this = manual.get_excluded_checksums_for_category(category_id)
+        if rejected_for_this:
+            rej_ids = [r['id'] for r in db.get_files_by_checksums(list(rejected_for_this))]
+            rej_embeddings = [e for _fid, e in db.get_embeddings_for_files(rej_ids)]
+            centroid = adjusted_centroid(example_embeddings, rej_embeddings)
+        else:
+            centroid = mean_normalized_centroid(example_embeddings)
         if centroid is None:
             return []
 
         all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
         already_has_this = set(example_checksums)
-        rejected_for_this = manual.get_excluded_checksums_for_category(category_id)
 
         filtered = [
             c for c in all_candidates

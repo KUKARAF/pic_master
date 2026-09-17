@@ -20,6 +20,13 @@
     <input type="range" id="category-temperature-slider" min="0" max="1" step="0.01" value="{{ category.temperature }}">
     <span id="category-temperature-value">{{ '%.2f' % category.temperature }}</span>
   </label>
+  <label class="sub" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+    <input type="checkbox" id="category-auto-approve-toggle">
+    Auto-approve above threshold
+    <input type="number" id="category-auto-approve-threshold" min="0" max="1" step="0.01" value="0.85"
+           style="display:none;width:70px;"
+           title="Suggestions at/above this similarity are confirmed automatically — raise it if auto-approved matches turn out wrong.">
+  </label>
   {{ macros.sort_controls(sort, order) }}
 </div>
 
@@ -117,11 +124,29 @@
     });
   }
 
-  window.initSwipeStack({
+  // Auto-approve above a threshold (same pattern as the faces find-person review).
+  // Categories are multi-valued and independent, so there's no "better rival"
+  // guard to worry about — just confirm any card scoring >= the threshold.
+  const catAutoToggle = document.getElementById('category-auto-approve-toggle');
+  const catAutoThreshold = document.getElementById('category-auto-approve-threshold');
+  let catAutoHandle = null;
+  function cancelAutoApprove() {
+    if (catAutoHandle) { clearTimeout(catAutoHandle); catAutoHandle = null; }
+  }
+  function armAutoApprove(card) {
+    cancelAutoApprove();
+    if (!catAutoToggle || !catAutoToggle.checked || !card) return;
+    const threshold = parseFloat(catAutoThreshold.value);
+    if (!isFinite(threshold) || card.score < threshold) return;
+    catAutoHandle = setTimeout(function() { catAutoHandle = null; stack.decide('confirm'); }, 0);
+  }
+
+  const stack = window.initSwipeStack({
     stackElId: 'category-swipe-stack',
     confirmBtnId: 'category-swipe-confirm-btn',
     rejectBtnId: 'category-swipe-reject-btn',
     initialCards: [],
+    onTopCardChange: (card) => armAutoApprove(card),
     fetchMoreUrl: (excludeSet, biasKey, biasAction, need) =>
       `/api/categories/${categoryId}/suggestions/next?count=${need || 10}`,
     renderCard: (card) => ({
@@ -146,6 +171,15 @@
     emptyStateHtml: 'No more suggestions for this category right now.<br>'
       + 'Assign a few more example files above, or come back after indexing more photos.',
   });
+
+  if (catAutoToggle) {
+    catAutoToggle.addEventListener('change', function() {
+      catAutoThreshold.style.display = catAutoToggle.checked ? 'inline-block' : 'none';
+      if (catAutoToggle.checked) armAutoApprove(stack.getTopCard());
+      else cancelAutoApprove();
+    });
+    catAutoThreshold.addEventListener('change', function() { armAutoApprove(stack.getTopCard()); });
+  }
 })();
 </script>
 {% endblock %}
