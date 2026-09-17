@@ -31,11 +31,16 @@ fails loudly if you name a backend that isn't usable, rather than silently
 running on CPU). Out of the box `requirements.txt` pins CPU `onnxruntime` and a
 CPU/CUDA `torch`. To actually use a GPU:
 
-- **NVIDIA (CUDA):** swap `onnxruntime` → `onnxruntime-gpu`; install a CUDA `torch`.
+- **NVIDIA (CUDA):** swap `onnxruntime` → `onnxruntime-gpu`; install CUDA
+  `torch`+`torchvision` **together** (open_clip pulls torchvision, and a
+  mismatched pair fails with `operator torchvision::nms does not exist`).
 - **Intel Arc (XPU), incl. Arc Pro B70 / Battlemage:** swap `onnxruntime` →
-  `onnxruntime-openvino`, and install the XPU build of torch (`pip install torch
-  --index-url https://download.pytorch.org/whl/xpu`) on a host with the Intel GPU
-  runtime (kernel i915/xe + Level-Zero + compute-runtime). CLIP and YOLO-World run
+  `onnxruntime-openvino`, and install the XPU builds of **both** torch and
+  torchvision from the same index — they must match or you get `operator
+  torchvision::nms does not exist`:
+  `pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu`
+  — on a host with the Intel GPU runtime (kernel i915/xe + Level-Zero +
+  compute-runtime). CLIP and YOLO-World run
   on the Arc GPU; InsightFace faces run via OpenVINO. Age/gender (MiVOLO) runs in
   its own isolated venv, which `media age-setup` builds with `torch==2.7.1+xpu`
   (Battlemage needs torch ≥ 2.6, so the age venv no longer uses the old 2.5.1) —
