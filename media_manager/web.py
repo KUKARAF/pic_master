@@ -1545,6 +1545,89 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    @app.post('/api/ai/{file_id}/delete')
+    def api_ai_delete(file_id: int):
+        """Permanently delete an AI-generated item — its bytes AND every DB row.
+        Refuses anything not ai_generated: real photos are never byte-deleted (they
+        use the reversible trash). This is the one true-delete path in the app."""
+        row = _file_or_404(file_id)
+        checksum = row['checksum']
+        if checksum not in db.get_all_ai_generated_checksums():
+            raise HTTPException(status_code=403,
+                                detail='Only AI-generated items can be deleted.')
+        _ck, paths = db.delete_file_completely(file_id)      # media.db rows
+        for p in paths:
+            manual.delete_generated_artifact_by_path(p)      # provenance row(s)
+        manual.remove_all_for_checksum(checksum)             # manual.db rows
+        for p in paths:                                      # bytes (last)
+            try:
+                os.remove(os.path.join(data_root, p))
+            except OSError:
+                pass
+        return {'deleted': True}
+
+    @app.post('/api/files/{file_id}/generate')
+    def api_file_generate(file_id: int, kind: str = 'image', prompt: str = ''):
+        """Generate a new AI image or video FROM a single photo (the /photo 🙌
+        button). kind=image → image workflow; kind=video → image-to-video workflow.
+        Async; poll .../generate/status. Result → generated/ + the AI tab."""
+        from . import set_image, set_video, set_render
+        from .gen_service import ComfyUIClient
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        if kind not in ('image', 'video'):
+            raise HTTPException(status_code=400, detail="kind must be 'image' or 'video'")
+        if generate_photo_job['running']:
+            return {'started': False, 'message': 'A generation is already running.'}
+        gen = ComfyUIClient()
+        if not gen.is_available():
+            return {'started': False,
+                    'message': f'Generation service not reachable at {gen.base_url}. '
+                               'Start the ComfyUI service on the GPU box.'}
+        ext = 'mp4' if kind == 'video' else 'jpg'
+        out = set_render.output_path(data_root, 'photo-' + str(file_id), kind, ext)
+        generate_photo_job.update(running=True, file_id=file_id, kind=kind,
+                                  error=None, artifact_id=None)
+
+        def _run():
+            try:
+                if kind == 'video':
+                    set_video.image_to_video(abs_path, out, gen=gen, data_root=data_root,
+                                             params={'prompt': prompt})
+                    media_type = 'video/mp4'
+                else:
+                    set_image.image_from_set([abs_path], out, gen=gen, data_root=data_root,
+                                             params={'prompt': prompt})
+                    media_type = 'image/jpeg'
+                _fid, _ck, aid = set_render.register_generated_file(
+                    db, manual, data_root, out, set_id=None, kind=kind, origin='ai',
+                    media_type=media_type, model='comfyui',
+                    params={'source_file_id': file_id, 'prompt': prompt})
+                generate_photo_job['artifact_id'] = aid
+                print(f"[web] photo {file_id} {kind} done: {out} (artifact {aid})", flush=True)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                generate_photo_job['error'] = str(exc)
+                print(f"[web] photo {file_id} {kind} generation FAILED: {exc}", flush=True)
+            finally:
+                generate_photo_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True}
+
+    @app.get('/api/files/{file_id}/generate/status')
+    def api_file_generate_status(file_id: int):
+        j = generate_photo_job
+        mine = (j['file_id'] == file_id)
+        return {'running': j['running'] and mine,
+                'busy_other': j['running'] and not mine,
+                'kind': j['kind'] if mine else None,
+                'error': j['error'] if mine else None,
+                'artifact_id': j['artifact_id'] if mine else None}
+
     @app.get('/files', response_class=HTMLResponse)
     @app.get('/files/{subpath:path}', response_class=HTMLResponse)
     def files_page(request: Request, subpath: str = '',
@@ -2695,6 +2778,9 @@ def create_app(data_root: str) -> FastAPI:
     # Set → a new generated image (ComfyUI image workflow). One at a time.
     generate_image_job = {'running': False, 'set_id': None, 'error': None,
                           'artifact_id': None}
+    # Single photo → a new AI image or video (the /photo 🙌 button). One at a time.
+    generate_photo_job = {'running': False, 'file_id': None, 'kind': None,
+                          'error': None, 'artifact_id': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the

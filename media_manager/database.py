@@ -1924,6 +1924,35 @@ class Database(ThreadLocalDB):
             self._tile_ver += 1
         return (len(file_path_ids), files_removed)
 
+    def delete_file_completely(self, file_id):
+        """HARD-delete a file and every media.db row that references it. Used ONLY
+        for AI-generated items (the one class the app truly deletes; everything else
+        uses the reversible trash). Returns (checksum, [rel_paths]) so the caller can
+        purge manual.db by checksum and unlink the bytes.
+
+        FK cascade is not enforced in this DB, so every dependent table is cleared
+        explicitly — the full set (a superset of remove_paths_under, which misses
+        phashes/dup_group_members/pattern_tiles)."""
+        cursor = self.conn.cursor()
+        row = cursor.execute('SELECT checksum FROM files WHERE id = ?', (file_id,)).fetchone()
+        if row is None:
+            return (None, [])
+        checksum = row[0]
+        paths = [r[0] for r in cursor.execute(
+            'SELECT path FROM file_paths WHERE file_id = ?', (file_id,)).fetchall()]
+        for table in ('file_paths', 'embeddings', 'phashes', 'dup_group_members', 'tags',
+                      'detections', 'faces', 'body_embeddings', 'tile_embeddings',
+                      'pattern_tiles', 'file_category_matches'):
+            cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
+        cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
+        self.conn.commit()
+        # Removed embedding/face/body/tile rows — invalidate the cached matrices.
+        self._emb_ver += 1
+        self._face_ver += 1
+        self._body_ver += 1
+        self._tile_ver += 1
+        return (checksum, paths)
+
     def count_detected(self):
         """Return count of distinct files with a primary (frame_index IS NULL) detections row."""
         cursor = self.conn.cursor()

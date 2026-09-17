@@ -66,6 +66,12 @@
             title="Favorite (right-click to lower)">{% if file.favorite %}♥ {{ file.favorite }}{% else %}♡{% endif %}</button>
   </div>
 
+  <!-- bottom-left: generate a new AI image/video from this photo -->
+  <div class="stage-chrome stage-bottom-left">
+    <button type="button" id="photo-generate-btn" class="stage-btn stage-btn-accent"
+            title="Generate a new AI image or video from this photo">🙌</button>
+  </div>
+
   <!-- TOP-CENTER: file info + title (and, for videos, the frames pod beside it) -->
   <div class="stage-topbar">
   <div class="stage-pod" data-pod>

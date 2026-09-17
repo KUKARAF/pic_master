@@ -156,3 +156,60 @@ def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
     finally:
         import shutil
         shutil.rmtree(frame_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Image-to-video: animate a SINGLE image (used by the /photo 🙌 button). Distinct
+# from the morph above (which needs two frames) — this runs one still through an
+# image-to-video ComfyUI workflow at .media/i2v.api.json.
+# --------------------------------------------------------------------------
+DEFAULT_I2V_WORKFLOW_RELPATH = os.path.join(".media", "i2v.api.json")
+
+
+def load_i2v_workflow(path=None, data_root=None) -> dict:
+    candidates = [path, os.environ.get("MEDIA_I2V_WORKFLOW")]
+    if data_root:
+        candidates.append(os.path.join(data_root, DEFAULT_I2V_WORKFLOW_RELPATH))
+    for c in candidates:
+        if c and os.path.isfile(c):
+            with open(c) as f:
+                return json.load(f)
+    raise GenServiceUnavailable(
+        "image-to-video workflow not found — put the ComfyUI API-format workflow at "
+        f"<library>/{DEFAULT_I2V_WORKFLOW_RELPATH} (or set MEDIA_I2V_WORKFLOW)")
+
+
+def image_to_video(image_path, out_path, gen=None, workflow_template=None,
+                   data_root=None, fps=16, params=None):
+    """Animate a single image into a video via an image-to-video ComfyUI workflow
+    (auto-detects the LoadImage node + positive prompt; frames → mp4). Returns
+    out_path. Raises GenServiceUnavailable/GenServiceError."""
+    import shutil
+    from . import set_image
+    params = params or {}
+    if not (image_path and os.path.isfile(image_path)):
+        raise ValueError("image_to_video needs a readable image")
+    gen = gen or ComfyUIClient()
+    if not gen.is_configured():
+        raise GenServiceUnavailable("no generation service configured (MEDIA_GEN_SERVICE_URL)")
+    template = load_i2v_workflow(workflow_template, data_root)
+    with open(image_path, "rb") as f:
+        name, _ = gen.upload_image(f.read(), f"i2v{os.path.splitext(image_path)[1] or '.png'}")
+    workflow = set_image.build_image_workflow(template, [name], params.get("prompt", ""))
+    outputs = gen.run_workflow(workflow, timeout=params.get("timeout", 1800))
+    files = ComfyUIClient.collect_outputs(outputs)
+    if not files:
+        raise GenServiceError("image-to-video workflow produced no frames")
+    frame_dir = tempfile.mkdtemp(prefix="pm_i2v_")
+    ordered = []
+    try:
+        for i, (fn, sub, typ) in enumerate(files):
+            data = gen.fetch(fn, sub, typ)
+            fp = os.path.join(frame_dir, f"{i:06d}{os.path.splitext(fn)[1] or '.png'}")
+            with open(fp, "wb") as o:
+                o.write(data)
+            ordered.append(fp)
+        set_render.frames_to_video(ordered, out_path, fps=fps, origin="ai")
+        return out_path
+    finally:
+        shutil.rmtree(frame_dir, ignore_errors=True)

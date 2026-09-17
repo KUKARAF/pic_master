@@ -849,6 +849,28 @@ input[type="range"] { accent-color: var(--accent); }
   pointer-events: none;
 }
 
+/* Permanent-delete control — ONLY rendered on AI-generated cards (the one class
+   the app truly deletes). Hover-revealed, top-right, distinct from the AI badge. */
+.card .ai-delete-btn {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  border-radius: 50%;
+  background: rgba(180, 30, 30, 0.85);
+  color: #fff;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.card:hover .ai-delete-btn { opacity: 1; }
+
 .card img {
   width: 100%;
   aspect-ratio: 1;

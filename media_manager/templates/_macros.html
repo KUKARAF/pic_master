@@ -79,6 +79,12 @@
           data-file-id="{{ f.id }}" data-fav-count="{{ f.favorite or 0 }}"
           title="Favorite this photo (right-click to lower)">{% if f.favorite %}♥ {{ f.favorite }}{% else %}♡{% endif %}</button>
 
+  {% if f.ai_generated %}
+  {# AI items are the only class that can be permanently deleted (real photos use trash). #}
+  <button type="button" class="ai-delete-btn" data-file-id="{{ f.id }}"
+          title="Delete this AI item permanently">🗑</button>
+  {% endif %}
+
   {% if f.score is defined %}
   <span class="score-badge">{{ "%.3f" | format(f.score) }}</span>
   {% endif %}

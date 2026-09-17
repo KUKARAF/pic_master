@@ -2508,6 +2508,67 @@
   const fileId = window.MEDIA_FILE_ID;
   if (!fileId) return;
 
+  // 🙌 Generate a new AI image/video FROM this photo (bottom-left stage button).
+  // Opens a small modal (kind + prompt), POSTs, polls, and links to the result.
+  const photoGenBtn = document.getElementById('photo-generate-btn');
+  if (photoGenBtn) {
+    let genPoll = null;
+    function pollPhotoGen() {
+      fetch('/api/files/' + fileId + '/generate/status')
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          if (s.running) { photoGenBtn.textContent = '🙌 …'; return; }
+          if (genPoll) { clearInterval(genPoll); genPoll = null; }
+          photoGenBtn.textContent = '🙌';
+          photoGenBtn.disabled = false;
+          if (s.error) showToast('Generation failed: ' + s.error, 'error');
+          else if (s.artifact_id) {
+            showToast('AI ' + (s.kind || 'result') + ' ready — see the AI tab.', 'success');
+            window.open('/generated/' + s.artifact_id, '_blank');
+          }
+        })
+        .catch(function () {
+          if (genPoll) { clearInterval(genPoll); genPoll = null; }
+          photoGenBtn.textContent = '🙌'; photoGenBtn.disabled = false;
+        });
+    }
+    photoGenBtn.addEventListener('click', function () {
+      openModal('Generate from this photo', function (box) {
+        const kindSel = document.createElement('select');
+        kindSel.style.width = '100%'; kindSel.style.marginBottom = '8px';
+        kindSel.innerHTML = '<option value="image">Image</option>' +
+                            '<option value="video">Video (animate)</option>';
+        box.appendChild(kindSel);
+        const promptInput = document.createElement('input');
+        promptInput.type = 'text';
+        promptInput.placeholder = 'Optional prompt…';
+        promptInput.style.width = '100%'; promptInput.style.marginBottom = '8px';
+        box.appendChild(promptInput);
+        const go = document.createElement('button');
+        go.type = 'button'; go.className = 'btn-similar'; go.textContent = 'Generate';
+        go.addEventListener('click', function () {
+          const qs = new URLSearchParams({ kind: kindSel.value, prompt: promptInput.value || '' });
+          fetch('/api/files/' + fileId + '/generate?' + qs.toString(), { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+              if (!res.started) { showToast(res.message || 'Could not start generation.', 'error'); return; }
+              closeModal();
+              photoGenBtn.disabled = true; photoGenBtn.textContent = '🙌 …';
+              showToast('Generating… runs on the GPU box, can take a while.', 'info');
+              if (!genPoll) genPoll = setInterval(pollPhotoGen, 3000);
+            })
+            .catch(function (err) { showToast('Failed to start: ' + err.message, 'error'); });
+        });
+        box.appendChild(go);
+      });
+    });
+    fetch('/api/files/' + fileId + '/generate/status')
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        if (s.running) { photoGenBtn.disabled = true; photoGenBtn.textContent = '🙌 …'; genPoll = setInterval(pollPhotoGen, 3000); }
+      }).catch(function () {});
+  }
+
   /* Arrow-key photo navigation via the watch queue. The queue (file ids +
      cursor + a display label) is written to sessionStorage by base.html's
      click-capture script whenever a photo is opened from a grid (gallery,

@@ -114,6 +114,28 @@ document.addEventListener('click', function (e) {
   if (window.openPhoto) window.openPhoto(fid);
   else window.location.href = '/photo/' + fid;  // app.js not loaded yet — safe fallback
 });
+
+// Permanent delete for AI-only cards (the 🗑 button the card macro renders only on
+// ai_generated items). Capture phase + stopPropagation so it preempts the card-open
+// click above. Delegated, so it works wherever an AI card appears (AI tab, set grid).
+document.addEventListener('click', function (e) {
+  var btn = e.target.closest ? e.target.closest('.ai-delete-btn') : null;
+  if (!btn) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (!confirm('Permanently delete this AI-generated item? This cannot be undone.')) return;
+  fetch('/api/ai/' + btn.dataset.fileId + '/delete', { method: 'POST' })
+    .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then(function () {
+      var card = btn.closest('.card');
+      if (card) card.remove();
+      if (window.showToast) showToast('Deleted.');
+    })
+    .catch(function (err) {
+      if (window.showToast) showToast('Delete failed: ' + err.message);
+      else alert('Delete failed: ' + err.message);
+    });
+}, true);
 </script>
 <script src="/static/app.js"></script>
 {% block scripts %}{% endblock %}

@@ -1150,6 +1150,33 @@ class ManualDB(ThreadLocalDB):
         row = cur.fetchone()
         return dict(row) if row else None
 
+    def delete_generated_artifact_by_path(self, path):
+        """Drop the provenance row for a generated file (keyed by rel path)."""
+        self.conn.execute('DELETE FROM generated_artifacts WHERE path = ?', (path,))
+        self.conn.commit()
+
+    def remove_all_for_checksum(self, checksum):
+        """HARD-remove every manual.db row referencing this content — paired with
+        Database.delete_file_completely for AI-item deletion (the one place the app
+        truly deletes; real photos always use the reversible trash instead)."""
+        cur = self.conn.cursor()
+        cur.execute('BEGIN')
+        try:
+            for table in ('file_tags', 'file_favorites', 'file_titles', 'trash',
+                          'video_frame_scans', 'face_age_estimates', 'file_sets',
+                          'file_set_exclusions', 'identity_photo_assignments',
+                          'file_categories', 'file_category_exclusions', 'file_locations',
+                          'file_location_exclusions', 'file_studios', 'faces'):
+                cur.execute(f'DELETE FROM {table} WHERE checksum = ?', (checksum,))
+            cur.execute('DELETE FROM frame_captures WHERE child_checksum = ? OR parent_checksum = ?',
+                        (checksum, checksum))
+            cur.execute('DELETE FROM not_a_duplicate WHERE checksum_a = ? OR checksum_b = ?',
+                        (checksum, checksum))
+            cur.execute('COMMIT')
+        except Exception:
+            cur.execute('ROLLBACK')
+            raise
+
     # --- trash (soft-delete holding area; no bytes/labels are removed here) -----------
     def add_to_trash(self, checksum, reason=None, kept_checksum=None,
                      source_file_id=None, note=None):
