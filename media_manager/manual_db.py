@@ -1435,16 +1435,48 @@ class ManualDB(ThreadLocalDB):
 
     def save_age_estimates(self, checksum, results, model):
         """Upsert each {'face_ref', 'age', 'gender'} result — re-running the estimate
-        on the same face updates its row in place rather than piling up duplicates."""
+        on the same face updates its row in place rather than piling up duplicates.
+
+        A face the user has manually aged/gendered (a model='manual' row, written by
+        set_manual_age_gender) is SKIPPED: manual values take precedence over the ML
+        estimator everywhere, so an estimate re-run must never clobber them."""
         cur = self.conn.cursor()
         now = int(time.time())
+        refs = [r['face_ref'] for r in results]
+        manual_refs = set()
+        if refs:
+            ph = ','.join('?' * len(refs))
+            manual_refs = {row[0] for row in cur.execute(
+                f"SELECT face_ref FROM face_age_estimates WHERE model = 'manual' AND face_ref IN ({ph})",
+                refs).fetchall()}
         for r in results:
+            if r['face_ref'] in manual_refs:
+                continue  # manual override wins — don't overwrite with an ML guess
             cur.execute('''
                 INSERT INTO face_age_estimates (checksum, face_ref, age, gender, model, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(face_ref, model) DO UPDATE SET age=excluded.age, gender=excluded.gender,
                     checksum=excluded.checksum, created_at=excluded.created_at
             ''', (checksum, r['face_ref'], r.get('age'), r.get('gender'), model, now))
+        self.conn.commit()
+
+    def set_manual_age_gender(self, checksum, face_ref, age, gender):
+        """Store a MANUAL age/gender for one face (face_ref = 'manual:{id}' / 'auto:{id}').
+
+        Manual values must win over the ML estimator everywhere. Several readers just
+        take the newest row, or AVG across every row for a face — so rather than teach
+        all ten of them to prefer manual, we keep exactly ONE row per face: delete
+        whatever estimate(s) exist for this ref, then insert the manual row
+        (model='manual'). save_age_estimates() also skips manual refs, so a later ML
+        re-run can't overwrite it. Passing age=None with no gender clears the override
+        (the face reverts to having no estimate until it's re-estimated)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM face_age_estimates WHERE face_ref = ?', (face_ref,))
+        if age is not None or gender:
+            cur.execute('''
+                INSERT INTO face_age_estimates (checksum, face_ref, age, gender, model, created_at)
+                VALUES (?, ?, ?, ?, 'manual', ?)
+            ''', (checksum, face_ref, age, gender or None, int(time.time())))
         self.conn.commit()
 
     def get_age_estimates_for_checksum(self, checksum):

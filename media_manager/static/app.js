@@ -5002,6 +5002,76 @@
     });
   }
 
+  /* Manual age / gender edit — the 🎂 button on each face chip. Stores a manual
+     value that overrides the ML estimate everywhere (see set_manual_age_gender).
+     Delegated so it works for every chip; updates the ".face-age-gender" span in
+     place on success (same span the estimator writes to). */
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.face-age-edit-btn') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var faceRef = btn.dataset.faceRef;
+    var curAge = btn.dataset.age || '';
+    var curGender = btn.dataset.gender || '';
+    openModal('Edit age / gender', function (box) {
+      var wrap = document.createElement('div');
+      wrap.style.display = 'flex';
+      wrap.style.flexDirection = 'column';
+      wrap.style.gap = '10px';
+      wrap.innerHTML =
+        '<label class="sub">Age' +
+        '<input type="number" id="ag-age" min="0" max="120" step="1" value="' + curAge + '" ' +
+        'style="width:100%;margin-top:4px;" placeholder="e.g. 27"></label>' +
+        '<label class="sub">Gender' +
+        '<select id="ag-gender" style="width:100%;margin-top:4px;">' +
+        '<option value="">—</option>' +
+        '<option value="male"' + (curGender === 'male' ? ' selected' : '') + '>male</option>' +
+        '<option value="female"' + (curGender === 'female' ? ' selected' : '') + '>female</option>' +
+        '</select></label>' +
+        '<div class="sub" style="font-size:0.8em;">Manual values override the automatic estimate for this face. ' +
+        'Leave age blank and gender “—” to clear the override.</div>';
+      box.appendChild(wrap);
+      var save = document.createElement('button');
+      save.type = 'button';
+      save.className = 'btn-similar';
+      save.textContent = 'Save';
+      save.style.marginTop = '12px';
+      box.appendChild(save);
+      save.addEventListener('click', function () {
+        var ageStr = document.getElementById('ag-age').value.trim();
+        var gender = document.getElementById('ag-gender').value;
+        var age = ageStr === '' ? null : parseFloat(ageStr);
+        save.disabled = true;
+        fetch('/api/files/' + fileId + '/age-gender', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ face_ref: faceRef, age: age, gender: gender || null }),
+        })
+          .then(function (r) {
+            if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
+            return r.json();
+          })
+          .then(function (data) {
+            var el = document.querySelector('.face-age-gender[data-face-ref="' + faceRef + '"]');
+            if (el) {
+              el.textContent = (data.age !== null && data.age !== undefined) ? Math.round(data.age) : '';
+              el.classList.remove('gender-male', 'gender-female');
+              if (data.gender === 'male') el.classList.add('gender-male');
+              else if (data.gender === 'female') el.classList.add('gender-female');
+            }
+            btn.dataset.age = (data.age !== null && data.age !== undefined) ? Math.round(data.age) : '';
+            btn.dataset.gender = data.gender || '';
+            closeModal();
+            if (window.showToast) showToast('Saved.');
+          })
+          .catch(function (err) {
+            save.disabled = false;
+            if (window.showToast) showToast('Failed: ' + err.message);
+          });
+      });
+    });
+  });
+
   // ---- Find by body: body-index build banner (body_similar.html) ----
   const bodyIndexBanner = document.getElementById('body-index-banner');
   if (bodyIndexBanner) {

@@ -454,6 +454,11 @@
                   data-face-ref="{{ face.ref }}" style="font-size:0.85em;">
               {% if face.age is not none %}{{ face.age | round(0) | int }}{% endif %}
             </span>
+            <a href="#" class="face-age-edit-btn" data-face-ref="{{ face.ref }}"
+               data-age="{% if face.age is not none %}{{ face.age | round(0) | int }}{% endif %}"
+               data-gender="{{ face.gender or '' }}"
+               title="Edit age / gender (manual — overrides the estimate)"
+               style="font-size:0.85em;cursor:pointer;">🎂</a>
             {% if face.ref.startswith('manual:') %}
             <button type="button" class="heart-btn-inline face-heart-btn {{ 'is-favorite' if face.favorite else '' }}"
                     data-face-ref="{{ face.ref }}" data-fav-count="{{ face.favorite or 0 }}"

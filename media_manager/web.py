@@ -159,6 +159,11 @@ class AssignIdentitySetBody(BaseModel):
 class TitleBody(BaseModel):
     title: str
 
+class AgeGenderBody(BaseModel):
+    face_ref: str
+    age: Optional[float] = None
+    gender: Optional[str] = None
+
 class CategoryBody(BaseModel):
     name: Optional[str] = None
     temperature: Optional[float] = None
@@ -6691,6 +6696,26 @@ def create_app(data_root: str) -> FastAPI:
 
         manual.save_age_estimates(checksum, results, MODEL_ID)
         return {'results': results}
+
+    @app.post('/api/files/{file_id}/age-gender')
+    def api_set_age_gender(file_id: int, body: AgeGenderBody):
+        """Manual age/gender override for ONE face on this photo, keyed by face_ref
+        ('manual:{id}' / 'auto:{id}'). Takes precedence over the ML estimator
+        everywhere (manual.set_manual_age_gender keeps it the only row for the face,
+        and estimate re-runs skip it). age=None with empty gender clears the override."""
+        row = _file_or_404(file_id)
+        gender = (body.gender or '').strip().lower() or None
+        if gender not in (None, 'male', 'female'):
+            raise HTTPException(status_code=400, detail="gender must be 'male', 'female', or empty")
+        age = body.age
+        if age is not None and not (0 <= age <= 120):
+            raise HTTPException(status_code=400, detail='age must be between 0 and 120')
+        # Only allow writing to a face that's actually on this photo.
+        valid_refs = {f['ref'] for f in _combined_faces_for_file(file_id, row['checksum'])}
+        if body.face_ref not in valid_refs:
+            raise HTTPException(status_code=404, detail='That face is not on this photo')
+        manual.set_manual_age_gender(row['checksum'], body.face_ref, age, gender)
+        return {'face_ref': body.face_ref, 'age': age, 'gender': gender}
 
     # Cosine similarity above this, an unidentified face is suggested as a match
     # for an already-known person (embeddings are pre-normalized by InsightFace).
