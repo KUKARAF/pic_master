@@ -1508,18 +1508,23 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     @app.get('/browse/{kind}', response_class=HTMLResponse)
-    def browse_page(request: Request, kind: str, limit: int = 120):
+    def browse_page(request: Request, kind: str, limit: int = 120, sort: str = ''):
         """A random grid of one library slice — the clickable home stat tiles land here.
         kind: 'photos' | 'videos' | 'without-set'. (Known people → /faces, unknown faces
-        → /find_all_faces, sets → /sets, tags → /tags are their own pages.)"""
+        → /find_all_faces, sets → /sets, tags → /tags are their own pages.)
+        sort='recent' (photos/videos only) shows most-recently-added first — the 'see more'
+        target of the home 'New photos'/'New videos' sections."""
         titles = {'photos': '📷 Photos', 'videos': '🎬 Videos', 'without-set': '🗂 Without a set',
                   'broken': '💥 Damaged / broken'}
         if kind not in titles:
             raise HTTPException(status_code=404, detail='unknown browse kind')
+        recent = sort == 'recent'
         if kind == 'photos':
-            rows = db.get_random_files_by_ext(list(IMAGE_EXTENSIONS), limit)
+            rows = (db.get_recent_files(limit, IMAGE_EXTENSIONS) if recent
+                    else db.get_random_files_by_ext(list(IMAGE_EXTENSIONS), limit))
         elif kind == 'videos':
-            rows = db.get_random_files_by_ext(list(VIDEO_EXTENSIONS), limit)
+            rows = (db.get_recent_files(limit, VIDEO_EXTENSIONS) if recent
+                    else db.get_random_files_by_ext(list(VIDEO_EXTENSIONS), limit))
         elif kind == 'broken':
             rows = db.get_broken_files(limit)
         else:  # without-set: random files not in any set
@@ -1527,8 +1532,11 @@ def create_app(data_root: str) -> FastAPI:
             rows = [r for r in db.get_random_files_by_ext(list(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS), limit * 5)
                     if r['checksum'] not in members][:limit]
         files = _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows])
+        title = titles[kind]
+        if recent and kind in ('photos', 'videos'):
+            title = '🆕 New ' + ('photos' if kind == 'photos' else 'videos')
         return templates.TemplateResponse(request, 'browse.html', {
-            'title': titles[kind], 'files': files, 'kind': kind,
+            'title': title, 'files': files, 'kind': kind,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })

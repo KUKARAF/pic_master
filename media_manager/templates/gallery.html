@@ -21,22 +21,28 @@
   <a class="stat-tile" href="/tags"><span class="stat-value">{{ homepage_stats.total_auto_tags }}</span><span class="sub">Auto-detected tags</span></a>
 </div>
 
-{% macro photo_section(title, cards, queue_source) %}
+{% macro photo_section(title, cards, queue_source, more_url) %}
 {% if cards %}
-<div class="section-title" style="margin-bottom:10px;">{{ title }}</div>
+<div class="section-head">
+  <div class="section-title">{{ title }}</div>
+  {% if more_url %}<a class="see-more" href="{{ more_url }}">See more →</a>{% endif %}
+</div>
 <div class="grid" style="margin-bottom:28px;" data-queue-source="{{ queue_source }}">
   {% for f in cards %}{{ macros.card(f) }}{% endfor %}
 </div>
 {% endif %}
 {% endmacro %}
 
-{{ photo_section('Random', random_cards, 'Random') }}
-{{ photo_section('New photos', new_photos, 'New photos') }}
-{{ photo_section('New videos', new_videos, 'New videos') }}
-{{ photo_section('Favorites', favorites, 'Favorites') }}
+{{ photo_section('Random', random_cards, 'Random', '/random') }}
+{{ photo_section('New photos', new_photos, 'New photos', '/browse/photos?sort=recent') }}
+{{ photo_section('New videos', new_videos, 'New videos', '/browse/videos?sort=recent') }}
+{{ photo_section('Favorites', favorites, 'Favorites', '/favorites') }}
 
 {% if random_sets %}
-<div class="section-title" style="margin-bottom:10px;">Random sets</div>
+<div class="section-head">
+  <div class="section-title">Random sets</div>
+  <a class="see-more" href="/sets">See more →</a>
+</div>
 <div class="grid" style="margin-bottom:28px;">
   {% for s in random_sets %}
   <div class="card" data-set-id="{{ s.id }}">
@@ -54,7 +60,10 @@
 {% endif %}
 
 {% if needs_attention %}
-<div class="section-title" style="margin-bottom:4px;">Needs love</div>
+<div class="section-head" style="margin-bottom:4px;">
+  <div class="section-title">Needs love</div>
+  <a class="see-more" href="/unloved">See more →</a>
+</div>
 <div class="sub" style="margin-bottom:10px;">Least-viewed photos with no name, set, tag, or category yet.</div>
 <div class="grid" style="margin-bottom:28px;" data-queue-source="Needs love">
   {% for f in needs_attention %}{{ macros.card(f) }}{% endfor %}

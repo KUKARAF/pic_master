@@ -1756,6 +1756,27 @@ input[type="range"] { accent-color: var(--accent); }
   border-bottom: none;
 }
 
+/* Section header row: title on the left, a "see more" link on the right. */
+.section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.section-head .section-title { margin-bottom: 0; }
+.see-more {
+  font-family: var(--font-pixel);
+  font-size: 8px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color .12s ease;
+}
+.see-more:hover { color: var(--orange); }
+
 /* tag input */
 .tag-input-row { display: flex; gap: 6px; margin-top: 10px; }
 .tag-input-row input { flex: 1; min-width: 0; padding: 7px 9px; font-size: 15px; }
