@@ -96,12 +96,14 @@ window.initSwipeStack = function (config) {
   // that slider can adjust it without tearing down/re-creating the stack.
   let BUFFER_SIZE = config.bufferSize || 10;
   const DECIDE_THRESHOLD = 90; // px vertical drag distance that commits a decision
-  // Cards size themselves to their photo's own aspect ratio (see .swipe-card
-  // img's fixed height in style.css) rather than a uniform box, so this is
-  // only a rough estimate for "how many cards roughly fit" — not an enforced
-  // width. More cards fan out across the width rather than any one stretching.
-  const CARD_WIDTH_ESTIMATE = 320;
-  const PEEK_STEP = 64;
+  // Cards fill the (viewport-sized) stack box, so cards behind the top one peek out
+  // BELOW it: each step down is translated PEEK_Y px and scaled by PEEK_SCALE
+  // (transform-origin bottom centre, see .swipe-card). Nothing moves sideways, so
+  // nothing can overflow the screen. style.css reserves 28px under the card for
+  // MAX_PEEK * PEEK_Y.
+  const PEEK_Y = 12;
+  const PEEK_SCALE = 0.04;
+  const MAX_VISIBLE = 3;
 
   const stackEl = document.getElementById(config.stackElId);
   const confirmBtn = document.getElementById(config.confirmBtnId);
@@ -133,9 +135,7 @@ window.initSwipeStack = function (config) {
   const history = []; // [{card, action}, ...] — most recent decision last
 
   function visibleCount() {
-    const wrapWidth = stackEl.clientWidth || stackEl.getBoundingClientRect().width;
-    const fits = Math.floor((Math.max(wrapWidth, CARD_WIDTH_ESTIMATE) - CARD_WIDTH_ESTIMATE) / PEEK_STEP) + 1;
-    return Math.max(1, Math.min(fits, BUFFER_SIZE, queue.length));
+    return Math.max(1, Math.min(MAX_VISIBLE, BUFFER_SIZE, queue.length));
   }
 
   function cardEl(card, index) {
@@ -143,7 +143,8 @@ window.initSwipeStack = function (config) {
     el.className = 'swipe-card';
     el.dataset.ref = card.ref;
     el.style.zIndex = String(BUFFER_SIZE - index);
-    el.style.transform = `translateX(${index * PEEK_STEP}px)`;
+    // Top card keeps a clean (empty) transform so drag math starts from identity.
+    if (index > 0) el.style.transform = `translateY(${index * PEEK_Y}px) scale(${1 - index * PEEK_SCALE})`;
 
     const { imageUrl, questionHtml, scoreText, metaHtml, originalUrl } = config.renderCard(card);
     const imgTag = `<img src="${imageUrl}" alt="suggestion">`;

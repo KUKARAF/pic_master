@@ -303,12 +303,8 @@ input[type="range"] { accent-color: var(--accent); }
   .nav-links .nav-link { padding: 12px 18px; font-size: 10px; }
   .nav-search { max-width: none; }
 
-  /* Tinder-style swipe stack on phones. Shorter stack so the yes/no/skip controls
-     stay on screen under the card; the card leaves ~72px of room on the right so the
-     peeked next card (offset 64px by swipe-core's fan) isn't clipped off the edge. */
-  .swipe-stack-wrap { height: 68vh; }
-  .swipe-card { max-width: calc(100% - 72px); }
-  .swipe-card img { max-height: calc(68vh - 120px); }
+  /* Tinder-style swipe stack on phones: stack height is viewport-derived (see
+     .swipe-stack-wrap); only the control buttons shrink a little here. */
   .swipe-controls { gap: 16px; }
   .swipe-btn { width: 52px; height: 52px; font-size: 20px; }
   /* The full preview (right-arrow / tap) fills the phone screen. */
@@ -2014,17 +2010,27 @@ a.stat-tile .sub { text-decoration: none; }
 .swipe-stack-wrap {
   position: relative;
   width: 100%;
-  height: 80vh;
+  /* Definite box filling the viewport: 100dvh minus nav (56), container gutters
+     (22 top + 48 bottom), page heading, the 58px controls row, hint line and the
+     two 22px flex gaps. --swipe-chrome budgets all of that (~310px); the vh line is
+     the fallback for browsers without dvh. min-height keeps tiny/landscape screens usable. */
+  --swipe-chrome: 310px;
+  height: calc(100vh - var(--swipe-chrome));
+  height: calc(100dvh - var(--swipe-chrome));
+  min-height: 320px;
 }
 .swipe-card {
   position: absolute;
   top: 0;
   left: 0;
-  min-width: 220px;
-  /* Never wider than the stack wrap (which is the container's inner width) — without
-     this a landscape photo, sized by its natural width below, makes the card run off
-     the right edge of the screen (very visible on mobile). */
-  max-width: 100%;
+  right: 0;
+  /* Fills the stack box (minus 28px at the bottom where cards behind peek out).
+     Definite width AND height; the photo is object-fit:contained inside. */
+  width: 100%;
+  height: calc(100% - 28px);
+  display: flex;
+  flex-direction: column;
+  transform-origin: 50% 100%;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -2053,20 +2059,24 @@ a.stat-tile .sub { text-decoration: none; }
   display: block;
   cursor: pointer;
 }
+.swipe-card-img-link {
+  flex: 1 1 0;
+  min-height: 0;
+}
 .swipe-card img {
-  /* Each card takes on its photo's own aspect ratio (portrait/landscape/square)
-     instead of being cropped or letterboxed into a uniform box: the photo is bounded
-     by BOTH a height budget and the card's width (100% of the card, which is capped to
-     the wrap). Portrait → height binds; landscape → width binds and the height scales
-     down — so a wide photo can no longer overflow the screen. */
-  max-height: calc(80vh - 130px);
-  max-width: 100%;
-  width: auto;
-  height: auto;
+  /* Fill the card's remaining height/width and scale the photo to fit with its
+     aspect ratio kept (letterboxed on a dark backdrop). */
+  flex: 1 1 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
   display: block;
   pointer-events: none;
 }
 .swipe-card-body {
+  flex: none;
   padding: 14px 16px;
   display: flex;
   flex-direction: column;
