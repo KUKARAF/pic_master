@@ -5463,28 +5463,21 @@ def create_app(data_root: str) -> FastAPI:
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
 
-        # Rank by the PLACE (scene, people-masked) embedding when the place index is
-        # built, so a location match keys on where the photo was taken — not who's in
-        # it (the whole-image CLIP vector is dominated by people). Fall back to the CLIP
-        # embedding when place isn't indexed yet, keeping member+candidate vectors in the
-        # SAME space (never mix the two). use_place requires BOTH the members and the
-        # library to have place descriptors.
+        # Rank ONLY on the PLACE (scene, people-masked) embedding — never the whole-image
+        # CLIP vector, which is dominated by people and would silently reintroduce the
+        # person-matching this feature exists to kill. If the place index isn't built for
+        # this location's photos (or the library) yet, return place_ready=False so the
+        # endpoint/UI can say "build the place index" instead of serving a misleading
+        # people-matched ranking. Returns (cards, place_ready).
         place_member = db.get_place_embeddings_for_files(member_ids)
-        use_place = bool(place_member)
-        if use_place:
-            member_embeddings = [e for _fid, e in place_member]
-            all_rows = db.get_all_place_embeddings()
-            if not all_rows:            # members indexed but library isn't — stay coherent
-                use_place = False
-        if not use_place:
-            member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
-            all_rows = db.get_all_embeddings()
+        all_rows = db.get_all_place_embeddings() if place_member else []
+        if not place_member or not all_rows:
+            return [], False
+        member_embeddings = [e for _fid, e in place_member]
 
         centroid = mean_normalized_centroid(member_embeddings)
-        # A location with nothing placed at it yet has nothing to compare against
-        # — no centroid, no suggestions (the page says exactly that).
         if centroid is None:
-            return []
+            return [], True
 
         excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
         # Photos whose SET is already linked to this location: pressing `s` on one
@@ -5499,7 +5492,7 @@ def create_app(data_root: str) -> FastAPI:
             and row[3] not in set_settled_checksums
         ]
         if not candidates:
-            return []
+            return [], True
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
         if avoid_existing and passing:
@@ -5509,10 +5502,10 @@ def create_app(data_root: str) -> FastAPI:
         # geometric agreement with this location's own photos (people's keypoints already
         # dropped at place-index time). A candidate that geometrically matches a member
         # (same walls / landmark / furniture) floats above one that's merely scene-similar.
-        # Only when ranking on place embeddings and both sides have cached features;
-        # best-effort and non-fatal (keeps embedding order on any error); bounded to the
-        # top PLACE_RERANK_CAP so it stays swipe-interactive.
-        if use_place and len(passing) > 1:
+        # Runs only if both sides have cached features; best-effort and non-fatal (keeps
+        # embedding order on any error); bounded to the top PLACE_RERANK_CAP so it stays
+        # swipe-interactive.
+        if len(passing) > 1:
             PLACE_RERANK_CAP, MEMBER_REP_CAP = 30, 4
             try:
                 mem_kp = db.get_place_keypoints_for_files(member_ids[:MEMBER_REP_CAP])
@@ -5545,7 +5538,7 @@ def create_app(data_root: str) -> FastAPI:
         cards = _enrich_rows(rows, scores=scores_map)
         for card in cards:
             card['ref'] = str(card['id'])
-        return cards
+        return cards, True
 
     def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
@@ -6577,11 +6570,27 @@ def create_app(data_root: str) -> FastAPI:
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
-        results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
-                                                    exclude_ids=exclude_ids, avoid_existing=avoid_existing)
+        results, place_ready = _find_similar_files_for_location(
+            location_id, threshold, limit=limit, offset=offset,
+            exclude_ids=exclude_ids, avoid_existing=avoid_existing)
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
-        # is what swipe-core.js's fetchMoreUrl contract reads.
-        return {'results': results, 'cards': results}
+        # is what swipe-core.js's fetchMoreUrl contract reads. needs_place_index tells
+        # the UI the place index isn't built for this location yet — so it can say so
+        # instead of location matching silently doing nothing (we no longer fall back to
+        # the people-dominated CLIP ranking).
+        return {'results': results, 'cards': results, 'needs_place_index': not place_ready}
+
+    @app.get('/api/locations/{location_id}/place-status')
+    def api_location_place_status(location_id: int):
+        """Cheap check (no library scan) of whether the place index is built for this
+        location's photos — the location page preflights this to show a 'build the place
+        index' banner instead of an empty/misleading stack."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        member_checksums = manual.get_checksums_for_location(location_id)
+        member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
+        ready = bool(member_ids) and bool(db.get_place_embeddings_for_files(member_ids))
+        return {'needs_place_index': not ready, 'members': len(member_ids)}
 
     @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
     def api_exclude_file_location(file_id: int, location_id: int):

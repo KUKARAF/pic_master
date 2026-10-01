@@ -71,6 +71,16 @@
   <span id="location-buffer-size-value">10</span>
   are found
 </label>
+<!-- Shown (by the preflight below) only when the place index isn't built for this
+     location. Location matching is scene-based with people masked out and does NOT
+     fall back to the people-dominated whole-image ranking, so an unindexed location
+     has nothing to show — say that plainly rather than present an empty stack. -->
+<div id="location-place-warning" class="alert" style="display:none;margin-bottom:12px;">
+  📌 Location matching here needs the <strong>place index</strong>, which isn’t built yet.
+  It ranks by what the place looks like (people ignored), so there’s nothing to match
+  until it’s built. Build it on the <a href="/bulk">Bulk page</a> → “📌 Index places”,
+  then reload.
+</div>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="location-swipe-page" style="flex:1;min-width:300px;">
     <div class="swipe-stack-wrap" id="location-swipe-stack"></div>
@@ -183,6 +193,17 @@
   const locationName = {{ location.name | tojson }};
   const swipePage = document.getElementById('location-swipe-page');
   if (!swipePage || !window.initSwipeStack) return;
+
+  // Preflight (cheap, no library scan): is the place index built for this location?
+  // If not, show the banner — location matching no longer falls back to the
+  // people-dominated CLIP ranking, so an unindexed location simply has nothing to show.
+  fetch('/api/locations/' + {{ location.id }} + '/place-status')
+    .then(function(r) { return r.ok ? r.json() : null; })
+    .then(function(d) {
+      const warn = document.getElementById('location-place-warning');
+      if (warn && d && d.needs_place_index) warn.style.display = '';
+    })
+    .catch(function() {});
 
   let currentThreshold = {{ location_suggest_threshold | default(0.75) }};
   // Points at whichever initSwipeStack() call is current — the empty state's
