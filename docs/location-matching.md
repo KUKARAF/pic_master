@@ -20,27 +20,36 @@ The location ranking (`_find_similar_files_for_location`) uses place embeddings 
 the index is built, and **falls back to CLIP** (old behaviour) when it isn't — so
 nothing breaks before you build the index. The swipe UI / accept-reject are unchanged.
 
-## B70 setup (prod GPU host)
+## Setup
 
-Both models run **locally on the B70** (that's where the Arc GPU is — not offloaded to
-the worker). Full runbooks are in the module docstrings:
-`media_manager/place_encoder.py` and `media_manager/place_matcher.py`. In short:
+Both models run **locally on the GPU host** (that's where the Arc GPU is — not offloaded
+to the worker). Backend selection is **automatic** (`MEDIA_PLACE_MODEL=auto` /
+`MEDIA_PLACE_MATCHER=auto` by default).
 
-1. Install runtime: `openvino` (≥ **2025.3**, for the XFeat NMS fix), `optimum-intel`
-   (conversion only), `onnxruntime-openvino`, `accelerated_features` (XFeat), and the
-   DINOv2 backbone.
-2. Convert DINOv2 to OpenVINO IR (e.g. `optimum-cli export openvino --model
-   facebook/dinov2-giant --task image-feature-extraction <out>`), and place the AnyLoc
-   VLAD vocabulary under `<library>/.media/place_vocab/`. Env: `MEDIA_PLACE_MODEL`,
-   `MEDIA_PLACE_DEVICE=GPU`, `MEDIA_PLACE_DINOV2_OV`, `MEDIA_PLACE_FACET`,
-   `MEDIA_PLACE_MATCHER`. Optional PCA whitening at `<library>/.media/place_pca.npz`.
-3. Verify the graph runs on the GPU (no silent CPU fallback) — the modules log device
-   placement and raise loud errors with the exact fix command when deps/weights/vocab
-   are missing (no silent degrade).
+### Baseline — zero setup (just works)
+Out of the box the encoder resolves to **EigenPlaces** (runs on the torch the app already
+has, auto-downloads its own small weights) and the matcher to **SIFT** (OpenCV, already
+present). People are ignored by **pixel-masking** the person boxes from object detection.
+So: reinstall, (optionally `media place-setup` to pre-download), run object detection so
+masking has boxes, then **📌 Index places** on /bulk. No OpenVINO, no vocab, no env vars.
 
-Bring-up tip: set `MEDIA_PLACE_MODEL=eigenplaces` first (a plain ResNet that converts
-to OpenVINO trivially) to validate the whole index→rank→swipe path end to end, then
-switch to `anyloc` — the table/job/ranking are encoder-agnostic.
+### Upgrade — AnyLoc + XFeat (best quality, GPU, token-level people-dropping)
+Install the extra deps **into the app's venv** (Python **3.11–3.13** — `onnxruntime-openvino`
+has no 3.14 wheel; the prod `media-prod` venv is 3.12):
+
+```
+uv pip install --python /home/rafa/media-prod/bin/python openvino optimum-intel accelerated_features
+media place-setup --anyloc    # converts DINOv2 → OpenVINO IR; prints the one remaining vocab step
+```
+
+`place-setup --anyloc` converts the DINOv2 backbone to OpenVINO IR under
+`<library>/.media/dinov2_ov/`; add the AnyLoc VLAD vocabulary under
+`<library>/.media/place_vocab/` (see `place_encoder.py`'s runbook for fitting it over the
+served facet). Once both are present, `auto` upgrades the encoder to AnyLoc on its own —
+no config change, no index rebuild semantics change (the `model` column versions it, so a
+re-index picks up the better descriptor). `onnxruntime-openvino` is optional (only the
+XFeat *ONNX* serving path uses it; XFeat otherwise runs via torch). Full runbooks:
+`media_manager/place_encoder.py`, `media_manager/place_matcher.py`.
 
 ## Build the index
 

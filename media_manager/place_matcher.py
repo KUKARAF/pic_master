@@ -165,13 +165,25 @@ class PlaceMatcher:
 
     def __init__(self, backend: str = None, device: str = "GPU"):
         if backend is None:
-            backend = os.environ.get("MEDIA_PLACE_MATCHER", "xfeat")
+            backend = os.environ.get("MEDIA_PLACE_MATCHER", "auto")
         backend = str(backend).strip().lower()
-        if backend not in ("xfeat", "sift"):
+        if backend not in ("auto", "xfeat", "sift"):
             raise ValueError(
-                "Unknown MEDIA_PLACE_MATCHER backend %r; expected 'xfeat' or 'sift'."
+                "Unknown MEDIA_PLACE_MATCHER backend %r; expected 'auto', 'xfeat' or 'sift'."
                 % backend
             )
+        if backend == "auto":
+            # Default to the OpenCV-only SIFT backend (always present), upgrade to XFeat
+            # only when it's clearly installed. So the re-rank just works out of the box
+            # and gets better automatically once accelerated_features is installed.
+            backend = "sift"
+            try:
+                import importlib.util
+                if (importlib.util.find_spec("torch") is not None
+                        and importlib.util.find_spec("modules.xfeat") is not None):
+                    backend = "xfeat"
+            except Exception:
+                backend = "sift"
         self.backend = backend
 
         self.device = os.environ.get("MEDIA_PLACE_MATCHER_DEVICE", device) or "GPU"

@@ -151,8 +151,11 @@ class PlaceEncoder:
     CLIPIndexer so it slots into the remote-or-local factory."""
 
     def __init__(self, model_name: str = None, device: str = "GPU", data_root: str = None):
-        # model_name: backend id. Default from env, else 'anyloc'.
-        self.model_name = (model_name or _env("MEDIA_PLACE_MODEL", "anyloc")).lower()
+        # model_name: backend id. Default 'auto' — resolves (lazily) to 'anyloc' when its
+        # deps + artifacts are present, else 'eigenplaces', which runs on the torch the
+        # app already has and auto-downloads its own weights. So out of the box this just
+        # works (eigenplaces); AnyLoc is a drop-in upgrade once set up, no config change.
+        self.model_name = (model_name or _env("MEDIA_PLACE_MODEL", "auto")).lower()
         # device: OpenVINO device name for anyloc ('GPU'/'CPU'/'AUTO'). The ctor
         # default is 'GPU' (the B70 target); env wins over the arg so deployments
         # can flip it without code changes.
@@ -176,11 +179,39 @@ class PlaceEncoder:
         self._torch_device = None
         self._eigen_dim = 2048
 
-        if self.model_name not in ("anyloc", "eigenplaces"):
+        if self.model_name not in ("auto", "anyloc", "eigenplaces"):
             raise ValueError(
                 f"MEDIA_PLACE_MODEL={self.model_name!r} is not a known place backend "
-                f"(expected 'anyloc' or 'eigenplaces')."
+                f"(expected 'auto', 'anyloc' or 'eigenplaces')."
             )
+
+    # ------------------------------------------------------------------ resolution
+
+    def _anyloc_available(self) -> bool:
+        """Cheap check (no model load): can the AnyLoc backend actually run here? Needs
+        the OpenVINO runtime importable, the DINOv2 IR present, and a VLAD vocab present."""
+        try:
+            import importlib.util
+            if importlib.util.find_spec("openvino") is None:
+                return False
+        except Exception:
+            return False
+        try:
+            self._find_ir_xml(self._ir_dir())  # raises if the IR .xml isn't there
+        except Exception:
+            return False
+        vd = self._vocab_dir()
+        try:
+            return os.path.isdir(vd) and any(os.scandir(vd))
+        except Exception:
+            return False
+
+    def _resolve(self) -> str:
+        """Pin 'auto' to a concrete backend the first time it matters. AnyLoc when it's
+        fully set up, else eigenplaces (torch-only, self-downloading)."""
+        if self.model_name == "auto":
+            self.model_name = "anyloc" if self._anyloc_available() else "eigenplaces"
+        return self.model_name
 
     # ------------------------------------------------------------------ metadata
 
@@ -189,6 +220,7 @@ class PlaceEncoder:
         facet, cluster count and PCA width so any version-affecting change (new
         resolution, different facet, re-fit PCA) produces a different id and the
         index can detect staleness. Cheap to call before load — reads only files."""
+        self._resolve()
         if self.model_name == "eigenplaces":
             base = "eigenplaces-r50-gem-2048"
             return self._with_pca_suffix(base, self._eigen_pca_out_dim())
@@ -207,6 +239,7 @@ class PlaceEncoder:
         """Descriptor dimensionality AFTER any PCA (so callers can size the index).
         AnyLoc raw = num_c * desc_dim (~49152 for c32/ViT-g); PCA collapses that to
         'components' rows. Reads the PCA/vocab files without loading the model."""
+        self._resolve()
         if self.model_name == "eigenplaces":
             return self._eigen_pca_out_dim() or self._eigen_dim
         pca_out = self._pca_out_dim()
@@ -282,12 +315,34 @@ class PlaceEncoder:
         if self._backend == "anyloc":
             return self._embed_anyloc(pil_img, boxes)
         if self._backend == "eigenplaces":
-            return self._embed_eigenplaces(pil_img)
+            return self._embed_eigenplaces(pil_img, boxes)
         raise RuntimeError(f"place backend {self._backend!r} not loaded")
+
+    @staticmethod
+    def _mask_person_boxes(pil_img, boxes):
+        """Paint person rectangles with the ImageNet mean colour so, after mean/std
+        normalization, they contribute ~zero — EigenPlaces has no patch tokens to drop,
+        so pixel-masking is how people are ignored on this backend. Boxes are original
+        pixels on this (full-res) image, applied before the resize. No-op if no boxes."""
+        if not boxes:
+            return pil_img
+        from PIL import ImageDraw
+        im = pil_img.convert("RGB").copy()
+        draw = ImageDraw.Draw(im)
+        w, h = im.size
+        fill = (124, 116, 104)  # ~ _IMAGENET_MEAN * 255
+        for b in boxes:
+            x1, y1, x2, y2 = (int(b[0]), int(b[1]), int(b[2]), int(b[3]))
+            x1, x2 = max(0, min(x1, w)), max(0, min(x2, w))
+            y1, y2 = max(0, min(y1, h)), max(0, min(y2, h))
+            if x2 > x1 and y2 > y1:
+                draw.rectangle([x1, y1, x2, y2], fill=fill)
+        return im
 
     def _ensure_loaded(self):
         if self._loaded:
             return
+        self._resolve()
         if self.model_name == "anyloc":
             self._load_anyloc()
             self._backend = "anyloc"
@@ -727,9 +782,10 @@ class PlaceEncoder:
             self._pca_mean = np.ascontiguousarray(data["mean"], dtype=np.float32)
             self._pca_components = np.ascontiguousarray(data["components"], dtype=np.float32)
 
-    def _embed_eigenplaces(self, pil_img):
+    def _embed_eigenplaces(self, pil_img, boxes=None):
         import torch
 
+        pil_img = self._mask_person_boxes(pil_img, boxes)
         # 512x512 is EigenPlaces' standard test resolution.
         img = pil_img.resize((512, 512))
         a = np.asarray(img, dtype=np.float32) / 255.0

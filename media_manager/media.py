@@ -169,6 +169,15 @@ def main():
     index_cmd.add_argument('--reindex', action='store_true',
                            help='Clear existing detections and re-run on all images')
 
+    # media place-setup - download/prepare the place-matching (location-by-scene) models
+    place_setup = sub.add_parser(
+        'place-setup',
+        help='Download/prepare the location-by-scene (place) models. Baseline needs '
+             'nothing extra; --anyloc prepares the best-quality GPU backend.')
+    place_setup.add_argument('--anyloc', action='store_true',
+                             help='Also prepare the AnyLoc upgrade (converts DINOv2 to '
+                                  'OpenVINO IR; needs openvino + optimum-intel installed).')
+
     # media search <query> - search by detected object class (YOLO-World)
     search_cmd = sub.add_parser('search', help='Search images by detected object class (YOLO-World)')
     search_cmd.add_argument('query', help='Text query to search for')
@@ -565,6 +574,55 @@ def main():
         indexed, failed = m.index_files(args.path, model_size=args.model_size, conf_threshold=args.conf)
         print(f"Done: detected objects in {indexed} images, {failed} failed")
         m.close()
+        return 0
+
+    elif args.cmd == 'place-setup':
+        data_root = os.path.abspath('.')
+        # Baseline: instantiate + load the encoder/matcher so their weights download now
+        # (EigenPlaces via torch.hub, XFeat/SIFT). Auto-selection means this resolves to
+        # whatever is installed — eigenplaces+sift out of the box, upgrading on its own.
+        from media_manager.place_encoder import PlaceEncoder
+        from media_manager.place_matcher import PlaceMatcher
+        enc = PlaceEncoder(data_root=data_root)
+        print(f"Place encoder backend: {enc._resolve()}")
+        try:
+            enc._ensure_loaded()  # triggers the weight download / model compile
+            print(f"  ready: model_id={enc.model_id()} dim={enc.dim()}")
+        except Exception as exc:
+            print(f"  ERROR preparing encoder: {exc}", file=sys.stderr)
+            return 1
+        try:
+            mm = PlaceMatcher()
+            print(f"Place matcher backend: {mm.backend} (model_id={mm.model_id()})")
+        except Exception as exc:
+            print(f"  matcher note: {exc}", file=sys.stderr)
+
+        if args.anyloc:
+            import importlib.util
+            missing = [p for p in ('openvino', 'optimum') if importlib.util.find_spec(p) is None]
+            if missing:
+                print("\nAnyLoc upgrade needs extra packages that aren't installed: "
+                      + ", ".join(missing) + "\nInstall them into THIS venv (Python 3.11-3.13 "
+                      "— onnxruntime-openvino has no 3.14 wheel), e.g.:\n"
+                      "    uv pip install openvino optimum-intel accelerated_features\n"
+                      "then re-run 'media place-setup --anyloc'.", file=sys.stderr)
+                return 1
+            ir_dir = os.path.join(data_root, '.media', 'dinov2_ov')
+            print(f"\nConverting DINOv2 (giant) to OpenVINO IR at {ir_dir} …")
+            import subprocess
+            rc = subprocess.call([
+                'optimum-cli', 'export', 'openvino',
+                '--model', 'facebook/dinov2-giant',
+                '--task', 'image-feature-extraction', ir_dir,
+            ])
+            if rc != 0:
+                print("  optimum-cli export failed — see output above.", file=sys.stderr)
+                return 1
+            print("  DINOv2 IR ready.")
+            print("Remaining AnyLoc step: place a VLAD vocabulary under "
+                  f"{os.path.join(data_root, '.media', 'place_vocab')}/ (fit over the served "
+                  "facet — see place_encoder.py's runbook). Until then the encoder stays on "
+                  "eigenplaces.")
         return 0
 
     elif args.cmd == 'search':
