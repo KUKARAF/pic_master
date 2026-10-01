@@ -4272,9 +4272,9 @@ def create_app(data_root: str) -> FastAPI:
         place_index_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
+            from media_manager import place_index
             try:
                 enc = _get_place_encoder(data_root)
-                enc_model = enc.model_id()
                 matcher = None
                 try:
                     matcher = _get_place_matcher()
@@ -4282,31 +4282,15 @@ def create_app(data_root: str) -> FastAPI:
                     # Matcher optional for this pass (re-rank just won't have features);
                     # loud, not silent, then carry on with embeddings only.
                     print(f'[place-index] matcher unavailable, embeddings only: {exc}', flush=True)
-                done = 0
-                for fid, rel in candidates:
-                    abs_path = _live_abs_path(fid, rel)
-                    if abs_path is None:
-                        done += 1; place_index_job['done'] = done; continue
-                    boxes = db.get_person_detections_for_file(
-                        fid, class_names=body_index.PERSON_LIKE_CLASSES)
-                    try:
-                        embs, failed = enc.embed_images([abs_path], [boxes])
-                        if not failed and embs:
-                            db.insert_place_embedding(fid, embs[0].astype('float32').tobytes(), enc_model)
-                        else:
-                            db.insert_place_embedding(fid, b'', enc_model)  # sentinel
-                            errors.log(rel, f'place embed failed: {failed}')
-                    except Exception as exc:
-                        db.insert_place_embedding(fid, b'', enc_model)      # sentinel, don't re-queue
-                        errors.log(rel, f'place embed error: {exc}')
-                    if matcher is not None:
-                        try:
-                            feat = matcher.extract(abs_path, person_boxes=boxes)
-                            db.insert_place_keypoints(fid, matcher.serialize(feat), matcher.model_id())
-                        except Exception as exc:
-                            errors.log(rel, f'place keypoints error: {exc}')
-                    done += 1
-                    place_index_job['done'] = done
+                place_index.build_place_index(
+                    db, enc, matcher, data_root,
+                    image_exts=IMAGE_EXTENSIONS,
+                    person_boxes_fn=lambda fid: db.get_person_detections_for_file(
+                        fid, class_names=body_index.PERSON_LIKE_CLASSES),
+                    abs_path_fn=_live_abs_path,
+                    candidates=candidates,
+                    on_progress=lambda d, t: place_index_job.update(done=d, total=t),
+                    log=errors.log)
             except Exception as exc:
                 import traceback
                 traceback.print_exc()

@@ -178,6 +178,15 @@ def main():
                              help='Also prepare the AnyLoc upgrade (converts DINOv2 to '
                                   'OpenVINO IR; needs openvino + optimum-intel installed).')
 
+    # media place-index - build the location-by-scene (place) index
+    place_index_cmd = sub.add_parser(
+        'place-index',
+        help='Build the location-by-scene (place) index — a people-masked scene '
+             'descriptor per image + cached features for the same-spot re-rank.')
+    place_index_cmd.add_argument('--reindex', action='store_true',
+                                 help='Clear existing place embeddings/keypoints and '
+                                      're-run on all images.')
+
     # media search <query> - search by detected object class (YOLO-World)
     search_cmd = sub.add_parser('search', help='Search images by detected object class (YOLO-World)')
     search_cmd.add_argument('query', help='Text query to search for')
@@ -623,6 +632,40 @@ def main():
                   f"{os.path.join(data_root, '.media', 'place_vocab')}/ (fit over the served "
                   "facet — see place_encoder.py's runbook). Until then the encoder stays on "
                   "eigenplaces.")
+        return 0
+
+    elif args.cmd == 'place-index':
+        m = MediaManager()
+        data_root = m.data_root
+        if args.reindex:
+            m.db.conn.execute('DELETE FROM place_embeddings')
+            m.db.conn.execute('DELETE FROM place_keypoints')
+            m.db.conn.commit()
+            print("Cleared existing place embeddings/keypoints.")
+        from media_manager import place_index, body_index
+        from media_manager.place_encoder import PlaceEncoder
+        from media_manager.place_matcher import PlaceMatcher
+        from media_manager.formats import IMAGE_EXTENSIONS
+        enc = PlaceEncoder(data_root=data_root)
+        print(f"Place encoder: {enc._resolve()} (model_id={enc.model_id()})")
+        try:
+            matcher = PlaceMatcher()
+        except Exception as exc:
+            matcher = None
+            print(f"  matcher unavailable, embeddings only: {exc}", file=sys.stderr)
+
+        def progress(done, total):
+            print(f"\r  {done}/{total}", end="", flush=True)
+
+        total = place_index.build_place_index(
+            m.db, enc, matcher, data_root,
+            image_exts=IMAGE_EXTENSIONS,
+            person_boxes_fn=lambda fid: m.db.get_person_detections_for_file(
+                fid, class_names=body_index.PERSON_LIKE_CLASSES),
+            on_progress=progress,
+            log=lambda p, msg: print(f"\n  WARN {p}: {msg}", file=sys.stderr))
+        print(f"\nPlace index: processed {total} image(s).")
+        m.close()
         return 0
 
     elif args.cmd == 'search':
