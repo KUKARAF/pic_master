@@ -97,6 +97,12 @@ class SpatialTagBody(BaseModel):
     # offline drive), which the whole-image tag path never required.
     image_width: Optional[int] = None
     image_height: Optional[int] = None
+    # Swipe suggestions carry a normalized (0..1) bbox (resolution-independent). When
+    # true, the server scales it to pixels using the resolved image dimensions before
+    # storing — lets the tag-swipe confirm persist the proposed box without the client
+    # doing the conversion. Hand-labeled regions (which already supply pixel coords)
+    # leave this false.
+    normalized: Optional[bool] = False
     # When rejecting an auto-detected object as a region negative, also delete the
     # detection row at the source (parity with the old whole-image reject path), so the
     # rejected class doesn't linger in non-negation-aware detection consumers.
@@ -1225,6 +1231,13 @@ def create_app(data_root: str) -> FastAPI:
             checksum = row['checksum']
             card_sets = sets_map.get(checksum, [])
             card['filename'] = os.path.basename(row['path'])
+            # Original pixel dims (may be NULL until a dedup scan backfills them) so a
+            # tag-swipe confirm can turn the card's normalized bbox into a stored region
+            # tag without the client re-opening the image. NULL → confirm falls back to
+            # a whole-image tag.
+            cols = row.keys()
+            card['image_width'] = row['width'] if 'width' in cols else None
+            card['image_height'] = row['height'] if 'height' in cols else None
             card['tags'] = tag_map.get(checksum, [])
             card['sets'] = card_sets
             card['people'] = _people_not_in_sets(identities_map.get(checksum, []), card_sets)
@@ -4303,13 +4316,15 @@ def create_app(data_root: str) -> FastAPI:
                 'tags': _photo_tags(row['checksum'])}
 
     @app.delete('/api/files/{file_id}/tags-by-label')
-    def api_remove_tag_by_label(file_id: int, label: str, polarity: str = 'positive'):
+    def api_remove_tag_by_label(file_id: int, label: str, polarity: str = 'positive',
+                                spatial: bool = False):
         """Undo a confirm or reject made via the tag-suggestion swipe stream —
         removes the specific tag row by (label, polarity) instead of by numeric
         id, since the swipe stream never learns the id the POST endpoint
-        assigned (it doesn't read the response body)."""
+        assigned (it doesn't read the response body). spatial=true undoes a
+        region confirm/reject (removes the box row rather than the whole-image row)."""
         row = _file_or_404(file_id)
-        manual.remove_tag_by_label(row['checksum'], label, polarity)
+        manual.remove_tag_by_label(row['checksum'], label, polarity, spatial=spatial)
         return {'tags': _photo_tags(row['checksum'])}
 
     @app.patch('/api/files/{file_id}/tags/{tag_id}')
@@ -4350,6 +4365,13 @@ def create_app(data_root: str) -> FastAPI:
             from PIL import Image as PILImage
             with PILImage.open(abs_path) as img:
                 width, height = img.size
+
+        # A swipe suggestion's box is normalized (0..1); scale to pixels now that the
+        # real dimensions are known, so it's stored in the same original-pixel space as
+        # a hand-labeled region (CLIP training crops by these pixels; YOLO re-normalizes
+        # by the stored dims — both need the box consistent with width/height).
+        if body.normalized:
+            x1 *= width; x2 *= width; y1 *= height; y2 *= height
 
         # Clamp to the image bounds (the offline path trusts client-supplied dims, and
         # a box slightly outside the frame shouldn't be stored raw), then re-validate.

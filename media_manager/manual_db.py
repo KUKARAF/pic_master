@@ -784,18 +784,24 @@ class ManualDB(ThreadLocalDB):
         cur.execute('DELETE FROM file_tags WHERE id = ?', (tag_id,))
         self.conn.commit()
 
-    def remove_tag_by_label(self, checksum, label, polarity):
+    def remove_tag_by_label(self, checksum, label, polarity, spatial=False):
         """Delete a single whole-file tag row by (checksum, label, polarity) rather
         than by numeric id — lets a caller (the tag-suggestion swipe stream's undo)
         reverse its own add_tag call without having to thread the row id it never
         asked for back through a fetch response. A label with no matching tag
-        definition at all has nothing to delete — no-op, not a create."""
+        definition at all has nothing to delete — no-op, not a create.
+
+        spatial=True instead removes this (checksum, label, polarity)'s REGION rows
+        (x1 IS NOT NULL) — the undo for a swipe confirm/reject that stored a box. The
+        swipe never learns the new row id (it doesn't read the POST response), and a
+        just-decided photo has at most the one region row this undoes."""
         cur = self.conn.cursor()
         row = cur.execute('SELECT id FROM tags WHERE label = ?', (label,)).fetchone()
         if row is None:
             return
+        box_clause = 'x1 IS NOT NULL' if spatial else 'x1 IS NULL'
         cur.execute(
-            'DELETE FROM file_tags WHERE checksum = ? AND tag_id = ? AND polarity = ? AND x1 IS NULL',
+            f'DELETE FROM file_tags WHERE checksum = ? AND tag_id = ? AND polarity = ? AND {box_clause}',
             (checksum, row[0], polarity)
         )
         self.conn.commit()

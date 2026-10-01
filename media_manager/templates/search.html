@@ -280,21 +280,32 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
           originalUrl: '/photo/' + card.file_id,
         };
       },
+      // When the suggestion carries a bbox (YOLO detection, or a CLIP highlight tile —
+      // both normalized 0..1), persist the TAG WITH THAT BOX so the swipe builds real
+      // spatial training data: confirm = positive region, reject = region hard-negative.
+      // No box (centroid stream, or CLIP without a tile index) → whole-image tag.
       onConfirm: function(card) {
-        return {
-          url: '/api/files/' + card.file_id + '/tags', method: 'POST',
-          body: { tag: tagLabel, polarity: 'positive' },
-        };
+        if (card.bbox && card.bbox.length === 4) {
+          return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',
+            body: { label: tagLabel, bbox: card.bbox, normalized: true, polarity: 'positive',
+                    image_width: card.image_width, image_height: card.image_height } };
+        }
+        return { url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+          body: { tag: tagLabel, polarity: 'positive' } };
       },
       onReject: function(card) {
-        return {
-          url: '/api/files/' + card.file_id + '/tags', method: 'POST',
-          body: { tag: tagLabel, polarity: 'negative' },
-        };
+        if (card.bbox && card.bbox.length === 4) {
+          return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',
+            body: { label: tagLabel, bbox: card.bbox, normalized: true, polarity: 'negative',
+                    image_width: card.image_width, image_height: card.image_height } };
+        }
+        return { url: '/api/files/' + card.file_id + '/tags', method: 'POST',
+          body: { tag: tagLabel, polarity: 'negative' } };
       },
       onUndo: function(card, action) {
         const polarity = action === 'confirm' ? 'positive' : 'negative';
         const params = new URLSearchParams({ label: tagLabel, polarity: polarity });
+        if (card.bbox && card.bbox.length === 4) params.set('spatial', 'true');
         return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
       },
       emptyStateHtml: '<div class="swipe-empty">No more suggestions for &quot;' + escapeHtml(tagLabel) + '&quot; right now.</div>',

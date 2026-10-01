@@ -59,18 +59,30 @@
         originalUrl: '/photo/' + card.file_id,
       };
     },
+    // Box-carrying suggestions (YOLO / CLIP highlight, normalized 0..1) persist the tag
+    // WITH its box: confirm = positive region, reject = region hard-negative. No box →
+    // whole-image tag. (See search.html for the fuller note.)
     onConfirm: function(card) {
+      if (card.bbox && card.bbox.length === 4) {
+        return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',
+          body: { label: label, bbox: card.bbox, normalized: true, polarity: 'positive',
+                  image_width: card.image_width, image_height: card.image_height } };
+      }
       return { url: '/api/files/' + card.file_id + '/tags', method: 'POST', body: { tag: label, polarity: 'positive' } };
     },
     onReject: function(card) {
+      if (card.bbox && card.bbox.length === 4) {
+        return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',
+          body: { label: label, bbox: card.bbox, normalized: true, polarity: 'negative',
+                  image_width: card.image_width, image_height: card.image_height } };
+      }
       return { url: '/api/files/' + card.file_id + '/tags', method: 'POST', body: { tag: label, polarity: 'negative' } };
     },
     onUndo: function(card, action) {
       const polarity = action === 'reject' ? 'negative' : 'positive';
-      return {
-        url: '/api/files/' + card.file_id + '/tags-by-label?label=' + encodeURIComponent(label) + '&polarity=' + polarity,
-        method: 'DELETE',
-      };
+      const params = new URLSearchParams({ label: label, polarity: polarity });
+      if (card.bbox && card.bbox.length === 4) params.set('spatial', 'true');
+      return { url: '/api/files/' + card.file_id + '/tags-by-label?' + params.toString(), method: 'DELETE' };
     },
   });
 })();
