@@ -417,6 +417,31 @@ def _get_age_estimator():
     return _age_estimator
 
 
+_place_encoder = None
+_place_matcher = None
+
+
+def _get_place_encoder(data_root):
+    """Local Visual-Place-Recognition encoder (AnyLoc/EigenPlaces — see place_encoder.py).
+    Runs on the GPU host (the B70) itself, NOT offloaded to the remote worker: the Arc
+    GPU is here, and the worker box may not have it. Lazy singleton."""
+    global _place_encoder
+    if _place_encoder is None:
+        from media_manager.place_encoder import PlaceEncoder
+        _place_encoder = PlaceEncoder(data_root=data_root)
+    return _place_encoder
+
+
+def _get_place_matcher():
+    """Local local-feature matcher (XFeat/SIFT — see place_matcher.py) for the same-spot
+    geometric re-rank. B70-local, same reasoning as the place encoder. Lazy singleton."""
+    global _place_matcher
+    if _place_matcher is None:
+        from media_manager.place_matcher import PlaceMatcher
+        _place_matcher = PlaceMatcher()
+    return _place_matcher
+
+
 def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 260) -> bool:
     """Crop a person from src_path using bbox JSON, save JPEG to dst_path. Unlike
     _make_face_crop this preserves aspect ratio — body boxes are tall, and squashing
@@ -2767,6 +2792,9 @@ def create_app(data_root: str) -> FastAPI:
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # Place (VPR) index: per-image scene descriptor + cached local features, people
+    # masked, for location-by-scene matching + the same-spot geometric re-rank.
+    place_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -4221,6 +4249,85 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(db.get_untiled_files()),
         }
 
+    @app.post('/api/place-index/start')
+    def api_place_index_start(include_trashed: bool = False):
+        """Build the place (Visual Place Recognition) index: for every un-indexed image,
+        compute a scene descriptor with PEOPLE MASKED OUT (person boxes from YOLO
+        detections) and cache its local features for the same-spot re-rank. Runs the
+        encoder/matcher LOCALLY on the GPU host. Background job; poll .../status.
+
+        Needs object detections present for masking to work — run tag/object reindex
+        first, else images are encoded unmasked (people not excluded). A photo the
+        encoder can't turn into a usable descriptor gets a sentinel row so it isn't
+        re-queued."""
+        from media_manager import body_index
+
+        if place_index_job['running']:
+            return {'started': False, 'message': 'Place indexing already running.'}
+        trashed = set() if include_trashed else set(_trashed_file_ids())
+        candidates = [
+            (fid, rel) for (fid, rel) in db.get_unplace_indexed_files()
+            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
+        ]
+        place_index_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                enc = _get_place_encoder(data_root)
+                enc_model = enc.model_id()
+                matcher = None
+                try:
+                    matcher = _get_place_matcher()
+                except Exception as exc:
+                    # Matcher optional for this pass (re-rank just won't have features);
+                    # loud, not silent, then carry on with embeddings only.
+                    print(f'[place-index] matcher unavailable, embeddings only: {exc}', flush=True)
+                done = 0
+                for fid, rel in candidates:
+                    abs_path = _live_abs_path(fid, rel)
+                    if abs_path is None:
+                        done += 1; place_index_job['done'] = done; continue
+                    boxes = db.get_person_detections_for_file(
+                        fid, class_names=body_index.PERSON_LIKE_CLASSES)
+                    try:
+                        embs, failed = enc.embed_images([abs_path], [boxes])
+                        if not failed and embs:
+                            db.insert_place_embedding(fid, embs[0].astype('float32').tobytes(), enc_model)
+                        else:
+                            db.insert_place_embedding(fid, b'', enc_model)  # sentinel
+                            errors.log(rel, f'place embed failed: {failed}')
+                    except Exception as exc:
+                        db.insert_place_embedding(fid, b'', enc_model)      # sentinel, don't re-queue
+                        errors.log(rel, f'place embed error: {exc}')
+                    if matcher is not None:
+                        try:
+                            feat = matcher.extract(abs_path, person_boxes=boxes)
+                            db.insert_place_keypoints(fid, matcher.serialize(feat), matcher.model_id())
+                        except Exception as exc:
+                            errors.log(rel, f'place keypoints error: {exc}')
+                    done += 1
+                    place_index_job['done'] = done
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                place_index_job['error'] = str(exc)
+                print(f'[place-index] FAILED: {exc}', flush=True)
+            finally:
+                place_index_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': place_index_job['total']}
+
+    @app.get('/api/place-index/status')
+    def api_place_index_status():
+        return {
+            'running': place_index_job['running'],
+            'done': place_index_job['done'],
+            'total': place_index_job['total'],
+            'error': place_index_job['error'],
+            'pending': len(db.get_unplace_indexed_files()),
+        }
+
     # ------------------------------------------------------------------
     # JSON API
     # ------------------------------------------------------------------
@@ -5355,7 +5462,23 @@ def create_app(data_root: str) -> FastAPI:
 
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
-        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
+
+        # Rank by the PLACE (scene, people-masked) embedding when the place index is
+        # built, so a location match keys on where the photo was taken — not who's in
+        # it (the whole-image CLIP vector is dominated by people). Fall back to the CLIP
+        # embedding when place isn't indexed yet, keeping member+candidate vectors in the
+        # SAME space (never mix the two). use_place requires BOTH the members and the
+        # library to have place descriptors.
+        place_member = db.get_place_embeddings_for_files(member_ids)
+        use_place = bool(place_member)
+        if use_place:
+            member_embeddings = [e for _fid, e in place_member]
+            all_rows = db.get_all_place_embeddings()
+            if not all_rows:            # members indexed but library isn't — stay coherent
+                use_place = False
+        if not use_place:
+            member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
+            all_rows = db.get_all_embeddings()
 
         centroid = mean_normalized_centroid(member_embeddings)
         # A location with nothing placed at it yet has nothing to compare against
@@ -5371,7 +5494,7 @@ def create_app(data_root: str) -> FastAPI:
         set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
 
         candidates = [
-            row for row in db.get_all_embeddings()
+            row for row in all_rows
             if row[3] not in member_checksums and row[3] not in excluded_checksum_set
             and row[3] not in set_settled_checksums
         ]
@@ -5382,6 +5505,35 @@ def create_app(data_root: str) -> FastAPI:
         if avoid_existing and passing:
             placed_anywhere = manual.get_checksums_with_any_location()
             passing = [item for item in passing if item[0][2] not in placed_anywhere]
+        # Stage 2 — "literally the same spot": re-rank the top candidates by LOCAL-FEATURE
+        # geometric agreement with this location's own photos (people's keypoints already
+        # dropped at place-index time). A candidate that geometrically matches a member
+        # (same walls / landmark / furniture) floats above one that's merely scene-similar.
+        # Only when ranking on place embeddings and both sides have cached features;
+        # best-effort and non-fatal (keeps embedding order on any error); bounded to the
+        # top PLACE_RERANK_CAP so it stays swipe-interactive.
+        if use_place and len(passing) > 1:
+            PLACE_RERANK_CAP, MEMBER_REP_CAP = 30, 4
+            try:
+                mem_kp = db.get_place_keypoints_for_files(member_ids[:MEMBER_REP_CAP])
+                if mem_kp:
+                    matcher = _get_place_matcher()
+                    mem_feats = [matcher.deserialize(b) for b in mem_kp.values()]
+                    head = passing[:PLACE_RERANK_CAP]
+                    cand_kp = db.get_place_keypoints_for_files([it[0][0] for it in head])
+
+                    def _inliers(fid):
+                        blob = cand_kp.get(fid)
+                        if not blob:
+                            return -1
+                        cf = matcher.deserialize(blob)
+                        return max((matcher.match_score(mf, cf).get('inliers', 0)
+                                    for mf in mem_feats), default=0)
+
+                    head = sorted(head, key=lambda it: (_inliers(it[0][0]), it[1]), reverse=True)
+                    passing = head + passing[PLACE_RERANK_CAP:]
+            except Exception:
+                traceback.print_exc()  # loud; fall back to embedding order
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
