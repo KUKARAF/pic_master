@@ -302,6 +302,17 @@ input[type="range"] { accent-color: var(--accent); }
   .nav-links.open { display: flex; }
   .nav-links .nav-link { padding: 12px 18px; font-size: 10px; }
   .nav-search { max-width: none; }
+
+  /* Tinder-style swipe stack on phones. Shorter stack so the yes/no/skip controls
+     stay on screen under the card; the card leaves ~72px of room on the right so the
+     peeked next card (offset 64px by swipe-core's fan) isn't clipped off the edge. */
+  .swipe-stack-wrap { height: 68vh; }
+  .swipe-card { max-width: calc(100% - 72px); }
+  .swipe-card img { max-height: calc(68vh - 120px); }
+  .swipe-controls { gap: 16px; }
+  .swipe-btn { width: 52px; height: 52px; font-size: 20px; }
+  /* The full preview (right-arrow / tap) fills the phone screen. */
+  .swipe-fullview-overlay img { max-width: 100vw; max-height: 100vh; }
 }
 
 .nav-tags-btn {
@@ -2010,6 +2021,10 @@ a.stat-tile .sub { text-decoration: none; }
   top: 0;
   left: 0;
   min-width: 220px;
+  /* Never wider than the stack wrap (which is the container's inner width) — without
+     this a landscape photo, sized by its natural width below, makes the card run off
+     the right edge of the screen (very visible on mobile). */
+  max-width: 100%;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius-card);
@@ -2039,11 +2054,15 @@ a.stat-tile .sub { text-decoration: none; }
   cursor: pointer;
 }
 .swipe-card img {
-  /* Fixed height, natural width — each card takes on its photo's own aspect
-     ratio (portrait/landscape/square) instead of being cropped or letterboxed
-     into a uniform box. */
-  height: calc(80vh - 130px);
+  /* Each card takes on its photo's own aspect ratio (portrait/landscape/square)
+     instead of being cropped or letterboxed into a uniform box: the photo is bounded
+     by BOTH a height budget and the card's width (100% of the card, which is capped to
+     the wrap). Portrait → height binds; landscape → width binds and the height scales
+     down — so a wide photo can no longer overflow the screen. */
+  max-height: calc(80vh - 130px);
+  max-width: 100%;
   width: auto;
+  height: auto;
   display: block;
   pointer-events: none;
 }
