@@ -116,6 +116,7 @@ class Database(ThreadLocalDB):
         self._face_ver = 0
         self._body_ver = 0
         self._tile_ver = 0
+        self._place_ver = 0  # bumped on place_embeddings writes (same pattern as above)
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
         self._emb_cache = None
@@ -408,6 +409,36 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_file ON pattern_tiles(file_id)')
+        # Place embeddings: one Visual-Place-Recognition descriptor per image for
+        # "same physical location" retrieval, computed with people MASKED OUT (so a
+        # location match keys on the scene/background, not who's in frame — unlike the
+        # whole-image `embeddings` CLIP vector, which is dominated by people). Derived,
+        # rebuildable, keyed by file_id; `model` versions the encoder (AnyLoc/EigenPlaces
+        # etc.) so a stale descriptor can be detected and re-indexed. embedding is raw
+        # float32 (D,) L2-normalized np.tobytes(). One row per file (primary frame only).
+        # A sentinel row (empty embedding) marks "processed but no usable place signal"
+        # (e.g. a photo that is all person) so the build job doesn't re-queue it.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_embeddings (
+                file_id INTEGER PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                model TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
+        # Place keypoints: cached local features (XFeat/ALIKED etc.) per image, with
+        # person-box keypoints already dropped, for the geometric "literally the same
+        # spot" re-rank of the top place-retrieval candidates. `features` is the matcher
+        # module's own serialized blob (kpts+desc+size); `model` versions it. Extract
+        # once here, match cheaply at query time. Derived + rebuildable, keyed by file_id.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_keypoints (
+                file_id INTEGER PRIMARY KEY,
+                features BLOB NOT NULL,
+                model TEXT NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
         # Cities: offline GeoNames reference data (cities15000, CC-BY 4.0) for
         # reverse-geocoding a photo's EXIF GPS to the nearest known city NAME
         # (files.city_id → cities.id). Optional/rebuildable — stays empty until
@@ -1911,7 +1942,9 @@ class Database(ThreadLocalDB):
             cursor.execute('SELECT COUNT(*) FROM file_paths WHERE file_id = ?', (file_id,))
             if cursor.fetchone()[0] > 0:
                 continue  # still tracked at another path (a duplicate) — keep its content row
-            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings', 'tile_embeddings', 'file_category_matches'):
+            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings',
+                          'tile_embeddings', 'place_embeddings', 'place_keypoints',
+                          'file_category_matches'):
                 cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
             files_removed += 1
@@ -1942,6 +1975,7 @@ class Database(ThreadLocalDB):
             'SELECT path FROM file_paths WHERE file_id = ?', (file_id,)).fetchall()]
         for table in ('file_paths', 'embeddings', 'phashes', 'dup_group_members', 'tags',
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
+                      'place_embeddings', 'place_keypoints',
                       'pattern_tiles', 'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
         cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
@@ -2707,6 +2741,104 @@ class Database(ThreadLocalDB):
         else:
             cursor.execute(sql)
         return cursor.fetchall()
+
+    # --- Place (Visual Place Recognition) embeddings + cached local features -------
+    # Location matching uses these instead of the whole-image `embeddings` CLIP vector
+    # so it keys on the scene with people masked out. A sentinel row (empty embedding,
+    # x'') marks "processed, no usable place signal" so the build job won't re-queue it;
+    # every read of real descriptors excludes it (embedding != x'').
+
+    EMPTY_BLOB = b''
+
+    def insert_place_embedding(self, file_id, embedding_bytes, model):
+        """Upsert one file's place descriptor (frame-0/primary only). Pass b'' as a
+        sentinel for "processed but no usable place signal" (e.g. an all-person photo),
+        so get_unplace_indexed_files won't re-queue it while real readers skip it."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO place_embeddings (file_id, embedding, model, indexed_at)
+            VALUES (?, ?, ?, strftime('%s','now'))
+            ON CONFLICT(file_id) DO UPDATE SET embedding=excluded.embedding,
+                model=excluded.model, indexed_at=excluded.indexed_at
+        ''', (file_id, embedding_bytes, model))
+        self.conn.commit()
+        self._place_ver += 1  # invalidate any cached place matrix
+
+    def get_all_place_embeddings(self):
+        """(file_id, path, embedding_bytes, checksum) for every file with a REAL place
+        descriptor — same row shape as get_all_embeddings so the location ranking can
+        drop it straight into rank_by_similarity(..., embedding_index=2). Sentinels
+        (empty embedding) are excluded."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            SELECT p.file_id, f.path, p.embedding, f.checksum
+            FROM place_embeddings p
+            JOIN files_with_path f ON f.id = p.file_id
+            WHERE p.embedding != x''
+        ''')
+        return cursor.fetchall()
+
+    def get_place_embeddings_for_files(self, file_ids):
+        """[(file_id, embedding_bytes), ...] real place descriptors for the given files
+        (sentinels excluded) — the location members' centroid source."""
+        if not file_ids:
+            return []
+        placeholders = ','.join('?' for _ in file_ids)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f"SELECT file_id, embedding FROM place_embeddings "
+            f"WHERE embedding != x'' AND file_id IN ({placeholders})",
+            tuple(file_ids)
+        )
+        return cursor.fetchall()
+
+    def get_unplace_indexed_files(self, limit=None) -> list:
+        """(id, path) for tracked files with NO place_embeddings row at all (sentinel
+        rows count as done). Mirrors get_untiled_files; caller skips non-images."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN place_embeddings p ON p.file_id = f.id
+            WHERE p.file_id IS NULL
+        '''
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def insert_place_keypoints(self, file_id, features_blob, model):
+        """Upsert one file's cached local-feature blob (person-box keypoints already
+        dropped) for the geometric same-spot re-rank."""
+        cursor = self.conn.cursor()
+        cursor.execute('''
+            INSERT INTO place_keypoints (file_id, features, model, indexed_at)
+            VALUES (?, ?, ?, strftime('%s','now'))
+            ON CONFLICT(file_id) DO UPDATE SET features=excluded.features,
+                model=excluded.model, indexed_at=excluded.indexed_at
+        ''', (file_id, features_blob, model))
+        self.conn.commit()
+
+    def get_place_keypoints_for_files(self, file_ids):
+        """{file_id: features_blob} for the given files (only those with a row)."""
+        if not file_ids:
+            return {}
+        placeholders = ','.join('?' for _ in file_ids)
+        cursor = self.conn.cursor()
+        cursor.execute(
+            f'SELECT file_id, features FROM place_keypoints WHERE file_id IN ({placeholders})',
+            tuple(file_ids)
+        )
+        return {r[0]: r[1] for r in cursor.fetchall()}
+
+    def get_place_keypoints(self, file_id):
+        """The cached local-feature blob for one file, or None."""
+        cursor = self.conn.cursor()
+        row = cursor.execute(
+            'SELECT features FROM place_keypoints WHERE file_id = ?', (file_id,)
+        ).fetchone()
+        return row[0] if row else None
 
     def iter_tile_embeddings(self, batch_size=20000):
         """Yield (file_ids: np.ndarray[int64], matrix: np.ndarray[k, D] float32)
