@@ -77,14 +77,16 @@
      unindexed count on load. Re-run after adding photos to pick up the new ones. -->
 <div style="margin:4px 0 12px;">
   <div class="bulk-action-row" style="display:flex;align-items:center;gap:8px;">
-    <button type="button" class="bulk-action-btn" data-start="/api/place-index/start"
-            data-status="/api/place-index/status">📌 Build place index (whole library · one-time)</button>
+    <button type="button" class="bulk-action-btn"
+            data-start="/api/locations/{{ location.id }}/index-members"
+            data-status="/api/locations/{{ location.id }}/index-members/status">📌 Index these photos</button>
     <span class="bulk-action-status sub" data-role="status"></span>
   </div>
   <p class="sub" style="margin-top:4px;font-size:0.8em;">
-    Indexes <em>every</em> photo so locations can match by scene — the 7 here are just the
-    target; the rest of the library is what gets ranked against them. Needed once;
-    incremental and skip-done afterwards.
+    Indexes just this location's own photos (fast) so it can be matched against whatever is
+    already in the place index — you search what you've already built, no full-library
+    rebuild. To grow the pool it ranks against, run
+    <a href="/bulk">Bulk → 📌 Index places</a> for the whole library.
   </p>
 </div>
 <!-- Shown (by the preflight below) only when the place index isn't built for this
@@ -94,7 +96,7 @@
 <div id="location-place-warning" class="alert" style="display:none;margin-bottom:12px;">
   📌 Location matching here needs the <strong>place index</strong>, which isn’t built yet.
   It ranks by what the place looks like (people ignored), so there’s nothing to match
-  until it’s built — click <strong>“📌 Index all present”</strong> above, then reload when it finishes.
+  until it’s built — click <strong>“📌 Index these photos”</strong> above (quick), then reload when it finishes.
 </div>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="location-swipe-page" style="flex:1;min-width:300px;">

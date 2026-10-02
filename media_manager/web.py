@@ -2805,6 +2805,9 @@ def create_app(data_root: str) -> FastAPI:
     # Place (VPR) index: per-image scene descriptor + cached local features, people
     # masked, for location-by-scene matching + the same-spot geometric re-rank.
     place_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
+    # Indexing just ONE location's own photos (fast) so it can be searched against the
+    # place index that already exists — no whole-library rebuild required.
+    location_member_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -6598,6 +6601,75 @@ def create_app(data_root: str) -> FastAPI:
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
         ready = bool(member_ids) and bool(db.get_place_embeddings_for_files(member_ids))
         return {'needs_place_index': not ready, 'members': len(member_ids)}
+
+    def _location_unindexed_member_rows(location_id):
+        """(file_id, rel_path) for this location's OWN image members that don't have a
+        place embedding yet — the small, cheap set the location page indexes so it can
+        be searched against the existing place index without a whole-library rebuild."""
+        rows = db.get_files_by_checksums(list(manual.get_checksums_for_location(location_id)))
+        indexed = {fid for fid, _ in db.get_place_embeddings_for_files([r['id'] for r in rows])}
+        return [(r['id'], r['path']) for r in rows
+                if r['id'] not in indexed
+                and os.path.splitext(r['path'])[1].lower() in IMAGE_EXTENSIONS]
+
+    @app.post('/api/locations/{location_id}/index-members')
+    def api_location_index_members(location_id: int):
+        """Place-index just THIS location's own photos (its members), not the whole
+        library. Fast — a handful of images — so the location becomes searchable
+        against whatever is already in the place index. Background job; poll
+        .../index-members/status. The candidate pool for ranking stays 'all place
+        embeddings that exist', so you search what you've already indexed."""
+        from media_manager import body_index, place_index
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        if location_member_index_job['running']:
+            return {'started': False, 'message': 'Already indexing a location.'}
+        cands = _location_unindexed_member_rows(location_id)
+        location_member_index_job.update(running=True, done=0, total=len(cands),
+                                         error=None, device=None)
+
+        def _run():
+            try:
+                enc = _get_place_encoder(data_root)
+                try:
+                    location_member_index_job['device'] = enc.device_label()
+                except Exception:
+                    location_member_index_job['device'] = None
+                matcher = None
+                try:
+                    matcher = _get_place_matcher()
+                except Exception as exc:
+                    print(f'[location-index] matcher unavailable, embeddings only: {exc}', flush=True)
+                place_index.build_place_index(
+                    db, enc, matcher, data_root,
+                    image_exts=IMAGE_EXTENSIONS,
+                    person_boxes_fn=lambda fid: db.get_person_detections_for_file(
+                        fid, class_names=body_index.PERSON_LIKE_CLASSES),
+                    abs_path_fn=_live_abs_path,
+                    candidates=cands,
+                    on_progress=lambda d, t: location_member_index_job.update(done=d, total=t),
+                    log=errors.log)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                location_member_index_job['error'] = str(exc)
+                print(f'[location-index] FAILED: {exc}', flush=True)
+            finally:
+                location_member_index_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': location_member_index_job['total']}
+
+    @app.get('/api/locations/{location_id}/index-members/status')
+    def api_location_index_members_status(location_id: int):
+        return {
+            'running': location_member_index_job['running'],
+            'done': location_member_index_job['done'],
+            'total': location_member_index_job['total'],
+            'error': location_member_index_job['error'],
+            'device': location_member_index_job.get('device'),
+            'pending': len(_location_unindexed_member_rows(location_id)),
+        }
 
     @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
     def api_exclude_file_location(file_id: int, location_id: int):
