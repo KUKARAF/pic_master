@@ -442,6 +442,16 @@ def _get_place_matcher():
     return _place_matcher
 
 
+def _ml_device_label():
+    """Device label for the torch/CLIP bulk jobs' status, so /bulk shows GPU vs CPU
+    live. These offload to the worker when one is configured (so the compute isn't
+    local at all); otherwise they run on this host's torch accelerator."""
+    if _worker_client is not None and _worker_client.is_configured():
+        return 'worker (offloaded)'
+    from media_manager import compute
+    return compute.accelerator_label()
+
+
 def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 260) -> bool:
     """Crop a person from src_path using bbox JSON, save JPEG to dst_path. Unlike
     _make_face_crop this preserves aspect ratio — body boxes are tall, and squashing
@@ -2794,7 +2804,7 @@ def create_app(data_root: str) -> FastAPI:
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Place (VPR) index: per-image scene descriptor + cached local features, people
     # masked, for location-by-scene matching + the same-spot geometric re-rank.
-    place_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    place_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -3103,6 +3113,7 @@ def create_app(data_root: str) -> FastAPI:
             'error': body_index_job['error'],
             'pending': len(db.get_unbody_indexed_files()),
             'empty': db.count_body_sentinels(),
+            'device': _ml_device_label(),
         }
 
     @app.post('/api/index/start')
@@ -3157,6 +3168,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': index_job['total'],
             'error': index_job['error'],
             'pending': len(db.get_unindexed_files()),
+            'device': _ml_device_label(),
         }
 
     def _unphashed_images():
@@ -4247,6 +4259,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': tile_index_job['total'],
             'error': tile_index_job['error'],
             'pending': len(db.get_untiled_files()),
+            'device': _ml_device_label(),
         }
 
     @app.post('/api/place-index/start')
@@ -4269,12 +4282,18 @@ def create_app(data_root: str) -> FastAPI:
             (fid, rel) for (fid, rel) in db.get_unplace_indexed_files()
             if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
         ]
-        place_index_job.update(running=True, done=0, total=len(candidates), error=None)
+        place_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
 
         def _run():
             from media_manager import place_index
             try:
                 enc = _get_place_encoder(data_root)
+                # Surface GPU vs CPU live in /bulk — the encoder knows its real device
+                # (torch for eigenplaces, OpenVINO for anyloc).
+                try:
+                    place_index_job['device'] = enc.device_label()
+                except Exception:
+                    place_index_job['device'] = None
                 matcher = None
                 try:
                     matcher = _get_place_matcher()
@@ -4310,6 +4329,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': place_index_job['total'],
             'error': place_index_job['error'],
             'pending': len(db.get_unplace_indexed_files()),
+            'device': place_index_job.get('device'),
         }
 
     # ------------------------------------------------------------------

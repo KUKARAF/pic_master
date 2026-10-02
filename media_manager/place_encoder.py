@@ -213,6 +213,20 @@ class PlaceEncoder:
             self.model_name = "anyloc" if self._anyloc_available() else "eigenplaces"
         return self.model_name
 
+    def device_label(self) -> str:
+        """Short human label of the device this encoder runs on, for job status (so a
+        run visibly says GPU vs CPU). Accurate per backend: eigenplaces uses the torch
+        device; anyloc uses its OpenVINO device. Call after loading for the real answer
+        (before load it reflects what it WOULD use)."""
+        self._resolve()
+        if self.model_name == "eigenplaces":
+            from . import compute
+            d = self._torch_device or compute.torch_device()
+            return {"xpu": "GPU (Intel XPU)", "cuda": "GPU (CUDA)",
+                    "mps": "GPU (Apple MPS)", "cpu": "CPU"}.get(str(d), str(d).upper())
+        dev = (self.device or "GPU").upper()
+        return "CPU (OpenVINO)" if dev == "CPU" else f"GPU (OpenVINO {dev})"
+
     # ------------------------------------------------------------------ metadata
 
     def model_id(self) -> str:

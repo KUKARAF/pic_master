@@ -88,6 +88,9 @@
       if (d.error) return 'error: ' + d.error;
       var doneN = d.done || 0, total = d.total || 0;
       var s = doneN.toLocaleString() + '/' + total.toLocaleString();
+      // Show which compute device the run is actually on (GPU vs CPU) when the job
+      // reports it — so a silent CPU fallback is obvious instead of invisible.
+      if (d.device) s += ' · ' + d.device;
       if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' ' + (countLabel || 'matched');
       if (rate && rate > 0) s += ' · ~' + Math.round(rate * 60) + '/min';
       // ETA: prefer a server-provided estimate (e.g. the imdb index load),

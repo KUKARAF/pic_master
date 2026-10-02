@@ -168,6 +168,18 @@ def describe() -> str:
     return f"torch={torch_device()} onnx={provs}"
 
 
+def accelerator_label() -> str:
+    """Short human label of the active torch compute device, for UI/job status —
+    so a run visibly says whether it's on the GPU or (silently) the CPU. Reflects
+    what the torch models actually run on (torch_device() is cached per process)."""
+    return {
+        "xpu": "GPU (Intel XPU)",
+        "cuda": "GPU (CUDA)",
+        "mps": "GPU (Apple MPS)",
+        "cpu": "CPU",
+    }.get(torch_device(), torch_device().upper())
+
+
 @functools.lru_cache(maxsize=None)
 def _warn_missing_ep(device: str, want: str) -> None:
     """One-time stderr warning when the torch device is a GPU but the matching
