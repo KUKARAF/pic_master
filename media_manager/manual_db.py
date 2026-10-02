@@ -3482,6 +3482,22 @@ class ManualDB(ThreadLocalDB):
                        WHERE identity IS NOT NULL AND rejected = 0''')
         return [(r[0], r[1], [r[2], r[3], r[4], r[5]]) for r in cur.fetchall()]
 
+    def get_named_faces_for_checksum(self, checksum):
+        """[(identity, [x1,y1,x2,y2]), ...] for the named faces ON one photo — the
+        first (GPU-free, near-certain) signal when suggesting who a drawn body is."""
+        cur = self.conn.cursor()
+        cur.execute('''SELECT identity, x1, y1, x2, y2 FROM faces
+                       WHERE checksum = ? AND identity IS NOT NULL AND rejected = 0''', (checksum,))
+        return [(r[0], [r[1], r[2], r[3], r[4]]) for r in cur.fetchall()]
+
+    def get_all_body_label_embeddings(self):
+        """[(identity, embedding_bytes), ...] over every confirmed body label — the
+        anchor pool for suggesting an identity from a drawn body crop (body match)."""
+        cur = self.conn.cursor()
+        cur.execute('''SELECT identity, embedding FROM body_identities
+                       WHERE identity IS NOT NULL AND rejected = 0''')
+        return cur.fetchall()
+
     def reject_body_candidate(self, source_body_id, checksum, identity, bbox,
                               embedding_bytes, model):
         """'This body is NOT <identity>' from the body-search swipe — kept as a

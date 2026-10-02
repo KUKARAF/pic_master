@@ -3918,6 +3918,12 @@
       nameInput.style.cssText = 'width:100%;margin:4px 0 12px;';
       const datalist = document.createElement('datalist');
       datalist.id = 'label-person-datalist';
+      // Recognition hint: shown when the server guesses who this body is (labeled
+      // face in the box / face recognition / known-body match). Pre-fills the name
+      // but writes nothing — the user still confirms with Save.
+      const guess = document.createElement('div');
+      guess.className = 'sub'; guess.style.cssText = 'margin:0 0 10px;min-height:1.1em;color:var(--muted,#999);';
+      guess.textContent = 'Recognizing…';
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
       const saveBtn = document.createElement('button');
@@ -3930,7 +3936,7 @@
       const err = document.createElement('div');
       err.className = 'sub'; err.style.cssText = 'color:#e0a;margin-top:8px;';
       row.appendChild(saveBtn); row.appendChild(anonBtn);
-      [nameLbl, nameInput, datalist, row, note, err].forEach(function (el) { box.appendChild(el); });
+      [nameLbl, nameInput, datalist, guess, row, note, err].forEach(function (el) { box.appendChild(el); });
 
       fetch('/api/identities')
         .then(function (r) { return r.json(); })
@@ -3943,6 +3949,25 @@
           });
         })
         .catch(function () {});
+
+      // Ask the server who this body is and pre-fill the name (never auto-saves).
+      // Don't stomp on anything the user has already typed by the time it returns.
+      const SRC = { 'labeled-face': 'from their labeled face',
+                    'face-match': 'recognized their face',
+                    'body-match': 'matches a known body' };
+      fetch('/api/files/' + fileId + '/suggest-body-identity', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bbox: bbox }),
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (res) {
+          if (!res || !res.name) { guess.textContent = 'No match — type a name.'; return; }
+          const why = SRC[res.source] || 'suggested';
+          const sc = (res.source !== 'labeled-face' && res.score != null) ? ' (' + res.score.toFixed(2) + ')' : '';
+          guess.innerHTML = '✓ looks like <strong>' + escapeHtml(res.name) + '</strong> — ' + escapeHtml(why) + sc + ' · change if wrong';
+          if (!nameInput.value.trim()) nameInput.value = res.name;
+        })
+        .catch(function () { guess.textContent = ''; });
 
       saveBtn.addEventListener('click', function () {
         const nm = nameInput.value.trim();

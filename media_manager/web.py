@@ -3279,6 +3279,70 @@ def create_app(data_root: str) -> FastAPI:
                               source_body_id=bid, source='face-link')
         return bid
 
+    @app.post('/api/files/{file_id}/suggest-body-identity')
+    def api_suggest_body_identity(file_id: int, body: ManualFaceBody):
+        """Best guess for WHO a just-drawn body box is, so "Label person" can pre-fill
+        the name. Three signals, surest + cheapest first, stopping at the first hit:
+          1. labeled-face: a face already named on THIS photo sits inside the box
+             (pure geometry, no GPU, near-certain);
+          2. face-match: detect+recognize a face in the box against known people (GPU,
+             only if #1 misses);
+          3. body-match: rank the body crop against known body anchors (CLIP).
+        Returns {name, source, score} or {name: None}. A suggestion only — nothing is
+        written here; the user still confirms in the modal."""
+        from media_manager.body_index import _containment, match_face_to_body, crop_bodies, \
+            MIN_FACE_IN_BODY_OVERLAP
+        if len(body.bbox) != 4:
+            raise HTTPException(status_code=400, detail='bbox must be [x1,y1,x2,y2]')
+        row = _file_or_404(file_id)
+        draw = [float(v) for v in body.bbox]
+
+        # 1) A face already named on this photo, whose box falls inside the drawn body.
+        best_name, best_cont = None, MIN_FACE_IN_BODY_OVERLAP
+        for identity, fbox in manual.get_named_faces_for_checksum(row['checksum']):
+            cont = _containment(fbox, draw)
+            if cont >= best_cont:
+                best_cont, best_name = cont, identity
+        if best_name is not None:
+            return {'name': best_name, 'source': 'labeled-face', 'score': 1.0}
+
+        abs_path = _live_abs_path(file_id, row['path'])
+
+        # 2) Recognize a face detected inside the drawn box against known identities.
+        if abs_path is not None:
+            try:
+                import cv2
+                img = cv2.imread(abs_path)
+                if img is not None:
+                    res = _get_face_detector().embed_bbox(img, draw)
+                    # det_score 0 == the unaligned last-resort fallback (no real face
+                    # found): don't match on that, it's barely an embedding.
+                    if res.get('det_score', 0.0) > 0 and res.get('embedding') is not None:
+                        name, score = manual.find_matching_identity(res['embedding'].astype('float32').tobytes())
+                        if name:
+                            return {'name': name, 'source': 'face-match', 'score': round(float(score), 3)}
+            except Exception as exc:
+                errors.log(f'[suggest-body-identity] face recognize failed on {file_id}: {exc}')
+
+        # 3) Body match: the drawn crop vs known body anchors.
+        if abs_path is not None:
+            try:
+                import numpy as np
+                anchors = manual.get_all_body_label_embeddings()
+                pairs = crop_bodies(abs_path, [[int(draw[0]), int(draw[1]), int(draw[2]), int(draw[3])]])
+                if anchors and pairs:
+                    q = _get_clip_indexer().embed_pil_images([pairs[0][1]])[0].astype('float32')
+                    names = [a[0] for a in anchors]
+                    mat = np.stack([np.frombuffer(a[1], dtype=np.float32) for a in anchors])
+                    scores = mat.dot(q)
+                    bi = int(scores.argmax())
+                    if float(scores[bi]) >= BODY_SUGGEST_THRESHOLD:
+                        return {'name': names[bi], 'source': 'body-match', 'score': round(float(scores[bi]), 3)}
+            except Exception as exc:
+                errors.log(f'[suggest-body-identity] body match failed on {file_id}: {exc}')
+
+        return {'name': None}
+
     @app.post('/api/bodies/{body_id}/identity')
     def api_assign_body_identity(body_id: int, body: IdentityBody):
         """Confirm an unlabeled body (from the swipe) as this person — writes a

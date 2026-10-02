@@ -219,7 +219,44 @@ def main_autolink():
     print('\nFACE->BODY AUTO-LINK TESTS PASSED')
 
 
+def main_suggest():
+    """suggest-body-identity, signal #1 — a face already named on the photo, whose box
+    falls inside the drawn body box, is suggested with no GPU. Signals #2 (face
+    recognition) and #3 (body match) only run when the file is on disk (they decode the
+    image / embed the crop); these DB-only fixtures have no real files, so those tiers
+    are correctly skipped and the endpoint returns {name:None}. Their wiring is covered
+    by the build route-check."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
+        app = create_app(tmp)
+        db, _errors, manual = app.state.dbs
+        client = TestClient(app)
+        rng = np.random.default_rng(29)
+
+        cs1 = ('s1' * 20)[:40]
+        fid1 = db.upsert_file_path('s1.jpg', cs1, size=100)
+        db.conn.commit()  # make the file row visible to the request handler's connection
+        # add_manual_face stores no identity; name it through the confirm path.
+        face1 = manual.add_manual_face(cs1, [20, 10, 40, 35], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
+        client.post('/api/faces/manual:%d/identity' % face1, json={'name': 'Dana'})
+
+        # Drawn body box covers the labeled face -> suggest Dana.
+        r = client.post('/api/files/%d/suggest-body-identity' % fid1, json={'bbox': [0, 0, 100, 200]})
+        assert r.status_code == 200, r.text
+        j = r.json()
+        assert j['name'] == 'Dana' and j['source'] == 'labeled-face' and j['score'] == 1.0, j
+        print('ok: signal #1 — a labeled face in the box suggests that person')
+
+        # A box that excludes the face -> no false suggestion (and no disk/GPU work).
+        r = client.post('/api/files/%d/suggest-body-identity' % fid1, json={'bbox': [60, 120, 95, 195]})
+        assert r.json()['name'] is None, r.json()
+        print('ok: a box not covering the face gives no false suggestion')
+
+    print('\nSUGGEST-IDENTITY TESTS PASSED')
+
+
 if __name__ == '__main__':
     main()
     main_autolink()
+    main_suggest()
     print('\nALL TESTS PASSED')
