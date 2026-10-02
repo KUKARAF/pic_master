@@ -90,12 +90,15 @@ class WorkerModels:
 models = WorkerModels()
 
 # Age/gender (MiVOLO) runs in its OWN isolated .age-venv subprocess (see
-# age_estimator.py), NOT in this process — so it doesn't contend with the three
-# in-process models above, and gets its own lock rather than models.lock. The
-# lock just serializes concurrent age requests so two MiVOLO subprocesses can't
-# spike RAM at once. Lazily built (its __init__ only resolves the venv path).
+# age_estimator.py) to avoid RAM contention with the three in-process models.
+# BUT that subprocess still runs on the SAME Arc GPU (torch-XPU / Level-Zero), so
+# running it WHILE an OpenVINO face/CLIP/YOLO inference is live means two GPU
+# runtimes contend on one device — the intermittent "[GPU] CL_OUT_OF_RESOURCES"
+# driver crash. So age estimation now takes the SAME models.lock as the OpenVINO
+# paths: the venv stays isolated for RAM, but GPU work is serialized end-to-end
+# (one GPU op at a time). Ping doesn't take the lock, so health checks stay
+# responsive. Lazily built (its __init__ only resolves the venv path).
 _age_estimator = None
-_age_lock = threading.Lock()
 
 
 def _get_age_estimator():
@@ -402,7 +405,10 @@ def handle_estimate_age(path, data, request_id, link_id, remote_identity, reques
         # ('ref' + 'bbox'); it returns [{face_ref, age, gender}, ...] already.
         faces = [{"ref": f["face_ref"], "bbox": f["bbox"]} for f in (req.get("faces") or [])]
         tmp = _write_temp(req["image"], name)
-        with _age_lock:
+        # Shares models.lock (NOT a separate lock) so MiVOLO's GPU work never runs
+        # concurrently with OpenVINO face/CLIP/YOLO inference — see the note by
+        # _age_estimator above (prevents Arc CL_OUT_OF_RESOURCES).
+        with models.lock:
             results = _get_age_estimator().estimate(tmp, faces)
         print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> "
               f"{len(results)} face(s)", flush=True)
