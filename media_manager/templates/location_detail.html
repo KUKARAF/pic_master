@@ -75,10 +75,17 @@
      every photo so this and every location can match by scene. Reuses the shared
      bulk-action wiring in app.js — live progress + the GPU/CPU device, and shows the
      unindexed count on load. Re-run after adding photos to pick up the new ones. -->
-<div class="bulk-action-row" style="display:flex;align-items:center;gap:8px;margin:4px 0 12px;">
-  <button type="button" class="bulk-action-btn" data-start="/api/place-index/start"
-          data-status="/api/place-index/status">📌 Index all present (build place index)</button>
-  <span class="bulk-action-status sub" data-role="status"></span>
+<div style="margin:4px 0 12px;">
+  <div class="bulk-action-row" style="display:flex;align-items:center;gap:8px;">
+    <button type="button" class="bulk-action-btn" data-start="/api/place-index/start"
+            data-status="/api/place-index/status">📌 Build place index (whole library · one-time)</button>
+    <span class="bulk-action-status sub" data-role="status"></span>
+  </div>
+  <p class="sub" style="margin-top:4px;font-size:0.8em;">
+    Indexes <em>every</em> photo so locations can match by scene — the 7 here are just the
+    target; the rest of the library is what gets ranked against them. Needed once;
+    incremental and skip-done afterwards.
+  </p>
 </div>
 <!-- Shown (by the preflight below) only when the place index isn't built for this
      location. Location matching is scene-based with people masked out and does NOT
