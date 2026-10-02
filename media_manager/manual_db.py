@@ -786,6 +786,22 @@ class ManualDB(ThreadLocalDB):
             'CREATE UNIQUE INDEX IF NOT EXISTS idx_body_identities_source '
             'ON body_identities (source_body_id) WHERE source_body_id IS NOT NULL'
         )
+        # Per-identity face negatives: "this auto-detected face is NOT <identity>".
+        # Distinct from reject_auto_face (a GLOBAL 'not a face / not anyone' that pulls
+        # the face out of the unknown pool): a negative keeps the face available to be
+        # matched to the RIGHT person, it just bars this one identity. Keyed by
+        # source_face_id (the media.db auto face id) because that survives the face
+        # being returned to the unknown pool. Powers the /person cleanup "broom".
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS face_identity_negatives (
+                source_face_id INTEGER NOT NULL,
+                identity       TEXT NOT NULL,
+                created_at     INTEGER NOT NULL,
+                UNIQUE(source_face_id, identity)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_face_neg_identity ON face_identity_negatives (identity)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_face_neg_source ON face_identity_negatives (source_face_id)')
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -2840,6 +2856,37 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
         self._face_ver += 1
 
+    # ---- Per-identity face negatives (the cleanup "broom"): bar one identity from a
+    # ---- face without removing it from the unknown pool (see the table comment).
+
+    def add_face_identity_negative(self, source_face_id, identity):
+        """Record 'auto face `source_face_id` is NOT `identity`'. Idempotent."""
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR IGNORE INTO face_identity_negatives (source_face_id, identity, created_at) '
+                    'VALUES (?,?,?)', (int(source_face_id), identity, int(time.time())))
+        self.conn.commit()
+
+    def remove_face_identity_negative(self, source_face_id, identity):
+        """Undo a face negative (the broom's Ctrl+Z)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM face_identity_negatives WHERE source_face_id = ? AND identity = ?',
+                    (int(source_face_id), identity))
+        self.conn.commit()
+
+    def get_negated_face_ids_for_identity(self, identity):
+        """set() of source_face_ids barred from `identity` — excluded from that person's
+        face-suggestion stream and auto-match promotion so a cleaned face never returns."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT source_face_id FROM face_identity_negatives WHERE identity = ?', (identity,))
+        return {int(r[0]) for r in cur.fetchall()}
+
+    def is_face_negated(self, source_face_id, identity):
+        """True if this auto face was marked 'not <identity>'."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT 1 FROM face_identity_negatives WHERE source_face_id = ? AND identity = ? LIMIT 1',
+                    (int(source_face_id), identity))
+        return cur.fetchone() is not None
+
     def set_face_rotation(self, manual_face_id, rotation, embedding_bytes=None):
         """Persist a manual 90° rotation (0..3 quarter-turns, clockwise) on a face so
         its crop renders upright everywhere. When `embedding_bytes` is given, replace
@@ -2896,6 +2943,7 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE body_identities SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE face_identity_negatives SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))

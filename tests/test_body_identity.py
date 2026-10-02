@@ -276,8 +276,84 @@ def main_suggest():
     print('\nSUGGEST-IDENTITY TESTS PASSED')
 
 
+def main_broom():
+    """Cleanup broom: a bad anchor's victims are rankable, removable (back to unknown +
+    barred from this person), excluded from that person's suggestion stream afterwards,
+    and the removal is undoable. All on seeded face embeddings (no detector)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
+        app = create_app(tmp)
+        db, _errors, manual = app.state.dbs
+        client = TestClient(app)
+        rng = np.random.default_rng(41)
+
+        alex = _unit(rng.standard_normal(D))      # the real Alex direction
+        junk = _unit(rng.standard_normal(D))      # the scrambled "trashcan" anchor
+
+        def auto_face(name, vec):
+            """Create a file + one auto-detected media.db face carrying this embedding."""
+            cs = (name * 10)[:40]
+            fid = db.upsert_file_path(name + '.jpg', cs, size=100)
+            db.insert_faces(fid, [{'bbox': [0, 0, 20, 20], 'embedding': vec, 'det_score': 0.9}], 'test')
+            db.conn.commit()
+            return cs, fid
+
+        # Good Alex anchors (two real faces) + the junk anchor, all confirmed as Alex.
+        good1 = _unit(alex + SIGMA * rng.standard_normal(D))
+        good2 = _unit(alex + SIGMA * rng.standard_normal(D))
+        g1_cs, _ = auto_face('ag1', good1)
+        g2_cs, _ = auto_face('ag2', good2)
+        j_cs, _ = auto_face('ajunk', junk)
+        gf1 = manual.add_manual_face(g1_cs, [0, 0, 20, 20], good1.tobytes(), 100, 100)
+        manual.assign_identity(gf1, 'Alex')
+        gf2 = manual.add_manual_face(g2_cs, [0, 0, 20, 20], good2.tobytes(), 100, 100)
+        manual.assign_identity(gf2, 'Alex')
+        # The suspect: a confirmed Alex face carrying the junk embedding.
+        jf = manual.add_manual_face(j_cs, [0, 0, 20, 20], junk.tobytes(), 100, 100)
+        manual.assign_identity(jf, 'Alex')
+        # Give the suspect a source_face_id so remove/undo exercises the real path:
+        # make a victim that is a PROMOTED auto face resembling the junk anchor.
+        victim_vec = _unit(junk + SIGMA * rng.standard_normal(D))
+        v_cs, v_fid = auto_face('avictim', victim_vec)
+        v_auto_id = db.get_faces_for_file(v_fid)[0]['id']
+        promoted = manual.promote_auto_face(v_auto_id, v_cs, [0, 0, 20, 20], victim_vec.tobytes(),
+                                            'Alex', None, None)
+        db.mark_faces_handled([v_auto_id])
+
+        suspect_ref = 'manual:%d' % jf
+        r = client.post('/api/person/Alex/broom-candidates?suspect=%s' % suspect_ref, json={'exclude': []})
+        assert r.status_code == 200, r.text
+        refs = {c['ref'] for c in r.json()['cards']}
+        assert ('manual:%d' % promoted) in refs, refs          # victim surfaces
+        assert ('manual:%d' % gf1) not in refs                 # a real Alex face does not
+        assert ('manual:%d' % gf2) not in refs
+        print('ok: broom surfaces the suspect\'s victims, not the real faces')
+
+        # Remove the victim -> returned to unknown + barred from Alex.
+        r = client.post('/api/faces/manual:%d/not-identity' % promoted, json={'name': 'Alex'})
+        assert r.status_code == 200 and r.json()['returned_to_unknown'], r.text
+        assert manual.is_face_negated(v_auto_id, 'Alex')
+        assert v_cs not in {cs for _id, cs, _e in manual.get_faces_for_identity('Alex')}
+        print('ok: removal returns the face to unknown AND bars it from this person')
+
+        # The barred face must not come back via Alex's suggestion stream.
+        r = client.post('/api/face-suggestions/next?identity=Alex&count=50', json={'exclude': []})
+        assert v_auto_id not in {c.get('face_id') for c in r.json()['cards']}, 'negated face re-offered'
+        print('ok: a barred face is excluded from the person\'s face-suggestion stream')
+
+        # Undo -> negative dropped and the face is Alex again.
+        r = client.delete('/api/faces/auto:%d/not-identity?name=Alex' % v_auto_id)
+        assert r.status_code == 200, r.text
+        assert not manual.is_face_negated(v_auto_id, 'Alex')
+        assert v_cs in {cs for _id, cs, _e in manual.get_faces_for_identity('Alex')}
+        print('ok: undo clears the negative and restores the assignment')
+
+    print('\nCLEANUP-BROOM TESTS PASSED')
+
+
 if __name__ == '__main__':
     main()
     main_autolink()
     main_suggest()
+    main_broom()
     print('\nALL TESTS PASSED')

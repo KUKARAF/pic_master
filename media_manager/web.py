@@ -2493,6 +2493,21 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    @app.get('/person/{name}/cleanup', response_class=HTMLResponse)
+    def cleanup_person_page(request: Request, name: str):
+        """Cleanup "broom": pick one of this person's faces as a suspect bad anchor
+        (e.g. one embedded at an odd angle that now matches everything), then review
+        and remove the faces it wrongly holds — each returned to the unknown pool AND
+        barred from this person. Reachable via the 🧹 icon on /person/{name}."""
+        canonical = manual.resolve_identity_name(name)
+        if canonical != name:
+            return RedirectResponse(url=f'/person/{quote(canonical)}/cleanup')
+        return templates.TemplateResponse(request, 'cleanup_person.html', {
+            'name': name,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
     @app.get('/person/{name}/split', response_class=HTMLResponse)
     def split_person_page(request: Request, name: str, with_: str = Query('', alias='with')):
         """'Split' review: walks every real face currently assigned to `name`
@@ -2555,6 +2570,68 @@ def create_app(data_root: str) -> FastAPI:
     def api_split_candidates(name: str, body: SwipeExcludeBody, with_: str = Query(..., alias='with'), count: int = 10):
         exclude_refs = set(body.exclude)
         return {'cards': _next_split_candidates(name, with_, exclude_refs, count)}
+
+    def _next_broom_candidates(name, suspect_ref, exclude_refs, count):
+        """Faces assigned to `name` that are 'held' by ONE suspect face — i.e. they
+        resemble the suspect more than they resemble the person's OTHER confirmed
+        faces. A face embedded at a bad angle becomes a scrambled 'trashcan' anchor
+        that pulls in unrelated faces; this surfaces exactly those victims so they can
+        be removed. Score = cos(face, suspect) − max cos(face, name's good faces);
+        > 0 means the suspect explains the assignment better than the real you.
+        Best-first. The suspect itself is excluded from the results."""
+        import numpy as np
+        kind, raw = _parse_face_ref(suspect_ref)
+        suspect_row = manual.get_face(raw) if kind == 'manual' else None
+        if suspect_row is None or not suspect_row['embedding']:
+            return []
+        suspect_vec = np.frombuffer(suspect_row['embedding'], dtype=np.float32)
+        faces = manual.get_faces_for_identity(name)
+        # "Good" anchors = every Alex face EXCEPT the suspect, kept with their face_id so
+        # each candidate can be compared against the others WITHOUT including itself
+        # (otherwise sim_good is always 1.0 and nothing ever surfaces).
+        good = [(fid, np.frombuffer(e, dtype=np.float32)) for fid, _cs, e in faces if fid != raw and e]
+        cands = []  # (score, ref, file_id, sim_suspect, sim_good)
+        for face_id, checksum, emb in faces:
+            if face_id == raw or not emb:
+                continue
+            ref = f'manual:{face_id}'
+            if ref in exclude_refs:
+                continue
+            frow = db.get_file_by_checksum(checksum)
+            if frow is None:
+                continue
+            v = np.frombuffer(emb, dtype=np.float32)
+            sim_suspect = float(v.dot(suspect_vec))
+            others = [gv for gfid, gv in good if gfid != face_id]
+            sim_good = max((float(gv.dot(v)) for gv in others), default=0.0)
+            score = sim_suspect - sim_good
+            if score > 0:
+                cands.append((score, ref, frow['id'], sim_suspect, sim_good))
+        cands.sort(key=lambda c: -c[0])
+        cards = []
+        for sc, ref, fid, ss, sg in cands[:count]:
+            srow = manual.get_face(int(ref.split(':', 1)[1]))
+            cards.append({'ref': ref, 'file_id': fid, 'score': round(sc, 3),
+                          'sim_suspect': round(ss, 3), 'sim_good': round(sg, 3),
+                          'source_face_id': (srow['source_face_id'] if srow else None)})
+        return _attach_file_meta(cards)
+
+    @app.post('/api/person/{name}/broom-candidates')
+    def api_broom_candidates(name: str, body: SwipeExcludeBody, suspect: str = Query(...), count: int = 20):
+        """Victims held by the `suspect` face (a manual:<id> ref of one of `name`'s
+        confirmed faces). See _next_broom_candidates."""
+        return {'cards': _next_broom_candidates(name, suspect, set(body.exclude), count)}
+
+    @app.get('/api/person/{name}/faces')
+    def api_person_faces(name: str):
+        """This person's own confirmed faces as selectable refs+crops — the picker the
+        cleanup page uses to choose the suspect anchor."""
+        canonical = manual.resolve_identity_name(name)
+        out = []
+        for face_id, checksum, _emb in manual.get_faces_for_identity(canonical):
+            frow = db.get_file_by_checksum(checksum)
+            out.append({'ref': f'manual:{face_id}', 'file_id': (frow['id'] if frow else None)})
+        return {'faces': out}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int):
@@ -4068,6 +4145,8 @@ def create_app(data_root: str) -> FastAPI:
                             name, _score = manual.find_matching_identity(emb, threshold=threshold)
                             if name is None:
                                 continue
+                            if manual.is_face_negated(face_row['id'], name):
+                                continue  # a human said this face is not this person
                             manual.promote_auto_face(face_row['id'], row['checksum'],
                                                      json.loads(face_row['bbox']), emb, name, None, None)
                             db.mark_faces_handled([face_row['id']])
@@ -4597,6 +4676,8 @@ def create_app(data_root: str) -> FastAPI:
                     name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
                     if name is None:
                         continue
+                    if manual.is_face_negated(face_id, name):
+                        continue  # a human said this face is not this person (cleanup broom)
                     file_row = db.get_file_by_id(file_id)
                     if file_row is None:
                         continue
@@ -8430,9 +8511,12 @@ def create_app(data_root: str) -> FastAPI:
                 return []
             import numpy as np
             matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
+            # Faces a human said are NOT this person (cleanup broom) must never be
+            # re-offered as them, no matter how well they score.
+            negated = manual.get_negated_face_ids_for_identity(identity_filter)
             for face_id_, file_id_, _path, _bbox, emb_bytes in _unpromoted_auto_faces(limit=None):
                 ref = f"auto:{face_id_}"
-                if ref in exclude_refs or not emb_bytes:
+                if ref in exclude_refs or not emb_bytes or face_id_ in negated:
                     continue
                 vec = np.frombuffer(emb_bytes, dtype=np.float32)
                 score = float(matrix.dot(vec).max())
@@ -8866,6 +8950,48 @@ def create_app(data_root: str) -> FastAPI:
         # `handled` is all it takes to resurface it.
         db.mark_faces_handled([raw_id], 0)
         return {'ok': True}
+
+    @app.post('/api/faces/{face_id}/not-identity')
+    def api_face_not_identity(face_id: str, body: IdentityBody):
+        """The cleanup "broom" action: this face is NOT `name`. Returns the face to the
+        unknown pool (so it can still be matched to the RIGHT person) AND records a
+        per-identity negative so it is never re-suggested or auto-matched as `name`
+        again — unlike a plain reject, which would remove it from the pool entirely.
+        For a hand-drawn face (no auto source to return to), it's rejected instead."""
+        name = (body.name or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='name required')
+        name = manual.resolve_identity_name(name)
+        kind, raw_id = _parse_face_ref(face_id)
+        if kind == 'manual':
+            row = manual.get_face(raw_id)
+            if row is None:
+                raise HTTPException(status_code=404, detail='Face not found')
+            src = row['source_face_id']
+            if src is None:
+                manual.reject_face(raw_id)  # hand-drawn: nothing to return to the pool
+                return {'ok': True, 'source_face_id': None, 'returned_to_unknown': False}
+            raw_id = int(src)
+        manual.add_face_identity_negative(raw_id, name)
+        manual.delete_face_decision_by_source(raw_id)
+        db.mark_faces_handled([raw_id], 0)
+        return {'ok': True, 'source_face_id': raw_id, 'returned_to_unknown': True}
+
+    @app.delete('/api/faces/{face_id}/not-identity')
+    def api_undo_face_not_identity(face_id: str, name: str = Query(...)):
+        """Undo a broom removal: drop the negative and put the face back on `name`.
+        `face_id` is auto:<source_face_id> for a returned-to-unknown face, or
+        manual:<id> for an un-rejected hand-drawn one (see api_face_not_identity)."""
+        name = manual.resolve_identity_name((name or '').strip())
+        kind, raw_id = _parse_face_ref(face_id)
+        if kind == 'manual':
+            manual.assign_identity(raw_id, name)  # un-reject + re-name the hand-drawn face
+            return {'ok': True, 'face_id': face_id, 'identity': name}
+        manual.remove_face_identity_negative(raw_id, name)
+        new_id = _confirm_auto_face(raw_id, name)
+        if new_id is None:
+            raise HTTPException(status_code=404, detail='Face not found')
+        return {'ok': True, 'face_id': f'manual:{new_id}', 'identity': name}
 
     @app.post('/api/faces/{face_id}/favorite')
     def api_set_face_favorite(face_id: str, body: FavoriteBody):

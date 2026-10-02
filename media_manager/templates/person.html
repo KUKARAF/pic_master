@@ -12,6 +12,7 @@
     <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
     <button type="button" id="estimate-all-age-btn" class="heart-btn-inline" title="Estimate age &amp; gender for every photo of {{ name }}">🎂</button>
     <button type="button" id="person-split-btn" class="heart-btn-inline" title="Split off photos that are actually someone else">✂️</button>
+    <a href="/person/{{ name | urlencode }}/cleanup" class="heart-btn-inline" title="Clean up: remove faces a bad anchor wrongly pulled in">🧹</a>
   </h1>
   {% if aliases %}
   <span class="sub">also known as {{ aliases | join(', ') }}</span>
