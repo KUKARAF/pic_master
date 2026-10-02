@@ -47,6 +47,19 @@
               data-count-label="re-embedded">🧭 Repair rotated faces (re-embed)</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/link-faces-to-bodies/start"
+              data-status="/api/link-faces-to-bodies/status" data-count="linked"
+              data-count-label="bodies linked">🔗 Link named faces → bodies</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <p class="sub" style="margin:6px 2px 0;">
+      For every person you've named by face, links the body they're standing in (the
+      detected person box containing their face) to them — so they're findable by body
+      (clothing/pose/build) with no manual body labeling. Needs
+      <strong>🧍 Index bodies</strong> to have run; skips faces whose body is undetected
+      or already decided by hand. Safe to re-run.
+    </p>
     <p class="sub" style="margin:6px 2px 0;">
       <strong>Run this once after upgrading.</strong> Faces that were sideways or upside-down in the
       photo were detected with mis-aligned landmarks, so the face vector stored for them is

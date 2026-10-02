@@ -136,8 +136,90 @@ def main():
         assert ids['anchor']['cs'] in manual.get_photos_with_body_identity('Alexandra')
         print('ok: rename moves body labels too')
 
-    print('\nALL BODY-IDENTITY TESTS PASSED')
+    print('\nBODY-IDENTITY TESTS PASSED')
+
+
+def _poll(client, url, timeout=10.0):
+    import time
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = client.get(url).json()
+        if not s['running']:
+            return s
+        time.sleep(0.02)
+    raise AssertionError('job did not finish: ' + url)
+
+
+def main_autolink():
+    """Naming a face auto-links the body that contains it; human decisions win; the
+    backfill links every already-named face."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
+        app = create_app(tmp)
+        db, _errors, manual = app.state.dbs
+        client = TestClient(app)
+        rng = np.random.default_rng(11)
+
+        def photo(name):
+            cs = (name * 8)[:40]
+            fid = db.upsert_file_path(name + '.jpg', cs, size=100)
+            return fid, cs
+
+        # Photo 1: a detected body box that fully contains a face box -> naming the
+        # face must auto-link that body.
+        fid1, cs1 = photo('p1')
+        body1 = db.add_manual_body(fid1, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        db.conn.commit()
+        face1 = manual.add_manual_face(cs1, [10, 10, 30, 30], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
+        r = client.post('/api/faces/manual:%d/identity' % face1, json={'name': 'Bob'})
+        assert r.status_code == 200, r.text
+        lab = manual.get_body_label_by_source(body1)
+        assert lab and lab['identity'] == 'Bob' and lab['source'] == 'face-link', lab
+        assert cs1 in manual.get_photos_with_body_identity('Bob')
+        print('ok: naming a face auto-links its containing body')
+
+        # Photo 2: a body a human already decided (manual label for someone else) must
+        # NOT be clobbered when a face there is named.
+        fid2, cs2 = photo('p2')
+        body2 = db.add_manual_body(fid2, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        db.conn.commit()
+        manual.add_body_label(cs2, 'Carol', [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(),
+                              'clip-test', source_body_id=body2, source='manual')
+        face2 = manual.add_manual_face(cs2, [10, 10, 30, 30], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
+        r = client.post('/api/faces/manual:%d/identity' % face2, json={'name': 'Bob'})
+        assert r.status_code == 200, r.text
+        lab2 = manual.get_body_label_by_source(body2)
+        assert lab2 and lab2['identity'] == 'Carol' and lab2['source'] == 'manual', lab2
+        print('ok: a human-decided body is never clobbered by the auto-linker')
+
+        # Photo 3: a body box that does NOT contain the face -> no link.
+        fid3, cs3 = photo('p3')
+        body3 = db.add_manual_body(fid3, [0, 0, 5, 5], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        db.conn.commit()
+        face3 = manual.add_manual_face(cs3, [50, 50, 80, 80], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
+        r = client.post('/api/faces/manual:%d/identity' % face3, json={'name': 'Bob'})
+        assert r.status_code == 200, r.text
+        assert manual.get_body_label_by_source(body3) is None, 'non-containing body must not link'
+        print('ok: a body that does not contain the face is left alone')
+
+        # Backfill: unlink Bob's photo-1 body, then run the job — it must re-link it.
+        manual.delete_body_decision_by_source(body1)
+        assert manual.get_body_label_by_source(body1) is None
+        r = client.post('/api/link-faces-to-bodies/start')
+        assert r.status_code == 200 and r.json()['started'], r.text
+        s = _poll(client, '/api/link-faces-to-bodies/status')
+        assert s['error'] is None, s
+        assert s['linked'] >= 1, s
+        relab = manual.get_body_label_by_source(body1)
+        assert relab and relab['identity'] == 'Bob' and relab['source'] == 'face-link', relab
+        # The backfill must still respect the human decision on photo 2.
+        assert manual.get_body_label_by_source(body2)['source'] == 'manual'
+        print('ok: backfill re-links named faces and respects human decisions')
+
+    print('\nFACE->BODY AUTO-LINK TESTS PASSED')
 
 
 if __name__ == '__main__':
     main()
+    main_autolink()
+    print('\nALL TESTS PASSED')

@@ -769,9 +769,17 @@ class ManualDB(ThreadLocalDB):
                 image_height INTEGER,
                 rejected INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
-                frame_index INTEGER
+                frame_index INTEGER,
+                source TEXT NOT NULL DEFAULT 'manual'
             )
         ''')
+        # `source` tells a human label ('manual') from one inferred by geometry
+        # ('face-link': the body box that contained a named face). Auto links are
+        # overridable — a manual label or a body-swipe reject on the same body wins —
+        # so a wrong containment guess is never permanent. ALTER for pre-existing DBs.
+        _bi_cols = {row[1] for row in cur.execute('PRAGMA table_info(body_identities)')}
+        if 'source' not in _bi_cols:
+            cur.execute("ALTER TABLE body_identities ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
         cur.execute('CREATE INDEX IF NOT EXISTS idx_body_identities_checksum ON body_identities (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_body_identities_identity ON body_identities (identity)')
         cur.execute(
@@ -3428,12 +3436,14 @@ class ManualDB(ThreadLocalDB):
 
     def add_body_label(self, checksum, identity, bbox, embedding_bytes, model,
                        image_width=None, image_height=None, source_body_id=None,
-                       frame_index=None, rejected=0):
+                       frame_index=None, rejected=0, source='manual'):
         """Record one ground-truth body label: this crop on `checksum` is (or,
         with rejected=1, is NOT) `identity`. Mirrors add_manual_face. Upserts on
         source_body_id so re-deciding the same media.db body replaces the prior
         decision rather than piling up rows (the unique partial index enforces it).
-        `identity` may be None only for an anonymous saved crop (name not given)."""
+        `identity` may be None only for an anonymous saved crop (name not given).
+        `source` is 'manual' for a human label or 'face-link' for one inferred from
+        a named face's body box (see get_body_label_by_source for the override rule)."""
         x1, y1, x2, y2 = [float(v) for v in bbox]
         cur = self.conn.cursor()
         if source_body_id is not None:
@@ -3441,14 +3451,36 @@ class ManualDB(ThreadLocalDB):
         cur.execute(
             '''INSERT INTO body_identities
                (checksum, identity, x1, y1, x2, y2, embedding, model, source_body_id,
-                image_width, image_height, rejected, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                image_width, image_height, rejected, created_at, source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
             (checksum, identity, x1, y1, x2, y2, embedding_bytes, model,
              (int(source_body_id) if source_body_id is not None else None),
-             image_width, image_height, int(rejected), int(time.time()))
+             image_width, image_height, int(rejected), int(time.time()), source)
         )
         self.conn.commit()
         return cur.lastrowid
+
+    def get_body_label_by_source(self, source_body_id):
+        """The existing decision for a media.db body, or None. Lets the face->body
+        auto-linker skip a body a human already decided (manual label or reject) and
+        never clobber it — auto links only fill genuinely undecided bodies."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'SELECT id, identity, rejected, source FROM body_identities WHERE source_body_id = ?',
+            (int(source_body_id),))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {'id': row[0], 'identity': row[1], 'rejected': row[2], 'source': row[3]}
+
+    def get_named_face_boxes(self):
+        """[(checksum, identity, [x1,y1,x2,y2]), ...] for every confirmed, non-rejected
+        named face — the input to the face->body backfill. Real faces only (a crop
+        with a box); whole-photo identity assignments have no box to match a body to."""
+        cur = self.conn.cursor()
+        cur.execute('''SELECT checksum, identity, x1, y1, x2, y2 FROM faces
+                       WHERE identity IS NOT NULL AND rejected = 0''')
+        return [(r[0], r[1], [r[2], r[3], r[4], r[5]]) for r in cur.fetchall()]
 
     def reject_body_candidate(self, source_body_id, checksum, identity, bbox,
                               embedding_bytes, model):

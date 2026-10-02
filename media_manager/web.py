@@ -2859,6 +2859,8 @@ def create_app(data_root: str) -> FastAPI:
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # DINOv2 region index for object-exemplar search (the library-wide candidate pool).
     object_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
+    # Face->body backfill: link every already-named face to its containing body crop.
+    face_body_link_job = {'running': False, 'done': 0, 'total': 0, 'linked': 0, 'error': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -3239,6 +3241,44 @@ def create_app(data_root: str) -> FastAPI:
             bbox = [0, 0, 0, 0]
         return file_row['checksum'], bbox, emb, model
 
+    def _link_body_for_named_face(checksum, identity, face_bbox):
+        """Auto-link the detected body that CONTAINS this named face to `identity`
+        (source='face-link'), reusing that body's stored CLIP embedding as a free
+        search anchor — so naming a face makes the person findable by body with no
+        manual body labeling. No-op when the photo has no detected body or none
+        contains the face (match_face_to_body returns None), and it never clobbers a
+        body a human already decided (a manual label or a reject wins). Returns the
+        linked media.db body id, or None. Images only: videos have no body rows here."""
+        from media_manager.body_index import match_face_to_body
+        frow = db.get_file_by_checksum(checksum)
+        if frow is None:
+            return None
+        parsed = []
+        for brow in db.get_body_embeddings_for_file(frow['id']):
+            try:
+                bb = json.loads(brow[1])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(bb, list) and len(bb) == 4:
+                parsed.append((brow[0], bb, brow[2]))
+        if not parsed:
+            return None
+        best = match_face_to_body(face_bbox, [p[1] for p in parsed])
+        if best is None:
+            return None
+        match = next((p for p in parsed if p[1] == best), None)
+        if match is None:
+            return None
+        bid, bb, emb = match
+        existing = manual.get_body_label_by_source(bid)
+        if existing is not None and existing['source'] != 'face-link':
+            return None  # a human decision on this body wins
+        info = _body_row_for_decision(bid)
+        model = info[3] if info else ''
+        manual.add_body_label(checksum, identity, bb, emb, model,
+                              source_body_id=bid, source='face-link')
+        return bid
+
     @app.post('/api/bodies/{body_id}/identity')
     def api_assign_body_identity(body_id: int, body: IdentityBody):
         """Confirm an unlabeled body (from the swipe) as this person — writes a
@@ -3274,6 +3314,49 @@ def create_app(data_root: str) -> FastAPI:
         """Undo a body confirm/reject (Ctrl+Z) — returns the body to the pool."""
         manual.delete_body_decision_by_source(body_id)
         return {'ok': True}
+
+    @app.post('/api/link-faces-to-bodies/start')
+    def api_link_faces_to_bodies_start():
+        """One-time backfill: for every already-named face, auto-link the detected
+        body that contains it (see _link_body_for_named_face) so 'find by body' has
+        anchors without hand-labeling. DB-only (reuses stored body embeddings), no
+        GPU. Idempotent — re-running only fills faces whose body wasn't linked yet,
+        and never touches a body a human decided. Background job; poll .../status."""
+        if face_body_link_job['running']:
+            return {'started': False, 'message': 'Face→body linking already running.'}
+        faces = manual.get_named_face_boxes()
+        face_body_link_job.update(running=True, done=0, total=len(faces), linked=0, error=None)
+
+        def _run():
+            try:
+                linked = 0
+                for i, (checksum, identity, bbox) in enumerate(faces, 1):
+                    try:
+                        if _link_body_for_named_face(checksum, identity, bbox) is not None:
+                            linked += 1
+                    except Exception as exc:  # one bad row must not abort the whole backfill
+                        errors.log(f'[face-body-link] {identity} @ {checksum[:12]}: {exc}')
+                    face_body_link_job.update(done=i, linked=linked)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                face_body_link_job['error'] = str(exc)
+                print(f'[face-body-link] FAILED: {exc}', flush=True)
+            finally:
+                face_body_link_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': face_body_link_job['total']}
+
+    @app.get('/api/link-faces-to-bodies/status')
+    def api_link_faces_to_bodies_status():
+        return {
+            'running': face_body_link_job['running'],
+            'done': face_body_link_job['done'],
+            'total': face_body_link_job['total'],
+            'linked': face_body_link_job['linked'],
+            'error': face_body_link_job['error'],
+        }
 
     @app.post('/api/body-index/start')
     def api_body_index_start(include_trashed: bool = False, retry_empty: bool = False):
@@ -8586,6 +8669,8 @@ def create_app(data_root: str) -> FastAPI:
             manual.assign_identity(raw_id, name)
             _persist_face_rotation(face_id, raw_id, rotate)
             _link_face_match_to_video(row['checksum'], name)  # a frame confirm credits the video
+            _link_body_for_named_face(row['checksum'], name,
+                                      [row['x1'], row['y1'], row['x2'], row['y2']])
             return {'face_id': face_id, 'identity': name}
 
         new_id = _confirm_auto_face(raw_id, name)
@@ -8593,6 +8678,10 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='Face not found')
         # The face is now a manual row; persist the chosen orientation on it.
         _persist_face_rotation(f"manual:{new_id}", new_id, rotate)
+        new_row = manual.get_face(new_id)
+        if new_row is not None:
+            _link_body_for_named_face(new_row['checksum'], name,
+                                      [new_row['x1'], new_row['y1'], new_row['x2'], new_row['y2']])
         return {'face_id': f"manual:{new_id}", 'identity': name}
 
     @app.post('/api/faces/{face_id}/reject')
