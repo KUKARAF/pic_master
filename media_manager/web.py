@@ -186,11 +186,12 @@ class LocationAssignBody(BaseModel):
     location_id: int
 
 class ObjectMarkBody(BaseModel):
-    name: str
+    name: str = ''
     file_id: int
     bbox: List[float]
     image_width: Optional[int] = None
     image_height: Optional[int] = None
+    polarity: str = 'positive'  # 'negative' marks a "looks similar but NOT this" exemplar
 
 class ObjectRenameBody(BaseModel):
     name: str
@@ -6591,12 +6592,16 @@ def create_app(data_root: str) -> FastAPI:
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1,y1,x2,y2]')
         name = body.name.strip()
+        x1, y1, x2, y2 = body.bbox
+        if (body.polarity or 'positive').strip().lower() == 'negative':
+            oid = manual.add_location_negative(location_id, row['checksum'], x1, y1, x2, y2,
+                                               body.image_width, body.image_height, object_name=name)
+            return {'id': oid, 'name': name, 'polarity': 'negative'}
         if not name:
             raise HTTPException(status_code=400, detail='name required')
-        x1, y1, x2, y2 = body.bbox
         oid = manual.add_location_object(location_id, name, row['checksum'], x1, y1, x2, y2,
                                          body.image_width, body.image_height, polarity='positive')
-        return {'id': oid, 'name': name}
+        return {'id': oid, 'name': name, 'polarity': 'positive'}
 
     @app.patch('/api/locations/{location_id}/objects/{obj_id}')
     def api_rename_location_object(location_id: int, obj_id: int, body: ObjectRenameBody):

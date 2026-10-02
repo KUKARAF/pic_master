@@ -111,32 +111,28 @@
   </p>
 
   <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;">
-    <!-- 1 · MARK an object -->
+    <!-- 1 · MARK objects — now done on each photo's own page (full-size, precise). -->
     <div class="sidebar-panel" style="flex:1;min-width:320px;">
-      <div class="section-title">1 · Mark an object</div>
+      <div class="section-title">1 · Mark objects</div>
+      <p class="sub" style="margin:8px 0 10px;">
+        Open a photo and use <strong>🏷 Tags → 📌 Mark object for location</strong> to drag a box
+        around a thing (couch, tiles, fan…), pick <em>this</em> location, and name it. Use
+        <strong>🚫 Mark object NOT for location</strong> for look-alikes that aren't it.
+      </p>
       {% if files %}
-      <p class="sub" style="margin:8px 0 6px;">Pick one of this location's photos:</p>
-      <div id="obj-mark-thumbs" style="display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;">
+      <p class="sub" style="margin:0 0 6px;">This location's photos — click to open &amp; mark:</p>
+      <div style="display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;">
         {% for f in files %}
-        <img src="/thumb/{{ f.id }}" data-file-id="{{ f.id }}" class="obj-thumb"
-             alt="{{ f.filename or '' }}" draggable="false"
-             style="height:62px;width:62px;object-fit:cover;border-radius:6px;cursor:pointer;flex:0 0 auto;border:2px solid transparent;">
+        <a href="/photo/{{ f.id }}" title="Open to mark objects">
+          <img src="/thumb/{{ f.id }}" alt="{{ f.filename or '' }}" draggable="false"
+               style="height:62px;width:62px;object-fit:cover;border-radius:6px;flex:0 0 auto;border:2px solid transparent;">
+        </a>
         {% endfor %}
       </div>
-      <div id="obj-mark-wrap" class="photo-image-wrap"
-           style="margin-top:10px;display:inline-block;max-width:100%;">
-        <img id="obj-mark-img" alt="photo to mark" draggable="false"
-             style="max-width:100%;max-height:340px;display:none;border-radius:8px;">
-      </div>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">
-        <button type="button" id="obj-draw-btn" class="btn-similar">✏️ Draw box</button>
-        <input type="text" id="obj-name-input" placeholder="Name this object" style="flex:1;min-width:140px;">
-        <button type="button" id="obj-save-btn" class="btn-similar">Save</button>
-      </div>
-      <p class="sub" id="obj-mark-status" style="margin-top:8px;">Pick a photo above to begin.</p>
       {% else %}
-      <p class="sub" style="margin-top:8px;">
-        This location has no photos yet — assign one first so you have something to mark on.
+      <p class="sub">
+        This location has no photos yet — assign one first, or just mark the object on any photo
+        and pick this location from the dropdown.
       </p>
       {% endif %}
     </div>

@@ -3779,6 +3779,89 @@
   wireLabelRegion('label-region-btn', 'positive', 'Label this region');
   wireLabelRegion('label-region-negative-btn', 'negative', 'Label this region as NOT…');
 
+  /* Mark object for location — draw a box on the FULL photo, pick which location the
+     object belongs to and name it, then save it as that location's exemplar (or, for
+     the 🚫 variant, a "looks similar but NOT this" negative). Mirrors wireLabelRegion
+     but posts to /api/locations/{lid}/objects; the location page then searches the
+     library for the same object. */
+  function openMarkObjectModal(bbox, polarity) {
+    const neg = polarity === 'negative';
+    openModal(neg ? 'Mark object NOT for a location' : 'Mark object for a location', function (box) {
+      const pre = window.MEDIA_FILE_LOCATION_IDS || [];
+      const sel = document.createElement('select');
+      sel.style.cssText = 'width:100%;margin:4px 0 12px;';
+      sel.innerHTML = '<option value="">Loading…</option>';
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.placeholder = neg ? 'e.g. couch (optional)' : 'e.g. brown couch';
+      nameInput.style.cssText = 'width:100%;margin:4px 0 12px;';
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button'; saveBtn.className = 'btn-similar'; saveBtn.textContent = 'Save';
+      const err = document.createElement('div');
+      err.className = 'sub'; err.style.cssText = 'color:#e0a;margin-top:8px;';
+
+      const locLbl = document.createElement('label');
+      locLbl.className = 'sub'; locLbl.style.display = 'block'; locLbl.textContent = 'Location';
+      const nameLbl = document.createElement('label');
+      nameLbl.className = 'sub'; nameLbl.style.display = 'block';
+      nameLbl.textContent = neg ? 'Name (optional)' : 'Object name';
+      [locLbl, sel, nameLbl, nameInput, saveBtn, err].forEach(function (el) { box.appendChild(el); });
+
+      fetch('/api/locations')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          const locs = (d && (d.locations || d)) || [];
+          if (!locs.length) { sel.innerHTML = '<option value="">No locations — create one first</option>'; return; }
+          sel.innerHTML = '';
+          locs.forEach(function (l) {
+            const o = document.createElement('option');
+            o.value = l.id; o.textContent = l.name;
+            if (pre.indexOf(l.id) !== -1) o.selected = true;
+            sel.appendChild(o);
+          });
+        })
+        .catch(function () { sel.innerHTML = '<option value="">Failed to load locations</option>'; });
+
+      saveBtn.addEventListener('click', function () {
+        const lid = sel.value, nm = nameInput.value.trim();
+        if (!lid) { err.textContent = 'Pick a location.'; return; }
+        if (!neg && !nm) { err.textContent = 'Name the object.'; return; }
+        saveBtn.disabled = true; err.textContent = '';
+        fetch('/api/locations/' + lid + '/objects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name: nm, file_id: fileId, bbox: bbox, polarity: polarity,
+            image_width: photoImg.naturalWidth, image_height: photoImg.naturalHeight,
+          }),
+        })
+          .then(function (r) {
+            if (!r.ok) return r.json().then(function (dd) { throw new Error(dd.detail || 'Request failed'); });
+            return r.json();
+          })
+          .then(function () {
+            const locName = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : '';
+            closeModal();
+            if (window.showToast) showToast((neg ? 'Negative' : (nm || 'Object')) + ' saved to ' + locName);
+          })
+          .catch(function (e2) { saveBtn.disabled = false; err.textContent = 'Failed: ' + e2.message; });
+      });
+      setTimeout(function () { try { nameInput.focus(); } catch (e) {} }, 30);
+    });
+  }
+
+  function wireMarkObject(btnId, polarity) {
+    const btn = document.getElementById(btnId);
+    if (!btn) return;
+    const idleLabel = btn.textContent;
+    const state = wireBoxDraw(btn, 'Click and drag on the photo…', idleLabel, function (bbox) {
+      openMarkObjectModal(bbox, polarity);
+    });
+    if (state) boxDrawStates.push(state);
+  }
+  wireMarkObject('mark-object-btn', 'positive');
+  wireMarkObject('mark-object-negative-btn', 'negative');
+
   /* Label person — drag a box around a person's body; it becomes a searchable
      find-by-body crop (mirrors "Add face" but CLIP-embeds the body crop via
      /api/files/{id}/bodies). Deep-linked from the find-by-body page's "Manually
@@ -5262,7 +5345,8 @@
     // Drag-to-draw (add face / label region) maps clicks through the img element
     // box, which only equals the visible image outside FILL mode — so entering a
     // draw tool snaps back to FIT.
-    ['add-face-btn', 'label-region-btn', 'label-region-negative-btn', 'label-person-btn'].forEach(function (id) {
+    ['add-face-btn', 'label-region-btn', 'label-region-negative-btn', 'label-person-btn',
+     'mark-object-btn', 'mark-object-negative-btn'].forEach(function (id) {
       const btn = document.getElementById(id);
       if (btn) btn.addEventListener('click', function () {
         if (photoStage.classList.contains('fit-cover')) setFit('fit');

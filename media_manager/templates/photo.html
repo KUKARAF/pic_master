@@ -8,6 +8,7 @@
 {% block head %}
 <script>
   window.MEDIA_FILE_ID = {{ file.id }};
+  window.MEDIA_FILE_LOCATION_IDS = {{ file.locations | map(attribute='id') | list | tojson }};
   window.MEDIA_FRAME_COUNT = {{ file.frame_count or 1 }};
   window.MEDIA_FILE_GPS = {% if file.gps_lat is not none %}{lat: {{ file.gps_lat }}, lon: {{ file.gps_lon }}}{% else %}null{% endif %};
   window.DETECTED_CLASSES = {{ detected_classes | tojson }};
@@ -233,8 +234,13 @@
       <button type="button" id="label-region-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">＋ Label region</button>
       <button type="button" id="label-region-negative-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🚫 Label region as NOT</button>
       <button type="button" id="label-person-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;">🧍 Label person</button>
+      <button type="button" id="mark-object-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;"
+              title="Draw a box around an object (couch, tiles, fan…) and save it as an exemplar for one of your locations, to find the same object elsewhere.">📌 Mark object for location</button>
+      <button type="button" id="mark-object-negative-btn" class="btn-similar" style="margin-top:10px;font-size:7px;padding:6px 8px;"
+              title="Draw a box around something that looks similar to a location's object but ISN'T it — a negative exemplar.">🚫 Mark object NOT for location</button>
       <div id="label-region-status" class="sub" style="display:none;"></div>
       <div id="label-person-status" class="sub" style="display:none;"></div>
+      <div id="mark-object-status" class="sub" style="display:none;"></div>
       {% endif %}
     </div>
     </div>
