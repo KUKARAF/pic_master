@@ -79,7 +79,7 @@
   <div class="bulk-action-row" style="display:flex;align-items:center;gap:8px;">
     <button type="button" class="bulk-action-btn"
             data-start="/api/locations/{{ location.id }}/index-members"
-            data-status="/api/locations/{{ location.id }}/index-members/status">📌 Index these photos</button>
+            data-status="/api/locations/{{ location.id }}/index-members/status">📌 Index all present</button>
     <span class="bulk-action-status sub" data-role="status"></span>
   </div>
   <p class="sub" style="margin-top:4px;font-size:0.8em;">
@@ -96,7 +96,7 @@
 <div id="location-place-warning" class="alert" style="display:none;margin-bottom:12px;">
   📌 Location matching here needs the <strong>place index</strong>, which isn’t built yet.
   It ranks by what the place looks like (people ignored), so there’s nothing to match
-  until it’s built — click <strong>“📌 Index these photos”</strong> above (quick), then reload when it finishes.
+  until it’s built — click <strong>“📌 Index all present”</strong> above (quick), then reload when it finishes.
 </div>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="location-swipe-page" style="flex:1;min-width:300px;">
