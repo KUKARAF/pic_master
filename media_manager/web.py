@@ -763,7 +763,18 @@ def create_app(data_root: str) -> FastAPI:
     static_dir = _HERE / 'static'
     templates_dir = _HERE / 'templates'
 
-    app.mount('/static', StaticFiles(directory=str(static_dir)), name='static')
+    class _RevalidatingStatic(StaticFiles):
+        """Serve /static with Cache-Control: no-cache so the browser REVALIDATES every
+        load (cheap 304 via the ETag StaticFiles already sends) instead of silently
+        running a stale cached app.js/CSS across a redeploy. Without this, a changed
+        app.js can keep running the old version until the browser's heuristic cache
+        expires — which is exactly how JS fixes 'don't take' after a deploy."""
+        async def get_response(self, path, scope):
+            resp = await super().get_response(path, scope)
+            resp.headers['Cache-Control'] = 'no-cache'
+            return resp
+
+    app.mount('/static', _RevalidatingStatic(directory=str(static_dir)), name='static')
     templates = Jinja2Templates(directory=str(templates_dir))
 
     # ------------------------------------------------------------------

@@ -3991,11 +3991,13 @@
         saveBtn.disabled = true; anonBtn.disabled = true;
         postBodyLabel(bbox, nm).then(closeModal);
       });
-      // Enter in the name field = Save & link (the common case: accept the pre-filled
-      // or typed name without reaching for the mouse).
-      nameInput.addEventListener('keydown', function (e) {
+      // Enter = Save & link. Caught in the CAPTURE phase on the modal box so it fires
+      // before the <datalist> dropdown's own Enter handling can swallow it (the classic
+      // "first Enter just closes the suggestion list" trap). Works from anywhere in the
+      // modal, and reads whatever is currently in the field (pre-filled or typed).
+      box.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') { e.preventDefault(); saveBtn.click(); }
-      });
+      }, true);
       anonBtn.addEventListener('click', function () {
         saveBtn.disabled = true; anonBtn.disabled = true;
         postBodyLabel(bbox, '').then(closeModal);
