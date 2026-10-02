@@ -10,6 +10,9 @@
   window.MEDIA_FILE_ID = {{ file.id }};
   window.MEDIA_FILE_LOCATION_IDS = {{ file.locations | map(attribute='id') | list | tojson }};
   window.MEDIA_FRAME_COUNT = {{ file.frame_count or 1 }};
+  // Sibling captured stills of this still's source video (ordered by capture time), so
+  // ←/→ can step between them. Empty unless this file is itself a captured frame.
+  window.MEDIA_SIBLING_FRAMES = {{ sibling_frames | tojson }};
   window.MEDIA_FILE_GPS = {% if file.gps_lat is not none %}{lat: {{ file.gps_lat }}, lon: {{ file.gps_lon }}}{% else %}null{% endif %};
   window.DETECTED_CLASSES = {{ detected_classes | tojson }};
   window.DETECTED_BBOXES = {{ detection_bboxes | tojson }};
@@ -45,9 +48,9 @@
        each step swaps #photo-image to /api/files/{id}/frame/{n} (a static frame) and
        "📸 Capture current frame" then grabs that exact frame by index. -->
   <div class="stage-chrome stage-bottom-center" id="frame-stepper">
-    <button type="button" id="frame-prev-btn" class="stage-btn" title="Previous frame ([ or ,)">◄</button>
-    <input type="range" id="frame-slider" min="0" max="{{ file.frame_count - 1 }}" value="0" step="1" title="Scrub frames" style="width:180px;">
-    <button type="button" id="frame-next-btn" class="stage-btn" title="Next frame (] or .)">►</button>
+    <button type="button" id="frame-prev-btn" class="stage-btn" title="Previous frame (← or [ or ,)">◄</button>
+    <input type="range" id="frame-slider" min="0" max="{{ file.frame_count - 1 }}" value="0" step="1" title="Scrub frames (← / →)" style="width:180px;">
+    <button type="button" id="frame-next-btn" class="stage-btn" title="Next frame (→ or ] or .)">►</button>
     <span class="stage-btn" id="frame-counter" style="cursor:default;">1 / {{ file.frame_count }}</span>
   </div>
   {% endif %}

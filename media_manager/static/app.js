@@ -2676,10 +2676,61 @@
         return;
       }
 
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      const dir = e.key === 'ArrowLeft' ? -1 : 1;
+
+      // On a frame — animated-image frame, video playhead, or a captured still of a
+      // video — ←/→ step to the previous/next FRAME. Only when already at the first/
+      // last frame do they fall through to moving between photos in the browse queue,
+      // so a frame view never traps navigation. tryFrameStep returns true if it
+      // consumed the key (stepped a frame), false at a boundary / not a frame view.
+      if (tryFrameStep(dir)) { e.preventDefault(); return; }
+
       if (!queue) return;
-      if (e.key === 'ArrowLeft') stepQueue(-1);
-      else if (e.key === 'ArrowRight') stepQueue(1);
+      stepQueue(dir);
     });
+
+    // Step one frame in whichever kind of frame view this is; false = at the first/
+    // last frame (or not a frame view), so the caller can move the queue instead.
+    function tryFrameStep(dir) {
+      // 1) Animated image (GIF/WEBP): drive the existing frame slider.
+      const slider = document.getElementById('frame-slider');
+      if (slider) {
+        const cur = parseInt(slider.value, 10) || 0;
+        const max = parseInt(slider.max, 10) || 0;
+        if (dir < 0 ? cur <= 0 : cur >= max) return false;
+        const btn = document.getElementById(dir < 0 ? 'frame-prev-btn' : 'frame-next-btn');
+        if (btn) btn.click();
+        return true;
+      }
+      // 2) Video: nudge the playhead one frame (~1/fps s), paused. HTML video has no
+      //    frame-accurate seek without a known fps, so we assume one (MEDIA_VIDEO_FPS,
+      //    default 30) — close enough to step through frames by eye.
+      const video = document.getElementById('photo-video');
+      if (video) {
+        const fps = window.MEDIA_VIDEO_FPS || 30;
+        const dur = isFinite(video.duration) ? video.duration : null;
+        const t = video.currentTime || 0;
+        const nt = t + dir / fps;
+        if (dur !== null && (nt < 0 || nt > dur)) return false;   // at an end → queue
+        video.pause();
+        video.currentTime = dur !== null ? Math.max(0, Math.min(nt, dur)) : Math.max(0, nt);
+        return true;
+      }
+      // 3) A captured still of a video: hop to the sibling stills of the same source,
+      //    in capture-time order (window.MEDIA_SIBLING_FRAMES, set by the template).
+      const sibs = window.MEDIA_SIBLING_FRAMES;
+      if (sibs && sibs.length > 1 && typeof fileId !== 'undefined' && fileId != null) {
+        const idx = sibs.findIndex(function (s) { return s.id === fileId; });
+        if (idx !== -1) {
+          const ni = idx + dir;
+          if (ni < 0 || ni >= sibs.length) return false;          // at an end → queue
+          goTo(sibs[ni].id);
+          return true;
+        }
+      }
+      return false;
+    }
 
     // Phone-first: swipe left = next photo, swipe right = previous — same queue
     // navigation as the arrow keys. Only fires when the image isn't zoomed/pannable

@@ -1981,12 +1981,20 @@ def create_app(data_root: str) -> FastAPI:
                 if rows:
                     captured_frames.append({'id': rows[0]['id'], 'time_ms': cap['time_ms']})
         parent_capture = None
+        sibling_frames = []
         pc = manual.get_parent_capture(checksum)
         if pc:
             prows = db.get_files_by_checksums([pc['parent_checksum']])
             if prows:
                 parent_capture = {'id': prows[0]['id'], 'time_ms': pc['time_ms'],
                                   'filename': os.path.basename(prows[0]['path'])}
+            # This still's siblings — every captured still of the same source video, in
+            # capture-time order — so ←/→ can hop between them (includes this one, so
+            # the client can find its own position). Few per video; a handful of reads.
+            for cap in manual.get_frame_captures_for(pc['parent_checksum']):
+                srows = db.get_files_by_checksums([cap['child_checksum']])
+                if srows:
+                    sibling_frames.append({'id': srows[0]['id'], 'time_ms': cap['time_ms']})
         # Nearest offline city for this photo's EXIF GPS (labeled by the 'Match cities'
         # job / metadata extraction) — shown as a place NAME in File-info. None when
         # untagged or the cities table was never fetched.
@@ -2003,6 +2011,7 @@ def create_app(data_root: str) -> FastAPI:
             'current_sets': current_sets,
             'captured_frames': captured_frames,
             'parent_capture': parent_capture,
+            'sibling_frames': sibling_frames,
             'city': city,
         })
 
