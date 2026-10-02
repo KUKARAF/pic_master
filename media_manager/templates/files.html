@@ -8,6 +8,8 @@
   <h1>Files</h1>
   <button type="button" id="use-folder-btn" data-folder="{{ folder }}" class="stage-btn-accent"
           title="Add every image/video under this folder to a set">＋ Use this folder…</button>
+  <button type="button" id="folder-video-btn" data-folder="{{ folder }}" class="stage-btn-accent"
+          title="Generate an AI morph video from every image in this folder, ordered by filename">🎬 Folder → video</button>
 </div>
 
 <!-- Phone-first swipe-down browse feeds -->
@@ -111,5 +113,47 @@ document.getElementById('use-folder-btn').addEventListener('click', function () 
       .catch(function (err) { showToast('Failed to add folder: ' + err.message); });
   });
 });
+
+// Folder → morph video: POST, then poll the (singleton) job status every ~2s,
+// surfacing done/total in a toast. Mirrors pollPhotoGen in app.js (inline so this
+// page needs nothing imported). On success, open the generated /photo result.
+document.getElementById('folder-video-btn').addEventListener('click', function () {
+  var folder = this.dataset.folder;
+  var prompt = window.prompt('Optional motion prompt for the morph (leave blank for none):', '');
+  if (prompt === null) return;  // cancelled
+  var url = '/api/folder-to-video?path=' + encodeURIComponent(folder)
+          + '&prompt=' + encodeURIComponent(prompt);
+  fetch(url, { method: 'POST' })
+    .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+    .then(function (d) {
+      if (!d.started) { showToast(d.message || 'Could not start folder video.'); return; }
+      showToast('Generating folder morph video (' + d.total + ' pairs)… this runs on the GPU box.');
+      pollFolderVideo();
+    })
+    .catch(function (err) { showToast('Failed to start folder video: ' + err.message); });
+});
+
+function pollFolderVideo() {
+  fetch('/api/folder-to-video/status')
+    .then(function (r) { return r.json(); })
+    .then(function (s) {
+      if (s.error) { showToast('Folder video failed: ' + s.error); return; }
+      if (s.running) {
+        showToast('Folder morph video: ' + s.done + '/' + s.total + ' pairs…');
+        setTimeout(pollFolderVideo, 2000);
+        return;
+      }
+      // Not running + no error → done.
+      if (s.artifact_id) {
+        showToast('Folder morph video ready! Opening result…');
+        window.open('/photo/' + s.artifact_id);
+      } else {
+        showToast('Folder morph video finished.');
+      }
+    })
+    .catch(function (err) {
+      showToast('Lost track of folder video: ' + err.message);
+    });
+}
 </script>
 {% endblock %}

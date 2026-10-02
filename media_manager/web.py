@@ -2862,6 +2862,11 @@ def create_app(data_root: str) -> FastAPI:
     # Single photo → a new AI image or video (the /photo 🙌 button). One at a time.
     generate_photo_job = {'running': False, 'file_id': None, 'kind': None,
                           'error': None, 'artifact_id': None}
+    # Folder → morph video (Wan FLF2V). Like generate_video_job but sourced from a
+    # /files folder and ordered strictly BY FILENAME (not CLIP similarity). One at a
+    # time; 'done'/'total' are FLF2V pairs; 'artifact_id' is set on success.
+    folder_video_job = {'running': False, 'path': None, 'done': 0, 'total': 0,
+                        'error': None, 'artifact_id': None}
 
     def _ensure_own_bodies(file_id: int, row) -> list:
         """Return this photo's non-sentinel body rows, embedding them on demand the
@@ -5863,6 +5868,80 @@ def create_app(data_root: str) -> FastAPI:
         if not folder_path:
             return db.list_files(limit=100_000_000)
         return db.find_files_under_folder(folder_path)
+
+    @app.post('/api/folder-to-video')
+    def api_folder_to_video(path: str = '', prompt: str = '', fps: int = 16,
+                            frames: int = 49, limit: int = 200):
+        """Generate a morph video from every image in a folder (Wan FLF2V between
+        consecutive images) on the GPU box. Mirrors api_set_generate_video but the
+        source is a /files folder and the order is strictly BY FILENAME (not the
+        set's CLIP-similarity chain). Async; poll .../folder-to-video/status."""
+        from . import set_video, set_render
+        from .gen_service import ComfyUIClient
+        if folder_video_job['running']:
+            return {'started': False, 'message': 'A folder video is already being generated.'}
+        rows = _files_under_folder(path)
+        rows = [r for r in rows
+                if os.path.splitext(r['path'])[1].lower() in IMAGE_EXTENSIONS]
+        ai = db.get_all_ai_generated_checksums()  # never morph AI output back in
+        rows = [r for r in rows if r['checksum'] not in ai]
+        # The whole point: order consecutive FLF2V pairs by filename, not similarity.
+        rows = sorted(rows, key=lambda r: os.path.basename(r['path']).lower())
+        rows = rows[:limit]
+        paths = []
+        for r in rows:
+            ap = _live_abs_path(r['id'], r['path'])
+            if ap:
+                paths.append(ap)
+        if len(paths) < 2:
+            return {'started': False, 'message': 'Need at least 2 images on disk in this folder.'}
+        gen = ComfyUIClient()
+        if not gen.is_available():
+            return {'started': False,
+                    'message': f'Generation service not reachable at {gen.base_url}. '
+                               'Start ComfyUI (llm-scaler) on the GPU box.'}
+        out = set_render.output_path(
+            data_root, (os.path.basename(path.strip('/')) or 'root'), 'folder-morph', 'mp4')
+        folder_video_job.update(running=True, path=path, done=0,
+                                total=len(paths) - 1, error=None, artifact_id=None)
+
+        def _run():
+            try:
+                set_video.morph_from_set(
+                    paths, out, gen=gen, data_root=data_root, fps=fps,
+                    params={'prompt': prompt, 'frames': frames},
+                    progress=lambda d, t: folder_video_job.update(done=d, total=t))
+                # Register the morph as a first-class (hidden + ai_generated) file and
+                # record provenance — no set assignment (set_id=None).
+                _fid, _ck, aid = set_render.register_generated_file(
+                    db, manual, data_root, out, set_id=None,
+                    kind='folder-morph', origin='ai', media_type='video/mp4',
+                    model='wan2.2-flf2v',
+                    params={'images': len(paths), 'fps': fps, 'prompt': prompt, 'folder': path})
+                folder_video_job['artifact_id'] = aid
+                print(f"[web] folder '{path}' morph video done: {out} (artifact {aid})", flush=True)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                folder_video_job['error'] = str(exc)
+                print(f"[web] folder '{path}' video generation FAILED: {exc}", flush=True)
+            finally:
+                folder_video_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': folder_video_job['total']}
+
+    @app.get('/api/folder-to-video/status')
+    def api_folder_to_video_status():
+        j = folder_video_job
+        return {
+            'running': j['running'],
+            'path': j['path'],
+            'done': j['done'],
+            'total': j['total'],
+            'error': j['error'],
+            'artifact_id': j['artifact_id'],
+        }
 
     @app.get('/api/sets/{set_id}/add-folder/preview')
     def api_preview_add_folder_to_set(set_id: int, path: str):

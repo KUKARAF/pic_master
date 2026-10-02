@@ -286,6 +286,19 @@ def main():
     dir2set.add_argument('--reindex', action='store_true',
                           help='Force reprocessing (clear detections/faces/embedding) for already-tracked files found in this scan')
 
+    # media folder-to-video <path> - morph video from every image in a folder,
+    # ordered BY FILENAME (not set CLIP-similarity). Mirrors `set generate-video`.
+    f2v = sub.add_parser(
+        'folder-to-video',
+        help='Generate a morph video from a folder (Wan FLF2V; images ordered by filename; needs the B70 gen service)')
+    f2v.add_argument('path', help='Folder (relative to the data root) whose images to morph across')
+    f2v.add_argument('--prompt', default='', help='Optional motion prompt for FLF2V')
+    f2v.add_argument('--fps', type=int, default=16, help='Output frame rate (default: 16)')
+    f2v.add_argument('--frames', type=int, default=49,
+                     help='Frames generated per image pair (default: 49)')
+    f2v.add_argument('--limit', type=int, default=200,
+                     help='Max images to morph across, after filename sort (default: 200)')
+
     # media category <create|ls|assign|clear|files|match> - single-value,
     # ML-assisted classification (e.g. Outside/Convention/Anime)
     category_cmd = sub.add_parser('category', help='Manage image categories (multi-value, ML-assisted classification)')
@@ -778,6 +791,52 @@ def main():
                   f"photo(s) to the set ({len(matches) - added} already there).")
         m.close()
         return exit_code
+
+    elif args.cmd == 'folder-to-video':
+        from . import set_video, set_render
+        from .gen_service import GenServiceUnavailable, GenServiceError
+        from .formats import IMAGE_EXTENSIONS
+        m = MediaManager()
+        rel_path = os.path.relpath(
+            os.path.join(m.data_root, args.path), m.data_root).replace(os.sep, '/').strip('/')
+        ai = m.db.get_all_ai_generated_checksums()  # never morph AI output back in
+        rows = m.db.find_files_under_folder(rel_path)
+        rows = [r for r in rows
+                if os.path.splitext(r['path'])[1].lower() in IMAGE_EXTENSIONS
+                and r['checksum'] not in ai]
+        # The whole point: consecutive FLF2V pairs are ordered by filename.
+        rows = sorted(rows, key=lambda r: os.path.basename(r['path']).lower())
+        rows = rows[:args.limit]
+        paths = []
+        for r in rows:
+            ap = os.path.join(m.data_root, r['path'])
+            if os.path.isfile(ap):
+                paths.append(ap)
+        if len(paths) < 2:
+            print("ERROR: need at least 2 readable images in this folder to morph",
+                  file=sys.stderr)
+            m.close(); sys.exit(1)
+        out = set_render.output_path(
+            m.data_root, (os.path.basename(rel_path) or 'root'), 'folder-morph', 'mp4')
+        try:
+            set_video.morph_from_set(
+                paths, out, data_root=m.data_root, fps=args.fps,
+                params={'prompt': args.prompt, 'frames': args.frames},
+                progress=lambda d, t: print(f"  FLF2V pair {d}/{t}", flush=True))
+        except (GenServiceUnavailable, GenServiceError) as exc:
+            print(f"ERROR: video generation failed — {exc}", file=sys.stderr)
+            m.close(); sys.exit(1)
+        _fid, _ck, _aid = set_render.register_generated_file(
+            m.db, m.manual, m.data_root, out, set_id=None,
+            kind='folder-morph', origin='ai', media_type='video/mp4',
+            model='wan2.2-flf2v',
+            params={'images': len(paths), 'fps': args.fps, 'prompt': args.prompt,
+                    'folder': rel_path})
+        rel = os.path.relpath(out, m.data_root)
+        print(f"Generated folder morph video: {rel} "
+              f"({len(paths)} images, filename order, flagged AI, in the /ai tab)")
+        m.close()
+        return 0
 
     elif args.cmd == 'category':
         m = MediaManager()
