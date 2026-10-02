@@ -351,9 +351,54 @@ def main_broom():
     print('\nCLEANUP-BROOM TESTS PASSED')
 
 
+def main_match():
+    """Auto-match job: base (model-free) promotion works, the per-identity negative
+    blocks promotion, and the try_rotations flag is accepted and completes. The
+    rotation RE-EMBED itself needs the detector + a real image, so with these DB-only
+    fixtures the rotation branch no-ops (no disk files) — that path's logic is reviewed,
+    not unit-run."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
+        app = create_app(tmp)
+        db, _errors, manual = app.state.dbs
+        client = TestClient(app)
+        rng = np.random.default_rng(53)
+        alex = _unit(rng.standard_normal(D))
+
+        # A named Alex anchor so find_matching_identity has something to match against.
+        acs = ('mref' * 10)[:40]
+        db.upsert_file_path('mref.jpg', acs, size=100); db.conn.commit()
+        af = manual.add_manual_face(acs, [0, 0, 20, 20], alex.tobytes(), 100, 100)
+        manual.assign_identity(af, 'Alex')
+
+        def auto(name, vec):
+            cs = (name * 10)[:40]
+            fid = db.upsert_file_path(name + '.jpg', cs, size=100)
+            db.insert_faces(fid, [{'bbox': [0, 0, 20, 20], 'embedding': vec, 'det_score': 0.9}], 'test')
+            db.conn.commit()
+            return cs, db.get_faces_for_file(fid)[0]['id']
+
+        hit_cs, hit_id = auto('mhit', _unit(alex + SIGMA * rng.standard_normal(D)))   # should match
+        neg_cs, neg_id = auto('mneg', _unit(alex + SIGMA * rng.standard_normal(D)))   # matches, but barred
+        manual.add_face_identity_negative(neg_id, 'Alex')
+
+        r = client.post('/api/match-faces/start?try_rotations=1', json=None)
+        assert r.status_code == 200 and r.json()['started'], r.text
+        s = _poll(client, '/api/match-faces/status')
+        assert s['error'] is None, s
+        alex_cs = {cs for _id, cs, _e in manual.get_faces_for_identity('Alex')}
+        assert hit_cs in alex_cs, 'base auto-match did not promote the matching face'
+        assert neg_cs not in alex_cs, 'negated face was promoted despite the broom negative'
+        assert 'rotated' in s
+        print('ok: auto-match promotes matches, honours negatives, accepts try_rotations')
+
+    print('\nAUTO-MATCH TESTS PASSED')
+
+
 if __name__ == '__main__':
     main()
     main_autolink()
     main_suggest()
     main_broom()
+    main_match()
     print('\nALL TESTS PASSED')

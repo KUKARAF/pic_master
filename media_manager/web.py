@@ -2929,7 +2929,7 @@ def create_app(data_root: str) -> FastAPI:
     # to known people (no model — pure embedding math, so it also carries a
     # 'matched' count).
     index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
-    match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
+    match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'rotated': 0, 'error': None}
     # Tile (region) index: per-image CLIP crops of an overlapping grid, so region
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
@@ -4650,17 +4650,24 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/match-faces/start')
-    def api_match_faces_start(threshold: float = None, include_trashed: bool = False):
+    def api_match_faces_start(threshold: float = None, include_trashed: bool = False,
+                              try_rotations: bool = False):
         """Match every not-yet-named auto-detected face against known identities and
         promote the confident hits — the library-wide version of the auto-match that
         api_detect_faces already does per photo. `threshold` (cosine, 0..1) overrides the
         default AUTO_MATCH_THRESHOLD so the /bulk page can dial confidence up or down.
-        Needs no model: find_matching_identity is a dot-product against the cached
-        named-face matrix, so this is fast and never touches the worker."""
+
+        The base pass needs no model: find_matching_identity is a dot-product against the
+        cached named-face matrix, so it's fast and never touches the worker. `try_rotations`
+        adds a slower second chance for faces that DON'T match as stored — a face detected
+        sideways/upside-down has a scrambled embedding that matches nobody, so this
+        re-embeds it at 90/180/270° (via the face detector — GPU) and promotes it at the
+        orientation that clears the threshold, persisting that rotation so the crop renders
+        upright. Off by default because it runs the detector on every unmatched face."""
         if match_faces_job['running']:
             return {'started': False, 'message': 'Face matching already running.'}
         pool = _drop_trashed(_unpromoted_auto_faces(limit=None), include_trashed, fid_pos=1)
-        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, error=None)
+        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, rotated=0, error=None)
 
         def _run():
             try:
@@ -4674,6 +4681,19 @@ def create_app(data_root: str) -> FastAPI:
                     if not emb_bytes:
                         continue
                     name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
+                    rot_used, rot_emb = 0, None
+                    # Second chance: a sideways/upside-down face won't match as stored, so
+                    # re-embed it at each quarter-turn and take the first that matches.
+                    if name is None and try_rotations:
+                        for rot in (1, 2, 3):
+                            remb, _angle = _rotated_face_embedding(f'auto:{face_id}', rot)
+                            if remb is None:
+                                continue
+                            cand, _s = manual.find_matching_identity(
+                                remb.astype('float32').tobytes(), threshold=threshold)
+                            if cand is not None:
+                                name, rot_used, rot_emb = cand, rot, remb
+                                break
                     if name is None:
                         continue
                     if manual.is_face_negated(face_id, name):
@@ -4681,9 +4701,15 @@ def create_app(data_root: str) -> FastAPI:
                     file_row = db.get_file_by_id(file_id)
                     if file_row is None:
                         continue
-                    manual.promote_auto_face(
-                        face_id, file_row['checksum'], json.loads(bbox), emb_bytes,
+                    promote_emb = rot_emb.astype('float32').tobytes() if rot_emb is not None else emb_bytes
+                    new_id = manual.promote_auto_face(
+                        face_id, file_row['checksum'], json.loads(bbox), promote_emb,
                         name, None, None)
+                    # Persist the winning orientation so the crop renders upright (the
+                    # stored embedding is already the rotated/aligned one).
+                    if rot_used and new_id is not None:
+                        manual.set_face_rotation(new_id, rot_used)
+                        match_faces_job['rotated'] += 1
                     # Keep media.db's handled mirror in step with the new decision
                     # (see _confirm_auto_face).
                     db.mark_faces_handled([face_id])
@@ -4705,6 +4731,7 @@ def create_app(data_root: str) -> FastAPI:
             'done': match_faces_job['done'],
             'total': match_faces_job['total'],
             'matched': match_faces_job['matched'],
+            'rotated': match_faces_job['rotated'],
             'error': match_faces_job['error'],
         }
 

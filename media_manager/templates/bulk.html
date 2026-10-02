@@ -32,10 +32,21 @@
     </div>
     <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start-base="/api/match-faces/start"
-              data-status="/api/match-faces/status" data-count="matched" data-threshold="1">
+              data-status="/api/match-faces/status" data-count="matched" data-threshold="1"
+              data-try-rotations>
         🤝 Auto-match unknown → known</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
+    <label class="sub" style="display:flex;align-items:center;gap:6px;margin:-2px 2px 4px;">
+      <input type="checkbox" id="match-try-rotations">
+      Also retry unmatched faces rotated 90/180/270° (slower — uses the GPU)
+    </label>
+    <p class="sub" style="margin:0 2px 0;">
+      A face detected sideways or upside-down gets a scrambled vector that matches nobody,
+      so it stays unknown no matter who it is. With this on, any face that doesn't match as-is
+      is re-embedded at each quarter-turn and matched again; a hit is saved at the orientation
+      that worked (crop rendered upright). Leave off for a fast, model-free pass.
+    </p>
     <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start="/api/estimate-age/start"
               data-status="/api/estimate-age/status">🎂 Estimate ages (named faces)</button>
@@ -211,6 +222,7 @@
   var out = document.getElementById('match-threshold-val');
   var trashCb = document.getElementById('include-trashed');
   var capCb = document.getElementById('capture-unmatched-faces');
+  var rotCb = document.getElementById('match-try-rotations');
   function sync() {
     if (out && slider) out.textContent = slider.value;
     document.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
@@ -220,12 +232,14 @@
       if (trashCb && trashCb.checked) params.push('include_trashed=1');
       // Only send when OFF — the endpoint defaults capture_unmatched=true.
       if (btn.hasAttribute('data-capture-unmatched') && capCb && !capCb.checked) params.push('capture_unmatched=0');
+      if (btn.hasAttribute('data-try-rotations') && rotCb && rotCb.checked) params.push('try_rotations=1');
       btn.dataset.start = btn.dataset.startBase + (params.length ? ('?' + params.join('&')) : '');
     });
   }
   if (slider) slider.addEventListener('input', sync);
   if (trashCb) trashCb.addEventListener('change', sync);
   if (capCb) capCb.addEventListener('change', sync);
+  if (rotCb) rotCb.addEventListener('change', sync);
   sync();
 })();
 </script>
