@@ -3279,44 +3279,101 @@ def create_app(data_root: str) -> FastAPI:
                               source_body_id=bid, source='face-link')
         return bid
 
+    def _face_on_body_score(fbox, draw):
+        """How strongly a face box belongs to a drawn body box, or None. A body box is
+        usually drawn around the torso with the HEAD ABOVE it, so plain containment
+        isn't enough. Two ways to belong, strongest first:
+          • the face is inside the box (containment >= 0.5) -> 1 + containment;
+          • the face sits on top of the body: horizontally over it (>=50% of the face
+            width overlaps the box's x-span and the face's center-x is within it) and
+            vertically head-like (within the box's top half, allowed to rise above the
+            box top by up to its own height) -> the horizontal-overlap fraction.
+        Returns a comparable score so the best-matching face wins; None if unrelated."""
+        fx1, fy1, fx2, fy2 = fbox
+        dx1, dy1, dx2, dy2 = draw
+        ix = max(0.0, min(fx2, dx2) - max(fx1, dx1))
+        iy = max(0.0, min(fy2, dy2) - max(fy1, dy1))
+        face_area = max(1.0, (fx2 - fx1) * (fy2 - fy1))
+        containment = (ix * iy) / face_area
+        if containment >= 0.5:
+            return 1.0 + containment
+        fw = max(1.0, fx2 - fx1)
+        xov = ix / fw
+        fcx = (fx1 + fx2) / 2.0
+        bh = max(1.0, dy2 - dy1)
+        on_top = (xov >= 0.5 and dx1 <= fcx <= dx2
+                  and fy1 <= dy1 + 0.5 * bh    # head is in the body's upper half...
+                  and fy2 >= dy1 - bh)         # ...and not floating far above it
+        return xov if on_top else None
+
     @app.post('/api/files/{file_id}/suggest-body-identity')
     def api_suggest_body_identity(file_id: int, body: ManualFaceBody):
         """Best guess for WHO a just-drawn body box is, so "Label person" can pre-fill
-        the name. Three signals, surest + cheapest first, stopping at the first hit:
-          1. labeled-face: a face already named on THIS photo sits inside the box
-             (pure geometry, no GPU, near-certain);
-          2. face-match: detect+recognize a face in the box against known people (GPU,
-             only if #1 misses);
+        the name. Signals, surest + cheapest first, stopping at the first hit:
+          1. labeled-face: a face already named on THIS photo belongs to the box (see
+             _face_on_body_score) — or, if nothing matches geometrically but the photo
+             has exactly ONE named face, that person (single-subject shortcut);
+          2. face-match: a DETECTED face on the box already has a precomputed
+             suggested_identity (GPU-free), else recognize one by expanding the box up
+             to include the head and matching against known people;
           3. body-match: rank the body crop against known body anchors (CLIP).
         Returns {name, source, score} or {name: None}. A suggestion only — nothing is
         written here; the user still confirms in the modal."""
-        from media_manager.body_index import _containment, match_face_to_body, crop_bodies, \
-            MIN_FACE_IN_BODY_OVERLAP
+        from media_manager.body_index import crop_bodies
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1,y1,x2,y2]')
         row = _file_or_404(file_id)
         draw = [float(v) for v in body.bbox]
 
-        # 1) A face already named on this photo, whose box falls inside the drawn body.
-        best_name, best_cont = None, MIN_FACE_IN_BODY_OVERLAP
-        for identity, fbox in manual.get_named_faces_for_checksum(row['checksum']):
-            cont = _containment(fbox, draw)
-            if cont >= best_cont:
-                best_cont, best_name = cont, identity
+        # 1) A face already named on this photo that belongs to the drawn body.
+        named = manual.get_named_faces_for_checksum(row['checksum'])
+        best_name, best_score = None, 0.0
+        for identity, fbox in named:
+            s = _face_on_body_score(fbox, draw)
+            if s is not None and s > best_score:
+                best_score, best_name = s, identity
         if best_name is not None:
             return {'name': best_name, 'source': 'labeled-face', 'score': 1.0}
+        # Single-subject shortcut: one named face on the photo -> it's almost certainly
+        # whose body this is, even if the box missed the head.
+        distinct = {n for n, _ in named}
+        if len(distinct) == 1:
+            return {'name': next(iter(distinct)), 'source': 'labeled-face', 'score': 1.0}
+
+        # 2a) A DETECTED (unnamed) face on the box whose identity was already guessed by
+        #     the face-scoring job — reuse it, no GPU.
+        cur = db.conn.cursor()
+        cur.execute(
+            "SELECT bbox, suggested_identity, suggested_score FROM faces "
+            "WHERE file_id = ? AND suggested_identity IS NOT NULL "
+            "AND (identity IS NULL OR identity != '__indexed__')", (file_id,))
+        best_name, best_score, best_sugg = None, 0.0, None
+        for bbox_json, sugg, sugg_score in cur.fetchall():
+            try:
+                fbox = json.loads(bbox_json)
+            except (TypeError, ValueError):
+                continue
+            s = _face_on_body_score(fbox, draw)
+            if s is not None and s > best_score:
+                best_score, best_name, best_sugg = s, sugg, sugg_score
+        if best_name is not None:
+            return {'name': best_name, 'source': 'face-match',
+                    'score': round(float(best_sugg or 0.0), 3)}
 
         abs_path = _live_abs_path(file_id, row['path'])
 
-        # 2) Recognize a face detected inside the drawn box against known identities.
+        # 2b) No precomputed guess — recognize a face by expanding the box UP to catch a
+        #     head drawn above the torso, then match against known people.
         if abs_path is not None:
             try:
                 import cv2
                 img = cv2.imread(abs_path)
                 if img is not None:
-                    res = _get_face_detector().embed_bbox(img, draw)
-                    # det_score 0 == the unaligned last-resort fallback (no real face
-                    # found): don't match on that, it's barely an embedding.
+                    bh = draw[3] - draw[1]
+                    up = [draw[0], max(0.0, draw[1] - 0.6 * bh), draw[2], draw[3]]
+                    res = _get_face_detector().embed_bbox(img, up)
+                    # det_score 0 == the unaligned last-resort fallback (no real face):
+                    # don't match on that, it's barely an embedding.
                     if res.get('det_score', 0.0) > 0 and res.get('embedding') is not None:
                         name, score = manual.find_matching_identity(res['embedding'].astype('float32').tobytes())
                         if name:

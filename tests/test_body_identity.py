@@ -220,12 +220,13 @@ def main_autolink():
 
 
 def main_suggest():
-    """suggest-body-identity, signal #1 — a face already named on the photo, whose box
-    falls inside the drawn body box, is suggested with no GPU. Signals #2 (face
-    recognition) and #3 (body match) only run when the file is on disk (they decode the
-    image / embed the crop); these DB-only fixtures have no real files, so those tiers
-    are correctly skipped and the endpoint returns {name:None}. Their wiring is covered
-    by the build route-check."""
+    """suggest-body-identity signal #1 (labeled face), the common cases that used to
+    fail: the face sits ABOVE the drawn torso box, and the single-subject shortcut.
+    Signals #2/#3 only run with the file on disk (decode/embed) so they're correctly
+    skipped by these DB-only fixtures; their wiring is covered by the build route-check."""
+    def suggest(client, fid, bbox):
+        return client.post('/api/files/%d/suggest-body-identity' % fid, json={'bbox': bbox}).json()
+
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
         app = create_app(tmp)
@@ -233,24 +234,44 @@ def main_suggest():
         client = TestClient(app)
         rng = np.random.default_rng(29)
 
-        cs1 = ('s1' * 20)[:40]
-        fid1 = db.upsert_file_path('s1.jpg', cs1, size=100)
-        db.conn.commit()  # make the file row visible to the request handler's connection
-        # add_manual_face stores no identity; name it through the confirm path.
-        face1 = manual.add_manual_face(cs1, [20, 10, 40, 35], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
-        client.post('/api/faces/manual:%d/identity' % face1, json={'name': 'Dana'})
+        def photo(name):
+            cs = (name * 20)[:40]
+            fid = db.upsert_file_path(name + '.jpg', cs, size=100)
+            db.conn.commit()
+            return fid, cs
 
-        # Drawn body box covers the labeled face -> suggest Dana.
-        r = client.post('/api/files/%d/suggest-body-identity' % fid1, json={'bbox': [0, 0, 100, 200]})
-        assert r.status_code == 200, r.text
-        j = r.json()
-        assert j['name'] == 'Dana' and j['source'] == 'labeled-face' and j['score'] == 1.0, j
-        print('ok: signal #1 — a labeled face in the box suggests that person')
+        def name_face(cs, fbox, name):
+            fid = manual.add_manual_face(cs, fbox, _unit(rng.standard_normal(D)).tobytes(), 200, 300)
+            client.post('/api/faces/manual:%d/identity' % fid, json={'name': name})
 
-        # A box that excludes the face -> no false suggestion (and no disk/GPU work).
-        r = client.post('/api/files/%d/suggest-body-identity' % fid1, json={'bbox': [60, 120, 95, 195]})
-        assert r.json()['name'] is None, r.json()
-        print('ok: a box not covering the face gives no false suggestion')
+        # (1) Head ABOVE the torso box — the case that used to miss. Face [20,0,45,25]
+        #     sits just above body [15,30,60,180]; must still suggest Dana.
+        f1, cs1 = photo('p1')
+        name_face(cs1, [20, 0, 45, 25], 'Dana')
+        j = suggest(client, f1, [15, 30, 60, 180])
+        assert j['name'] == 'Dana' and j['source'] == 'labeled-face', j
+        print('ok: a face drawn ABOVE the body box is still matched (head-on-top)')
+
+        # (2) Single-subject shortcut — the one named face on the photo is suggested even
+        #     when the box misses it entirely.
+        f2, cs2 = photo('p2')
+        name_face(cs2, [10, 10, 30, 30], 'Eli')
+        j = suggest(client, f2, [120, 150, 160, 290])
+        assert j['name'] == 'Eli' and j['source'] == 'labeled-face', j
+        print('ok: single named face on the photo -> suggested even if the box missed it')
+
+        # (3) Ambiguous — two named faces, box matches NEITHER geometrically -> no guess.
+        f3, cs3 = photo('p3')
+        name_face(cs3, [10, 10, 30, 30], 'Finn')
+        name_face(cs3, [160, 10, 185, 35], 'Gwen')
+        j = suggest(client, f3, [80, 120, 110, 260])
+        assert j['name'] is None, j
+        print('ok: two faces, box matches neither -> no false guess')
+
+        # (4) Ambiguous but one clearly belongs — box over Gwen's head -> Gwen.
+        j = suggest(client, f3, [150, 40, 195, 260])
+        assert j['name'] == 'Gwen', j
+        print('ok: with two faces, the one the box belongs to wins')
 
     print('\nSUGGEST-IDENTITY TESTS PASSED')
 

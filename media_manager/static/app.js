@@ -3975,6 +3975,11 @@
         saveBtn.disabled = true; anonBtn.disabled = true;
         postBodyLabel(bbox, nm).then(closeModal);
       });
+      // Enter in the name field = Save & link (the common case: accept the pre-filled
+      // or typed name without reaching for the mouse).
+      nameInput.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter') { e.preventDefault(); saveBtn.click(); }
+      });
       anonBtn.addEventListener('click', function () {
         saveBtn.disabled = true; anonBtn.disabled = true;
         postBodyLabel(bbox, '').then(closeModal);
