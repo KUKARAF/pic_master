@@ -6784,7 +6784,26 @@ def create_app(data_root: str) -> FastAPI:
                 scored.append((fid, sum(s for _n, s, _b in matched), matched))
         scored.sort(key=lambda t: -t[1])
 
-        # resolve + filter (drop members, location-excluded, already-seen)
+        # resolve + filter (drop members, location-excluded, already-seen). We also
+        # need each image's ORIGINAL pixel dims so the client can position the boxes
+        # (region boxes are stored in original px): prefer the files table, else read
+        # the header cheaply with PIL.
+        def _orig_dims(fr):
+            keys = fr.keys() if hasattr(fr, 'keys') else []
+            w = fr['width'] if 'width' in keys else None
+            h = fr['height'] if 'height' in keys else None
+            if w and h:
+                return int(w), int(h)
+            ap = _live_abs_path(fr['id'], fr['path'])
+            if ap:
+                try:
+                    from PIL import Image
+                    with Image.open(ap) as im:
+                        return int(im.width), int(im.height)
+                except Exception:
+                    pass
+            return None, None
+
         page = []
         for fid, overall, matched in scored:
             frow = db.get_files_by_ids([fid])
@@ -6793,22 +6812,24 @@ def create_app(data_root: str) -> FastAPI:
             fr = frow[0]
             if fr['checksum'] in member_cs or fr['checksum'] in excluded_cs or fid in exclude_ids:
                 continue
-            page.append((fid, fr['path'], fr['checksum'], overall, matched))
+            iw, ih = _orig_dims(fr)
+            page.append((fid, fr['path'], fr['checksum'], overall, matched, iw, ih))
             if len(page) >= limit:
                 break
 
-        rows = [(fid, path, True, cs) for fid, path, cs, _o, _m in page]
-        scores_map = {fid: round(ov, 3) for fid, _p, _cs, ov, _m in page}
+        rows = [(fid, path, True, cs) for fid, path, cs, _o, _m, _iw, _ih in page]
+        scores_map = {fid: round(ov, 3) for fid, _p, _cs, ov, _m, _iw, _ih in page}
         cards = _enrich_rows(rows, scores=scores_map)
         by_fid = {c['id']: c for c in cards}
-        for fid, _p, _cs, _ov, matched in page:
+        for fid, _p, _cs, _ov, matched, iw, ih in page:
             c = by_fid.get(fid)
             if c is None:
                 continue
             c['ref'] = str(c['id'])
             c['object_boxes'] = [
                 {'name': n, 'bbox': [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
-                 'score': round(float(s), 3)} for n, s, b in matched
+                 'score': round(float(s), 3), 'image_width': iw, 'image_height': ih}
+                for n, s, b in matched
             ]
         return cards, False
 

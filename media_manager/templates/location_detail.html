@@ -161,9 +161,9 @@
   <div class="swipe-page" id="obj-swipe-page" style="margin-top:16px;">
     <div class="swipe-stack-wrap" id="obj-swipe-stack"></div>
     <div class="swipe-hint">
-      Swipe up if it matches, down if not (or use ↑ / ↓) ·
-      click the photo for a full view with the object(s) outlined ·
-      <strong>Ctrl/⌘+Z</strong> undo
+      The matched object(s) are outlined on each card. Swipe up if it matches, down if not
+      (or use ↑ / ↓) · <strong>→</strong> or click the photo for a full-size labeled view ·
+      a "no" makes that region a negative for this location · <strong>Ctrl/⌘+Z</strong> undo
     </div>
   </div>
 </div>
@@ -797,6 +797,61 @@
     });
   }
 
+  /* The highest-scoring matched box on a card (used for swipe-core's native
+     Right-arrow reveal, which only understands a single normalized bbox). */
+  function bestObjectBox(card) {
+    const boxes = (card && card.object_boxes) || [];
+    let best = null;
+    boxes.forEach(function (b) {
+      if (!Array.isArray(b.bbox) || b.bbox.length !== 4) return;
+      if (!best || (typeof b.score === 'number' && b.score > (best.score || -Infinity))) best = b;
+    });
+    return best;
+  }
+
+  /* Draw every matched object box directly on the TOP card's thumbnail (with its
+     name) so you can SEE what was matched and WHERE without opening anything —
+     this is the whole point of "how do I know what matched where". Re-runs each
+     time the top card changes (swipe-core's onTopCardChange). */
+  function drawTopCardBoxes(card) {
+    if (!swipeStackWrap) return;
+    const cards = swipeStackWrap.querySelectorAll('.swipe-card');
+    const cardEl = cards[cards.length - 1];   // top card is appended last → last in DOM
+    if (!cardEl) return;
+    const img = cardEl.querySelector('img');
+    if (!img) return;
+    const boxes = (card && card.object_boxes) || [];
+    function paint() {
+      Array.prototype.forEach.call(cardEl.querySelectorAll('.obj-card-box'), function (b) { b.remove(); });
+      const cw = img.clientWidth, ch = img.clientHeight;
+      if (!cw || !ch) return;
+      if (getComputedStyle(cardEl).position === 'static') cardEl.style.position = 'relative';
+      boxes.forEach(function (b) {
+        if (!Array.isArray(b.bbox) || b.bbox.length !== 4) return;
+        const iw = b.image_width, ih = b.image_height;
+        if (!iw || !ih) return;
+        const el = document.createElement('div');
+        el.className = 'face-hilite-box obj-card-box';
+        el.style.position = 'absolute';
+        el.style.pointerEvents = 'none';
+        el.style.left = (img.offsetLeft + b.bbox[0] / iw * cw) + 'px';
+        el.style.top = (img.offsetTop + b.bbox[1] / ih * ch) + 'px';
+        el.style.width = ((b.bbox[2] - b.bbox[0]) / iw * cw) + 'px';
+        el.style.height = ((b.bbox[3] - b.bbox[1]) / ih * ch) + 'px';
+        if (b.name) {
+          const lab = document.createElement('span');
+          lab.textContent = b.name;
+          lab.style.cssText = 'position:absolute;left:0;top:-15px;font-size:11px;line-height:1.3;' +
+            'background:rgba(0,0,0,.72);color:#fff;padding:1px 5px;border-radius:3px;white-space:nowrap;';
+          el.appendChild(lab);
+        }
+        cardEl.appendChild(el);
+      });
+    }
+    if (img.complete && img.naturalWidth) paint();
+    img.addEventListener('load', paint, { once: true });
+  }
+
   function objScoreText(card) {
     const boxes = (card && card.object_boxes) || [];
     const named = boxes.map(function (b) { return b.name; }).filter(Boolean);
@@ -828,6 +883,14 @@
       },
       renderCard: function (card) {
         const fid = card.file_id != null ? card.file_id : card.id;
+        // Give swipe-core's native Right-arrow reveal a (normalized) box to
+        // highlight — the primary matched region. Click still opens the full
+        // labeled multi-box overlay.
+        const bb = bestObjectBox(card);
+        if (bb && bb.image_width && bb.image_height) {
+          card.bbox = [bb.bbox[0] / bb.image_width, bb.bbox[1] / bb.image_height,
+                       bb.bbox[2] / bb.image_width, bb.bbox[3] / bb.image_height];
+        }
         return {
           imageUrl: '/thumb/' + fid,
           questionHtml: 'Does this contain the selected object(s)?',
@@ -837,6 +900,9 @@
           // opens the labeled full view instead of a new tab.
         };
       },
+      // Draw the matched box(es) right on the top card so the match is visible
+      // at a glance (not only after a click / Right-arrow).
+      onTopCardChange: function (card) { if (card) drawTopCardBoxes(card); },
       onConfirm: function (card) {
         // Mirror the "Suggested photos" swipe: a match places the photo here.
         const fid = card.file_id != null ? card.file_id : card.id;
