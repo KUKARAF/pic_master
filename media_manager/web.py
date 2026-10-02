@@ -417,31 +417,6 @@ def _get_age_estimator():
     return _age_estimator
 
 
-_place_encoder = None
-_place_matcher = None
-
-
-def _get_place_encoder(data_root):
-    """Local Visual-Place-Recognition encoder (AnyLoc/EigenPlaces — see place_encoder.py).
-    Runs on the GPU host (the B70) itself, NOT offloaded to the remote worker: the Arc
-    GPU is here, and the worker box may not have it. Lazy singleton."""
-    global _place_encoder
-    if _place_encoder is None:
-        from media_manager.place_encoder import PlaceEncoder
-        _place_encoder = PlaceEncoder(data_root=data_root)
-    return _place_encoder
-
-
-def _get_place_matcher():
-    """Local local-feature matcher (XFeat/SIFT — see place_matcher.py) for the same-spot
-    geometric re-rank. B70-local, same reasoning as the place encoder. Lazy singleton."""
-    global _place_matcher
-    if _place_matcher is None:
-        from media_manager.place_matcher import PlaceMatcher
-        _place_matcher = PlaceMatcher()
-    return _place_matcher
-
-
 def _ml_device_label():
     """Device label for the torch/CLIP bulk jobs' status, so /bulk shows GPU vs CPU
     live. These offload to the worker when one is configured (so the compute isn't
@@ -2802,12 +2777,6 @@ def create_app(data_root: str) -> FastAPI:
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
-    # Place (VPR) index: per-image scene descriptor + cached local features, people
-    # masked, for location-by-scene matching + the same-spot geometric re-rank.
-    place_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
-    # Indexing just ONE location's own photos (fast) so it can be searched against the
-    # place index that already exists — no whole-library rebuild required.
-    location_member_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -4265,87 +4234,6 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
-    @app.post('/api/place-index/start')
-    def api_place_index_start(include_trashed: bool = False):
-        """Build the place (Visual Place Recognition) index: for every un-indexed image,
-        compute a scene descriptor with PEOPLE MASKED OUT (person boxes from YOLO
-        detections) and cache its local features for the same-spot re-rank. Runs the
-        encoder/matcher LOCALLY on the GPU host. Background job; poll .../status.
-
-        Needs object detections present for masking to work — run tag/object reindex
-        first, else images are encoded unmasked (people not excluded). A photo the
-        encoder can't turn into a usable descriptor gets a sentinel row so it isn't
-        re-queued."""
-        from media_manager import body_index
-
-        if place_index_job['running']:
-            return {'started': False, 'message': 'Place indexing already running.'}
-        # CPU is only ever used when the user explicitly chose it (MEDIA_DEVICE=cpu);
-        # otherwise an undetected GPU is an error state (torch reports 0 devices), so we
-        # surface it loudly in /bulk via `message` rather than silently falling back to a
-        # ~20x slower CPU run. compute.torch_device() is cached and cheap.
-        import os
-        from media_manager import compute
-        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
-            return {'started': False, 'message':
-                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
-                'This is a GPU job and would be far slower on CPU. Fix the GPU/driver (and check '
-                'torch.xpu.device_count()), or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
-        trashed = set() if include_trashed else set(_trashed_file_ids())
-        candidates = [
-            (fid, rel) for (fid, rel) in db.get_unplace_indexed_files()
-            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
-        ]
-        place_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
-
-        def _run():
-            from media_manager import place_index
-            try:
-                enc = _get_place_encoder(data_root)
-                # Surface GPU vs CPU live in /bulk — the encoder knows its real device
-                # (torch for eigenplaces, OpenVINO for anyloc).
-                try:
-                    place_index_job['device'] = enc.device_label()
-                except Exception:
-                    place_index_job['device'] = None
-                matcher = None
-                try:
-                    matcher = _get_place_matcher()
-                except Exception as exc:
-                    # Matcher optional for this pass (re-rank just won't have features);
-                    # loud, not silent, then carry on with embeddings only.
-                    print(f'[place-index] matcher unavailable, embeddings only: {exc}', flush=True)
-                place_index.build_place_index(
-                    db, enc, matcher, data_root,
-                    image_exts=IMAGE_EXTENSIONS,
-                    person_boxes_fn=lambda fid: db.get_person_detections_for_file(
-                        fid, class_names=body_index.PERSON_LIKE_CLASSES),
-                    abs_path_fn=_live_abs_path,
-                    candidates=candidates,
-                    on_progress=lambda d, t: place_index_job.update(done=d, total=t),
-                    log=errors.log)
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                place_index_job['error'] = str(exc)
-                print(f'[place-index] FAILED: {exc}', flush=True)
-            finally:
-                place_index_job['running'] = False
-
-        _spawn_job(_run)
-        return {'started': True, 'total': place_index_job['total']}
-
-    @app.get('/api/place-index/status')
-    def api_place_index_status():
-        return {
-            'running': place_index_job['running'],
-            'done': place_index_job['done'],
-            'total': place_index_job['total'],
-            'error': place_index_job['error'],
-            'pending': len(db.get_unplace_indexed_files()),
-            'device': place_index_job.get('device'),
-        }
-
     # ------------------------------------------------------------------
     # JSON API
     # ------------------------------------------------------------------
@@ -5466,11 +5354,8 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True):
-        """Images not yet at this location whose people-masked PLACE (scene) embedding
-        is close to the centroid of the ones that are — "photos probably taken at this
-        place". Ranks ONLY on place embeddings (never the whole-image CLIP vector, which
-        is dominated by people); when the place index isn't built it returns
-        place_ready=False rather than falling back to CLIP.
+        """Images not yet at this location whose CLIP embedding is close to the
+        centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
         it for the offset/exclude_ids/avoid_existing semantics, which are
         identical here) rather than a second, GPS-flavoured ranking: what makes
@@ -5483,22 +5368,13 @@ def create_app(data_root: str) -> FastAPI:
 
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
-
-        # Rank ONLY on the PLACE (scene, people-masked) embedding — never the whole-image
-        # CLIP vector, which is dominated by people and would silently reintroduce the
-        # person-matching this feature exists to kill. If the place index isn't built for
-        # this location's photos (or the library) yet, return place_ready=False so the
-        # endpoint/UI can say "build the place index" instead of serving a misleading
-        # people-matched ranking. Returns (cards, place_ready).
-        place_member = db.get_place_embeddings_for_files(member_ids)
-        all_rows = db.get_all_place_embeddings() if place_member else []
-        if not place_member or not all_rows:
-            return [], False
-        member_embeddings = [e for _fid, e in place_member]
+        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
 
         centroid = mean_normalized_centroid(member_embeddings)
+        # A location with nothing placed at it yet has nothing to compare against
+        # — no centroid, no suggestions (the page says exactly that).
         if centroid is None:
-            return [], True
+            return []
 
         excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
         # Photos whose SET is already linked to this location: pressing `s` on one
@@ -5508,46 +5384,17 @@ def create_app(data_root: str) -> FastAPI:
         set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
 
         candidates = [
-            row for row in all_rows
+            row for row in db.get_all_embeddings()
             if row[3] not in member_checksums and row[3] not in excluded_checksum_set
             and row[3] not in set_settled_checksums
         ]
         if not candidates:
-            return [], True
+            return []
         ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
         passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
         if avoid_existing and passing:
             placed_anywhere = manual.get_checksums_with_any_location()
             passing = [item for item in passing if item[0][2] not in placed_anywhere]
-        # Stage 2 — "literally the same spot": re-rank the top candidates by LOCAL-FEATURE
-        # geometric agreement with this location's own photos (people's keypoints already
-        # dropped at place-index time). A candidate that geometrically matches a member
-        # (same walls / landmark / furniture) floats above one that's merely scene-similar.
-        # Runs only if both sides have cached features; best-effort and non-fatal (keeps
-        # embedding order on any error); bounded to the top PLACE_RERANK_CAP so it stays
-        # swipe-interactive.
-        if len(passing) > 1:
-            PLACE_RERANK_CAP, MEMBER_REP_CAP = 30, 4
-            try:
-                mem_kp = db.get_place_keypoints_for_files(member_ids[:MEMBER_REP_CAP])
-                if mem_kp:
-                    matcher = _get_place_matcher()
-                    mem_feats = [matcher.deserialize(b) for b in mem_kp.values()]
-                    head = passing[:PLACE_RERANK_CAP]
-                    cand_kp = db.get_place_keypoints_for_files([it[0][0] for it in head])
-
-                    def _inliers(fid):
-                        blob = cand_kp.get(fid)
-                        if not blob:
-                            return -1
-                        cf = matcher.deserialize(blob)
-                        return max((matcher.match_score(mf, cf).get('inliers', 0)
-                                    for mf in mem_feats), default=0)
-
-                    head = sorted(head, key=lambda it: (_inliers(it[0][0]), it[1]), reverse=True)
-                    passing = head + passing[PLACE_RERANK_CAP:]
-            except Exception:
-                traceback.print_exc()  # loud; fall back to embedding order
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -5559,7 +5406,7 @@ def create_app(data_root: str) -> FastAPI:
         cards = _enrich_rows(rows, scores=scores_map)
         for card in cards:
             card['ref'] = str(card['id'])
-        return cards, True
+        return cards
 
     def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
@@ -6591,107 +6438,11 @@ def create_app(data_root: str) -> FastAPI:
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
-        results, place_ready = _find_similar_files_for_location(
-            location_id, threshold, limit=limit, offset=offset,
-            exclude_ids=exclude_ids, avoid_existing=avoid_existing)
+        results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
+                                                    exclude_ids=exclude_ids, avoid_existing=avoid_existing)
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
-        # is what swipe-core.js's fetchMoreUrl contract reads. needs_place_index tells
-        # the UI the place index isn't built for this location yet — so it can say so
-        # instead of location matching silently doing nothing (we no longer fall back to
-        # the people-dominated CLIP ranking).
-        return {'results': results, 'cards': results, 'needs_place_index': not place_ready}
-
-    @app.get('/api/locations/{location_id}/place-status')
-    def api_location_place_status(location_id: int):
-        """Cheap check (no library scan) of whether the place index is built for this
-        location's photos — the location page preflights this to show a 'build the place
-        index' banner instead of an empty/misleading stack."""
-        if manual.get_location(location_id) is None:
-            raise HTTPException(status_code=404, detail='Location not found')
-        member_checksums = manual.get_checksums_for_location(location_id)
-        member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
-        ready = bool(member_ids) and bool(db.get_place_embeddings_for_files(member_ids))
-        return {'needs_place_index': not ready, 'members': len(member_ids)}
-
-    def _location_unindexed_member_rows(location_id):
-        """(file_id, rel_path) for this location's OWN image members that don't have a
-        place embedding yet — the small, cheap set the location page indexes so it can
-        be searched against the existing place index without a whole-library rebuild."""
-        rows = db.get_files_by_checksums(list(manual.get_checksums_for_location(location_id)))
-        indexed = {fid for fid, _ in db.get_place_embeddings_for_files([r['id'] for r in rows])}
-        return [(r['id'], r['path']) for r in rows
-                if r['id'] not in indexed
-                and os.path.splitext(r['path'])[1].lower() in IMAGE_EXTENSIONS]
-
-    @app.post('/api/locations/{location_id}/index-members')
-    def api_location_index_members(location_id: int):
-        """Place-index just THIS location's own photos (its members), not the whole
-        library. Fast — a handful of images — so the location becomes searchable
-        against whatever is already in the place index. Background job; poll
-        .../index-members/status. The candidate pool for ranking stays 'all place
-        embeddings that exist', so you search what you've already indexed."""
-        from media_manager import body_index, place_index
-        if manual.get_location(location_id) is None:
-            raise HTTPException(status_code=404, detail='Location not found')
-        if location_member_index_job['running']:
-            return {'started': False, 'message': 'Already indexing a location.'}
-        # CPU is only ever used when the user explicitly chose it (MEDIA_DEVICE=cpu);
-        # otherwise an undetected GPU is an error state (torch reports 0 devices), so we
-        # surface it loudly in /bulk via `message` rather than silently falling back to a
-        # ~20x slower CPU run. compute.torch_device() is cached and cheap.
-        import os
-        from media_manager import compute
-        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
-            return {'started': False, 'message':
-                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
-                'This is a GPU job and would be far slower on CPU. Fix the GPU/driver (and check '
-                'torch.xpu.device_count()), or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
-        cands = _location_unindexed_member_rows(location_id)
-        location_member_index_job.update(running=True, done=0, total=len(cands),
-                                         error=None, device=None)
-
-        def _run():
-            try:
-                enc = _get_place_encoder(data_root)
-                try:
-                    location_member_index_job['device'] = enc.device_label()
-                except Exception:
-                    location_member_index_job['device'] = None
-                matcher = None
-                try:
-                    matcher = _get_place_matcher()
-                except Exception as exc:
-                    print(f'[location-index] matcher unavailable, embeddings only: {exc}', flush=True)
-                place_index.build_place_index(
-                    db, enc, matcher, data_root,
-                    image_exts=IMAGE_EXTENSIONS,
-                    person_boxes_fn=lambda fid: db.get_person_detections_for_file(
-                        fid, class_names=body_index.PERSON_LIKE_CLASSES),
-                    abs_path_fn=_live_abs_path,
-                    candidates=cands,
-                    on_progress=lambda d, t: location_member_index_job.update(done=d, total=t),
-                    log=errors.log)
-            except Exception as exc:
-                import traceback
-                traceback.print_exc()
-                location_member_index_job['error'] = str(exc)
-                print(f'[location-index] FAILED: {exc}', flush=True)
-            finally:
-                location_member_index_job['running'] = False
-
-        _spawn_job(_run)
-        return {'started': True, 'total': location_member_index_job['total']}
-
-    @app.get('/api/locations/{location_id}/index-members/status')
-    def api_location_index_members_status(location_id: int):
-        return {
-            'running': location_member_index_job['running'],
-            'done': location_member_index_job['done'],
-            'total': location_member_index_job['total'],
-            'error': location_member_index_job['error'],
-            'device': location_member_index_job.get('device'),
-            'pending': len(_location_unindexed_member_rows(location_id)),
-        }
+        # is what swipe-core.js's fetchMoreUrl contract reads.
+        return {'results': results, 'cards': results}
 
     @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
     def api_exclude_file_location(file_id: int, location_id: int):
