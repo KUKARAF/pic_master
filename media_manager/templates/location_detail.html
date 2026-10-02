@@ -71,6 +71,15 @@
   <span id="location-buffer-size-value">10</span>
   are found
 </label>
+<!-- Build the place index right here (same job as /bulk's 📌 Index places): indexes
+     every photo so this and every location can match by scene. Reuses the shared
+     bulk-action wiring in app.js — live progress + the GPU/CPU device, and shows the
+     unindexed count on load. Re-run after adding photos to pick up the new ones. -->
+<div class="bulk-action-row" style="display:flex;align-items:center;gap:8px;margin:4px 0 12px;">
+  <button type="button" class="bulk-action-btn" data-start="/api/place-index/start"
+          data-status="/api/place-index/status">📌 Index all present (build place index)</button>
+  <span class="bulk-action-status sub" data-role="status"></span>
+</div>
 <!-- Shown (by the preflight below) only when the place index isn't built for this
      location. Location matching is scene-based with people masked out and does NOT
      fall back to the people-dominated whole-image ranking, so an unindexed location
@@ -78,8 +87,7 @@
 <div id="location-place-warning" class="alert" style="display:none;margin-bottom:12px;">
   📌 Location matching here needs the <strong>place index</strong>, which isn’t built yet.
   It ranks by what the place looks like (people ignored), so there’s nothing to match
-  until it’s built. Build it on the <a href="/bulk">Bulk page</a> → “📌 Index places”,
-  then reload.
+  until it’s built — click <strong>“📌 Index all present”</strong> above, then reload when it finishes.
 </div>
 <div style="display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap;">
   <div class="swipe-page" id="location-swipe-page" style="flex:1;min-width:300px;">

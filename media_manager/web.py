@@ -5452,8 +5452,11 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True):
-        """Images not yet at this location whose CLIP embedding is close to the
-        centroid of the ones that are — "photos probably taken at this place".
+        """Images not yet at this location whose people-masked PLACE (scene) embedding
+        is close to the centroid of the ones that are — "photos probably taken at this
+        place". Ranks ONLY on place embeddings (never the whole-image CLIP vector, which
+        is dominated by people); when the place index isn't built it returns
+        place_ready=False rather than falling back to CLIP.
         Deliberately the same centroid math as _find_similar_files_for_set (see
         it for the offset/exclude_ids/avoid_existing semantics, which are
         identical here) rather than a second, GPS-flavoured ranking: what makes
