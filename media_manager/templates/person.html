@@ -7,7 +7,8 @@
 <div class="page-heading">
   <h1>
     {{ name }}
-    <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }}">🔍</a>
+    <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }} by face">🔍</a>
+    <a href="/find-person/{{ name | urlencode }}/body" class="heart-btn-inline" title="Find more photos of {{ name }} by body (clothing/pose/build)">🧍</a>
     <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
     <button type="button" id="estimate-all-age-btn" class="heart-btn-inline" title="Estimate age &amp; gender for every photo of {{ name }}">🎂</button>
     <button type="button" id="person-split-btn" class="heart-btn-inline" title="Split off photos that are actually someone else">✂️</button>

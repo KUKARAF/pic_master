@@ -3862,35 +3862,104 @@
   wireMarkObject('mark-object-btn', 'positive');
   wireMarkObject('mark-object-negative-btn', 'negative');
 
-  /* Label person — drag a box around a person's body; it becomes a searchable
-     find-by-body crop (mirrors "Add face" but CLIP-embeds the body crop via
-     /api/files/{id}/bodies). Deep-linked from the find-by-body page's "Manually
-     label person" button via the #label-person hash. */
+  /* Label person — drag a box around a person's body, then NAME them: the crop is
+     CLIP-embedded (searchable find-by-body) AND, when a name is given, linked to
+     that person as a ground-truth body label so they can be found by body on
+     /find-person/{name}/body. Blank name keeps the old anonymous-crop behavior.
+     Deep-linked from the find-by-body page's "Manually label person" button via
+     the #label-person hash. */
   const labelPersonStatus = document.getElementById('label-person-status');
   const labelPersonBtn = document.getElementById('label-person-btn');
-  const labelPersonState = wireBoxDraw(labelPersonBtn, 'Drag a box around the person…', '🧍 Label person', function (bbox) {
+
+  function postBodyLabel(bbox, name) {
     if (labelPersonStatus) { labelPersonStatus.style.display = 'block'; labelPersonStatus.textContent = 'Embedding…'; }
-    fetch('/api/files/' + fileId + '/bodies', {
+    return fetch('/api/files/' + fileId + '/bodies', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ bbox: bbox }),
+      body: JSON.stringify({
+        bbox: bbox, name: name || '',
+        image_width: photoImg ? photoImg.naturalWidth : null,
+        image_height: photoImg ? photoImg.naturalHeight : null,
+      }),
     })
       .then(function (r) {
         if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || 'Request failed'); });
         return r.json();
       })
-      .then(function () {
+      .then(function (res) {
         if (labelPersonStatus) {
-          labelPersonStatus.textContent = 'Saved. ';
-          var a = document.createElement('a');
-          a.href = '/body-similar/' + fileId;
-          a.textContent = 'Find similar people →';
-          labelPersonStatus.appendChild(a);
+          labelPersonStatus.textContent = res.identity ? ('Linked to ' + res.identity + '. ') : 'Saved. ';
+          if (res.identity) {
+            var fp = document.createElement('a');
+            fp.href = '/find-person/' + encodeURIComponent(res.identity) + '/body';
+            fp.textContent = 'Find ' + res.identity + ' by body →';
+            labelPersonStatus.appendChild(fp);
+          } else {
+            var a = document.createElement('a');
+            a.href = '/body-similar/' + fileId;
+            a.textContent = 'Find similar people →';
+            labelPersonStatus.appendChild(a);
+          }
         }
       })
       .catch(function (err) {
         if (labelPersonStatus) { labelPersonStatus.style.display = 'block'; labelPersonStatus.textContent = 'Failed: ' + err.message; }
       });
+  }
+
+  function openLabelPersonModal(bbox) {
+    openModal('Label person', function (box) {
+      const nameLbl = document.createElement('label');
+      nameLbl.className = 'sub'; nameLbl.style.display = 'block';
+      nameLbl.textContent = 'Who is this? (pick or type a name — leave blank to just save the crop)';
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text'; nameInput.setAttribute('list', 'label-person-datalist');
+      nameInput.placeholder = 'e.g. Alex';
+      nameInput.style.cssText = 'width:100%;margin:4px 0 12px;';
+      const datalist = document.createElement('datalist');
+      datalist.id = 'label-person-datalist';
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;';
+      const saveBtn = document.createElement('button');
+      saveBtn.type = 'button'; saveBtn.className = 'btn-similar'; saveBtn.textContent = 'Save & link';
+      const anonBtn = document.createElement('button');
+      anonBtn.type = 'button'; anonBtn.className = 'btn-similar'; anonBtn.textContent = 'Save crop only';
+      const note = document.createElement('div');
+      note.className = 'sub'; note.style.cssText = 'margin-top:10px;opacity:.8;';
+      note.textContent = 'Body matching uses clothing/pose/build, so it finds this person best in the same outfit — it is a weaker signal than faces.';
+      const err = document.createElement('div');
+      err.className = 'sub'; err.style.cssText = 'color:#e0a;margin-top:8px;';
+      row.appendChild(saveBtn); row.appendChild(anonBtn);
+      [nameLbl, nameInput, datalist, row, note, err].forEach(function (el) { box.appendChild(el); });
+
+      fetch('/api/identities')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          const people = (d && (d.identities || d)) || [];
+          people.forEach(function (p) {
+            const o = document.createElement('option');
+            o.value = p.name || p;
+            datalist.appendChild(o);
+          });
+        })
+        .catch(function () {});
+
+      saveBtn.addEventListener('click', function () {
+        const nm = nameInput.value.trim();
+        if (!nm) { err.textContent = 'Type a name, or use “Save crop only”.'; return; }
+        saveBtn.disabled = true; anonBtn.disabled = true;
+        postBodyLabel(bbox, nm).then(closeModal);
+      });
+      anonBtn.addEventListener('click', function () {
+        saveBtn.disabled = true; anonBtn.disabled = true;
+        postBodyLabel(bbox, '').then(closeModal);
+      });
+      setTimeout(function () { try { nameInput.focus(); } catch (e) {} }, 30);
+    });
+  }
+
+  const labelPersonState = wireBoxDraw(labelPersonBtn, 'Drag a box around the person…', '🧍 Label person', function (bbox) {
+    openLabelPersonModal(bbox);
   });
   if (labelPersonState) boxDrawStates.push(labelPersonState);
 

@@ -747,6 +747,37 @@ class ManualDB(ThreadLocalDB):
             'CREATE UNIQUE INDEX IF NOT EXISTS idx_manual_faces_source '
             'ON faces (source_face_id) WHERE source_face_id IS NOT NULL'
         )
+        # Body identities — the ground-truth mirror of `faces`, for "who" a body
+        # crop is (clothing/pose/build via CLIP, not a face). Kept here in manual.db
+        # keyed by checksum (not in media.db's derived, rebuildable body_embeddings)
+        # for the same reason faces.identity lives here: a label a human made must
+        # survive a media.db rescan. `source_body_id` points back at the media.db
+        # body_embeddings row the label was made from (when it came from the swipe
+        # stream or "Label person"), so the suggestion stream can exclude bodies
+        # already decided for a person. A `rejected=1` row is a kept hard-negative
+        # ("this body is NOT <identity>") so the stream never re-offers it.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS body_identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checksum TEXT NOT NULL,
+                identity TEXT,
+                x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+                embedding BLOB NOT NULL,
+                model TEXT NOT NULL,
+                source_body_id INTEGER,
+                image_width INTEGER,
+                image_height INTEGER,
+                rejected INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                frame_index INTEGER
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_body_identities_checksum ON body_identities (checksum)')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_body_identities_identity ON body_identities (identity)')
+        cur.execute(
+            'CREATE UNIQUE INDEX IF NOT EXISTS idx_body_identities_source '
+            'ON body_identities (source_body_id) WHERE source_body_id IS NOT NULL'
+        )
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -2856,6 +2887,7 @@ class ManualDB(ThreadLocalDB):
         new_name = new_name.strip()
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE body_identities SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))
@@ -3390,6 +3422,83 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute("SELECT id, checksum, embedding FROM faces WHERE identity = ? AND rejected = 0", (name,))
         return cur.fetchall()
+
+    # ---- Body identities (ground-truth "who is this body", mirrors the faces
+    # ---- methods above but for CLIP body crops; see the body_identities table).
+
+    def add_body_label(self, checksum, identity, bbox, embedding_bytes, model,
+                       image_width=None, image_height=None, source_body_id=None,
+                       frame_index=None, rejected=0):
+        """Record one ground-truth body label: this crop on `checksum` is (or,
+        with rejected=1, is NOT) `identity`. Mirrors add_manual_face. Upserts on
+        source_body_id so re-deciding the same media.db body replaces the prior
+        decision rather than piling up rows (the unique partial index enforces it).
+        `identity` may be None only for an anonymous saved crop (name not given)."""
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        cur = self.conn.cursor()
+        if source_body_id is not None:
+            cur.execute('DELETE FROM body_identities WHERE source_body_id = ?', (int(source_body_id),))
+        cur.execute(
+            '''INSERT INTO body_identities
+               (checksum, identity, x1, y1, x2, y2, embedding, model, source_body_id,
+                image_width, image_height, rejected, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (checksum, identity, x1, y1, x2, y2, embedding_bytes, model,
+             (int(source_body_id) if source_body_id is not None else None),
+             image_width, image_height, int(rejected), int(time.time()))
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def reject_body_candidate(self, source_body_id, checksum, identity, bbox,
+                              embedding_bytes, model):
+        """'This body is NOT <identity>' from the body-search swipe — kept as a
+        rejected=1 row so the stream never re-offers it (mirrors reject_auto_face)."""
+        return self.add_body_label(checksum, identity, bbox, embedding_bytes, model,
+                                   source_body_id=source_body_id, rejected=1)
+
+    def delete_body_decision_by_source(self, source_body_id):
+        """Undo a body confirm/reject made from a media.db body row (Ctrl+Z) — hard
+        delete so the body returns to the unlabeled pool (mirrors
+        delete_face_decision_by_source)."""
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM body_identities WHERE source_body_id = ?', (int(source_body_id),))
+        self.conn.commit()
+        return cur.rowcount
+
+    def get_body_embeddings_for_identity(self, name):
+        """[embedding_bytes, ...] for every body crop confirmed as this person —
+        the anchors the body-suggestion stream ranks the unlabeled pool against."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT embedding FROM body_identities WHERE identity = ? AND rejected = 0", (name,))
+        return [row[0] for row in cur.fetchall()]
+
+    def get_decided_body_source_ids(self, name):
+        """set() of media.db body_embeddings ids already confirmed OR rejected for
+        `name` — excluded from that person's suggestion stream so a decided body is
+        never offered again."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT source_body_id FROM body_identities WHERE identity = ? AND source_body_id IS NOT NULL",
+            (name,))
+        return {int(r[0]) for r in cur.fetchall()}
+
+    def get_photos_with_body_identity(self, name, limit=1000):
+        """Checksums with at least one body confirmed as `name` (rejected=0) — the
+        body half of a person's unified presence (see _identity_instances)."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT checksum FROM body_identities WHERE identity = ? AND rejected = 0 LIMIT ?",
+            (name, limit))
+        return [r[0] for r in cur.fetchall()]
+
+    def get_body_label_counts(self):
+        """{identity: count} of confirmed body labels — lets a page show whether a
+        person has any body anchors to search by at all."""
+        cur = self.conn.cursor()
+        cur.execute('''SELECT identity, COUNT(*) FROM body_identities
+                       WHERE identity IS NOT NULL AND rejected = 0 GROUP BY identity''')
+        return {r[0]: r[1] for r in cur.fetchall()}
 
     def get_all_identities(self):
         """Return [(identity, count), ...] ordered by count descending."""

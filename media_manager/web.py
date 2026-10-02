@@ -87,6 +87,14 @@ class ConfirmAboveThresholdBody(BaseModel):
 class ManualFaceBody(BaseModel):
     bbox: List[float]
 
+class BodyLabelBody(BaseModel):
+    bbox: List[float]
+    # Optional person to link this body crop to (datalist on the photo view). Blank/
+    # omitted keeps the old anonymous-crop behavior (searchable, but credited to nobody).
+    name: Optional[str] = None
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+
 class SpatialTagBody(BaseModel):
     label: str
     bbox: List[float]
@@ -2053,6 +2061,16 @@ def create_app(data_root: str) -> FastAPI:
         for checksum in manual.get_photos_assigned_to_identity(name, limit=1000):
             if checksum not in seen_face_checksums:
                 instances.append({'checksum': checksum, 'face_ref': None})
+                seen_face_checksums.add(checksum)
+        # Body-only appearances: a photo/video where this person was identified by
+        # their body (no recognizable face), collapsed to its source video like faces
+        # above and de-duped against checksums already covered by a face/whole-photo
+        # instance, so a body label on a photo that also has their face doesn't count twice.
+        for checksum in manual.get_photos_with_body_identity(name):
+            vid_cs = _source_video(checksum)
+            if vid_cs not in seen_face_checksums:
+                instances.append({'checksum': vid_cs, 'face_ref': None})
+                seen_face_checksums.add(vid_cs)
         linked_sets = manual.get_sets_linked_to_identity(name)
         return instances, linked_sets
 
@@ -2452,6 +2470,25 @@ def create_app(data_root: str) -> FastAPI:
             return RedirectResponse(url=f'/find-person/{quote(canonical)}')
         return templates.TemplateResponse(request, 'find_person.html', {
             'name': name,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/find-person/{name}/body', response_class=HTMLResponse)
+    def find_person_body_page(request: Request, name: str):
+        """Find a person by BODY — the swipe sibling of /find-person/{name}, ranking
+        the unlabeled body pool against this person's confirmed body crops (see
+        _next_body_suggestions). Deliberately leaner than the face page: no rotate /
+        rival / calibrate, because body similarity is a coarser signal and those tools
+        are face-specific. `anchor_count` lets the template tell the user to label a
+        body first when there's nothing to rank against."""
+        canonical = manual.resolve_identity_name(name)
+        if canonical != name:
+            return RedirectResponse(url=f'/find-person/{quote(canonical)}/body')
+        anchor_count = len(manual.get_body_embeddings_for_identity(name))
+        return templates.TemplateResponse(request, 'find_person_body.html', {
+            'name': name,
+            'anchor_count': anchor_count,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
@@ -3028,10 +3065,13 @@ def create_app(data_root: str) -> FastAPI:
         return {'bodies': count}
 
     @app.post('/api/files/{file_id}/bodies')
-    def api_add_manual_body(file_id: int, body: ManualFaceBody):
+    def api_add_manual_body(file_id: int, body: BodyLabelBody):
         """Add one hand-drawn body box as a searchable body embedding (mirrors
         api_add_manual_face, but crops+CLIP-embeds instead of face recognition).
-        Backs the photo view's "Label person" region tool."""
+        Backs the photo view's "Label person" region tool. If `name` is given, the
+        crop is ALSO written as a ground-truth body label (manual.db body_identities)
+        so the person is findable by body — otherwise it stays an anonymous crop,
+        exactly as before."""
         from media_manager import body_index
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1, y1, x2, y2]')
@@ -3048,9 +3088,16 @@ def create_app(data_root: str) -> FastAPI:
         indexer = _get_clip_indexer()
         embs = indexer.embed_pil_images([crop for _, crop in pairs])
         used_bbox = pairs[0][0]
-        body_id = db.add_manual_body(
-            file_id, used_bbox, embs[0].astype('float32').tobytes(), indexer.model_name)
-        return {'id': body_id, 'bbox': used_bbox}
+        emb_bytes = embs[0].astype('float32').tobytes()
+        body_id = db.add_manual_body(file_id, used_bbox, emb_bytes, indexer.model_name)
+        identity = (body.name or '').strip()
+        if identity:
+            # Ground-truth label (survives a media.db rescan); source_body_id ties it
+            # to the media.db row so the person's suggestion stream won't re-offer it.
+            manual.add_body_label(row['checksum'], identity, used_bbox, emb_bytes,
+                                  indexer.model_name, image_width=body.image_width,
+                                  image_height=body.image_height, source_body_id=body_id)
+        return {'id': body_id, 'bbox': used_bbox, 'identity': identity or None}
 
     @app.post('/api/files/{file_id}/body-search')
     def api_body_search(file_id: int, body: ManualFaceBody, limit: int = 50):
@@ -3094,6 +3141,139 @@ def create_app(data_root: str) -> FastAPI:
             if src_path is None or not _make_body_crop(src_path, bbox_json, crop_path):
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
         return FileResponse(crop_path, media_type='image/jpeg', headers=IMMUTABLE_CACHE_HEADERS)
+
+    # ---- Find a person BY BODY: rank the unlabeled body pool against one person's
+    # ---- confirmed body crops (the ground-truth anchors in manual.db body_identities).
+    # CLIP body similarity keys on clothing/pose/build, so this is a far weaker identity
+    # signal than faces (same person, different outfit often won't match) — it is for
+    # finding someone whose face isn't visible and for within-shoot propagation, not a
+    # reliable cross-outfit identity. The UI says so; see find_person_body.html.
+    BODY_SUGGEST_THRESHOLD = 0.5
+
+    def _next_body_suggestions(name, count, exclude_refs, threshold=BODY_SUGGEST_THRESHOLD,
+                               avoid_existing=True):
+        """Up to `count` 'is this <name>'s body?' cards, best cosine first. Ranks every
+        indexed body crop (db body matrix) against this person's confirmed body anchors
+        and keeps the best-scoring crop per file. Excludes bodies already decided for
+        this person (confirmed or rejected) and photos already carrying their body, plus
+        whatever the client still holds (`exclude_refs`). Empty anchors → empty (there is
+        nothing to rank against), same contract as the face stream's identity_filter."""
+        import numpy as np
+        anchors = manual.get_body_embeddings_for_identity(name)
+        if not anchors:
+            return []
+        body_ids_arr, file_ids_arr, bboxes, matrix = db.get_body_embeddings_matrix()
+        if matrix.shape[0] == 0:
+            return []
+        anchor_mat = np.stack([np.frombuffer(a, dtype=np.float32) for a in anchors])
+        # best anchor similarity per candidate body
+        scores = matrix.dot(anchor_mat.T).max(axis=1)
+
+        decided = manual.get_decided_body_source_ids(name)
+        # Files already carrying a confirmed body of this person — don't re-offer them.
+        excluded_files = set()
+        for cs in manual.get_photos_with_body_identity(name):
+            frow = db.get_file_by_checksum(cs)
+            if frow is not None:
+                excluded_files.add(int(frow['id']))
+
+        best_per_file = {}  # file_id -> (body_id, score, bbox)
+        for i in np.argsort(-scores):
+            i = int(i)
+            score = float(scores[i])
+            if score < threshold:
+                break
+            body_id = int(body_ids_arr[i])
+            fid = int(file_ids_arr[i])
+            if body_id in decided or fid in excluded_files:
+                continue
+            if f"body:{body_id}" in exclude_refs or fid in best_per_file:
+                continue
+            best_per_file[fid] = (body_id, score, bboxes[i])
+            if len(best_per_file) >= max(count * 5, count + 50):
+                break
+
+        cards = []
+        for fid, (body_id, score, bbox_json) in best_per_file.items():
+            try:
+                bbox = json.loads(bbox_json)
+            except (TypeError, ValueError):
+                bbox = None
+            cards.append({'ref': f"body:{body_id}", 'body_id': body_id, 'file_id': fid,
+                          'identity': name, 'score': round(score, 3), 'bbox': bbox})
+        cards.sort(key=lambda c: -c['score'])
+        if avoid_existing:
+            cards = _deprioritize_files_with_named_face(cards, 'file_id')
+        cards = cards[:count]
+        return _attach_file_meta(cards)
+
+    @app.post('/api/body-suggestions/next')
+    def api_next_body_suggestions(body: SwipeExcludeBody, count: int = 10,
+                                   identity: str = '', avoid_existing: bool = True):
+        """Background buffer for the find-person-by-body swipe (find_person_body.html).
+        `identity` scopes the stream to one person's confirmed body crops; `body.exclude`
+        is every body ref the client already holds so a refill never repeats a card."""
+        name = manual.resolve_identity_name(identity) if identity else ''
+        if not name:
+            return {'cards': []}
+        cards = _next_body_suggestions(name, count, set(body.exclude), avoid_existing=avoid_existing)
+        return {'cards': cards}
+
+    def _body_row_for_decision(body_id):
+        """(checksum, bbox_list, embedding_bytes, model) for a media.db body row, or
+        None — the shared read for confirm/reject of a body-suggestion card."""
+        rec = db.get_body_embedding(body_id)
+        if rec is None:
+            return None
+        b_file_id, bbox_json, emb = rec
+        file_row = db.get_file_by_id(b_file_id)
+        if file_row is None:
+            return None
+        cur = db.conn.cursor()
+        cur.execute('SELECT model FROM body_embeddings WHERE id = ?', (body_id,))
+        mrow = cur.fetchone()
+        model = mrow[0] if mrow else ''
+        try:
+            bbox = json.loads(bbox_json)
+        except (TypeError, ValueError):
+            bbox = [0, 0, 0, 0]
+        return file_row['checksum'], bbox, emb, model
+
+    @app.post('/api/bodies/{body_id}/identity')
+    def api_assign_body_identity(body_id: int, body: IdentityBody):
+        """Confirm an unlabeled body (from the swipe) as this person — writes a
+        ground-truth body label tied to the media.db body row via source_body_id."""
+        name = (body.name or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='name required')
+        name = manual.resolve_identity_name(name)
+        info = _body_row_for_decision(body_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail='Body not found')
+        checksum, bbox, emb, model = info
+        manual.add_body_label(checksum, name, bbox, emb, model, source_body_id=body_id)
+        return {'body_id': body_id, 'identity': name}
+
+    @app.post('/api/bodies/{body_id}/reject')
+    def api_reject_body_identity(body_id: int, body: IdentityBody):
+        """'This body is NOT <name>' from the swipe — kept as a hard-negative row so
+        the person's stream never offers it again."""
+        name = (body.name or '').strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='name required')
+        name = manual.resolve_identity_name(name)
+        info = _body_row_for_decision(body_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail='Body not found')
+        checksum, bbox, emb, model = info
+        manual.reject_body_candidate(body_id, checksum, name, bbox, emb, model)
+        return {'ok': True}
+
+    @app.delete('/api/bodies/{body_id}/decision')
+    def api_undo_body_decision(body_id: int):
+        """Undo a body confirm/reject (Ctrl+Z) — returns the body to the pool."""
+        manual.delete_body_decision_by_source(body_id)
+        return {'ok': True}
 
     @app.post('/api/body-index/start')
     def api_body_index_start(include_trashed: bool = False, retry_empty: bool = False):

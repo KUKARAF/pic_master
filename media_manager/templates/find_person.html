@@ -8,6 +8,10 @@
   <a href="/person/{{ name | urlencode }}" class="sub">← Back to {{ name }}</a>
 </div>
 
+<p class="sub" style="margin-bottom:10px;">
+  Searching by face. Can't see their face in a shot? <a href="/find-person/{{ name | urlencode }}/body">Find {{ name }} by body</a> (clothing/pose/build).
+</p>
+
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
   <input type="checkbox" id="find-person-avoid-existing-toggle" checked>
   Deprioritize photos that already have an identified face

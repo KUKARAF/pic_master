@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+
+{% block title %}Find {{ name }} by body — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Find {{ name }} by body</h1>
+  <a href="/person/{{ name | urlencode }}" class="sub">← Back to {{ name }}</a>
+</div>
+
+<p class="sub" style="margin-bottom:12px;max-width:640px;">
+  Ranks every indexed body against the body crops you've confirmed as
+  <strong>{{ name }}</strong>. Body matching reads clothing, pose and build — not a
+  face — so it finds this person best <em>in the same outfit/shoot</em> and in photos
+  where their face isn't visible. It's a weaker signal than face matching: check each
+  card. Looking for faces instead? <a href="/find-person/{{ name | urlencode }}">Find {{ name }} by face</a>.
+</p>
+
+{% if anchor_count == 0 %}
+<div class="swipe-empty">
+  No body crops are labeled as {{ name }} yet, so there's nothing to match against.
+  Open a photo where you can see them, use <strong>🧍 Label person</strong> (in the
+  👤 Faces pod), draw a box around their body and type “{{ name }}”. Then come back here.
+</div>
+{% else %}
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:10px;">
+  <input type="checkbox" id="find-body-avoid-existing-toggle" checked>
+  Deprioritize photos that already have an identified face
+</label>
+
+<label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+  Keep searching until
+  <input type="range" id="find-body-buffer-size-slider" min="10" max="200" step="10" value="10">
+  <span id="find-body-buffer-size-value">10</span>
+  are found
+</label>
+
+<div class="swipe-page">
+  <div class="swipe-stack-wrap" id="find-body-swipe-stack"></div>
+  <div class="swipe-controls">
+    <button type="button" class="swipe-btn swipe-btn-reject" id="find-body-swipe-reject-btn" title="Not them (↓)">✕</button>
+    <button type="button" class="swipe-btn swipe-btn-confirm" id="find-body-swipe-confirm-btn" title="Same person (↑)">✓</button>
+  </div>
+  <div class="swipe-hint">Swipe up to confirm, down to reject, left if not sure (or use ↑ / ↓ / ←) · <strong>→</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo</div>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/swipe-core.js"></script>
+<script>
+/* Identity-scoped body-suggestion stream — the body sibling of find_person.html.
+   Each card is one indexed body crop ranked by CLIP similarity to this person's
+   confirmed body crops (see _next_body_suggestions). Confirm writes a ground-truth
+   body label; reject keeps a hard-negative so it isn't re-offered. */
+(function() {
+  const personName = {{ name | tojson }};
+  const stackEl = document.getElementById('find-body-swipe-stack');
+  if (!personName || !window.initSwipeStack || !stackEl) return;
+
+  const bufferSizeSlider = document.getElementById('find-body-buffer-size-slider');
+
+  const stack = window.initSwipeStack({
+    stackElId: 'find-body-swipe-stack',
+    confirmBtnId: 'find-body-swipe-confirm-btn',
+    rejectBtnId: 'find-body-swipe-reject-btn',
+    bufferSize: bufferSizeSlider ? parseInt(bufferSizeSlider.value, 10) : 10,
+    initialCards: [],
+    fetchMoreUrl: function(excludeSet, biasKey, biasAction, need) {
+      const avoidToggle = document.getElementById('find-body-avoid-existing-toggle');
+      const params = new URLSearchParams({
+        count: String(need || 10),
+        identity: personName,
+        avoid_existing: String(!avoidToggle || avoidToggle.checked),
+      });
+      return '/api/body-suggestions/next?' + params.toString();
+    },
+    renderCard: function(card) {
+      return {
+        imageUrl: '/body-crop/' + encodeURIComponent(card.body_id),
+        questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>?',
+        scoreText: 'body match ' + (card.score != null ? card.score.toFixed(2) : '—'),
+        metaHtml: swipeCardMeta(card),
+        originalUrl: '/photo/' + card.file_id,
+      };
+    },
+    onConfirm: function(card) {
+      return {
+        url: '/api/bodies/' + encodeURIComponent(card.body_id) + '/identity',
+        method: 'POST',
+        body: { name: personName },
+      };
+    },
+    onReject: function(card) {
+      return {
+        url: '/api/bodies/' + encodeURIComponent(card.body_id) + '/reject',
+        method: 'POST',
+        body: { name: personName },
+      };
+    },
+    onUndo: function(card) {
+      return { url: '/api/bodies/' + encodeURIComponent(card.body_id) + '/decision', method: 'DELETE' };
+    },
+    emptyStateHtml: function(el) {
+      el.innerHTML = '<div class="swipe-empty">No more unlabeled bodies match ' +
+        escapeHtml(personName) + ' at the default threshold. Label a few more of their ' +
+        'bodies (in different photos/outfits) to widen the net.</div>';
+    },
+  });
+
+  wireBufferSizeSlider(stack, 'find-body-buffer-size-slider', 'find-body-buffer-size-value');
+})();
+</script>
+{% endblock %}
