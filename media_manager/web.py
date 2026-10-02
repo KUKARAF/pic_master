@@ -185,6 +185,24 @@ class LocationBody(BaseModel):
 class LocationAssignBody(BaseModel):
     location_id: int
 
+class ObjectMarkBody(BaseModel):
+    name: str
+    file_id: int
+    bbox: List[float]
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+
+class ObjectRenameBody(BaseModel):
+    name: str
+
+class ObjectSearchBody(BaseModel):
+    names: List[str] = []
+    exclude: List = []  # swipe-stack sends seen file ids/refs (ints or strings) — accept both
+
+class ObjectRejectBody(BaseModel):
+    file_id: int
+    object_boxes: List[dict] = []  # [{name, bbox:[x1,y1,x2,y2], image_width, image_height}]
+
 class AdoptSetBody(BaseModel):
     """Body for POST /api/locations/{id}/adopt-set — the location swipe stack's
     `s` key. Identifies the photo whose set(s) should be placed at this location."""
@@ -425,6 +443,30 @@ def _ml_device_label():
         return 'worker (offloaded)'
     from media_manager import compute
     return compute.accelerator_label()
+
+
+_object_encoder = None
+_object_matcher = None
+
+
+def _get_object_encoder(data_root):
+    """Local DINOv2 region/crop encoder for object-exemplar search (object_encoder.py).
+    B70-local (runs where the GPU is), not offloaded. Lazy singleton."""
+    global _object_encoder
+    if _object_encoder is None:
+        from media_manager.object_encoder import ObjectEncoder
+        _object_encoder = ObjectEncoder(data_root=data_root)
+    return _object_encoder
+
+
+def _get_object_matcher():
+    """Local local-feature geometric verifier for same-object confirmation
+    (object_matcher.py). B70-local. Lazy singleton."""
+    global _object_matcher
+    if _object_matcher is None:
+        from media_manager.object_matcher import ObjectMatcher
+        _object_matcher = ObjectMatcher()
+    return _object_matcher
 
 
 def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 260) -> bool:
@@ -2777,6 +2819,8 @@ def create_app(data_root: str) -> FastAPI:
     # search can localize small/off-center things (see tile_index.py + the region
     # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
     tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # DINOv2 region index for object-exemplar search (the library-wide candidate pool).
+    object_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
     # Metadata (EXIF capture-time + GPS) extraction: same {running,done,total,error}
     # job shape; surfaced in the ⚡ menu as "Extract locations". Mirrors
     # MediaManager.extract_metadata but with progress (see api_metadata_start).
@@ -4232,6 +4276,63 @@ def create_app(data_root: str) -> FastAPI:
             'error': tile_index_job['error'],
             'pending': len(db.get_untiled_files()),
             'device': _ml_device_label(),
+        }
+
+    @app.post('/api/object-index/start')
+    def api_object_index_start(include_trashed: bool = False):
+        """Build the DINOv2 region index (object_region_embeddings) — the candidate pool
+        for object-exemplar location search. Background job; poll .../status. Refuses to
+        run on CPU unless MEDIA_DEVICE=cpu (an undetected GPU is surfaced loudly, not a
+        silent slow fallback)."""
+        import os as _os
+        from media_manager import compute, object_index
+        if object_index_job['running']:
+            return {'started': False, 'message': 'Object indexing already running.'}
+        if compute.torch_device() == 'cpu' and _os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
+            return {'started': False, 'message':
+                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
+                'Fix the GPU/driver, or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
+        trashed = set() if include_trashed else set(_trashed_file_ids())
+        candidates = [
+            (fid, rel) for (fid, rel) in db.get_unobject_indexed_files()
+            if _os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
+        ]
+        object_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
+
+        def _run():
+            try:
+                enc = _get_object_encoder(data_root)
+                try:
+                    object_index_job['device'] = enc.device_label()
+                except Exception:
+                    object_index_job['device'] = None
+                object_index.build_object_index(
+                    db, enc, data_root,
+                    image_exts=IMAGE_EXTENSIONS,
+                    abs_path_fn=_live_abs_path,
+                    candidates=candidates,
+                    on_progress=lambda d, t: object_index_job.update(done=d, total=t),
+                    log=errors.log)
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                object_index_job['error'] = str(exc)
+                print(f'[object-index] FAILED: {exc}', flush=True)
+            finally:
+                object_index_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': object_index_job['total']}
+
+    @app.get('/api/object-index/status')
+    def api_object_index_status():
+        return {
+            'running': object_index_job['running'],
+            'done': object_index_job['done'],
+            'total': object_index_job['total'],
+            'error': object_index_job['error'],
+            'pending': len(db.get_unobject_indexed_files()),
+            'device': object_index_job.get('device'),
         }
 
     # ------------------------------------------------------------------
@@ -6461,6 +6562,206 @@ def create_app(data_root: str) -> FastAPI:
         row = _file_or_404(file_id)
         manual.remove_location_exclusion(row['checksum'], location_id)
         return {'ok': True}
+
+    # ---- Object-exemplar search: mark named object boxes per location, then find and
+    # ---- localize those same objects across the library (instance-level, with negatives).
+    def _object_row_to_card(obj):
+        """A location_objects dict -> a UI-friendly object dict (adds file_id)."""
+        frow = db.get_file_by_checksum(obj['checksum'])
+        return {
+            'id': obj['id'], 'name': obj['name'], 'checksum': obj['checksum'],
+            'file_id': (frow['id'] if frow is not None else None),
+            'bbox': [obj['x1'], obj['y1'], obj['x2'], obj['y2']],
+            'image_width': obj['image_width'], 'image_height': obj['image_height'],
+            'polarity': obj['polarity'],
+        }
+
+    @app.get('/api/locations/{location_id}/objects')
+    def api_list_location_objects(location_id: int):
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        objs = [_object_row_to_card(o) for o in manual.get_location_objects(location_id)]
+        return {'objects': objs, 'names': manual.get_location_object_names(location_id)}
+
+    @app.post('/api/locations/{location_id}/objects')
+    def api_add_location_object(location_id: int, body: ObjectMarkBody):
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        row = _file_or_404(body.file_id)
+        if len(body.bbox) != 4:
+            raise HTTPException(status_code=400, detail='bbox must be [x1,y1,x2,y2]')
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail='name required')
+        x1, y1, x2, y2 = body.bbox
+        oid = manual.add_location_object(location_id, name, row['checksum'], x1, y1, x2, y2,
+                                         body.image_width, body.image_height, polarity='positive')
+        return {'id': oid, 'name': name}
+
+    @app.patch('/api/locations/{location_id}/objects/{obj_id}')
+    def api_rename_location_object(location_id: int, obj_id: int, body: ObjectRenameBody):
+        manual.rename_location_object(obj_id, body.name.strip())
+        return {'ok': True}
+
+    @app.delete('/api/locations/{location_id}/objects/{obj_id}')
+    def api_delete_location_object(location_id: int, obj_id: int):
+        manual.delete_location_object(obj_id)
+        return {'ok': True}
+
+    def _embed_object_crops(objs):
+        """Crop each location_objects row to its box on its photo and DINOv2-embed it.
+        Returns {name: [vec, ...]} (positives grouped by name) — skips rows whose file or
+        crop can't be loaded."""
+        import numpy as np
+        from PIL import Image
+        enc = _get_object_encoder(data_root)
+        crops, keys = [], []
+        pil_cache = {}
+        for o in objs:
+            frow = db.get_file_by_checksum(o['checksum'])
+            if frow is None:
+                continue
+            ap = _live_abs_path(frow['id'], frow['path'])
+            if ap is None:
+                continue
+            try:
+                if o['checksum'] not in pil_cache:
+                    pil_cache[o['checksum']] = Image.open(ap).convert('RGB')
+                im = pil_cache[o['checksum']]
+                box = (int(o['x1']), int(o['y1']), int(o['x2']), int(o['y2']))
+                if box[2] <= box[0] or box[3] <= box[1]:
+                    continue
+                crops.append(im.crop(box))
+                keys.append(o['name'])
+            except Exception:
+                continue
+        if not crops:
+            return {}
+        vecs = enc.embed_crops(crops)
+        out = {}
+        for name, v in zip(keys, vecs):
+            if v is not None:
+                out.setdefault(name, []).append(np.asarray(v, dtype=np.float32))
+        return out
+
+    def _object_search(location_id, names, exclude_ids, limit):
+        """The cascade: embed the selected marked objects (positives) + the location's
+        negatives, scan the DINOv2 region index, and rank/ localize candidates. Returns
+        (cards, needs_object_index)."""
+        import numpy as np
+        if db.count_object_indexed_files() == 0:
+            return [], True
+        all_pos = manual.get_location_objects(location_id, polarity='positive')
+        if names:
+            sel = set(names)
+            all_pos = [o for o in all_pos if o['name'] in sel]
+        if not all_pos:
+            return [], True   # nothing marked/selected to search for
+        pos_by_name = _embed_object_crops(all_pos)
+        if not pos_by_name:
+            return [], True
+        # negatives: this location's rejected regions for the selected names (or general)
+        negs = manual.get_location_objects(location_id, polarity='negative')
+        if names:
+            sel = set(names)
+            negs = [o for o in negs if (o['name'] in sel or not o['name'])]
+        neg_vecs = []
+        for vs in _embed_object_crops(negs).values():
+            neg_vecs.extend(vs)
+        neg_mat = np.stack(neg_vecs) if neg_vecs else None  # [Nneg, D]
+        name_mats = {n: np.stack(vs) for n, vs in pos_by_name.items()}  # name -> [Np, D]
+
+        LAMBDA = float(os.environ.get('MEDIA_OBJECT_NEG_WEIGHT', '0.5') or 0.5)
+        NAME_THRESHOLD = float(os.environ.get('MEDIA_OBJECT_THRESHOLD', '0.35') or 0.35)
+        member_cs = manual.get_checksums_for_location(location_id)
+        excluded_cs = manual.get_excluded_checksums_for_location(location_id)
+        exclude_ids = exclude_ids or set()
+
+        # stream the region index, keeping per (file, name) the best adjusted score + box
+        best = {}  # fid -> {name: (score, box)}
+        for file_ids, boxes, matrix in db.iter_object_regions():
+            if matrix.size == 0:
+                continue
+            neg_pen = (matrix @ neg_mat.T).max(axis=1) if neg_mat is not None else None  # [k]
+            for name, Pn in name_mats.items():
+                sims = (matrix @ Pn.T).max(axis=1)  # [k] best positive sim per region
+                adj = sims - LAMBDA * neg_pen if neg_pen is not None else sims
+                for i in range(len(file_ids)):
+                    s = float(adj[i])
+                    fid = int(file_ids[i])
+                    cur = best.setdefault(fid, {})
+                    if name not in cur or s > cur[name][0]:
+                        cur[name] = (s, boxes[i])
+
+        scored = []
+        for fid, per_name in best.items():
+            matched = [(n, s, box) for n, (s, box) in per_name.items() if s >= NAME_THRESHOLD]
+            if matched:
+                scored.append((fid, sum(s for _n, s, _b in matched), matched))
+        scored.sort(key=lambda t: -t[1])
+
+        # resolve + filter (drop members, location-excluded, already-seen)
+        page = []
+        for fid, overall, matched in scored:
+            frow = db.get_files_by_ids([fid])
+            if not frow:
+                continue
+            fr = frow[0]
+            if fr['checksum'] in member_cs or fr['checksum'] in excluded_cs or fid in exclude_ids:
+                continue
+            page.append((fid, fr['path'], fr['checksum'], overall, matched))
+            if len(page) >= limit:
+                break
+
+        rows = [(fid, path, True, cs) for fid, path, cs, _o, _m in page]
+        scores_map = {fid: round(ov, 3) for fid, _p, _cs, ov, _m in page}
+        cards = _enrich_rows(rows, scores=scores_map)
+        by_fid = {c['id']: c for c in cards}
+        for fid, _p, _cs, _ov, matched in page:
+            c = by_fid.get(fid)
+            if c is None:
+                continue
+            c['ref'] = str(c['id'])
+            c['object_boxes'] = [
+                {'name': n, 'bbox': [float(b[0]), float(b[1]), float(b[2]), float(b[3])],
+                 'score': round(float(s), 3)} for n, s, b in matched
+            ]
+        return cards, False
+
+    @app.post('/api/locations/{location_id}/object-search')
+    def api_object_search(location_id: int, body: Optional[ObjectSearchBody] = None,
+                          names: List[str] = Query(default=[]), limit: int = 12):
+        # Selected object names ride in the query string (so swipe-stack refills, which
+        # only control the POST body's `exclude`, still carry the selection); the initial
+        # fetch also puts them in the body. Merge both, de-duped, preserving order.
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        body = body or ObjectSearchBody()
+        sel = []
+        for n in list(names) + list(body.names):
+            if n and n not in sel:
+                sel.append(n)
+        exclude_ids = {int(x) for x in body.exclude if str(x).isdigit()}
+        cards, needs = _object_search(location_id, sel, exclude_ids, max(1, min(limit, 48)))
+        return {'results': cards, 'cards': cards, 'needs_object_index': needs}
+
+    @app.post('/api/locations/{location_id}/object-search/reject')
+    def api_object_search_reject(location_id: int, body: ObjectRejectBody):
+        """A rejected result's localized region(s) become location-specific NEGATIVES
+        ('looks similar but not what I mean')."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        row = _file_or_404(body.file_id)
+        n = 0
+        for ob in body.object_boxes or []:
+            bbox = ob.get('bbox')
+            if not bbox or len(bbox) != 4:
+                continue
+            manual.add_location_negative(location_id, row['checksum'], bbox[0], bbox[1], bbox[2], bbox[3],
+                                         ob.get('image_width'), ob.get('image_height'),
+                                         object_name=(ob.get('name') or ''))
+            n += 1
+        return {'ok': True, 'added': n}
 
     @app.post('/api/locations/{location_id}/adopt-set')
     def api_location_adopt_set(location_id: int, body: AdoptSetBody):

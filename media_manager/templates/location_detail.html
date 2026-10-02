@@ -96,6 +96,81 @@
   visual similarity to it.
 </div>
 {% endif %}
+
+{# ============ Find objects across the library ============
+   A self-contained feature, independent of the "Suggested photos" swipe above:
+   mark a region on one of THIS location's photos, name it, then swipe through
+   the rest of the library for photos that contain the same object. #}
+<div class="section-title" style="margin-top:36px;margin-bottom:12px;">
+  Find objects
+</div>
+<div id="object-search-section">
+  <p class="sub" style="margin-bottom:12px;">
+    Mark an object on one of this location's photos, give it a name, then search
+    the whole library for other photos that contain the same thing.
+  </p>
+
+  <div style="display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;">
+    <!-- 1 · MARK an object -->
+    <div class="sidebar-panel" style="flex:1;min-width:320px;">
+      <div class="section-title">1 · Mark an object</div>
+      {% if files %}
+      <p class="sub" style="margin:8px 0 6px;">Pick one of this location's photos:</p>
+      <div id="obj-mark-thumbs" style="display:flex;gap:6px;overflow-x:auto;padding-bottom:6px;">
+        {% for f in files %}
+        <img src="/thumb/{{ f.id }}" data-file-id="{{ f.id }}" class="obj-thumb"
+             alt="{{ f.filename or '' }}" draggable="false"
+             style="height:62px;width:62px;object-fit:cover;border-radius:6px;cursor:pointer;flex:0 0 auto;border:2px solid transparent;">
+        {% endfor %}
+      </div>
+      <div id="obj-mark-wrap" class="photo-image-wrap"
+           style="margin-top:10px;display:inline-block;max-width:100%;">
+        <img id="obj-mark-img" alt="photo to mark" draggable="false"
+             style="max-width:100%;max-height:340px;display:none;border-radius:8px;">
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px;">
+        <button type="button" id="obj-draw-btn" class="btn-similar">✏️ Draw box</button>
+        <input type="text" id="obj-name-input" placeholder="Name this object" style="flex:1;min-width:140px;">
+        <button type="button" id="obj-save-btn" class="btn-similar">Save</button>
+      </div>
+      <p class="sub" id="obj-mark-status" style="margin-top:8px;">Pick a photo above to begin.</p>
+      {% else %}
+      <p class="sub" style="margin-top:8px;">
+        This location has no photos yet — assign one first so you have something to mark on.
+      </p>
+      {% endif %}
+    </div>
+
+    <!-- 2 · CHOOSE what to search for  +  3 · SEARCH -->
+    <div class="sidebar-panel" style="flex:1;min-width:320px;">
+      <div class="section-title">2 · Choose what to search for</div>
+      <div id="obj-names-list" style="margin:10px 0;">
+        <span class="sub">No objects marked yet.</span>
+      </div>
+      <button type="button" id="obj-search-btn" class="btn-similar" disabled>🔎 Search selected</button>
+
+      <div class="section-title" style="margin-top:18px;">Marked boxes</div>
+      <div id="obj-boxes-list" style="margin-top:8px;">
+        <span class="sub">None yet.</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Shown instead of starting the stack when the server reports the object
+       index has not been built yet. -->
+  <div id="obj-index-banner" class="swipe-empty" style="display:none;margin-top:16px;">
+    Build the object index first (Bulk → 📌 Index objects)
+  </div>
+
+  <div class="swipe-page" id="obj-swipe-page" style="margin-top:16px;">
+    <div class="swipe-stack-wrap" id="obj-swipe-stack"></div>
+    <div class="swipe-hint">
+      Swipe up if it matches, down if not (or use ↑ / ↓) ·
+      click the photo for a full view with the object(s) outlined ·
+      <strong>Ctrl/⌘+Z</strong> undo
+    </div>
+  </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -388,6 +463,442 @@
   }
 
   launchStack([]);
+})();
+</script>
+
+<script>
+/* Find objects across the library — a wholly separate feature from the
+   "Suggested photos" swipe above (its own IIFE, its own DOM ids, its own swipe
+   stack). It reuses the shared helpers window.showToast / window.escapeHtml /
+   window.swipeCardMeta / window.initSwipeStack. wireBoxDraw and showHoverBbox
+   in app.js are bound to photo.html's single #photo-image and aren't global,
+   so their displayed<->original pixel mapping (naturalWidth/clientWidth
+   scaling) is replicated here against this page's own mark image. */
+(function () {
+  const locationId = {{ location.id }};
+  const section = document.getElementById('object-search-section');
+  if (!section || !window.initSwipeStack) return;
+
+  const esc = window.escapeHtml || function (s) {
+    const d = document.createElement('div');
+    d.textContent = s == null ? '' : s;
+    return d.innerHTML;
+  };
+  function toast(msg, type) { if (window.showToast) window.showToast(msg, type); }
+
+  const thumbStrip = document.getElementById('obj-mark-thumbs');
+  const markWrap = document.getElementById('obj-mark-wrap');
+  const markImg = document.getElementById('obj-mark-img');
+  const drawBtn = document.getElementById('obj-draw-btn');
+  const nameInput = document.getElementById('obj-name-input');
+  const saveBtn = document.getElementById('obj-save-btn');
+  const markStatus = document.getElementById('obj-mark-status');
+  const namesList = document.getElementById('obj-names-list');
+  const boxesList = document.getElementById('obj-boxes-list');
+  const searchBtn = document.getElementById('obj-search-btn');
+  const banner = document.getElementById('obj-index-banner');
+  const swipeStackWrap = document.getElementById('obj-swipe-stack');
+
+  let selectedFileId = null;
+  let pendingBbox = null;   // [x1,y1,x2,y2] in ORIGINAL image pixels
+  let stackHandle = null;
+
+  function setStatus(txt) { if (markStatus) markStatus.textContent = txt; }
+  function clearPreview() {
+    if (!markWrap) return;
+    Array.prototype.forEach.call(markWrap.querySelectorAll('.obj-pending-box'), function (b) { b.remove(); });
+  }
+
+  /* ---- Pick a photo to mark on ---- */
+  if (thumbStrip) {
+    thumbStrip.addEventListener('click', function (e) {
+      const t = e.target.closest ? e.target.closest('.obj-thumb') : null;
+      if (!t) return;
+      selectedFileId = parseInt(t.getAttribute('data-file-id'), 10);
+      Array.prototype.forEach.call(thumbStrip.querySelectorAll('.obj-thumb'), function (x) {
+        x.style.borderColor = 'transparent';
+      });
+      t.style.borderColor = 'var(--accent)';
+      pendingBbox = null;
+      clearPreview();
+      if (markImg) { markImg.src = '/image/' + selectedFileId; markImg.style.display = ''; }
+      setStatus('Click "Draw box", drag a rectangle over the object, name it, and Save.');
+    });
+  }
+
+  /* ---- Draw a box (replicates app.js wireBoxDraw's displayed<->original mapping) ---- */
+  (function wireMarkDraw() {
+    if (!drawBtn || !markWrap || !markImg) return;
+    let drawing = false, dragging = false, startX = 0, startY = 0, box = null;
+
+    function deactivate() {
+      drawing = false;
+      markWrap.classList.remove('add-face-active');
+      drawBtn.textContent = '✏️ Draw box';
+    }
+    drawBtn.addEventListener('click', function () {
+      if (!selectedFileId) { toast('Pick a photo first'); return; }
+      if (drawing) { deactivate(); return; }
+      drawing = true;
+      markWrap.classList.add('add-face-active');
+      drawBtn.textContent = 'Cancel drawing';
+    });
+
+    markWrap.addEventListener('mousedown', function (e) {
+      if (!drawing) return;
+      e.preventDefault();
+      clearPreview();
+      dragging = true;
+      const rect = markWrap.getBoundingClientRect();
+      startX = e.clientX - rect.left;
+      startY = e.clientY - rect.top;
+      box = document.createElement('div');
+      box.className = 'face-draw-box obj-pending-box';
+      box.style.left = startX + 'px';
+      box.style.top = startY + 'px';
+      box.style.width = '0px';
+      box.style.height = '0px';
+      markWrap.appendChild(box);
+    });
+
+    markWrap.addEventListener('mousemove', function (e) {
+      if (!dragging || !box) return;
+      const rect = markWrap.getBoundingClientRect();
+      const curX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+      const curY = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+      box.style.left = Math.min(startX, curX) + 'px';
+      box.style.top = Math.min(startY, curY) + 'px';
+      box.style.width = Math.abs(curX - startX) + 'px';
+      box.style.height = Math.abs(curY - startY) + 'px';
+    });
+
+    window.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false;
+      const wasDrawing = drawing;
+      deactivate();
+      if (!wasDrawing || !box) return;
+      const cssX1 = parseFloat(box.style.left);
+      const cssY1 = parseFloat(box.style.top);
+      const cssW = parseFloat(box.style.width);
+      const cssH = parseFloat(box.style.height);
+      if (cssW < 10 || cssH < 10 || !markImg.naturalWidth || !markImg.clientWidth) {
+        clearPreview();
+        box = null;
+        return;
+      }
+      // Displayed CSS px -> original image px, exactly as wireBoxDraw does.
+      const scaleX = markImg.naturalWidth / markImg.clientWidth;
+      const scaleY = markImg.naturalHeight / markImg.clientHeight;
+      pendingBbox = [
+        cssX1 * scaleX,
+        cssY1 * scaleY,
+        (cssX1 + cssW) * scaleX,
+        (cssY1 + cssH) * scaleY,
+      ];
+      box = null; // keep the drawn .obj-pending-box on screen as a preview
+      setStatus('Box set. Type a name and press Save.');
+    });
+  })();
+
+  /* ---- Save a marked object ---- */
+  if (saveBtn) {
+    saveBtn.addEventListener('click', function () {
+      const name = (nameInput && nameInput.value || '').trim();
+      if (!selectedFileId) { toast('Pick a photo first'); return; }
+      if (!name) { toast('Type a name for the object'); return; }
+      if (!pendingBbox) { toast('Draw a box on the photo first'); return; }
+      fetch('/api/locations/' + locationId + '/objects', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: name,
+          file_id: selectedFileId,
+          bbox: pendingBbox,
+          image_width: markImg.naturalWidth,
+          image_height: markImg.naturalHeight,
+        }),
+      })
+        .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+        .then(function () {
+          toast('Saved “' + name + '”', 'success');
+          if (nameInput) nameInput.value = '';
+          pendingBbox = null;
+          clearPreview();
+          setStatus('Saved. Draw another, or search below.');
+          loadObjects();
+        })
+        .catch(function (err) { toast('Failed to save object: ' + err.message); });
+    });
+  }
+
+  /* ---- List + select ---- */
+  function loadObjects() {
+    fetch('/api/locations/' + locationId + '/objects')
+      .then(function (r) { return r.ok ? r.json() : { objects: [], names: [] }; })
+      .then(renderObjects)
+      .catch(function () { renderObjects({ objects: [], names: [] }); });
+  }
+
+  function renderObjects(data) {
+    const objects = (data && data.objects) || [];
+    const names = (data && data.names) || [];
+
+    if (namesList) {
+      namesList.innerHTML = '';
+      if (!names.length) {
+        namesList.innerHTML = '<span class="sub">No objects marked yet.</span>';
+      } else {
+        names.forEach(function (nm) {
+          const label = document.createElement('label');
+          label.className = 'sub';
+          label.style.cssText = 'display:inline-flex;align-items:center;gap:4px;margin:0 12px 6px 0;';
+          const cb = document.createElement('input');
+          cb.type = 'checkbox';
+          cb.className = 'obj-name-check';
+          cb.checked = true;           // all checked by default, per spec
+          cb.value = nm;
+          label.appendChild(cb);
+          label.appendChild(document.createTextNode(' ' + nm));
+          namesList.appendChild(label);
+        });
+      }
+    }
+    if (searchBtn) searchBtn.disabled = !names.length;
+
+    if (boxesList) {
+      boxesList.innerHTML = '';
+      if (!objects.length) {
+        boxesList.innerHTML = '<span class="sub">None yet.</span>';
+      }
+      objects.forEach(function (o) {
+        const neg = o.polarity != null && o.polarity < 0;   // negatives shown subtly
+        const row = document.createElement('div');
+        row.className = 'sub';
+        row.style.cssText = 'display:flex;align-items:center;gap:8px;margin:5px 0;' + (neg ? 'opacity:0.45;' : '');
+
+        if (o.file_id != null) {
+          const thumb = document.createElement('img');
+          thumb.src = '/thumb/' + o.file_id;
+          thumb.alt = '';
+          thumb.style.cssText = 'height:34px;width:34px;object-fit:cover;border-radius:4px;flex:0 0 auto;';
+          row.appendChild(thumb);
+        }
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = (neg ? '🚫 ' : '') + (o.name || '');
+        nameSpan.style.cssText = 'flex:1;cursor:pointer;';
+        nameSpan.title = 'Click to rename';
+        nameSpan.addEventListener('click', function () { renameObject(o); });
+        row.appendChild(nameSpan);
+
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'heart-btn-inline';
+        del.textContent = '×';
+        del.title = 'Delete this marked box';
+        del.addEventListener('click', function () { deleteObject(o.id); });
+        row.appendChild(del);
+
+        boxesList.appendChild(row);
+      });
+    }
+  }
+
+  function renameObject(o) {
+    const next = window.prompt('Rename object', o.name || '');
+    if (next == null) return;
+    const name = next.trim();
+    if (!name || name === o.name) return;
+    fetch('/api/locations/' + locationId + '/objects/' + o.id, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name }),
+    })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function () { loadObjects(); })
+      .catch(function (err) { toast('Rename failed: ' + err.message); });
+  }
+
+  function deleteObject(id) {
+    fetch('/api/locations/' + locationId + '/objects/' + id, { method: 'DELETE' })
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); })
+      .then(function () { loadObjects(); })
+      .catch(function (err) { toast('Delete failed: ' + err.message); });
+  }
+
+  function checkedNames() {
+    return Array.prototype.slice
+      .call(document.querySelectorAll('.obj-name-check:checked'))
+      .map(function (cb) { return cb.value; });
+  }
+
+  /* ---- Labeled full-view overlay (reuses .swipe-fullview-* CSS; its own
+     element so it never collides with swipe-core's shared singleton). Boxes
+     are converted from each box's image_width/height to the displayed image,
+     the same mapping showHoverBbox uses. ---- */
+  let objFullview = null;
+  function ensureFullview() {
+    if (objFullview) return objFullview;
+    const ov = document.createElement('div');
+    ov.className = 'swipe-fullview-overlay';
+    ov.id = 'obj-fullview-overlay';
+    const frame = document.createElement('div');
+    frame.className = 'swipe-fullview-frame';
+    const img = document.createElement('img');
+    frame.appendChild(img);
+    ov.appendChild(frame);
+    ov.addEventListener('click', function () { ov.classList.remove('open'); });
+    document.body.appendChild(ov);
+    objFullview = ov;
+    return ov;
+  }
+  function showObjFullview(fid, boxes) {
+    const ov = ensureFullview();
+    const frame = ov.querySelector('.swipe-fullview-frame');
+    const img = ov.querySelector('img');
+    function drawBoxes() {
+      Array.prototype.forEach.call(frame.querySelectorAll('.obj-fv-box'), function (b) { b.remove(); });
+      const dw = img.clientWidth, dh = img.clientHeight;
+      (boxes || []).forEach(function (b) {
+        if (!Array.isArray(b.bbox) || b.bbox.length !== 4) return;
+        const iw = b.image_width || img.naturalWidth;
+        const ih = b.image_height || img.naturalHeight;
+        if (!iw || !ih) return;
+        const sx = dw / iw, sy = dh / ih;
+        const el = document.createElement('div');
+        el.className = 'face-hilite-box obj-fv-box';
+        el.style.left = (b.bbox[0] * sx) + 'px';
+        el.style.top = (b.bbox[1] * sy) + 'px';
+        el.style.width = ((b.bbox[2] - b.bbox[0]) * sx) + 'px';
+        el.style.height = ((b.bbox[3] - b.bbox[1]) * sy) + 'px';
+        if (b.name) {
+          const lab = document.createElement('span');
+          lab.textContent = b.name;
+          lab.style.cssText = 'position:absolute;left:0;top:-18px;font-size:12px;line-height:1.4;' +
+            'background:rgba(0,0,0,.72);color:#fff;padding:1px 6px;border-radius:3px;white-space:nowrap;';
+          el.appendChild(lab);
+        }
+        frame.appendChild(el);
+      });
+    }
+    img.onload = drawBoxes;
+    img.src = '/image/' + fid;
+    ov.classList.add('open');
+    if (img.complete && img.naturalWidth) drawBoxes();
+  }
+
+  // Click the top card's photo to open the labeled full view. (swipe-core's
+  // built-in Right-arrow still opens the plain image as a fallback.)
+  if (swipeStackWrap) {
+    swipeStackWrap.addEventListener('click', function (e) {
+      const img = e.target.closest ? e.target.closest('.swipe-card img') : null;
+      if (!img || !stackHandle) return;
+      const top = stackHandle.getTopCard && stackHandle.getTopCard();
+      if (!top) return;
+      const fid = top.file_id != null ? top.file_id : top.id;
+      showObjFullview(fid, top.object_boxes || []);
+    });
+  }
+
+  function objScoreText(card) {
+    const boxes = (card && card.object_boxes) || [];
+    const named = boxes.map(function (b) { return b.name; }).filter(Boolean);
+    let best = -Infinity;
+    boxes.forEach(function (b) { if (typeof b.score === 'number' && b.score > best) best = b.score; });
+    const parts = [];
+    if (isFinite(best)) parts.push('Match: ' + best.toFixed(3));
+    else if (typeof card.score === 'number') parts.push('Score: ' + card.score.toFixed(3));
+    if (named.length) parts.push(named.join(', '));
+    return parts.join(' · ');
+  }
+
+  function objectSearchUrl(names, need) {
+    return '/api/locations/' + locationId + '/object-search?limit=' + (need || 10) +
+      names.map(function (n) { return '&names=' + encodeURIComponent(n); }).join('');
+  }
+
+  function startStack(names, initialCards) {
+    if (swipeStackWrap) swipeStackWrap.innerHTML = '';   // tear down any prior stack's DOM
+    stackHandle = initSwipeStack({
+      stackElId: 'obj-swipe-stack',
+      initialCards: initialCards || [],
+      autoStart: true,
+      // swipe-core always POSTs {exclude: Array.from(known)}; feature params
+      // (the checked names) ride in the query string, matching how the
+      // "Suggested photos" stack above passes threshold/limit/avoid_existing.
+      fetchMoreUrl: function (known, biasKey, biasAction, need) {
+        return objectSearchUrl(names, need);
+      },
+      renderCard: function (card) {
+        const fid = card.file_id != null ? card.file_id : card.id;
+        return {
+          imageUrl: '/thumb/' + fid,
+          questionHtml: 'Does this contain the selected object(s)?',
+          scoreText: objScoreText(card),
+          metaHtml: window.swipeCardMeta ? window.swipeCardMeta(card) : esc(card.filename || ''),
+          // No originalUrl: the image stays a plain <img> so our click handler
+          // opens the labeled full view instead of a new tab.
+        };
+      },
+      onConfirm: function (card) {
+        // Mirror the "Suggested photos" swipe: a match places the photo here.
+        const fid = card.file_id != null ? card.file_id : card.id;
+        return { url: '/api/files/' + fid + '/locations', method: 'POST', body: { location_id: locationId } };
+      },
+      onReject: function (card) {
+        const fid = card.file_id != null ? card.file_id : card.id;
+        const objBoxes = (card.object_boxes || []).map(function (b) {
+          return { name: b.name, bbox: b.bbox, image_width: b.image_width, image_height: b.image_height };
+        });
+        return {
+          url: '/api/locations/' + locationId + '/object-search/reject',
+          method: 'POST',
+          body: { file_id: fid, object_boxes: objBoxes },
+        };
+      },
+      onUndo: function (card, action) {
+        if (action === 'confirm') {
+          const fid = card.file_id != null ? card.file_id : card.id;
+          return { url: '/api/files/' + fid + '/locations/' + locationId, method: 'DELETE' };
+        }
+        // Reject undo is best-effort client-side only (swipe-core still restores
+        // the card); recording a negative is cheap to re-do if needed.
+        return null;
+      },
+      emptyStateHtml: '<div class="swipe-empty">No more candidates for the selected object(s).</div>',
+    });
+  }
+
+  /* ---- Launch: probe once so we can show the "build the index" banner before
+     starting the stack, then hand the first batch to startStack. ---- */
+  function launchObjectSearch(names) {
+    if (banner) banner.style.display = 'none';
+    fetch(objectSearchUrl(names, 10), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names: names, exclude: [] }),
+    })
+      .then(function (r) { return r.ok ? r.json() : { cards: [] }; })
+      .then(function (data) {
+        if (data && data.needs_object_index) {
+          if (banner) banner.style.display = '';
+          return;
+        }
+        startStack(names, (data && data.cards) || []);
+      })
+      .catch(function () { startStack(names, []); });
+  }
+
+  if (searchBtn) {
+    searchBtn.addEventListener('click', function () {
+      const names = checkedNames();
+      if (!names.length) { toast('Check at least one object to search for'); return; }
+      launchObjectSearch(names);
+    });
+  }
+
+  loadObjects();
 })();
 </script>
 {% endblock %}

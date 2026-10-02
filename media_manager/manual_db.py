@@ -662,6 +662,28 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_location_exclusions_location ON file_location_exclusions (location_id)')
+        # Marked objects — the human ground truth for object-exemplar location
+        # search. Each location has named bounding boxes drawn on its photos
+        # (e.g. "brown couch", "folding fan", "tiles"). positive rows = objects
+        # to search for (the marked exemplars the search UI offers as selectable
+        # objects); negative rows = location-specific "looks similar but not this"
+        # regions recorded from rejected search results. Box coords are in the
+        # photo's ORIGINAL pixels (x1,y1,x2,y2 with image_width/image_height so a
+        # resized render can rescale). checksum-keyed ground truth, same as the
+        # location link tables above.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS location_objects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                location_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+                image_width INTEGER, image_height INTEGER,
+                polarity TEXT NOT NULL DEFAULT 'positive',
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_location_objects_loc ON location_objects(location_id)')
         # A studio assigned directly to an individual file (photo/video), multi-valued,
         # exactly like file_locations/file_categories — studios used to be a set-only
         # attribute (sets.studio_id); this lets an item carry a studio of its own.
@@ -1172,7 +1194,7 @@ class ManualDB(ThreadLocalDB):
                           'video_frame_scans', 'face_age_estimates', 'file_sets',
                           'file_set_exclusions', 'identity_photo_assignments',
                           'file_categories', 'file_category_exclusions', 'file_locations',
-                          'file_location_exclusions', 'file_studios', 'faces'):
+                          'file_location_exclusions', 'file_studios', 'location_objects', 'faces'):
                 cur.execute(f'DELETE FROM {table} WHERE checksum = ?', (checksum,))
             cur.execute('DELETE FROM frame_captures WHERE child_checksum = ? OR parent_checksum = ?',
                         (checksum, checksum))
@@ -2366,8 +2388,10 @@ class ManualDB(ThreadLocalDB):
 
     def delete_location(self, location_id):
         """Delete the location entity; ON DELETE CASCADE removes every
-        file/set/studio link to it (mirrors delete_category)."""
+        file/set/studio link to it (mirrors delete_category). location_objects
+        has no FK (it's content ground truth, not a link), so clear it here."""
         cur = self.conn.cursor()
+        cur.execute('DELETE FROM location_objects WHERE location_id = ?', (location_id,))
         cur.execute('DELETE FROM locations WHERE id = ?', (location_id,))
         self.conn.commit()
 
@@ -2449,6 +2473,75 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('SELECT checksum FROM file_location_exclusions WHERE location_id = ?', (location_id,))
         return {row[0] for row in cur.fetchall()}
+
+    # --- Marked objects (per-location named bounding-box ground truth) ---------
+    def add_location_object(self, location_id, name, checksum, x1, y1, x2, y2,
+                            image_width, image_height, polarity='positive'):
+        """Record one marked box on a photo for a location. positive = an object
+        exemplar to search for; negative = a region confirmed "looks similar but
+        not this". name may be '' for an unnamed/general negative. Coords are in
+        the photo's ORIGINAL pixels. Returns the new row id."""
+        cur = self.conn.cursor()
+        cur.execute(
+            'INSERT INTO location_objects '
+            '(location_id, name, checksum, x1, y1, x2, y2, image_width, image_height, polarity, created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (location_id, name.strip(), checksum, x1, y1, x2, y2,
+             image_width, image_height, polarity, int(time.time()))
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def add_location_negative(self, location_id, checksum, x1, y1, x2, y2,
+                              image_width, image_height, object_name=''):
+        """Convenience for a rejected-result region: inserts a polarity='negative'
+        row (name=object_name, '' for an unnamed/general negative)."""
+        return self.add_location_object(
+            location_id, object_name, checksum, x1, y1, x2, y2,
+            image_width, image_height, polarity='negative'
+        )
+
+    def get_location_objects(self, location_id, polarity=None):
+        """Marked boxes for this location as dicts (id, name, checksum, x1,y1,x2,y2,
+        image_width, image_height, polarity). Filtered by polarity if given."""
+        cur = self.conn.cursor()
+        if polarity is None:
+            cur.execute(
+                'SELECT id, name, checksum, x1, y1, x2, y2, image_width, image_height, polarity '
+                'FROM location_objects WHERE location_id = ? ORDER BY id',
+                (location_id,)
+            )
+        else:
+            cur.execute(
+                'SELECT id, name, checksum, x1, y1, x2, y2, image_width, image_height, polarity '
+                'FROM location_objects WHERE location_id = ? AND polarity = ? ORDER BY id',
+                (location_id, polarity)
+            )
+        return [{'id': r[0], 'name': r[1], 'checksum': r[2],
+                 'x1': r[3], 'y1': r[4], 'x2': r[5], 'y2': r[6],
+                 'image_width': r[7], 'image_height': r[8], 'polarity': r[9]}
+                for r in cur.fetchall()]
+
+    def get_location_object_names(self, location_id):
+        """Distinct non-empty names among POSITIVE rows — the selectable objects
+        the search UI offers for this location."""
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT DISTINCT name FROM location_objects "
+            "WHERE location_id = ? AND polarity = 'positive' AND name != '' ORDER BY name",
+            (location_id,)
+        )
+        return [r[0] for r in cur.fetchall()]
+
+    def rename_location_object(self, obj_id, name):
+        cur = self.conn.cursor()
+        cur.execute('UPDATE location_objects SET name = ? WHERE id = ?', (name.strip(), obj_id))
+        self.conn.commit()
+
+    def delete_location_object(self, obj_id):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM location_objects WHERE id = ?', (obj_id,))
+        self.conn.commit()
 
     def add_set_location(self, set_id, location_id):
         cur = self.conn.cursor()

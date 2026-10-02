@@ -116,6 +116,7 @@ class Database(ThreadLocalDB):
         self._face_ver = 0
         self._body_ver = 0
         self._tile_ver = 0
+        self._objreg_ver = 0  # bumped on object_region_embeddings writes (same pattern)
         self._place_ver = 0  # bumped on place_embeddings writes (same pattern as above)
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
@@ -393,6 +394,23 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tile_file ON tile_embeddings(file_id)')
+        # DINOv2 region descriptors (overlapping grid crops) for instance-level object
+        # search; box (x1,y1,x2,y2) in ORIGINAL pixels; embedding is raw float32
+        # .tobytes(); wholesale-replaced per file (see insert_object_regions). This is
+        # the library-wide candidate pool for object-exemplar search. CREATE TABLE IF
+        # NOT EXISTS is itself the migration — it runs on every init.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS object_region_embeddings (
+                id INTEGER PRIMARY KEY,
+                file_id INTEGER NOT NULL,
+                tile_index INTEGER NOT NULL,
+                x1 REAL, y1 REAL, x2 REAL, y2 REAL,
+                embedding BLOB NOT NULL,
+                model TEXT,
+                indexed_at INTEGER
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_objreg_file ON object_region_embeddings(file_id)')
         # Pattern tiles: classical texture+colour descriptors per grid tile (find-by-
         # pattern — see pattern_descriptor.py). Same shape as tile_embeddings but a
         # different descriptor; `algo` versions it so a query ignores stale descriptors
@@ -1943,7 +1961,8 @@ class Database(ThreadLocalDB):
             if cursor.fetchone()[0] > 0:
                 continue  # still tracked at another path (a duplicate) — keep its content row
             for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings',
-                          'tile_embeddings', 'place_embeddings', 'place_keypoints',
+                          'tile_embeddings', 'object_region_embeddings',
+                          'place_embeddings', 'place_keypoints',
                           'file_category_matches'):
                 cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
@@ -1955,6 +1974,7 @@ class Database(ThreadLocalDB):
             self._face_ver += 1
             self._body_ver += 1
             self._tile_ver += 1
+            self._objreg_ver += 1
         return (len(file_path_ids), files_removed)
 
     def delete_file_completely(self, file_id):
@@ -1975,6 +1995,7 @@ class Database(ThreadLocalDB):
             'SELECT path FROM file_paths WHERE file_id = ?', (file_id,)).fetchall()]
         for table in ('file_paths', 'embeddings', 'phashes', 'dup_group_members', 'tags',
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
+                      'object_region_embeddings',
                       'place_embeddings', 'place_keypoints',
                       'pattern_tiles', 'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
@@ -1985,6 +2006,7 @@ class Database(ThreadLocalDB):
         self._face_ver += 1
         self._body_ver += 1
         self._tile_ver += 1
+        self._objreg_ver += 1
         return (checksum, paths)
 
     def count_detected(self):
@@ -2881,6 +2903,108 @@ class Database(ThreadLocalDB):
             if len(batch_blobs) >= batch_size:
                 yield _flush()
                 batch_fids = []
+                batch_blobs = []
+        if batch_blobs:
+            yield _flush()
+
+    # --- object region embeddings (DINOv2 object-exemplar search) --------------------
+    def insert_object_regions(self, file_id: int, regions: list, model: str) -> None:
+        """Replace the object-region-embedding rows for a file (idempotent re-index).
+        regions: list of ((x1,y1,x2,y2), embedding_bytes) — one per overlapping grid
+        crop, box in ORIGINAL image pixels, embedding already raw float32 .tobytes().
+        DELETEs any existing rows for the file first so a re-index never leaves stale/
+        duplicate regions, then inserts each with tile_index = its position in the
+        list. Mirrors insert_tile_embeddings; a file with no regions simply gets no
+        rows (get_unobject_indexed_files re-queues it)."""
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM object_region_embeddings WHERE file_id = ?', (file_id,))
+        for tile_index, (box, embedding_bytes) in enumerate(regions):
+            x1, y1, x2, y2 = box
+            cursor.execute(
+                'INSERT INTO object_region_embeddings '
+                '(file_id, tile_index, x1, y1, x2, y2, embedding, model, indexed_at) '
+                "VALUES (?,?,?,?,?,?,?,?,strftime('%s','now'))",
+                (file_id, tile_index, x1, y1, x2, y2, embedding_bytes, model)
+            )
+        self.conn.commit()
+        self._objreg_ver += 1  # invalidate anything keyed off the object-region version
+
+    def count_object_indexed_files(self) -> int:
+        """Number of distinct files that have at least one object-region row.
+        Used to show a "pending" status for the object-exemplar candidate pool."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM object_region_embeddings')
+        row = cursor.fetchone()
+        return row[0] if row else 0
+
+    def get_unobject_indexed_files(self, limit=None) -> list:
+        """Return (id, path) for tracked files that have NO object_region_embeddings
+        row. Mirrors get_untiled_files; the caller skips non-images, so there is no
+        kind filter here."""
+        cursor = self.conn.cursor()
+        sql = '''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN object_region_embeddings o ON o.file_id = f.id
+            WHERE o.file_id IS NULL
+        '''
+        if limit is not None:
+            cursor.execute(sql + ' LIMIT ?', (limit,))
+        else:
+            cursor.execute(sql)
+        return cursor.fetchall()
+
+    def get_object_regions_for_file(self, file_id):
+        """[((x1,y1,x2,y2), embedding_bytes), ...] for every region of one file, in
+        region order. [] if the file has not been object-indexed."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT x1, y1, x2, y2, embedding FROM object_region_embeddings '
+            'WHERE file_id = ? ORDER BY tile_index', (file_id,))
+        return [((r[0], r[1], r[2], r[3]), r[4]) for r in cursor.fetchall()]
+
+    def iter_object_regions(self, batch_size=20000):
+        """Yield (file_ids: np.ndarray[int64], boxes: list[(x1,y1,x2,y2)],
+        matrix: np.ndarray[k, D] float32) chunks over ALL object-region rows, ordered
+        by id, up to batch_size rows per chunk — the RAM-bounded candidate pool for
+        object-exemplar search (mirrors iter_tile_embeddings). Each chunk's blobs are
+        joined and reshaped in a single allocation (D inferred from the first blob
+        length // 4). A malformed/empty blob is skipped with a printed WARNING (the
+        scan keeps going), and file_ids/boxes stay aligned to matrix rows because the
+        skipped row is dropped from all three."""
+        import numpy as np
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT id, file_id, x1, y1, x2, y2, embedding '
+                       'FROM object_region_embeddings ORDER BY id')
+        batch_fids = []
+        batch_boxes = []
+        batch_blobs = []
+        D = None
+
+        def _flush():
+            fids = np.array(batch_fids, dtype=np.int64)
+            matrix = np.frombuffer(b''.join(batch_blobs), np.float32).reshape(len(batch_blobs), D)
+            return fids, list(batch_boxes), matrix
+
+        for row_id, file_id, x1, y1, x2, y2, blob in cursor:
+            if not blob or (len(blob) % 4) != 0:
+                print(f"[iter_object_regions] WARNING: skipping row id {row_id} "
+                      f"(file_id {file_id}): blob length {len(blob) if blob else 0} not a float32 vector")
+                continue
+            row_D = len(blob) // 4
+            if D is None:
+                D = row_D
+            elif row_D != D:
+                print(f"[iter_object_regions] WARNING: skipping row id {row_id} "
+                      f"(file_id {file_id}): D={row_D} != expected D={D}")
+                continue
+            batch_fids.append(file_id)
+            batch_boxes.append((x1, y1, x2, y2))
+            batch_blobs.append(blob)
+            if len(batch_blobs) >= batch_size:
+                yield _flush()
+                batch_fids = []
+                batch_boxes = []
                 batch_blobs = []
         if batch_blobs:
             yield _flush()

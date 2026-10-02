@@ -169,6 +169,12 @@ def main():
     index_cmd.add_argument('--reindex', action='store_true',
                            help='Clear existing detections and re-run on all images')
 
+    # media object-index - build the DINOv2 region index for object-exemplar search
+    objidx_cmd = sub.add_parser('object-index',
+                                help='Build the DINOv2 region index (object-exemplar location search)')
+    objidx_cmd.add_argument('--reindex', action='store_true',
+                            help='Clear existing object-region embeddings and rebuild all')
+
     # media search <query> - search by detected object class (YOLO-World)
     search_cmd = sub.add_parser('search', help='Search images by detected object class (YOLO-World)')
     search_cmd.add_argument('query', help='Text query to search for')
@@ -564,6 +570,30 @@ def main():
             print("Cleared existing detections.")
         indexed, failed = m.index_files(args.path, model_size=args.model_size, conf_threshold=args.conf)
         print(f"Done: detected objects in {indexed} images, {failed} failed")
+        m.close()
+        return 0
+
+    elif args.cmd == 'object-index':
+        m = MediaManager()
+        data_root = m.data_root
+        if args.reindex:
+            m.db.conn.execute('DELETE FROM object_region_embeddings')
+            m.db.conn.commit()
+            print("Cleared existing object-region embeddings.")
+        from media_manager import object_index
+        from media_manager.object_encoder import ObjectEncoder
+        from media_manager.formats import IMAGE_EXTENSIONS
+        enc = ObjectEncoder(data_root=data_root)
+        print(f"Object encoder: {enc.model_id()} on {enc.device_label()}")
+
+        def _progress(done, total):
+            print(f"\r  {done}/{total}", end="", flush=True)
+
+        total = object_index.build_object_index(
+            m.db, enc, data_root, image_exts=IMAGE_EXTENSIONS,
+            on_progress=_progress,
+            log=lambda p, msg: print(f"\n  WARN {p}: {msg}", file=sys.stderr))
+        print(f"\nObject index: processed {total} image(s).")
         m.close()
         return 0
 
