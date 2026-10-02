@@ -16,7 +16,14 @@ insightface
 # (Level-Zero + compute-runtime). See media_manager/compute.py.
 onnxruntime
 open_clip_torch
-torch
+# torch/torchvision are PINNED so a `media-manager` reinstall never silently bumps
+# them. Unpinned, a reinstall jumps torch to a build that stops detecting the Intel
+# Arc GPU (torch.xpu.device_count() -> 0), dropping ALL ML to CPU. The +xpu local
+# build (installed once from https://download.pytorch.org/whl/xpu — see note above)
+# satisfies these public-version pins, so reinstalls KEEP the GPU build untouched and
+# no manual re-pin is needed. Bump these deliberately to move to a newer torch-xpu.
+torch==2.7.1
+torchvision==0.22.1
 # The `media worker` offload feature (worker_*.py): the worker is a local HTTP
 # service (FastAPI/uvicorn, above) and the client talks to it with `requests`;
 # both sides serialize msgpack dicts (raw bytes / float32 embeddings round-trip).
