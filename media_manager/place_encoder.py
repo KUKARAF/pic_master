@@ -163,6 +163,14 @@ class PlaceEncoder:
         self.data_root = _default_data_root(data_root)
         self._media_dir = os.path.join(self.data_root, ".media")
         self.facet = _env("MEDIA_PLACE_FACET", "token")
+        # How many images to stack into one GPU forward (eigenplaces batching). Read
+        # once here so the ctor stays cheap; bad values fall back to the default.
+        try:
+            self._batch = int(_env("MEDIA_PLACE_BATCH", "16"))
+        except ValueError:
+            self._batch = 16
+        if self._batch < 1:
+            self._batch = 1
 
         # Lazy state — nothing heavy is imported or loaded here, so this ctor is
         # safe on a CPU-only dev box with none of the deps installed.
@@ -280,8 +288,16 @@ class PlaceEncoder:
         from PIL import Image
 
         self._ensure_loaded()
+        # Decode every path to PIL up front (handling unsupported-extension and
+        # open failures with their specific reasons, as before), then run the whole
+        # decoded set through the one batched path. This keeps a single embed code
+        # path while preserving the (embeddings, failed) contract this method and
+        # its callers depend on.
         embeddings: list = []
         failed: list = []
+        decoded: list = []        # PIL images to embed, in input order
+        decoded_boxes: list = []  # parallel person boxes for `decoded`
+        decoded_paths: list = []  # parallel source paths for `decoded`
         for i, path in enumerate(paths):
             ext = os.path.splitext(path)[1].lower()
             if ext not in SUPPORTED_EXTENSIONS:
@@ -292,11 +308,16 @@ class PlaceEncoder:
             except Exception as exc:  # loud per-item failure, keeps going
                 failed.append((path, str(exc)))
                 continue
-            boxes = self._boxes_for(person_boxes, i)
-            try:
-                embeddings.append(self._embed_one(img, boxes))
-            except Exception as exc:
-                failed.append((path, str(exc)))
+            decoded.append(img)
+            decoded_boxes.append(self._boxes_for(person_boxes, i))
+            decoded_paths.append(path)
+
+        results = self.embed_batch(decoded, decoded_boxes)
+        for path, emb in zip(decoded_paths, results):
+            if emb is None:
+                failed.append((path, "embed failed"))
+            else:
+                embeddings.append(emb)
         return embeddings, failed
 
     def embed_pil_images(self, images: list, person_boxes=None) -> tuple:
@@ -304,16 +325,85 @@ class PlaceEncoder:
         ships raw bytes, decoded to PIL upstream). ``failed`` entries use the image
         index as their 'path' since there is no on-disk path."""
         self._ensure_loaded()
+        results = self.embed_batch(images, person_boxes)
         embeddings: list = []
         failed: list = []
-        for i, img in enumerate(images):
-            boxes = self._boxes_for(person_boxes, i)
-            try:
-                rgb = img.convert("RGB") if img.mode != "RGB" else img
-                embeddings.append(self._embed_one(rgb, boxes))
-            except Exception as exc:
-                failed.append((i, str(exc)))
+        for i, emb in enumerate(results):
+            if emb is None:
+                failed.append((i, "embed failed"))
+            else:
+                embeddings.append(emb)
         return embeddings, failed
+
+    def embed_batch(self, pil_images, person_boxes=None) -> list:
+        """Embed a LIST of already-decoded PIL images, batched on the GPU. Returns a
+        list ALIGNED 1:1 with pil_images: each element is an L2-normalized float32
+        np.ndarray of length dim(), or None if that image failed. person_boxes, when
+        given, is a parallel list; person_boxes[i] is a list of (x1,y1,x2,y2) rectangles
+        IN THE COORDINATE SPACE OF pil_images[i] (the caller already scaled them to the
+        decoded image) to ignore/mask. A single bad image yields None in its slot and
+        must not fail the batch."""
+        self._ensure_loaded()
+        n = len(pil_images)
+        out: list = [None] * n
+        if n == 0:
+            return out
+        if self._backend == "eigenplaces":
+            # The batching win: stack a chunk of images into ONE [B,3,512,512]
+            # tensor and run a single GPU forward per chunk.
+            for start in range(0, n, self._batch):
+                idxs = range(start, min(start + self._batch, n))
+                self._embed_eigen_chunk(pil_images, person_boxes, list(idxs), out)
+        else:
+            # anyloc: the OpenVINO IR is compiled for a static [1,3,518,518] input,
+            # so genuine batching needs a reshape that may not be supported. Loop
+            # per image via the existing single-image path; still return the aligned
+            # list with None in any failed slot.
+            for i in range(n):
+                boxes = self._boxes_for(person_boxes, i)
+                try:
+                    img = pil_images[i]
+                    rgb = img.convert("RGB") if img.mode != "RGB" else img
+                    out[i] = self._embed_one(rgb, boxes)
+                except Exception:
+                    out[i] = None
+        return out
+
+    def _embed_eigen_chunk(self, pil_images, person_boxes, idxs, out):
+        """Preprocess the images at `idxs`, stack the good ones into one batch tensor,
+        run a single eigenplaces forward, and write each result into out[i] (None for
+        any image that failed preprocessing). Mirrors _embed_eigenplaces' preprocessing
+        exactly (mask boxes -> resize 512 -> ImageNet-normalized CHW)."""
+        import torch
+
+        tensors: list = []
+        slots: list = []  # parallel to tensors: which out index each batch row maps to
+        for i in idxs:
+            try:
+                img = pil_images[i]
+                boxes = self._boxes_for(person_boxes, i)
+                rgb = img.convert("RGB") if img.mode != "RGB" else img
+                rgb = self._mask_person_boxes(rgb, boxes)
+                # 512x512 is EigenPlaces' standard test resolution.
+                im = rgb.resize((512, 512))
+                a = np.asarray(im, dtype=np.float32) / 255.0
+                a = (a - _IMAGENET_MEAN) / _IMAGENET_STD
+                a = np.transpose(a, (2, 0, 1))  # CHW
+                tensors.append(np.ascontiguousarray(a, dtype=np.float32))
+                slots.append(i)
+            except Exception:
+                out[i] = None  # one bad image must not sink the chunk
+        if not tensors:
+            return
+        batch = torch.from_numpy(np.stack(tensors, axis=0)).to(self._torch_device)
+        with torch.no_grad():
+            feats = self._torch_model(batch)
+        feats = feats.detach().float().cpu().numpy()  # [B, 2048]
+        for row, i in enumerate(slots):
+            try:
+                out[i] = self._apply_pca_and_norm(feats[row])
+            except Exception:
+                out[i] = None
 
     @staticmethod
     def _boxes_for(person_boxes, i):

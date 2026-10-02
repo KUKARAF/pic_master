@@ -4280,6 +4280,17 @@ def create_app(data_root: str) -> FastAPI:
 
         if place_index_job['running']:
             return {'started': False, 'message': 'Place indexing already running.'}
+        # CPU is only ever used when the user explicitly chose it (MEDIA_DEVICE=cpu);
+        # otherwise an undetected GPU is an error state (torch reports 0 devices), so we
+        # surface it loudly in /bulk via `message` rather than silently falling back to a
+        # ~20x slower CPU run. compute.torch_device() is cached and cheap.
+        import os
+        from media_manager import compute
+        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
+            return {'started': False, 'message':
+                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
+                'This is a GPU job and would be far slower on CPU. Fix the GPU/driver (and check '
+                'torch.xpu.device_count()), or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
         trashed = set() if include_trashed else set(_trashed_file_ids())
         candidates = [
             (fid, rel) for (fid, rel) in db.get_unplace_indexed_files()
@@ -6624,6 +6635,17 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=404, detail='Location not found')
         if location_member_index_job['running']:
             return {'started': False, 'message': 'Already indexing a location.'}
+        # CPU is only ever used when the user explicitly chose it (MEDIA_DEVICE=cpu);
+        # otherwise an undetected GPU is an error state (torch reports 0 devices), so we
+        # surface it loudly in /bulk via `message` rather than silently falling back to a
+        # ~20x slower CPU run. compute.torch_device() is cached and cheap.
+        import os
+        from media_manager import compute
+        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
+            return {'started': False, 'message':
+                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
+                'This is a GPU job and would be far slower on CPU. Fix the GPU/driver (and check '
+                'torch.xpu.device_count()), or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
         cands = _location_unindexed_member_rows(location_id)
         location_member_index_job.update(running=True, done=0, total=len(cands),
                                          error=None, device=None)

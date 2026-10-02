@@ -294,6 +294,83 @@ class PlaceMatcher:
             "model": self.model_id(),
         }
 
+    def extract_batch(self, images, person_boxes=None) -> list:
+        """Extract cached local features for a LIST of images, as efficiently as the
+        backend allows. Returns a list ALIGNED 1:1 with images: each element is the same
+        feature dict that extract() returns, or None if that image failed. images[i] may
+        be a PIL image, an np.ndarray, or a path (same as extract()). person_boxes, when
+        given, is a parallel list; person_boxes[i] is a list of (x1,y1,x2,y2) rectangles
+        IN THE COORDINATE SPACE OF images[i] whose keypoints must be dropped (same
+        semantics as extract's person_boxes). A bad image yields None in its slot and
+        must not fail the batch."""
+        import numpy as np
+
+        images = list(images)
+        n = len(images)
+        if person_boxes is None:
+            boxes_list = [None] * n
+        else:
+            boxes_list = list(person_boxes)
+            if len(boxes_list) != n:
+                raise ValueError(
+                    "place_matcher.extract_batch: person_boxes length %d != images "
+                    "length %d." % (len(boxes_list), n)
+                )
+
+        results = [None] * n
+        pending = set(range(n))
+
+        # True batched GPU path for the xfeat/torch engine: decode all images,
+        # group by identical pixel shape so each group shares one [B,C,H,W]
+        # tensor, run XFeat.detectAndCompute once per group with the model kept
+        # resident, then apply the per-image person-box drop exactly as
+        # extract() does. Any slot the batched path can't fill stays pending and
+        # drops to the per-image fallback below, so one bad image / an API that
+        # only does one image at a time never fails the batch.
+        if self.backend == "xfeat" and self._engine == "torch":
+            try:
+                self._extract_batch_xfeat_torch(images, boxes_list, results, pending, np)
+            except Exception as e:
+                logger.warning(
+                    "place_matcher.extract_batch: batched xfeat path failed (%s); "
+                    "falling back to per-image extraction.", e,
+                )
+
+        # Per-image fallback: sift (CPU, per-image), xfeat/onnx, and any slot the
+        # batched path left pending. A bad image yields None and never raises.
+        for i in sorted(pending):
+            try:
+                results[i] = self.extract(images[i], person_boxes=boxes_list[i])
+            except Exception as e:
+                logger.warning("place_matcher.extract_batch: image %d failed: %s", i, e)
+                results[i] = None
+
+        return results
+
+    def _finalize_feat(self, kpts, desc, size, person_boxes):
+        """Shape a raw (kpts, desc) pair into extract()'s feature dict.
+
+        Mirrors the tail of extract() exactly (contiguity, dtype, the kpts/desc
+        shape check, and the person-box drop) so batched results are identical
+        in shape to extract()'s and feed serialize()/match_score() unchanged.
+        """
+        import numpy as np
+        w, h = size
+        kpts = np.ascontiguousarray(kpts, dtype=np.float32).reshape(-1, 2)
+        desc = np.ascontiguousarray(desc, dtype=np.float32)
+        if desc.ndim != 2 or desc.shape[0] != kpts.shape[0]:
+            raise RuntimeError(
+                "place_matcher: backend %r returned mismatched kpts/desc "
+                "(%s vs %s)." % (self.backend, kpts.shape, desc.shape)
+            )
+        kpts, desc = _drop_in_boxes(kpts, desc, person_boxes)
+        return {
+            "kpts": kpts,
+            "desc": desc,
+            "size": (int(w), int(h)),
+            "model": self.model_id(),
+        }
+
     # ------------------------------------------------------------------ #
     # Serialization for DB caching (self-describing .npz blob)
     # ------------------------------------------------------------------ #
@@ -446,6 +523,78 @@ class PlaceMatcher:
         kpts = _to_numpy(out["keypoints"])
         desc = _to_numpy(out["descriptors"])
         return kpts, desc
+
+    def _extract_batch_xfeat_torch(self, images, boxes_list, results, pending, np):
+        """Batched XFeat extraction on the resident torch model.
+
+        Decodes each still-pending image, groups images of identical pixel shape
+        so one [B,C,H,W] tensor covers a whole group, and runs
+        ``XFeat.detectAndCompute`` once per group on the GPU. Keypoints come back
+        in input-pixel coordinates (XFeat rescales internally), so no undo is
+        needed -- same as the single-image torch path. Filled slots are removed
+        from ``pending``; everything else (undecodable images, an API that does
+        not accept a batch tensor, a group that errors) stays pending for the
+        per-image fallback so a single bad image never fails the batch.
+        """
+        import torch
+        xfeat = self._load_xfeat_torch()
+        dev = getattr(xfeat, "dev", self._torch_device or "cpu")
+
+        # Decode what we can; anything that fails to load stays pending.
+        loaded = {}  # index -> (rgb HxWx3 uint8, (w, h))
+        for i in list(pending):
+            try:
+                rgb, wh = _load_image_rgb(images[i])
+                loaded[i] = (np.ascontiguousarray(rgb), wh)
+            except Exception as e:
+                logger.warning(
+                    "place_matcher.extract_batch: image %d failed to load: %s", i, e
+                )
+
+        # Group by identical (H, W, C) so each group shares one tensor.
+        groups = {}
+        for i, (rgb, _) in loaded.items():
+            groups.setdefault(rgb.shape, []).append(i)
+
+        for shape, idxs in groups.items():
+            try:
+                batch = np.stack([loaded[i][0] for i in idxs], axis=0)  # [B,H,W,3]
+                tensor = (
+                    torch.from_numpy(np.ascontiguousarray(batch))
+                    .permute(0, 3, 1, 2)
+                    .float()
+                    .to(dev)
+                )
+                outs = xfeat.detectAndCompute(tensor, top_k=self.top_k)
+            except Exception as e:
+                logger.warning(
+                    "place_matcher.extract_batch: batched detectAndCompute failed for "
+                    "shape %s (%s); these %d images fall back to per-image.",
+                    shape, e, len(idxs),
+                )
+                continue
+
+            if not isinstance(outs, (list, tuple)) or len(outs) != len(idxs):
+                logger.warning(
+                    "place_matcher.extract_batch: XFeat returned an unexpected result "
+                    "count for a batch of %d; falling back to per-image for this group.",
+                    len(idxs),
+                )
+                continue
+
+            for out, i in zip(outs, idxs):
+                try:
+                    kpts = _to_numpy(out["keypoints"])
+                    desc = _to_numpy(out["descriptors"])
+                    results[i] = self._finalize_feat(
+                        kpts, desc, loaded[i][1], boxes_list[i]
+                    )
+                    pending.discard(i)
+                except Exception as e:
+                    logger.warning(
+                        "place_matcher.extract_batch: post-processing image %d failed: "
+                        "%s", i, e,
+                    )
 
     def _load_xfeat_onnx(self):
         """Build (once) the OpenVINO ONNX Runtime session for XFeat."""
