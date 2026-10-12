@@ -172,7 +172,10 @@ class ObjectEncoder:
         return self._dim
 
     def device_label(self) -> str:
-        """Human label for job status — cheap, no heavy imports required."""
+        """Human label for job status. The OpenVINO branch is cheap (no heavy
+        imports); the torch branch resolves compute.torch_device(), which imports
+        torch (once — it's cached) and raises on a misconfigured MEDIA_DEVICE,
+        exactly as model loading would."""
         if self._backend == 'openvino':
             dev = (self._device or '').upper()
             if dev.startswith('GPU'):
@@ -182,11 +185,9 @@ class ObjectEncoder:
             if dev == 'AUTO':
                 return 'AUTO (OpenVINO)'
             return f'{self._device} (OpenVINO)'
-        # torch backend: defer to the central compute label (cuda/xpu/mps/cpu).
-        try:
-            return compute.device_label()
-        except Exception:  # hook-allow: broad — label is cosmetic, never fail on it
-            return 'CPU'
+        # torch backend: defer to the central compute label (cuda/xpu/mps/cpu),
+        # e.g. 'GPU (Intel XPU)' / 'GPU (CUDA)' / 'CPU' — same as the other ML jobs.
+        return compute.accelerator_label()
 
     # -- public embedding API -------------------------------------------------
     def embed_crops(self, images, boxes=None) -> list:
