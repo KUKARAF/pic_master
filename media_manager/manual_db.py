@@ -3493,7 +3493,7 @@ class ManualDB(ThreadLocalDB):
         x1, y1, x2, y2 = [float(v) for v in bbox]
         cur = self.conn.cursor()
         if source_body_id is not None:
-            cur.execute('DELETE FROM body_identities WHERE source_body_id = ?', (int(source_body_id),))
+            self._delete_body_rows_by_source(cur, source_body_id)
         cur.execute(
             '''INSERT INTO body_identities
                (checksum, identity, x1, y1, x2, y2, embedding, model, source_body_id,
@@ -3556,9 +3556,37 @@ class ManualDB(ThreadLocalDB):
         delete so the body returns to the unlabeled pool (mirrors
         delete_face_decision_by_source)."""
         cur = self.conn.cursor()
-        cur.execute('DELETE FROM body_identities WHERE source_body_id = ?', (int(source_body_id),))
+        deleted = self._delete_body_rows_by_source(cur, source_body_id)
         self.conn.commit()
+        return deleted
+
+    @staticmethod
+    def _delete_body_rows_by_source(cur, source_body_id):
+        """Delete the body_identities row(s) for a media.db body AND their body-only
+        age estimates (face_ref 'body:{id}', see get_bodies_for_age) — the new row a
+        re-decision inserts gets a fresh id, so the old estimate would otherwise be
+        orphaned. Does not commit; returns how many body rows went."""
+        ids = [r[0] for r in cur.execute(
+            'SELECT id FROM body_identities WHERE source_body_id = ?', (int(source_body_id),)).fetchall()]
+        if ids:
+            cur.executemany('DELETE FROM face_age_estimates WHERE face_ref = ?',
+                            [(f'body:{i}',) for i in ids])
+        cur.execute('DELETE FROM body_identities WHERE source_body_id = ?', (int(source_body_id),))
         return cur.rowcount
+
+    def get_bodies_for_age(self, checksum):
+        """[{'id', 'identity', 'bbox'}, ...] for the bodies on one photo that can be
+        age/gender-estimated from the body crop alone: confirmed (not rejected) and
+        human-drawn/labelled — a 'face-link' body was inferred FROM a named face, so
+        that face's own estimate already covers it. Their estimates live in
+        face_age_estimates under face_ref 'body:{id}'. The caller still drops any
+        body that contains a face (see web.py _bodies_for_age)."""
+        cur = self.conn.cursor()
+        cur.execute('''SELECT id, identity, x1, y1, x2, y2 FROM body_identities
+                       WHERE checksum = ? AND rejected = 0 AND source != 'face-link'
+                       ORDER BY id''', (checksum,))
+        return [{'id': r[0], 'identity': r[1], 'bbox': [r[2], r[3], r[4], r[5]]}
+                for r in cur.fetchall()]
 
     def get_body_embeddings_for_identity(self, name):
         """[embedding_bytes, ...] for every body crop confirmed as this person —

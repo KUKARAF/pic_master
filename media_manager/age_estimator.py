@@ -249,17 +249,21 @@ class AgeGenderEstimator:
                 pass
 
     # -- request / response ---------------------------------------------------
-    def estimate(self, image_path: str, faces: list) -> list:
+    def estimate(self, image_path: str, faces: list, bodies: list | None = None) -> list:
         """faces: [{'ref': ..., 'bbox': [x1,y1,x2,y2], ...}, ...] — the same shape
-        web.py's _combined_faces_for_file already returns. Returns
+        web.py's _combined_faces_for_file already returns. bodies (optional): same
+        shape, for named person boxes with no face on them ('ref' = 'body:{id}') —
+        estimated by MiVOLO from the body crop alone. Returns
         [{'face_ref': ..., 'age': float|None, 'gender': str|None}, ...], one entry per
-        input face, in the same order (a failed individual face is still present with
-        null age/gender rather than dropped from the list)."""
-        if not faces:
+        input face then per body, in the same order (a failed individual entry is
+        still present with null age/gender rather than dropped from the list)."""
+        bodies = bodies or []
+        if not faces and not bodies:
             return []
         payload = {
             "image_path": image_path,
             "faces": [{"face_ref": f["ref"], "bbox": f["bbox"]} for f in faces],
+            "bodies": [{"face_ref": b["ref"], "bbox": b["bbox"]} for b in bodies],
         }
         with self._lock:  # one shared pipe → one request in flight at a time
             return self._request(payload, allow_respawn=True)

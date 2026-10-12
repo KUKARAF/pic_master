@@ -567,8 +567,8 @@ class RemoteCLIPIndexer:
 class RemoteAgeEstimator:
     """Drop-in for :class:`age_estimator.AgeGenderEstimator` backed by the worker.
 
-    Same ``estimate(image_path, faces)`` signature — ships the image + face
-    bboxes to the worker, which runs MiVOLO in its OWN isolated ``.age-venv``
+    Same ``estimate(image_path, faces, bodies=None)`` signature — ships the image
+    + face (and face-less body) bboxes to the worker, which runs MiVOLO in its OWN isolated ``.age-venv``
     there. Raises :class:`RuntimeError` (matching the local estimator's error
     contract, which web.py's ``api_estimate_age`` already handles) rather than
     WorkerError, so a failure surfaces cleanly with no web.py change."""
@@ -576,8 +576,9 @@ class RemoteAgeEstimator:
     def __init__(self, client: WorkerClient):
         self.client = client
 
-    def estimate(self, image_path: str, faces: list) -> list:
-        if not faces:
+    def estimate(self, image_path: str, faces: list, bodies: list | None = None) -> list:
+        bodies = bodies or []
+        if not faces and not bodies:
             return []
         basename = os.path.basename(image_path)
         with open(image_path, "rb") as f:
@@ -590,7 +591,9 @@ class RemoteAgeEstimator:
             worker_protocol.PATH_ESTIMATE_AGE,
             {"name": basename, "image": image_bytes,
              "faces": [{"face_ref": fc["ref"], "bbox": [float(v) for v in fc["bbox"]]}
-                       for fc in faces]},
+                       for fc in faces],
+             "bodies": [{"face_ref": b["ref"], "bbox": [float(v) for v in b["bbox"]]}
+                        for b in bodies]},
             timeout=200)
         if resp.get("error"):
             raise RuntimeError(resp["error"])

@@ -445,6 +445,27 @@
         </div>
       </div>
       {% endif %}
+      {% if file.is_image %}
+      {# Age / gender for hand-drawn named bodies ("Label person") — filled by the
+         🎂 estimator; app.js appends chips here for bodies labelled after load.
+         No manual 🎂 edit button yet (the /age-gender endpoint does accept body refs). #}
+      <div id="body-age-chips-wrap" {% if not body_ages %}style="display:none;"{% endif %}>
+        <div class="sub" style="margin-bottom:4px;">🧍 Bodies</div>
+        <div class="face-chips" id="body-age-chips">
+          {% for b in body_ages or [] %}
+          <div class="face-chip body-age-chip" data-body-ref="{{ b.ref }}">
+            <span class="face-name">
+              <a href="/person/{{ b.identity | urlencode }}">{{ b.identity }}</a>
+              <span class="face-age-gender {{ 'gender-male' if b.gender == 'male' else ('gender-female' if b.gender == 'female' else '') }}"
+                    data-face-ref="{{ b.ref }}" style="font-size:0.85em;">
+                {% if b.age is not none %}{{ b.age | round(0) | int }}{% endif %}
+              </span>
+            </span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
       {% if faces %}
       <div class="face-chips" id="face-chips">
         {% for face in faces %}

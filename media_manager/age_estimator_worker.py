@@ -6,14 +6,23 @@ being importable in-process.
 
 Input (stdin, one JSON object):
     {"image_path": "/abs/path/to/photo.jpg",
-     "faces": [{"face_ref": "manual:1", "bbox": [x1, y1, x2, y2]}, ...]}
+     "faces": [{"face_ref": "manual:1", "bbox": [x1, y1, x2, y2]}, ...],
+     "bodies": [{"face_ref": "body:12", "bbox": [x1, y1, x2, y2]}, ...]}  # optional
+
+"bodies" are hand-drawn, named person boxes with NO face on them (the caller drops
+any body that already contains a face — that face's estimate uses it). Each runs
+through MiVOLO's body-only mode: the face slot gets None, mirroring how a face with
+no detected body passes None for the body slot.
 
 Output (stdout, one JSON object):
-    {"results": [{"face_ref": "manual:1", "age": 27.4, "gender": "male"}, ...]}
-    or {"error": "message"} on failure (nonzero exit code).
+    {"results": [{"face_ref": "manual:1", "age": 27.4, "gender": "male"},
+                 {"face_ref": "body:12", "age": 8.1, "gender": "female"}, ...]}
+    or {"error": "message"} on failure (nonzero exit code). Faces come first, then
+    bodies, each in input order.
 
-A face with no usable estimate (e.g. inference failed for just that one crop) still
-appears in "results" with age/gender set to null, rather than being dropped silently.
+A face or body with no usable estimate (e.g. inference failed for just that one crop)
+still appears in "results" with age/gender set to null, rather than being dropped
+silently.
 """
 import json
 import os
@@ -194,10 +203,10 @@ def load_models():
             "processor": processor, "dev": dev, "person": person}
 
 
-def infer(models, image_path, faces):
-    """Age/gender for one image's faces, using already-loaded `models` (from
-    load_models()). This is the only per-request work — everything heavy already
-    happened once at load time."""
+def infer(models, image_path, faces, bodies=()):
+    """Age/gender for one image's faces (and face-less bodies, see the module
+    docstring), using already-loaded `models` (from load_models()). This is the only
+    per-request work — everything heavy already happened once at load time."""
     import cv2  # hook-allow: lazy — heavy; .age-venv only
 
     torch = models["torch"]
@@ -210,7 +219,9 @@ def infer(models, image_path, faces):
     if image is None:
         raise RuntimeError(f"Could not read image: {image_path}")
 
-    person_boxes = detect_person_boxes(models["person"], image)
+    # Only faces need the person detector (to find their body); a body-only request
+    # already has its boxes.
+    person_boxes = detect_person_boxes(models["person"], image) if faces else []
 
     face_crops = []
     body_crops = []
@@ -251,13 +262,32 @@ def infer(models, image_path, faces):
         except Exception as exc:  # noqa: BLE001 - one bad face must not sink the batch  # hook-allow: broad
             results.append({"face_ref": face_ref, "age": None, "gender": None, "error": str(exc)})
 
+    # Body-only: no face crop at all, so the face slot gets None (MiVOLO's processor
+    # turns None into an empty input, same as a missing body above).
+    for body in bodies:
+        body_ref = body["face_ref"]
+        body_crop_img = crop(image, body["bbox"])
+        if body_crop_img is None:
+            results.append({"face_ref": body_ref, "age": None, "gender": None})
+            continue
+        try:
+            faces_input = processor(images=[None])["pixel_values"].to(dev)
+            body_input = processor(images=[body_crop_img])["pixel_values"].to(dev)
+            with torch.no_grad():
+                output = model(faces_input=faces_input, body_input=body_input)
+            age = round(output.age_output[0].item(), 1)
+            gender = config.gender_id2label[output.gender_class_idx[0].item()]
+            results.append({"face_ref": body_ref, "age": age, "gender": gender})
+        except Exception as exc:  # noqa: BLE001 - one bad body must not sink the batch  # hook-allow: broad
+            results.append({"face_ref": body_ref, "age": None, "gender": None, "error": str(exc)})
+
     return results
 
 
-def run(image_path, faces):
+def run(image_path, faces, bodies=()):
     """One-shot path (legacy / no --serve): load models, then infer once. Kept so a
     direct `python age_estimator_worker.py` still works; the fast path is serve()."""
-    return infer(load_models(), image_path, faces)
+    return infer(load_models(), image_path, faces, bodies)
 
 
 def serve():
@@ -268,7 +298,8 @@ def serve():
     the ~1 s model load + XPU init is amortized across all images instead of paid
     per image (the old spawn-per-call cost ~1.25 s/face, essentially all reload).
 
-    Protocol: one request object per line in — {"image_path": str, "faces": [...]};
+    Protocol: one request object per line in — {"image_path": str, "faces": [...],
+    "bodies": [...] (optional)};
     one response object per line out — {"results": [...]} or {"error": str}. ONLY
     responses are ever written to the real stdout; all model-load chatter,
     warnings, and tracebacks go to stderr so they can neither corrupt the pipe
@@ -292,7 +323,8 @@ def serve():
             continue
         try:
             req = json.loads(line)
-            resp = {"results": infer(models, req["image_path"], req["faces"])}
+            resp = {"results": infer(models, req["image_path"], req["faces"],
+                                     req.get("bodies") or [])}
         except Exception as exc:  # noqa: BLE001 - report per-request, keep serving  # hook-allow: broad
             traceback.print_exc()
             resp = {"error": str(exc)}
@@ -303,7 +335,7 @@ def serve():
 def main():
     try:
         payload = json.loads(sys.stdin.read())
-        results = run(payload["image_path"], payload["faces"])
+        results = run(payload["image_path"], payload["faces"], payload.get("bodies") or [])
         json.dump({"results": results}, sys.stdout)
     except Exception as exc:  # noqa: BLE001 - report, don't traceback, to the caller  # hook-allow: broad
         json.dump({"error": str(exc)}, sys.stdout)

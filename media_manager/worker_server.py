@@ -408,14 +408,15 @@ def handle_estimate_age(path, data, request_id, link_id, remote_identity, reques
         # Map the wire faces to the shape AgeGenderEstimator.estimate expects
         # ('ref' + 'bbox'); it returns [{face_ref, age, gender}, ...] already.
         faces = [{"ref": f["face_ref"], "bbox": f["bbox"]} for f in (req.get("faces") or [])]
+        bodies = [{"ref": b["face_ref"], "bbox": b["bbox"]} for b in (req.get("bodies") or [])]
         tmp = _write_temp(req["image"], name)
         # Shares models.lock (NOT a separate lock) so MiVOLO's GPU work never runs
         # concurrently with OpenVINO face/CLIP/YOLO inference — see the note by
         # _age_estimator above (prevents Arc CL_OUT_OF_RESOURCES).
         with models.lock:
-            results = _get_age_estimator().estimate(tmp, faces)
+            results = _get_age_estimator().estimate(tmp, faces, bodies)
         print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> "
-              f"{len(results)} face(s)", flush=True)
+              f"{len(results)} face(s)/body(ies)", flush=True)
         return worker_protocol.pack({"results": results, "error": None})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()

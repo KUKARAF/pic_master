@@ -868,6 +868,22 @@ def create_app(data_root: str) -> FastAPI:
                 deduped[deduped.index(dup)] = face
         return deduped
 
+    def _bodies_for_age(checksum, faces):
+        """Named, hand-labelled bodies on this photo to age/gender-estimate from the
+        body crop alone (MiVOLO body-only mode): manual.get_bodies_for_age minus any
+        body that contains one of `faces` (same containment rule the worker uses to
+        pair a face with its body) — that face's estimate already uses the body, so
+        estimating it again would just be a second, worse guess for the same person.
+        Returns [{'ref': 'body:{id}', 'bbox', 'identity'}, ...] — the estimator's
+        input shape."""
+        face_boxes = [f['bbox'] for f in faces if f.get('bbox')]
+        out = []
+        for b in manual.get_bodies_for_age(checksum):
+            if any(body_index.match_face_to_body(fb, [b['bbox']]) is not None for fb in face_boxes):
+                continue
+            out.append({'ref': f"body:{b['id']}", 'bbox': b['bbox'], 'identity': b['identity']})
+        return out
+
     def _parse_face_ref(face_id: str):
         if ':' not in face_id:
             raise HTTPException(status_code=400, detail='face id must be "auto:<id>" or "manual:<id>"')
@@ -1985,6 +2001,14 @@ def create_app(data_root: str) -> FastAPI:
             est = age_by_ref.get(face['ref'])
             face['age'] = est['age'] if est else None
             face['gender'] = est['gender'] if est else None
+        # Face-less named bodies get their own chip (body-only estimate, see
+        # _bodies_for_age); age/gender stay None until estimated.
+        body_ages = []
+        for b in _bodies_for_age(checksum, faces):
+            est = age_by_ref.get(b['ref'])
+            body_ages.append({'ref': b['ref'], 'identity': b['identity'],
+                              'age': est['age'] if est else None,
+                              'gender': est['gender'] if est else None})
         # Manually-captured stills of this video (for the Frames pod), and — when this
         # file is itself a captured still — a link back to its source video.
         captured_frames = []
@@ -2018,6 +2042,7 @@ def create_app(data_root: str) -> FastAPI:
             'detection_bboxes': detection_bboxes,
             'single_detections': single_detections,
             'faces': faces,
+            'body_ages': body_ages,
             'whole_photo_identities': whole_photo_identities,
             'all_tags': all_tags,
             'all_categories': all_categories,
@@ -7533,24 +7558,31 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/files/{file_id}/estimate-age')
     def api_estimate_age(file_id: int):
         """Experimental — see age_estimator.py. Runs MiVOLO (in its own isolated venv,
-        via subprocess) on every face already known for this photo."""
+        via subprocess) on every face already known for this photo, plus every named
+        face-less body ("Label person") from the body crop alone (_bodies_for_age).
+        Body results carry face_ref 'body:{id}' and their 'identity' for the UI chip."""
 
         row = _file_or_404(file_id)
         checksum = row['checksum']
         faces = _combined_faces_for_file(file_id, checksum)
-        if not faces:
-            return {'results': [], 'message': 'No faces detected in this photo yet.'}
+        bodies = _bodies_for_age(checksum, faces)
+        if not faces and not bodies:
+            return {'results': [], 'message': 'No faces or labelled bodies on this photo yet.'}
 
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
             raise HTTPException(status_code=404, detail='Image file not found on disk')
 
         try:
-            results = _get_age_estimator().estimate(abs_path, faces)
+            results = _get_age_estimator().estimate(abs_path, faces, bodies)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
         manual.save_age_estimates(checksum, results, MODEL_ID)
+        identity_by_body = {b['ref']: b['identity'] for b in bodies}
+        for r in results:
+            if r.get('face_ref') in identity_by_body:
+                r['identity'] = identity_by_body[r['face_ref']]
         return {'results': results}
 
     @app.post('/api/files/{file_id}/age-gender')
@@ -7566,8 +7598,11 @@ def create_app(data_root: str) -> FastAPI:
         age = body.age
         if age is not None and not (0 <= age <= 120):
             raise HTTPException(status_code=400, detail='age must be between 0 and 120')
-        # Only allow writing to a face that's actually on this photo.
-        valid_refs = {f['ref'] for f in _combined_faces_for_file(file_id, row['checksum'])}
+        # Only allow writing to a face (or face-less named body) that's actually on
+        # this photo.
+        faces = _combined_faces_for_file(file_id, row['checksum'])
+        valid_refs = {f['ref'] for f in faces}
+        valid_refs |= {b['ref'] for b in _bodies_for_age(row['checksum'], faces)}
         if body.face_ref not in valid_refs:
             raise HTTPException(status_code=404, detail='That face is not on this photo')
         manual.set_manual_age_gender(row['checksum'], body.face_ref, age, gender)

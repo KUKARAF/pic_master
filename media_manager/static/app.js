@@ -5171,6 +5171,31 @@
      separate list. */
   const estimateAgeBtn = document.getElementById('estimate-age-btn');
   const estimateAgeStatus = document.getElementById('estimate-age-status');
+  // Mirrors the server-rendered body chip in photo.html; returns its age span.
+  function addBodyAgeChip(est) {
+    const wrap = document.getElementById('body-age-chips-wrap');
+    const list = document.getElementById('body-age-chips');
+    if (!wrap || !list) return null;
+    const chip = document.createElement('div');
+    chip.className = 'face-chip body-age-chip';
+    chip.dataset.bodyRef = est.face_ref;
+    const name = document.createElement('span');
+    name.className = 'face-name';
+    const link = document.createElement('a');
+    link.href = '/person/' + encodeURIComponent(est.identity || '');
+    link.textContent = est.identity || 'Unknown';
+    const span = document.createElement('span');
+    span.className = 'face-age-gender';
+    span.dataset.faceRef = est.face_ref;
+    span.style.fontSize = '0.85em';
+    name.appendChild(link);
+    name.appendChild(document.createTextNode(' '));
+    name.appendChild(span);
+    chip.appendChild(name);
+    list.appendChild(chip);
+    wrap.style.display = '';
+    return span;
+  }
   if (estimateAgeBtn) {
     estimateAgeBtn.addEventListener('click', function () {
       estimateAgeBtn.disabled = true;
@@ -5189,7 +5214,12 @@
           }
           estimateAgeStatus.style.display = 'none';
           data.results.forEach(function (est) {
-            const el = document.querySelector('.face-age-gender[data-face-ref="' + est.face_ref + '"]');
+            let el = document.querySelector('.face-age-gender[data-face-ref="' + est.face_ref + '"]');
+            // A body labelled after page load has no chip yet — build one in the
+            // "🧍 Bodies" row (no 🎂 edit button for bodies yet).
+            if (!el && typeof est.face_ref === 'string' && est.face_ref.indexOf('body:') === 0) {
+              el = addBodyAgeChip(est);
+            }
             if (!el) return;
             el.textContent = est.age !== null && est.age !== undefined ? Math.round(est.age) : '';
             el.classList.remove('gender-male', 'gender-female');

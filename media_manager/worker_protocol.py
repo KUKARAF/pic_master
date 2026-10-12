@@ -123,7 +123,9 @@ ALL_PATHS = [
 #
 #   PATH_ESTIMATE_AGE   (MiVOLO age/gender, run in the worker's isolated .age-venv)
 #     req:  {"name": <str>, "image": <bytes: encoded image>,
-#            "faces": [{"face_ref": <str>, "bbox": [x1, y1, x2, y2]}, ...]}
+#            "faces": [{"face_ref": <str>, "bbox": [x1, y1, x2, y2]}, ...],
+#            "bodies": [{"face_ref": "body:<id>", "bbox": [...]}, ...]}  # optional,
+#                                   # face-less named bodies (body-only MiVOLO)
 #     resp: {"results": [{"face_ref": <str>, "age": <float|None>,
 #                         "gender": <str|None>}, ...],
 #            "error": <None|str>}   # error e.g. "run media age-setup" when the
