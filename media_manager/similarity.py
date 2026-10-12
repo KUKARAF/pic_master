@@ -3,6 +3,8 @@ category auto-matching and web.py's set-similarity features use the exact same
 computation, without media.py (CLI/core layer) importing web.py."""
 import numpy as np
 
+from . import gpu_search
+
 
 def mean_normalized_centroid(embedding_bytes_list):
     """Mean of a list of embedding byte-blobs, L2-normalized. None if the list
@@ -68,7 +70,6 @@ def rank_matrix(centroid, matrix, k=None, gpu_key=None, gpu_version=None):
     centroid = np.asarray(centroid, dtype=np.float32)
     scores = None
     if gpu_key is not None and gpu_version is not None:
-        from . import gpu_search
         scores = gpu_search.matvec(gpu_key, gpu_version, matrix, centroid)
     if scores is None:
         scores = matrix.dot(centroid)  # numpy fallback (CPU / no key) — unchanged path

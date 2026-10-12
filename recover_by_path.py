@@ -139,7 +139,7 @@ def main():
                 (new_fid, old_fid, set_id)
             )
         manual_conn.commit()
-    except Exception:
+    except Exception:  # hook-allow: broad — rollback then re-raise
         manual_conn.rollback()
         print('Something went wrong — rolled back, manual.db is unchanged. '
               f'Your pre-write backup is still at {backup_path} regardless.')

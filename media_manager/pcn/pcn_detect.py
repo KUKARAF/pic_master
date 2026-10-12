@@ -23,6 +23,8 @@ import os
 import numpy as np
 import cv2
 
+from .. import compute
+
 # --- global settings (unchanged from upstream) ---------------------------------
 EPS = 1e-5
 minFace_ = 20 * 1.4
@@ -338,8 +340,7 @@ class PCNDetector:
     [{'bbox':[x1,y1,x2,y2], 'angle':degrees, 'conf':float, 'points':[(x,y)x4]}]."""
 
     def __init__(self, model_dir=None):
-        import onnxruntime as ort
-        from .. import compute
+        import onnxruntime as ort  # hook-allow: lazy — heavy dep (onnxruntime)
         d = model_dir or os.path.dirname(os.path.abspath(__file__))
         so = ort.SessionOptions()
         so.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)

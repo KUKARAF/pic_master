@@ -181,7 +181,7 @@ class WorkerClient:
                 f"{resp.text[:200]!r}")
         try:
             return worker_protocol.unpack(resp.content)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — any msgpack decode failure → WorkerError
             raise WorkerError(
                 f"worker request {path!r} returned an undecodable body ({exc})") from exc
 
@@ -215,7 +215,7 @@ class WorkerClient:
                 resp = self.request(worker_protocol.PATH_PING, {},
                                     timeout=_PROBE_PING_TIMEOUT, retries=0)
                 result = resp.get("ok") is True
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — any failure = unavailable (warned)
                 _warn(f"availability check failed: {exc}")
                 result = False
 
@@ -492,7 +492,7 @@ class RemoteFaceDetector:
 
     @staticmethod
     def model_id(*args, **kwargs) -> str:
-        from .face_detector import FaceDetector
+        from .face_detector import FaceDetector  # hook-allow: lazy — model module, only for id
         return FaceDetector.model_id(*args, **kwargs)
 
 
@@ -502,7 +502,7 @@ class RemoteCLIPIndexer:
     def __init__(self, client: WorkerClient):
         self.client = client
         # Must equal the model the worker uses so the DB 'model' column matches.
-        from .indexer import CLIPIndexer
+        from .indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
         self.model_name = CLIPIndexer.model_id()
 
     def embed_images(self, paths):
@@ -560,7 +560,7 @@ class RemoteCLIPIndexer:
 
     @staticmethod
     def model_id(*args, **kwargs):
-        from .indexer import CLIPIndexer
+        from .indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
         return CLIPIndexer.model_id(*args, **kwargs)
 
 
@@ -634,5 +634,5 @@ class RemoteYOLODetector:
 
     @staticmethod
     def model_id(*args, **kwargs):
-        from .detector import YOLOWorldDetector
+        from .detector import YOLOWorldDetector  # hook-allow: lazy — model module, only for id
         return YOLOWorldDetector.model_id(*args, **kwargs)

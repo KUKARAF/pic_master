@@ -4,6 +4,7 @@ import math
 import numpy as np
 
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
+from . import compute
 
 # --- Angle convention: the single source of truth for the whole app -----------
 # Every face dict carries 'angle' = the in-plane roll of the face AS IT SITS IN
@@ -163,8 +164,7 @@ def _inflate_square(bbox, pad_ratio):
 
 class FaceDetector:
     def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=None):
-        from insightface.app import FaceAnalysis
-        from . import compute
+        from insightface.app import FaceAnalysis  # hook-allow: lazy — heavy optional dep (insightface)
         self.det_thresh = det_thresh
         self._model_name = model_name
         # Central onnxruntime provider pick: CUDA (NVIDIA), OpenVINO GPU (Intel
@@ -190,9 +190,9 @@ class FaceDetector:
         detection — PCN is a supplementary recall boost, never a hard requirement."""
         if self._pcn is None and not self._pcn_failed:
             try:
-                from media_manager.pcn import PCNDetector
+                from media_manager.pcn import PCNDetector  # hook-allow: lazy — optional PCN; load failure disables it
                 self._pcn = PCNDetector()
-            except Exception:
+            except Exception:  # hook-allow: broad — optional PCN, any load failure falls back to InsightFace-only
                 self._pcn_failed = True
         return self._pcn
 
@@ -206,7 +206,7 @@ class FaceDetector:
                   0.0 when the face needed no rotation correction
           error = None on success, str on failure
         """
-        import cv2
+        import cv2  # hook-allow: lazy — heavy dep (cv2)
         results = []
         for path in paths:
             ext = os.path.splitext(path)[1].lower()
@@ -232,7 +232,7 @@ class FaceDetector:
                     })
                 self._normalize_in_place(img, faces)
                 results.append((path, faces, None))
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — per-image resilience, error reported in result
                 results.append((path, [], str(exc)))
         return results
 
@@ -339,7 +339,7 @@ class FaceDetector:
                 })
                 claimed.add(len(faces) - 1)
             return claimed
-        except Exception:
+        except Exception:  # hook-allow: broad — PCN pass is best-effort by design
             return claimed
 
     def _correct_face(self, pcn, img, cand, angle, faces, hit, claimed):
@@ -420,7 +420,7 @@ class FaceDetector:
         aligned upright path. Confidently-detected faces skip the sweep entirely,
         so they cost nothing.
         """
-        import cv2
+        import cv2  # hook-allow: lazy — heavy dep (cv2)
         turns = ((1, cv2.ROTATE_90_CLOCKWISE),
                  (2, cv2.ROTATE_180),
                  (3, cv2.ROTATE_90_COUNTERCLOCKWISE))
@@ -457,7 +457,7 @@ class FaceDetector:
                 # which is exactly what 'angle' reports.
                 face['angle'] = _norm_angle(-90.0 * best_k)
                 claimed.add(i)
-            except Exception:
+            except Exception:  # hook-allow: broad — per-crop resilience
                 continue  # one bad crop must not cost us the rest of the image
 
     def _centered_face(self, got, shape):
@@ -511,7 +511,7 @@ class FaceDetector:
         if rotated is not None:
             return rotated
 
-        import cv2
+        import cv2  # hook-allow: lazy — heavy dep (cv2)
         # LAST RESORT: an UNALIGNED 112x112 resize straight into ArcFace. With no
         # landmarks the face is never warped onto the canonical template, so this
         # vector is only loosely comparable to properly aligned ones — it exists so
@@ -533,7 +533,7 @@ class FaceDetector:
         is what keeps the manual "rotate and re-score" path off the unaligned
         fallback. Returns a face dict in original-image coordinates, or None."""
         try:
-            import cv2
+            import cv2  # hook-allow: lazy — heavy dep (cv2)
             pcn = self._get_pcn()
             if pcn is None:
                 return None
@@ -564,7 +564,7 @@ class FaceDetector:
                 'det_score': got['det_score'],
                 'angle': _norm_angle(-cand['angle']),
             }
-        except Exception:
+        except Exception:  # hook-allow: broad — best-effort rotated embed, None means fallback
             return None
 
     @staticmethod

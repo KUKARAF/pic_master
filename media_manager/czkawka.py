@@ -30,7 +30,7 @@ def info():
         return None
     try:
         out = subprocess.run([path, '--version'], capture_output=True, text=True, timeout=15).stdout
-    except Exception:
+    except Exception:  # hook-allow: broad — external tool probe, absent/broken means None
         return None
     m = re.search(r'(\d+)\.(\d+)\.(\d+)', out)
     version = m.group(0) if m else (out.strip().splitlines() or [''])[0]

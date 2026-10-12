@@ -84,6 +84,9 @@ import os
 import numpy as np
 from PIL import Image
 
+from . import compute
+from .tile_index import generate_tiles
+
 # Fixed network geometry for the ViT-B/14 (and -S/-L/14) dinov2-with-registers
 # backbones: a 224x224 input at patch 14 gives a 16x16 patch grid. Static, so the
 # OpenVINO IR can be reshaped to a fixed shape and compiled once.
@@ -181,9 +184,8 @@ class ObjectEncoder:
             return f'{self._device} (OpenVINO)'
         # torch backend: defer to the central compute label (cuda/xpu/mps/cpu).
         try:
-            from . import compute
             return compute.device_label()
-        except Exception:
+        except Exception:  # hook-allow: broad — label is cosmetic, never fail on it
             return 'CPU'
 
     # -- public embedding API -------------------------------------------------
@@ -207,7 +209,7 @@ class ObjectEncoder:
                     crop = _crop_to_box(img, boxes[i])
                 tensors.append(self._preprocess(crop))
                 idxs.append(i)
-            except Exception:
+            except Exception:  # hook-allow: broad — per-crop prep resilience
                 # Per-crop prep failure is a legitimate None (e.g. degenerate box);
                 # a missing runtime/weights is NOT swallowed — that raises in
                 # _ensure_loaded below.
@@ -228,8 +230,6 @@ class ObjectEncoder:
         Returns ``[ ((x1,y1,x2,y2) in ORIGINAL pixels, vec float32 L2-norm), ... ]``,
         dropping any tile whose crop failed. This is what the library indexing job
         calls per image."""
-        from .tile_index import generate_tiles
-
         if isinstance(image, (str, os.PathLike)):
             with Image.open(image) as im:
                 img = im.convert('RGB')
@@ -320,7 +320,7 @@ class ObjectEncoder:
                 f"{self._ir_dir}"
             )
         try:
-            import openvino as ov
+            import openvino as ov  # hook-allow: lazy — optional heavy runtime (openvino)
         except ImportError as exc:
             raise RuntimeError(
                 "OpenVINO runtime is not installed (needed for the ObjectEncoder "
@@ -336,11 +336,11 @@ class ObjectEncoder:
         model.reshape({self._ov_input: [self._batch, 3, _RESOLUTION, _RESOLUTION]})
         try:
             self._compiled = core.compile_model(model, self._device)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — third-party compile, re-raised with context
             avail = ''
             try:
                 avail = f" Available OpenVINO devices: {core.available_devices}."
-            except Exception:
+            except Exception:  # hook-allow: broad — diagnostic probe only
                 pass
             raise RuntimeError(
                 f"OpenVINO failed to compile the DINOv2 IR to device "
@@ -374,7 +374,7 @@ class ObjectEncoder:
 
     def _load_torch(self):
         try:
-            import torch
+            import torch  # hook-allow: lazy — optional heavy dep (torch)
         except ImportError as exc:
             raise RuntimeError(
                 "torch is not installed (needed for the ObjectEncoder torch "
@@ -385,12 +385,11 @@ class ObjectEncoder:
                 "or set MEDIA_OBJECT_DINOV2_OV to use the OpenVINO backend."
             ) from exc
 
-        from . import compute
         self._torch = torch
         self._torch_device = compute.torch_device()
         try:
             model = torch.hub.load('facebookresearch/dinov2', self._hub_name)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — torch.hub load, re-raised with context
             raise RuntimeError(
                 f"Failed to load DINOv2 weights '{self._hub_name}' from torch.hub "
                 f"(facebookresearch/dinov2): {exc}. This needs network access on "

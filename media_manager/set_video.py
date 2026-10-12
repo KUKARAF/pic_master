@@ -17,9 +17,11 @@ caller gets a loud error (generation has no CPU substitute).
 """
 import json
 import os
+import shutil
 import tempfile
 
 from . import set_render
+from . import set_image
 from .gen_service import ComfyUIClient, GenServiceUnavailable, GenServiceError
 
 
@@ -110,7 +112,7 @@ def order_by_similarity(items):
     {'name': str, 'path': str, 'embedding': bytes|None}. Members with no embedding
     can't be placed by similarity, so they're appended at the end in name order.
     Returns the same dicts, reordered (does not mutate the input list)."""
-    import numpy as np
+    import numpy as np  # hook-allow: lazy — heavy dep (numpy), only for ordering
     by_name = lambda it: (it.get('name') or '').lower()
     if len(items) <= 2:
         return sorted(items, key=by_name)
@@ -201,7 +203,6 @@ def morph_from_set(member_paths, out_path, gen=None, workflow_template=None,
         set_render.frames_to_video(ordered_frames, out_path, fps=fps, origin="ai")
         return out_path
     finally:
-        import shutil
         shutil.rmtree(frame_dir, ignore_errors=True)
 
 
@@ -231,8 +232,6 @@ def image_to_video(image_path, out_path, gen=None, workflow_template=None,
     """Animate a single image into a video via an image-to-video ComfyUI workflow
     (auto-detects the LoadImage node + positive prompt; frames → mp4). Returns
     out_path. Raises GenServiceUnavailable/GenServiceError."""
-    import shutil
-    from . import set_image
     params = params or {}
     if not (image_path and os.path.isfile(image_path)):
         raise ValueError("image_to_video needs a readable image")

@@ -1,9 +1,12 @@
 """
 Main MediaManager class providing the primary interface for media management operations.
 """
+import json
 import os
 import sys
 from .database import Database
+from .exif_reader import extract_exif_metadata
+from .formats import IMAGE_EXTENSIONS
 from .fast_scan import fast_scan
 from .broken_finder import find_broken
 from .error_log import ErrorLog
@@ -47,7 +50,7 @@ class MediaManager:
         """Return the process WorkerClient for this data_root. is_available() on it
         is TTL-cached and returns False cheaply when no worker is configured (no RNS
         init), so calling this per batch method is free when nothing is offloaded."""
-        from . import worker_client
+        from . import worker_client  # hook-allow: lazy — pulls cv2/requests
         return worker_client.get_client(self.data_root)
 
     def start_scan(self, path, recursive=True, reindex=False):
@@ -183,8 +186,6 @@ class MediaManager:
         runs off plain file discovery so it works whether or not you've committed.
         Returns (checked_count, found_count).
         """
-        from .exif_reader import extract_exif_metadata
-        from .formats import IMAGE_EXTENSIONS
 
         candidates_all = self.db.get_files_without_metadata(limit=None)
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
@@ -224,6 +225,7 @@ class MediaManager:
         Run YOLO-World on undetected image files under path, store detections in DB.
         Returns (indexed_count, failed_count).
         """
+        # hook-allow: lazy — model module
         from .detector import YOLOWorldDetector, SUPPORTED_EXTENSIONS, load_vocab_from_file, merge_vocab
 
         vocab_path = os.path.join(self.data_root, '.media', 'search_terms.txt')
@@ -231,7 +233,7 @@ class MediaManager:
         vocab = merge_vocab(base_vocab, self.manual.get_all_positive_labels())
         client = self._worker()
         if client.is_configured():
-            from . import worker_client
+            from . import worker_client  # hook-allow: lazy — pulls cv2/requests
             # The worker runs a fixed model_size='s' @ conf 0.15; it does not honor
             # per-request model_size/conf_threshold. Warn loudly if the caller asked
             # for something else, and record the model_id the worker ACTUALLY used
@@ -289,11 +291,11 @@ class MediaManager:
         Powers the "find similar" visual-similarity feature (separate from YOLO-World
         object-class search). Returns (indexed_count, failed_count).
         """
-        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
+        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS  # hook-allow: lazy — torch/open_clip
 
         client = self._worker()
         if client.is_configured():
-            from . import worker_client
+            from . import worker_client  # hook-allow: lazy — pulls cv2/requests
             # The worker runs the default CLIPIndexer (ViT-B-32/openai) and ignores a
             # requested model_name/pretrained. Warn and record the worker's actual
             # model_id so embeddings aren't stored under a model tag they don't match.
@@ -362,8 +364,8 @@ class MediaManager:
         count of (file, category) matches, not files; skipped is files that
         matched zero categories this run.
         """
-        import numpy as np
-        from .similarity import mean_normalized_centroid, adjusted_centroid
+        import numpy as np  # hook-allow: lazy — heavy
+        from .similarity import mean_normalized_centroid, adjusted_centroid  # hook-allow: lazy — numpy
 
         categories = self.manual.list_categories()
         if not categories:
@@ -436,13 +438,14 @@ class MediaManager:
         runs its own dedicated person-only detection pass instead of skipping it,
         so this doesn't require `media index` to have run first. Returns
         (indexed_count, failed_count)."""
+        # hook-allow: lazy — model modules (PIL/torch/open_clip)
         from . import body_index
-        from .detector import YOLOWorldDetector
-        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS
+        from .detector import YOLOWorldDetector  # hook-allow: lazy
+        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS  # hook-allow: lazy
 
         client = self._worker()
         if client.is_configured():
-            from . import worker_client
+            from . import worker_client  # hook-allow: lazy — pulls cv2/requests
             print("[media] offloading body indexing (person detection + CLIP) to remote worker")
             detector = worker_client.RemoteYOLODetector(
                 client, conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
@@ -471,7 +474,7 @@ class MediaManager:
             try:
                 body_index.embed_bodies_for_file(self.db, clip_indexer, file_id, abs_file, detector=detector)
                 indexed_count += 1
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — per-file resilience, logged
                 failed_count += 1
                 self.errors.log(abs_file, str(exc))
             if total > 0 and (i % batch_size == 0 or i == total):
@@ -483,11 +486,11 @@ class MediaManager:
         """Run InsightFace on un-face-indexed image files under path.
         Returns (indexed_count, face_count, failed_count).
         """
-        from .face_detector import FaceDetector, SUPPORTED_EXTENSIONS
+        from .face_detector import FaceDetector, SUPPORTED_EXTENSIONS  # hook-allow: lazy — model module
 
         client = self._worker()
         if client.is_configured():
-            from . import worker_client
+            from . import worker_client  # hook-allow: lazy — pulls cv2/requests
             # The worker runs the default FaceDetector (buffalo_l @ det_thresh 0.5) and
             # ignores per-request model_name/det_thresh. Warn and record the worker's
             # actual model_id so faces aren't mislabeled in the DB.
@@ -543,7 +546,6 @@ class MediaManager:
         """After detection, auto-promote any newly detected face in this file to an
         existing identity if it clears manual_db.AUTO_MATCH_THRESHOLD — no human
         confirmation needed for a high-confidence repeat appearance."""
-        import json
         file_row = self.db.get_file_by_id(file_id)
         if file_row is None:
             return
@@ -562,8 +564,8 @@ class MediaManager:
         """Given an image path, detect the first face and find similar faces in the library.
         Returns [{'path', 'score', 'face_id', 'file_id'}, ...].
         """
-        import numpy as np
-        from .face_detector import FaceDetector
+        import numpy as np  # hook-allow: lazy — heavy
+        from .face_detector import FaceDetector  # hook-allow: lazy — model module
 
         detector = FaceDetector()
         results = detector.detect_faces([image_path])

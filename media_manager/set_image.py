@@ -16,6 +16,8 @@ import io
 import json
 import os
 
+from PIL import Image
+
 from . import set_render
 from .gen_service import ComfyUIClient, GenServiceUnavailable, GenServiceError
 
@@ -107,7 +109,6 @@ def image_from_set(member_paths, out_path, gen=None, workflow_template=None,
         raise GenServiceError("image workflow produced no output")
     fn, sub, typ = files[0]
     data = gen.fetch(fn, sub, typ)
-    from PIL import Image
     img = Image.open(io.BytesIO(data)).convert("RGB")
     set_render.save_image_with_provenance(img, out_path, origin="ai")
     return out_path

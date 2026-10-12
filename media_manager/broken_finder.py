@@ -29,7 +29,7 @@ def verify_image(path):
         if caught:
             return True, '; '.join(str(w.message) for w in caught)
         return True, None
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — any decode error means broken
         return False, str(exc)
 
 def verify_video(path):
@@ -49,7 +49,7 @@ def verify_video(path):
             return (True, None) if ret else (False, 'could not read a frame')
         finally:
             cap.release()
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — any decode error means broken
         return False, str(exc)
 
 def find_broken(root_path, db_conn, data_root, max_workers=8, error_log=None):
@@ -91,7 +91,7 @@ def find_broken(root_path, db_conn, data_root, max_workers=8, error_log=None):
             path, checker = futures[fut]
             try:
                 healthy, message = fut.result()
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — worker crash treated as failure
                 healthy, message = False, str(exc)     # treat worker crash as failure
 
             rel_path = os.path.relpath(str(path), data_root)

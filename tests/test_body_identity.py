@@ -15,6 +15,7 @@ Run standalone: python tests/test_body_identity.py
 import os
 import sys
 import tempfile
+import time
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -26,7 +27,7 @@ from fastapi.testclient import TestClient
 # loads; nothing under test touches it.
 sys.modules.setdefault('cv2', MagicMock())
 
-from media_manager.web import create_app
+from media_manager.web import create_app  # hook-allow: staged — must import after the cv2 stub above
 
 D = 512
 # For x = unit(d + s*n), two independent noisy versions of the same direction d have
@@ -122,7 +123,6 @@ def main():
 
         # 5) Unified presence: a body-only labeled photo shows up as an appearance even
         #    with no face. near_1 was confirmed by body above and has no face row.
-        from media_manager.web import create_app as _ca  # noqa: F401 (keep import local)
         r = client.get('/person/Alex')
         assert r.status_code == 200, r.text
         # anchor + near_1 are both body-labeled -> both are Alex checksums.
@@ -140,7 +140,6 @@ def main():
 
 
 def _poll(client, url, timeout=10.0):
-    import time
     deadline = time.time() + timeout
     while time.time() < deadline:
         s = client.get(url).json()

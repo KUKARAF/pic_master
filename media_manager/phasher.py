@@ -18,6 +18,8 @@ SQLite's signed INTEGER range.
 import numpy as np
 from PIL import Image
 
+from . import video_decode
+
 # Bump when the algorithm changes so a rehash can be told apart from old rows.
 ALGO_TAG = 'dct32-phash+dhash-v1'
 
@@ -82,8 +84,7 @@ def extract_video_frames(abs_path, fractions=VIDEO_FRACTIONS):
         unreadable frame count, or a frame that won't decode/encode) means the video is
         damaged and the caller should mark it so.
     """
-    import cv2  # heavy; imported lazily like the thumbnail path does
-    from . import video_decode
+    import cv2  # hook-allow: lazy — heavy, like the thumbnail path
     frames = []
     # Route through video_decode so the Arc media engine (VAAPI/QSV) does the decode
     # when available, with a loud software fallback otherwise.
@@ -125,8 +126,7 @@ def iter_video_frames_sampled(abs_path, target_fps=1.0, max_frames=3600):
     `max_frames`. A generator so a long video never buffers hundreds of JPEGs at once.
     Same fd-safe `try/finally: cap.release()` as extract_video_frames — the caller must
     exhaust it or close it (a for-loop does both on normal/exception exit)."""
-    import cv2  # heavy; lazy like the rest of this module
-    from . import video_decode
+    import cv2  # hook-allow: lazy — heavy, like the rest of this module
     # Route through video_decode for GPU (VAAPI/QSV) decode with loud software fallback.
     cap = video_decode.open_capture(abs_path)
     try:

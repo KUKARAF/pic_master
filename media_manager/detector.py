@@ -2,6 +2,7 @@
 import os
 
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
+from . import compute
 
 # Default vocabulary used when .media/search_terms.txt does not exist.
 # Add/remove terms freely, or create .media/search_terms.txt (one term per line)
@@ -76,8 +77,7 @@ WEIGHTS_DIR = os.path.expanduser('~/.cache/media_manager/weights')
 class YOLOWorldDetector:
     def __init__(self, model_size='s', conf_threshold=0.15, vocab_path=None, vocab=None,
                  device=None):
-        from ultralytics import YOLOWorld as _YOLOWorld
-        from . import compute
+        from ultralytics import YOLOWorld as _YOLOWorld  # hook-allow: lazy — heavy dep (ultralytics)
         self.conf_threshold = conf_threshold
         self._model_size = model_size
         # ultralytics auto-picks CUDA-or-CPU; give it our central device so an
@@ -123,7 +123,7 @@ class YOLOWorldDetector:
                         x1, y1, x2, y2 = [float(v) for v in box.xyxy[0]]
                         detections.append((class_name, confidence, x1, y1, x2, y2))
                 results_out.append((path, detections, None))
-            except Exception as e:
+            except Exception as e:  # hook-allow: broad — per-image resilience, error reported in result
                 results_out.append((path, [], str(e)))
         return results_out
 

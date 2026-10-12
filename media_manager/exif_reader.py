@@ -36,7 +36,7 @@ def _dms_to_degrees(dms, ref):
 def extract_exif_metadata(abs_path):
     """Return (taken_at, gps_lat, gps_lon) — each None if not present in the file's EXIF."""
     try:
-        from PIL import Image
+        from PIL import Image  # hook-allow: lazy — inside the try, missing PIL degrades to no EXIF
         with Image.open(abs_path) as img:
             exif = img.getexif()
             if not exif:
@@ -57,5 +57,5 @@ def extract_exif_metadata(abs_path):
                 gps_lon = _dms_to_degrees(gps_ifd.get(4), gps_ifd.get(3))
 
             return taken_at, gps_lat, gps_lon
-    except Exception:
+    except Exception:  # hook-allow: broad — third-party EXIF decode, best-effort
         return None, None, None

@@ -21,13 +21,13 @@ def _decode_draft(abs_path, long_side):
     1/2,1/4,1/8 decode, then a resize to land at ~long_side). Returns (PIL.Image RGB,
     (sx, sy)) mapping DECODED-image coords back to ORIGINAL pixels (so region boxes can
     be stored in original coordinates), or (None, (1.0, 1.0)) on failure."""
-    from PIL import Image
+    from PIL import Image  # hook-allow: lazy — PIL only for decode
     try:
         im = Image.open(abs_path)
         ow, oh = im.size
         try:
             im.draft('RGB', (long_side, long_side))
-        except Exception:
+        except Exception:  # hook-allow: broad — draft is an optional speedup
             pass
         im = im.convert('RGB')
         w, h = im.size
@@ -38,7 +38,7 @@ def _decode_draft(abs_path, long_side):
         dw, dh = im.size
         # scale to convert a DECODED-coord value back to ORIGINAL pixels
         return im, (ow / dw if dw else 1.0, oh / dh if dh else 1.0)
-    except Exception:
+    except Exception:  # hook-allow: broad — third-party decode, failure is a sentinel
         return None, (1.0, 1.0)
 
 
@@ -98,7 +98,7 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
                 else:
                     try:
                         regions = encoder.embed_regions(im)  # [(box_in_decoded_px, vec), ...]
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-image inference resilience, logged
                         db.insert_object_regions(fid, [((0.0, 0.0, 0.0, 0.0), b'')], enc_model)  # sentinel
                         if log:
                             log(rel, f'object-index embed error: {exc}')

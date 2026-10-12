@@ -20,7 +20,7 @@ def check(n, c, e=''):
 
 print("[1] shipped ONNX weights load and run without torch")
 assert 'torch' not in sys.modules, "torch must not be imported by the PCN path"
-from media_manager.pcn import PCNDetector
+from media_manager.pcn import PCNDetector  # hook-allow: staged — must import after the torch-absent assert
 det = PCNDetector()  # loads media_manager/pcn/pcn{1,2,3}.onnx
 check('3 onnx sessions loaded', len(det.nets) == 3)
 blank = np.zeros((200, 300, 3), dtype=np.uint8)
@@ -29,8 +29,8 @@ check('torch was never imported', 'torch' not in sys.modules)
 
 
 print("\n[2] angle convention: PCN's frame vs ours")
-from media_manager.pcn.pcn_detect import Window, crop_face
-from media_manager.face_detector import _norm_angle, _kps_angle
+from media_manager.pcn.pcn_detect import Window, crop_face  # hook-allow: staged — script sections import as they go
+from media_manager.face_detector import _norm_angle, _kps_angle  # hook-allow: staged — script sections import as they go
 
 # A synthetic "face": white on the TOP half of a square, black below. After a
 # correct upright warp the white must be back on top.
@@ -91,8 +91,8 @@ print("\n[3] angle sign end to end on a real rotated photo (needs insightface + 
 def _real_setup():
     """A real detector plus a real photo with detectable faces, or (None, why)."""
     try:
-        import insightface
-        from media_manager.face_detector import FaceDetector
+        import insightface  # hook-allow: lazy — optional insightface probe
+        from media_manager.face_detector import FaceDetector  # hook-allow: lazy — optional; real-model section only
         photo = os.path.join(os.path.dirname(insightface.__file__),
                              'data', 'images', 't1.jpg')
         if not os.path.exists(photo):
@@ -101,7 +101,7 @@ def _real_setup():
         if img is None:
             return None, 'sample photo unreadable'
         return (FaceDetector(), img), None
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — optional real-model probe, any failure skips
         return None, f'{type(exc).__name__}: {exc}'
 
 real, why = _real_setup()
@@ -134,7 +134,7 @@ else:
 
 
 print("\n[4] PCN correct + recover merge pass (fakes)")
-from media_manager.face_detector import (
+from media_manager.face_detector import (  # hook-allow: staged — script sections import as they go
     FaceDetector, PCN_MAX_RECOVER, PCN_MIN_CONF, PCN_CORRECT_MIN_CONF,
     PCN_CORRECT_MIN_ANGLE, ROTATION_CORRECT_MARGIN, ROTATION_TTA_TRIGGER,
     ROTATION_ALIGN_TOLERANCE)

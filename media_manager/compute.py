@@ -46,8 +46,8 @@ def _maybe_import_ipex() -> None:
     this import. Absent → fine (we just won't see an XPU device). Cached so the
     (potentially slow) import is attempted at most once."""
     try:
-        import intel_extension_for_pytorch  # noqa: F401
-    except Exception:
+        import intel_extension_for_pytorch  # noqa: F401  # hook-allow: lazy — optional IPEX probe, slow import
+    except Exception:  # hook-allow: broad — optional hardware probe, absence is fine
         pass
 
 
@@ -59,7 +59,7 @@ def torch_device() -> str:
     isn't free. torch is imported lazily so callers that only need the
     onnxruntime answer (or the torch-free PCN path) don't pay for it.
     """
-    import torch
+    import torch  # hook-allow: lazy — heavy dep (torch), see docstring
 
     ov = _override()
     if ov:
@@ -105,7 +105,7 @@ def onnx_providers():
     ``(name, options)`` tuple. ``CPUExecutionProvider`` is always the final
     fallback so a session can still build if the accelerator EP is missing.
     """
-    import onnxruntime as ort
+    import onnxruntime as ort  # hook-allow: lazy — heavy dep (onnxruntime)
 
     available = set(ort.get_available_providers())
     dev = torch_device()

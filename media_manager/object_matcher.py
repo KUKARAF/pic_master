@@ -142,6 +142,7 @@ command to fix it -- it never quietly falls back to a weaker backend.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import logging
 import os
@@ -182,11 +183,10 @@ class ObjectMatcher:
             # and gets better automatically once accelerated_features is installed.
             backend = "sift"
             try:
-                import importlib.util
                 if (importlib.util.find_spec("torch") is not None
                         and importlib.util.find_spec("modules.xfeat") is not None):
                     backend = "xfeat"
-            except Exception:
+            except Exception:  # hook-allow: broad — optional-backend probe
                 backend = "sift"
         self.backend = backend
 
@@ -235,9 +235,9 @@ class ObjectMatcher:
 
         if self.backend == "sift":
             try:
-                import cv2  # noqa: lazy
+                import cv2  # noqa: lazy  # hook-allow: lazy — optional cv2
                 ver = cv2.__version__
-            except Exception:
+            except Exception:  # hook-allow: broad — version probe only
                 ver = "unknown"
             mid = "sift-magsac/opencv%s/top%d/%s" % (ver, self.top_k, _SCHEMA_VERSION)
         elif self._engine == "onnx":
@@ -272,7 +272,7 @@ class ObjectMatcher:
              'size': (w, h),
              'model': model_id()}
         """
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
 
         rgb, (w, h) = _load_image_rgb(image)
 
@@ -307,7 +307,7 @@ class ObjectMatcher:
         IN THE COORDINATE SPACE OF images[i] whose keypoints must be dropped (same
         semantics as extract's person_boxes). A bad image yields None in its slot and
         must not fail the batch."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
 
         images = list(images)
         n = len(images)
@@ -334,7 +334,7 @@ class ObjectMatcher:
         if self.backend == "xfeat" and self._engine == "torch":
             try:
                 self._extract_batch_xfeat_torch(images, boxes_list, results, pending, np)
-            except Exception as e:
+            except Exception as e:  # hook-allow: broad — batched path falls back per-image
                 logger.warning(
                     "place_matcher.extract_batch: batched xfeat path failed (%s); "
                     "falling back to per-image extraction.", e,
@@ -345,7 +345,7 @@ class ObjectMatcher:
         for i in sorted(pending):
             try:
                 results[i] = self.extract(images[i], person_boxes=boxes_list[i])
-            except Exception as e:
+            except Exception as e:  # hook-allow: broad — one bad image must not fail the batch
                 logger.warning("place_matcher.extract_batch: image %d failed: %s", i, e)
                 results[i] = None
 
@@ -358,7 +358,7 @@ class ObjectMatcher:
         shape check, and the person-box drop) so batched results are identical
         in shape to extract()'s and feed serialize()/match_score() unchanged.
         """
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         w, h = size
         kpts = np.ascontiguousarray(kpts, dtype=np.float32).reshape(-1, 2)
         desc = np.ascontiguousarray(desc, dtype=np.float32)
@@ -380,7 +380,7 @@ class ObjectMatcher:
     # ------------------------------------------------------------------ #
     def serialize(self, feat: dict) -> bytes:
         """Pack a feature dict into compact, self-describing bytes for the DB."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
 
         buf = io.BytesIO()
         np.savez_compressed(
@@ -395,7 +395,7 @@ class ObjectMatcher:
 
     def deserialize(self, blob: bytes) -> dict:
         """Inverse of :meth:`serialize`."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
 
         with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
             size = npz["size"]
@@ -424,7 +424,7 @@ class ObjectMatcher:
         ``inliers`` is the monotone re-rank score (higher = more likely the same
         object) and ``ratio`` is inliers / putative-matches.
         """
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
 
         q_kpts = np.asarray(query_feat["kpts"], dtype=np.float32)
         c_kpts = np.asarray(cand_feat["kpts"], dtype=np.float32)
@@ -467,7 +467,7 @@ class ObjectMatcher:
         if self._xfeat is not None:
             return self._xfeat
         try:
-            import torch  # noqa: F401
+            import torch  # noqa: F401  # hook-allow: lazy — optional torch
         except ImportError as e:
             raise ImportError(
                 "The xfeat backend needs PyTorch. Install it, e.g.:\n"
@@ -475,7 +475,7 @@ class ObjectMatcher:
                 "or set MEDIA_PLACE_MATCHER=sift for the OpenCV-only fallback."
             ) from e
         try:
-            from modules.xfeat import XFeat
+            from modules.xfeat import XFeat  # hook-allow: lazy — optional XFeat
         except ImportError as e:
             raise ImportError(
                 "Could not import XFeat from the accelerated_features package.\n"
@@ -491,7 +491,7 @@ class ObjectMatcher:
         try:
             self._xfeat = self._xfeat.to(self._torch_device)
             self._xfeat.dev = self._torch_device
-        except Exception:
+        except Exception:  # hook-allow: broad — device move is best-effort
             # XFeat manages its own .dev; if moving failed, keep the default.
             logger.warning("place_matcher: could not move XFeat to %r; using its default device.",
                             self._torch_device)
@@ -500,7 +500,7 @@ class ObjectMatcher:
         return self._xfeat
 
     def _resolve_torch_device(self):
-        import torch
+        import torch  # hook-allow: lazy — torch
         want = (self.device or "GPU").upper()
         if want == "CPU":
             return "cpu"
@@ -518,7 +518,7 @@ class ObjectMatcher:
         return "cpu"
 
     def _extract_xfeat_torch(self, rgb):
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         xfeat = self._load_xfeat_torch()
         # XFeat.detectAndCompute accepts an HxWx3 uint8/float ndarray (it parses
         # it to a [1,C,H,W] tensor internally). Keypoints come back in input
@@ -540,7 +540,7 @@ class ObjectMatcher:
         not accept a batch tensor, a group that errors) stays pending for the
         per-image fallback so a single bad image never fails the batch.
         """
-        import torch
+        import torch  # hook-allow: lazy — torch
         xfeat = self._load_xfeat_torch()
         dev = getattr(xfeat, "dev", self._torch_device or "cpu")
 
@@ -550,7 +550,7 @@ class ObjectMatcher:
             try:
                 rgb, wh = _load_image_rgb(images[i])
                 loaded[i] = (np.ascontiguousarray(rgb), wh)
-            except Exception as e:
+            except Exception as e:  # hook-allow: broad — one bad image must not fail the batch
                 logger.warning(
                     "place_matcher.extract_batch: image %d failed to load: %s", i, e
                 )
@@ -570,7 +570,7 @@ class ObjectMatcher:
                     .to(dev)
                 )
                 outs = xfeat.detectAndCompute(tensor, top_k=self.top_k)
-            except Exception as e:
+            except Exception as e:  # hook-allow: broad — group falls back per-image
                 logger.warning(
                     "place_matcher.extract_batch: batched detectAndCompute failed for "
                     "shape %s (%s); these %d images fall back to per-image.",
@@ -594,7 +594,7 @@ class ObjectMatcher:
                         kpts, desc, loaded[i][1], boxes_list[i]
                     )
                     pending.discard(i)
-                except Exception as e:
+                except Exception as e:  # hook-allow: broad — one bad image must not fail the batch
                     logger.warning(
                         "place_matcher.extract_batch: post-processing image %d failed: "
                         "%s", i, e,
@@ -614,7 +614,7 @@ class ObjectMatcher:
                 % (self._onnx_path, self.top_k, self.top_k)
             )
         try:
-            import onnxruntime as ort
+            import onnxruntime as ort  # hook-allow: lazy — optional onnxruntime
         except ImportError as e:
             raise ImportError(
                 "The xfeat ONNX/OpenVINO path needs onnxruntime-openvino >= 1.23.0 "
@@ -653,7 +653,7 @@ class ObjectMatcher:
         return session
 
     def _extract_xfeat_onnx(self, rgb):
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         session = self._load_xfeat_onnx()
         in_name, out_names, hw = self._ort_io
 
@@ -695,8 +695,8 @@ class ObjectMatcher:
         fast even on CPU); see the module docstring for the fully-ONNX
         ALIKED+LightGlue alternative.
         """
-        import numpy as np
-        import torch
+        import numpy as np  # hook-allow: lazy — numpy
+        import torch  # hook-allow: lazy — torch
 
         xfeat = self._load_xfeat_torch()
         dev = getattr(xfeat, "dev", self._torch_device or "cpu")
@@ -739,7 +739,7 @@ class ObjectMatcher:
         return self._sift
 
     def _extract_sift(self, rgb):
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         cv2 = _load_cv2()
         sift = self._load_sift()
         gray = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2GRAY)
@@ -751,7 +751,7 @@ class ObjectMatcher:
 
     def _match_sift(self, q_kpts, q_desc, c_kpts, c_desc):
         """Mutual nearest-neighbour + Lowe ratio test."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         cv2 = _load_cv2()
         if q_desc.shape[0] < 2 or c_desc.shape[0] < 2:
             return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
@@ -785,7 +785,7 @@ class ObjectMatcher:
     # Shared geometric verifier: F vs H via USAC_MAGSAC, keep the winner
     # ================================================================== #
     def _geometric_verify(self, pts0, pts1, size) -> dict:
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — numpy
         cv2 = _load_cv2()
 
         if not hasattr(cv2, "USAC_MAGSAC"):
@@ -848,7 +848,7 @@ class ObjectMatcher:
 # ====================================================================== #
 def _load_cv2():
     try:
-        import cv2
+        import cv2  # hook-allow: lazy — cv2
         return cv2
     except ImportError as e:
         raise ImportError(
@@ -859,7 +859,7 @@ def _load_cv2():
 
 def _to_numpy(x):
     """Convert a torch tensor or array-like to a contiguous numpy array."""
-    import numpy as np
+    import numpy as np  # hook-allow: lazy — numpy
     if hasattr(x, "detach"):  # torch tensor
         x = x.detach().cpu().numpy()
     return np.ascontiguousarray(x)
@@ -867,7 +867,7 @@ def _to_numpy(x):
 
 def _load_image_rgb(image):
     """Return (rgb_uint8 HxWx3, (w, h)) from a path, PIL image, or ndarray."""
-    import numpy as np
+    import numpy as np  # hook-allow: lazy — numpy
 
     # numpy ndarray
     if isinstance(image, np.ndarray):
@@ -932,7 +932,7 @@ def _pick_output(named, want_cols, fallbacks, exclude=None):
     array (the remaining 2-D float output). Raises loudly if nothing fits so a
     mismatched export never silently yields garbage.
     """
-    import numpy as np
+    import numpy as np  # hook-allow: lazy — numpy
     for key in fallbacks:
         for name, val in named.items():
             if key in name.lower():
@@ -959,7 +959,7 @@ def _pick_output(named, want_cols, fallbacks, exclude=None):
 
 def _drop_in_boxes(kpts, desc, person_boxes):
     """Drop keypoints (and their descriptors) that fall inside any person box."""
-    import numpy as np
+    import numpy as np  # hook-allow: lazy — numpy
     if not person_boxes or kpts.shape[0] == 0:
         return kpts, desc
     x = kpts[:, 0]

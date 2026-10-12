@@ -198,7 +198,7 @@ def main():
                     mcur.execute(f'UPDATE {table} SET file_id = ? WHERE file_id = ?', (canon_id, old_id))
             manual_conn.commit()
             print(f'manual.db repointed for {len(remap)} duplicate ids.')
-    except Exception:
+    except Exception:  # hook-allow: broad — rollback then re-raise
         media_conn.rollback()
         print(f'Something went wrong — rolled back media.db changes. '
               f'Your pre-write backups are still at {media_backup}'

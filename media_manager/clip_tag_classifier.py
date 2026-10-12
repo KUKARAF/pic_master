@@ -65,20 +65,20 @@ def train_for_tag(data_root, tag_label):
 
     try:
         _train(data_root, tag_label, out_dir)
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — boundary records failure then re-raises
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
         raise
 
 
 def _train(data_root, tag_label, out_dir):
-    import torch
+    import torch  # hook-allow: lazy — heavy dep (torch)
 
     # Imported here (not at module load) so importing this module for its
     # slugify/classifier_dir helpers — e.g. from web.py, in-process — never
     # pulls in torch/manual_db/database just to compute a path.
-    from media_manager.database import Database
-    from media_manager.manual_db import ManualDB
+    from media_manager.database import Database  # hook-allow: lazy — deliberately deferred, see comment above
+    from media_manager.manual_db import ManualDB  # hook-allow: lazy — deliberately deferred, see comment above
 
     data_root = os.path.abspath(data_root)
     media_dir = os.path.join(data_root, '.media')
@@ -137,8 +137,8 @@ def _add_region_examples(db, data_root, region_rows, xs, ys):
     model (real weights, real memory) when there's at least one region row to
     process — most tags will have none, and this function is a no-op call
     away from that cost in that case (see its caller)."""
-    from PIL import Image as PILImage
-    from media_manager.indexer import CLIPIndexer
+    from PIL import Image as PILImage  # hook-allow: lazy — PIL only needed when regions exist
+    from media_manager.indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
 
     checksums = {row[0] for row in region_rows}
     file_rows = {r['checksum']: r for r in db.get_files_by_checksums(list(checksums))}
@@ -155,7 +155,7 @@ def _add_region_examples(db, data_root, region_rows, xs, ys):
             with PILImage.open(abs_path) as img:
                 crop = img.convert('RGB').crop((x1, y1, x2, y2))
                 crop.load()  # force decode while the file is still open
-        except Exception:
+        except Exception:  # hook-allow: broad — per-region decode resilience
             n_skipped += 1
             continue
         crops.append(crop)
@@ -222,7 +222,7 @@ def _fit_logistic(X, y, epochs=200, lr=0.01):
     this small (tens to low hundreds of examples) doesn't need more than a
     full-batch Adam loop; no new dependency, torch is already required for
     CLIP embedding (see indexer.py)."""
-    import torch
+    import torch  # hook-allow: lazy — heavy dep (torch)
 
     torch.manual_seed(0)
     x_t = torch.from_numpy(X)

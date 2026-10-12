@@ -33,6 +33,8 @@ import time
 from media_manager.clip_tag_classifier import (
     classifier_dir, slugify, write_status, MIN_EXAMPLES_PER_CLASS)
 from media_manager.yolo_tag_classifier import MIN_BOXES
+from media_manager.database import Database
+from media_manager.manual_db import ManualDB
 
 _MAX_LONG_SIDE = 640          # ultralytics trains at imgsz=640; no point shipping bigger
 _YOLO_UPLOAD_BATCH = 16       # images per train_add — keeps each RNS request modest
@@ -64,7 +66,7 @@ def _log(out_dir, msg):
 
 
 def _client(data_root):
-    from media_manager import worker_client
+    from media_manager import worker_client  # hook-allow: lazy — worker_client pulls cv2/requests
     return worker_client.get_client(data_root)
 
 
@@ -94,7 +96,7 @@ def train_for_tag(data_root, tag_label, kind):
             _drive_yolo(data_root, tag_label, out_dir, pid, started_at)
         else:
             _drive_clip(data_root, tag_label, out_dir, pid, started_at)
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — top-level boundary records failure then re-raises
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
         _log(out_dir, f'FAILED: {exc}')
@@ -109,9 +111,7 @@ def _require_worker(client, out_dir):
 
 
 def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
-    from media_manager.database import Database
-    from media_manager.manual_db import ManualDB
-    from PIL import Image as PILImage
+    from PIL import Image as PILImage  # hook-allow: lazy — PIL only needed for this path
 
     client = _client(data_root)
     _require_worker(client, out_dir)
@@ -148,7 +148,7 @@ def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
             with PILImage.open(src_path) as im:
                 img = im.convert('RGB')
                 img.load()
-        except Exception:
+        except Exception:  # hook-allow: broad — per-image decode resilience
             n_skipped += 1  # missing / undecodable — skip rather than fail the whole run
             continue
         image_bytes = _downscale_jpeg(img)
@@ -179,9 +179,7 @@ def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
 
 
 def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
-    from media_manager.database import Database
-    from media_manager.manual_db import ManualDB
-    from PIL import Image as PILImage
+    from PIL import Image as PILImage  # hook-allow: lazy — PIL only needed for this path
 
     client = _client(data_root)
     _require_worker(client, out_dir)
@@ -231,7 +229,7 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
                 with PILImage.open(abs_path) as im:
                     crop = im.convert('RGB').crop((x1, y1, x2, y2))
                     crop.load()
-            except Exception:
+            except Exception:  # hook-allow: broad — per-region decode resilience
                 n_region_skipped += 1
                 continue
             label = 1 if polarity == 'positive' else 0
@@ -265,7 +263,7 @@ def _poll_until_done(client, job_id, out_dir, pid, started_at, kind, done_extra)
         try:
             st = client.train_status(job_id)
             consecutive_errors = 0
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — transient poll errors counted, then raised
             consecutive_errors += 1
             _log(out_dir, f'status poll error ({exc}) [{consecutive_errors}/{_MAX_POLL_ERRORS}]')
             if consecutive_errors >= _MAX_POLL_ERRORS:
@@ -324,7 +322,7 @@ def _sigterm(signum, frame):
     if client is not None and job_id is not None:
         try:
             client.train_cancel(job_id)
-        except Exception:
+        except Exception:  # hook-allow: broad — best-effort cancel in SIGTERM handler
             pass
     sys.exit(143)
 

@@ -121,7 +121,7 @@ def build_tile_index(db, errors, clip_indexer, data_root, on_progress=None, excl
             if not os.path.isfile(abs_path):
                 raise FileNotFoundError('file missing on disk')
             embed_tiles_for_file(db, clip_indexer, file_id, abs_path)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — per-file resilience, logged
             errors.log(rel_path, f'tile index: {exc}')
         processed += 1
         if on_progress:

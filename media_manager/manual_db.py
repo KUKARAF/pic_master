@@ -18,6 +18,7 @@ import time
 from collections import Counter
 
 from media_manager.database import ThreadLocalDB
+from media_manager.migrations import MIGRATIONS
 
 
 def _bbox_iou(a, b):
@@ -81,8 +82,6 @@ def run_migrations(db_path, apply=False):
     if not os.path.isfile(db_path):
         return [f"{db_path} does not exist yet — nothing to migrate."]
 
-    from media_manager.migrations import MIGRATIONS
-
     conn = sqlite3.connect(db_path, isolation_level=None)  # explicit BEGIN/COMMIT below, not pysqlite's implicit one
     reports = []
     backup_path = None
@@ -125,7 +124,7 @@ def run_migrations(db_path, apply=False):
                 )
                 conn.execute('COMMIT')
                 reports[-1] = f'{migration.ID}: {result}. Backup: {backup_path}'
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — rollback then re-raise
                 conn.execute('ROLLBACK')
                 raise RuntimeError(
                     f"Migration '{migration.ID}' failed and was rolled back — manual.db "
@@ -190,7 +189,6 @@ class ManualDB(ThreadLocalDB):
                 done_at INTEGER NOT NULL
             )
         ''')
-        from media_manager.migrations import MIGRATIONS
         pending_ids = []
         for migration in MIGRATIONS:
             applied = cur.execute('SELECT 1 FROM migration_state WHERE key = ?', (migration.ID,)).fetchone()
@@ -1256,7 +1254,7 @@ class ManualDB(ThreadLocalDB):
             cur.execute('DELETE FROM not_a_duplicate WHERE checksum_a = ? OR checksum_b = ?',
                         (checksum, checksum))
             cur.execute('COMMIT')
-        except Exception:
+        except Exception:  # hook-allow: broad — rollback then re-raise
             cur.execute('ROLLBACK')
             raise
 
@@ -1427,7 +1425,7 @@ class ManualDB(ThreadLocalDB):
 
             self.conn.commit()
             return summary
-        except Exception:
+        except Exception:  # hook-allow: broad — rollback then re-raise
             self.conn.rollback()
             raise
 
@@ -3333,7 +3331,7 @@ class ManualDB(ThreadLocalDB):
         wrong-length embedding blob are skipped (with a printed warning) so one bad
         row can't crash the rebuild. Returns the SAME cached objects on a cache hit
         — callers must treat the matrix as read-only (don't mutate in place)."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
             cached = self._named_matrix_cache
             if cached is not None and cached[0] == self._face_ver:
@@ -3367,8 +3365,8 @@ class ManualDB(ThreadLocalDB):
         gpu_search.matvec returns None and we fall back to the identical numpy
         dot, so auto-matching stays byte-identical off-GPU. Empty (nobody named
         yet) → empty array. `query` may be any array-like of the embedding dim."""
-        import numpy as np
-        from media_manager import gpu_search
+        import numpy as np  # hook-allow: lazy — heavy
+        from media_manager import gpu_search  # hook-allow: lazy — numpy/torch GPU path
         _identities, matrix = self.get_named_face_matrix()
         q = np.asarray(query, dtype=np.float32)
         if matrix.shape[0] == 0:
@@ -3391,7 +3389,7 @@ class ManualDB(ThreadLocalDB):
         Rows with an empty or wrong-length embedding blob are skipped (with a printed
         warning). Returns the SAME cached objects on a cache hit — callers must treat
         the returned arrays/lists as read-only (don't mutate in place)."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
             cached = self._all_faces_matrix_cache
             if cached is not None and cached[0] == self._face_ver:
@@ -3447,7 +3445,7 @@ class ManualDB(ThreadLocalDB):
         auto-matching a newly detected face to an existing identity without asking."""
         if threshold is None:
             threshold = AUTO_MATCH_THRESHOLD
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         # Cached, write-invalidated K×D matrix — no per-call re-SELECT/re-stack of
         # every named embedding (this method runs once per newly detected face).
         names, matrix = self.get_named_face_matrix()

@@ -4,28 +4,60 @@ FastAPI web server for media_manager — gallery UI with CLIP search, tags, and 
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
+import gc
 import io
 import json
+import math
 import os
 import random
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
+import warnings
+from itertools import combinations
 from urllib.parse import quote
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
+import numpy as np
+import xxhash
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from PIL import Image
+from PIL import Image as PILImage
 from pydantic import BaseModel
 
-from media_manager import frames, worker_client, worker_config
+from media_manager import (
+    body_index, compute, czkawka, exif_reader, frames, geonames, gpu_search, near_dup,
+    object_index, pattern_descriptor, phasher, remote_index_builder, set_image,
+    set_render, set_video, tile_index, video_decode, worker_client, worker_config,
+)
+from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
+from media_manager.body_index import crop_bodies, match_face_to_body
+from media_manager.clip_tag_classifier import (
+    MIN_EXAMPLES_PER_CLASS, classifier_dir, load_probe, score_all, slugify, write_status,
+)
+from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
+from media_manager.face_detector import FaceDetector, _norm_angle
 from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
+from media_manager.gen_service import ComfyUIClient
+from media_manager.object_encoder import ObjectEncoder
+from media_manager.object_matcher import ObjectMatcher
+from media_manager.remote_tag_trainer import _downscale_jpeg
+from media_manager.similarity import adjusted_centroid, mean_normalized_centroid, rank_by_similarity, top_k_indices
+from media_manager.swipe_support import bias_reorder
+from media_manager.tile_index import generate_tiles
+from media_manager.worker_client import WorkerError
+from media_manager.yolo_tag_classifier import MIN_BOXES
 from media_manager.category_resolver import (
     get_category_counts,
     get_resolved_checksums_for_category,
@@ -264,7 +296,6 @@ class RegionSearchBody(BaseModel):
 
 def _gray_placeholder() -> bytes:
     """Return a gray 400×400 JPEG as bytes (used when thumbnail generation fails)."""
-    from PIL import Image as PILImage
     img = PILImage.new('RGB', (400, 400), color=(180, 180, 180))
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=70)
@@ -281,7 +312,7 @@ def _save_jpeg_atomic(img, dst_path: str, quality: int):
     try:
         img.save(tmp_path, format='JPEG', quality=quality)
         os.replace(tmp_path, dst_path)
-    except BaseException:
+    except BaseException:  # hook-allow: broad — clean up temp file, then re-raise
         with contextlib.suppress(OSError):
             os.remove(tmp_path)
         raise
@@ -292,8 +323,6 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
     Returns (success, message). message is a non-fatal decoder warning (e.g.
     corrupt-but-recoverable JPEG data) when success=True, or the exception
     text when success=False, or None when there's nothing to report."""
-    from PIL import Image as PILImage
-    import warnings
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
@@ -308,7 +337,7 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
                 _save_jpeg_atomic(img, dst_path, quality=80)
         message = '; '.join(str(w.message) for w in caught) if caught else None
         return True, message
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — decode can raise anything; report failure
         return False, str(exc)
 
 
@@ -319,9 +348,6 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
     thumbnail's resize-to-400px + atomic-JPEG-save tail. Seeks ~1s in so the poster
     isn't a black/leading frame, falling back to frame 0. Returns (success, message)
     with the same shape as _make_thumbnail so serve_thumb treats them identically."""
-    import cv2
-    from PIL import Image as PILImage
-    from . import video_decode
     try:
         cap = video_decode.open_capture(src_path)
         # isOpened() check lives INSIDE the try so the finally always releases: FFmpeg
@@ -351,7 +377,7 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
         img = img.resize((new_w, new_h), PILImage.LANCZOS)
         _save_jpeg_atomic(img, dst_path, quality=80)
         return True, None
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — decode can raise anything; report failure
         return False, str(exc)
 
 
@@ -378,7 +404,6 @@ def _get_face_detector():
             _face_detector_remote = worker_client.RemoteFaceDetector(_worker_client)
         return _face_detector_remote
     if _face_detector_local is None:
-        from media_manager.face_detector import FaceDetector
         _face_detector_local = FaceDetector()
     return _face_detector_local
 
@@ -396,12 +421,10 @@ def _get_object_detector():
     global _object_detector_local, _object_detector_remote
     if _worker_client is not None and _worker_client.is_configured():
         if _object_detector_remote is None:
-            from media_manager.detector import DEFAULT_VOCAB
             _object_detector_remote = worker_client.RemoteYOLODetector(
                 _worker_client, vocab=list(DEFAULT_VOCAB))
         return _object_detector_remote
     if _object_detector_local is None:
-        from media_manager.detector import YOLOWorldDetector
         _object_detector_local = YOLOWorldDetector()
     return _object_detector_local
 
@@ -417,7 +440,7 @@ def _get_clip_indexer():
             _clip_indexer_remote = worker_client.RemoteCLIPIndexer(_worker_client)
         return _clip_indexer_remote
     if _clip_indexer_local is None:
-        from media_manager.indexer import CLIPIndexer
+        from media_manager.indexer import CLIPIndexer  # hook-allow: lazy — pulls in torch/open_clip
         _clip_indexer_local = CLIPIndexer()
     return _clip_indexer_local
 
@@ -439,7 +462,6 @@ def _get_age_estimator():
             _age_estimator_remote = worker_client.RemoteAgeEstimator(_worker_client)
         return _age_estimator_remote
     if _age_estimator is None:
-        from media_manager.age_estimator import AgeGenderEstimator
         _age_estimator = AgeGenderEstimator()
     return _age_estimator
 
@@ -450,7 +472,6 @@ def _ml_device_label():
     local at all); otherwise they run on this host's torch accelerator."""
     if _worker_client is not None and _worker_client.is_configured():
         return 'worker (offloaded)'
-    from media_manager import compute
     return compute.accelerator_label()
 
 
@@ -463,7 +484,6 @@ def _get_object_encoder(data_root):
     B70-local (runs where the GPU is), not offloaded. Lazy singleton."""
     global _object_encoder
     if _object_encoder is None:
-        from media_manager.object_encoder import ObjectEncoder
         _object_encoder = ObjectEncoder(data_root=data_root)
     return _object_encoder
 
@@ -473,7 +493,6 @@ def _get_object_matcher():
     (object_matcher.py). B70-local. Lazy singleton."""
     global _object_matcher
     if _object_matcher is None:
-        from media_manager.object_matcher import ObjectMatcher
         _object_matcher = ObjectMatcher()
     return _object_matcher
 
@@ -482,8 +501,6 @@ def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 
     """Crop a person from src_path using bbox JSON, save JPEG to dst_path. Unlike
     _make_face_crop this preserves aspect ratio — body boxes are tall, and squashing
     them square makes outfits (the thing find-by-body compares) unrecognizable."""
-    import json
-    from PIL import Image as PILImage
     try:
         bbox = json.loads(bbox_json)
         if not bbox or len(bbox) < 4:
@@ -501,7 +518,7 @@ def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 
             body = body.resize((new_w, height), PILImage.LANCZOS)
             _save_jpeg_atomic(body, dst_path, quality=85)
             return True
-    except Exception:
+    except Exception:  # hook-allow: broad — bad bbox/decode -> no crop
         return False
 
 
@@ -514,9 +531,6 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
     image (see the angle convention in face_detector.py) — so undoing it means rotating
     COUNTER-clockwise by `angle`, which is PIL's positive direction. Returns True on
     success."""
-    import json
-    import math
-    from PIL import Image as PILImage
     try:
         bbox = json.loads(bbox_json)
         if not bbox or len(bbox) < 4:
@@ -552,7 +566,7 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
             face = face.resize((size, size), PILImage.LANCZOS)
             _save_jpeg_atomic(face, dst_path, quality=85)
             return True
-    except Exception:
+    except Exception:  # hook-allow: broad — bad bbox/decode -> no crop
         return False
 
 
@@ -560,7 +574,6 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in kilometres between two (lat, lon) points
     (standard haversine formula). Used by the /search distance sort to rank
     photos by how close their EXIF GPS is to a target point."""
-    import math
     r = 6371.0  # Earth mean radius, km
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -583,7 +596,7 @@ def _read_rss_bytes():
             for line in f:
                 if line.startswith('VmRSS:'):
                     return int(line.split()[1]) * 1024  # value is in kB
-    except Exception:
+    except (OSError, ValueError, IndexError):
         return None
     return None
 
@@ -594,7 +607,7 @@ def _read_open_fds():
     under steady use means fds are being leaked. None on non-Linux / when unavailable."""
     try:
         return len(os.listdir('/proc/self/fd'))
-    except Exception:
+    except OSError:
         return None
 
 
@@ -607,13 +620,13 @@ def _raise_fd_limit(target=65536):
     visible on /stats (open_fds). Returns the new soft limit, or None if unchanged/
     unsupported."""
     try:
-        import resource
+        import resource  # hook-allow: lazy — Unix-only, probed best-effort
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         want = target if hard == resource.RLIM_INFINITY else min(target, hard)
         if soft != resource.RLIM_INFINITY and soft < want:
             resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
             return want
-    except Exception:
+    except Exception:  # hook-allow: broad — best-effort probe; unsupported -> no-op
         pass
     return None
 
@@ -628,7 +641,7 @@ def _start_fd_reaper(dbs, interval=90.0):
             for d in dbs:
                 try:
                     d.reap_dead_thread_connections()
-                except Exception:
+                except Exception:  # hook-allow: broad — background loop must not die
                     pass
     threading.Thread(target=_loop, daemon=True, name='fd-reaper').start()
 
@@ -642,12 +655,10 @@ def _start_malloc_trimmer(interval=60.0):
     threadpool RSS ratchets upward and 'never comes back down' even though nothing
     is actually leaked. A low-frequency background trim keeps RSS tracking live
     memory. No-op on non-glibc platforms (malloc_trim absent)."""
-    import ctypes
-    import ctypes.util
     try:
         libc = ctypes.CDLL(ctypes.util.find_library('c') or 'libc.so.6')
         trim = libc.malloc_trim
-    except Exception:
+    except Exception:  # hook-allow: broad — optional glibc probe
         return  # not glibc / no malloc_trim — nothing to do
 
     def _loop():
@@ -655,7 +666,7 @@ def _start_malloc_trimmer(interval=60.0):
             time.sleep(interval)
             try:
                 trim(0)
-            except Exception:
+            except Exception:  # hook-allow: broad — background loop must not die
                 return
 
     threading.Thread(target=_loop, daemon=True, name='malloc-trim').start()
@@ -690,9 +701,8 @@ def create_app(data_root: str) -> FastAPI:
     # (find-only — we never let it delete). Detect it once; if it's missing, log and
     # disable those features rather than crash. Similar-videos + broken-video checks
     # additionally need ffmpeg.
-    from media_manager import czkawka as _czkawka_mod
-    _czkawka = _czkawka_mod.info()
-    _ffmpeg = _czkawka_mod.has_ffmpeg()
+    _czkawka = czkawka.info()
+    _ffmpeg = czkawka.has_ffmpeg()
     if _czkawka is None:
         print("[web] czkawka not found, deduplication will not be available", flush=True)
     else:
@@ -709,9 +719,9 @@ def create_app(data_root: str) -> FastAPI:
     os.makedirs(thumbs_dir, exist_ok=True)
 
     # Import here so the module can be imported without heavy deps loaded
-    from media_manager.database import Database, FACE_NORM_VERSION
-    from media_manager.error_log import ErrorLog
-    from media_manager.manual_db import ManualDB
+    from media_manager.database import Database, FACE_NORM_VERSION  # hook-allow: lazy — deferred per comment above
+    from media_manager.error_log import ErrorLog  # hook-allow: lazy — deferred per comment above
+    from media_manager.manual_db import ManualDB  # hook-allow: lazy — DB layer deferred (see create_app)
 
     db = Database(db_path)
     errors = ErrorLog(os.path.join(media_dir, 'error.db'))
@@ -727,7 +737,6 @@ def create_app(data_root: str) -> FastAPI:
         thread); a one-shot job thread would otherwise leave its connections open and
         Python emits 'unclosed database' when the thread is collected. close() only
         affects the calling (job) thread's connections."""
-        import threading
 
         def _wrapped():
             try:
@@ -808,7 +817,7 @@ def create_app(data_root: str) -> FastAPI:
         """Best primary-frame row in `existing_rows` (from get_all_faces_for_checksum)
         whose box overlaps `bbox` at/above the same-face IoU, or None. Lets a re-detect
         recognise a face the human already saved instead of cloning it."""
-        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU
+        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU  # hook-allow: lazy — DB layer deferred (see create_app)
         thresh = FACE_SAME_BOX_IOU if min_iou is None else min_iou
         best, best_iou = None, thresh
         for r in existing_rows:
@@ -823,8 +832,7 @@ def create_app(data_root: str) -> FastAPI:
         """Merge manual.db's rows for this file (hand-drawn + promoted/named, keyed by
         checksum) with media.db's auto-detected rows that haven't been named yet
         (keyed by file_id, since those live entirely inside this one media.db)."""
-        import json as _json
-        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU
+        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU  # hook-allow: lazy — DB layer deferred (see create_app)
         manual_rows = manual.get_faces_for_file(checksum)
         promoted = {r['source_face_id'] for r in manual_rows if r['source_face_id']}
         out = [{'ref': f"manual:{r['id']}", 'bbox': [r['x1'], r['y1'], r['x2'], r['y2']],
@@ -838,7 +846,7 @@ def create_app(data_root: str) -> FastAPI:
             # `rotation` is 0 because a manual quarter-turn only exists once the face
             # has been named into manual.db. Hardcoding both to 0 (what this did
             # before) drew every rotation-corrected face sideways on the photo page.
-            out.append({'ref': f"auto:{r['id']}", 'bbox': _json.loads(r['bbox']),
+            out.append({'ref': f"auto:{r['id']}", 'bbox': json.loads(r['bbox']),
                         'identity': None, 'frame_index': r['frame_index'], 'favorite': 0,
                         'rotation': 0, 'angle': float(r['angle'] or 0.0)})
 
@@ -1532,7 +1540,6 @@ def create_app(data_root: str) -> FastAPI:
     def _random_set_cards(limit=6):
         """A random handful of sets as light cards {id, name, image_count, favorite,
         thumb_id} for the home 'Random sets' section."""
-        import random
         sets = manual.list_sets()
         if not sets:
             return []
@@ -1669,8 +1676,6 @@ def create_app(data_root: str) -> FastAPI:
         """Generate a new AI image or video FROM a single photo (the /photo 🙌
         button). kind=image → image workflow; kind=video → image-to-video workflow.
         Async; poll .../generate/status. Result → generated/ + the AI tab."""
-        from . import set_image, set_video, set_render
-        from .gen_service import ComfyUIClient
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
@@ -1705,8 +1710,7 @@ def create_app(data_root: str) -> FastAPI:
                     params={'source_file_id': file_id, 'prompt': prompt})
                 generate_photo_job['artifact_id'] = aid
                 print(f"[web] photo {file_id} {kind} done: {out} (artifact {aid})", flush=True)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 generate_photo_job['error'] = str(exc)
                 print(f"[web] photo {file_id} {kind} generation FAILED: {exc}", flush=True)
@@ -1850,8 +1854,6 @@ def create_app(data_root: str) -> FastAPI:
                 cs = get_resolved_checksums_for_category(manual, db, cat['id'], cat['name'])
                 rows = [(r['id'], r['path'], r['checksum']) for r in db.get_files_by_checksums(cs)]
         elif body.kind == 'similar':
-            import numpy as np
-            from media_manager.similarity import top_k_indices
             emb = db.get_embedding(int(body.value))
             if emb is not None:
                 query = np.frombuffer(emb, dtype=np.float32)
@@ -1959,7 +1961,7 @@ def create_app(data_root: str) -> FastAPI:
             if abs_path is not None:
                 try:
                     frame_count = frames.get_frame_count(abs_path)
-                except Exception:
+                except Exception:  # hook-allow: broad — unreadable file -> treat as single frame
                     frame_count = 1
         file_info['frame_count'] = frame_count
         # Frame capture applies to videos and multi-frame (animated) images.
@@ -2199,7 +2201,7 @@ def create_app(data_root: str) -> FastAPI:
             # YOLO-World object detection search, plus a filename/path substring
             # search — both kinds of matches are merged into one results grid.
             try:
-                from media_manager.media_manager import _parse_query
+                from media_manager.media_manager import _parse_query  # hook-allow: lazy — DB layer deferred (see create_app)
                 tokens = _parse_query(q)
 
                 class_rows = db.search_by_classes(tokens, limit=50) if tokens else []
@@ -2222,7 +2224,7 @@ def create_app(data_root: str) -> FastAPI:
                         seen_ids.add(file_id)
                         rows.append((file_id, path, False, checksum))
                     files = _enrich_rows(rows, scores=scores)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — report any search failure to the UI
                 message = f'Search error: {exc}'
 
         elif sort == 'distance':
@@ -2564,7 +2566,6 @@ def create_app(data_root: str) -> FastAPI:
         against). Mirrors _next_face_suggestions' identity_filter branch."""
         other_embeddings = manual.get_embeddings_for_identity(other)
         faces = manual.get_faces_for_identity(name)
-        import numpy as np
         matrix = (np.stack([np.frombuffer(e, dtype=np.float32) for e in other_embeddings])
                   if other_embeddings else None)
         candidates = []  # (score, ref, file_id)
@@ -2599,7 +2600,6 @@ def create_app(data_root: str) -> FastAPI:
         be removed. Score = cos(face, suspect) − max cos(face, name's good faces);
         > 0 means the suspect explains the assignment better than the real you.
         Best-first. The suspect itself is excluded from the results."""
-        import numpy as np
         kind, raw = _parse_face_ref(suspect_ref)
         suspect_row = manual.get_face(raw) if kind == 'manual' else None
         if suspect_row is None or not suspect_row['embedding']:
@@ -2669,8 +2669,6 @@ def create_app(data_root: str) -> FastAPI:
             no_embedding = True
         else:
             try:
-                import numpy as np
-                from media_manager.similarity import top_k_indices
                 query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
                 # Cached, write-invalidated matrix shared library-wide — NOT a
                 # per-request get_all_embeddings() rebuild, which allocated a fresh
@@ -2701,7 +2699,7 @@ def create_app(data_root: str) -> FastAPI:
                         rows.append((fr['id'], fr['path'], True, cs))
                         scoremap[fr['id']] = round(score, 4)
                     files = _enrich_rows(rows, scores=scoremap)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — report any search failure to the UI
                 message = f'Similarity search error: {exc}'
 
         return templates.TemplateResponse(request, 'similar.html', {
@@ -2728,8 +2726,6 @@ def create_app(data_root: str) -> FastAPI:
         if emb_bytes is None:
             # Distinct flag so the client can offer "embed now?" instead of a dead-end toast.
             return {'results': [], 'no_embedding': True, 'message': 'This photo has no embedding yet.'}
-        import numpy as np
-        from media_manager.similarity import top_k_indices
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
         file_ids, _checksums, matrix = db.get_embeddings_matrix()
         if matrix.shape[0] == 0:
@@ -2757,15 +2753,12 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = [float(v) for v in body.bbox]
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
-        from PIL import Image as PILImage
         with PILImage.open(abs_path) as im:
             crop = im.convert('RGB').crop((x1, y1, x2, y2))
             crop.load()
         embs = _get_clip_indexer().embed_pil_images([crop])
         if len(embs) == 0:
             raise HTTPException(status_code=500, detail='Could not embed the region.')
-        import numpy as np
-        from media_manager.similarity import top_k_indices
         query = np.asarray(embs[0], dtype=np.float32)
 
         # Prefer the tile index when it's been built: rank each photo by its
@@ -2818,16 +2811,14 @@ def create_app(data_root: str) -> FastAPI:
         if wc is not None and wc.is_configured():
             try:
                 return wc.pattern_index(image_bytes, name)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
                 errors.log('pattern-index', f'worker unavailable, computing locally: {exc}')
-        from media_manager import pattern_descriptor as pd
-        from media_manager.tile_index import generate_tiles
-        bgr = pd.decode_bgr(image_bytes)
+        bgr = pattern_descriptor.decode_bgr(image_bytes)
         if bgr is None:
             return None  # decode failure — distinct from [] (decoded, no tiles)
         h, w = bgr.shape[:2]
         tiles = generate_tiles(w, h)
-        descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
+        descs = pattern_descriptor.descriptors_for_boxes(bgr, [list(t) for t in tiles])
         return [(list(tiles[i]), descs[i]) for i in range(len(tiles)) if descs[i] is not None]
 
     def _pattern_query_descriptor(image_bytes, box, name='<query>'):
@@ -2836,22 +2827,19 @@ def create_app(data_root: str) -> FastAPI:
         if wc is not None and wc.is_configured():
             try:
                 return wc.pattern_query(image_bytes, box, name)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
                 errors.log('pattern-search', f'worker unavailable, computing locally: {exc}')
-        from media_manager import pattern_descriptor as pd
-        bgr = pd.decode_bgr(image_bytes)
+        bgr = pattern_descriptor.decode_bgr(image_bytes)
         if bgr is None:
             return None
-        return pd.descriptors_for_boxes(bgr, [box])[0]
+        return pattern_descriptor.descriptors_for_boxes(bgr, [box])[0]
 
     @app.post('/api/pattern-index/start')
     def api_pattern_index_start(include_trashed: bool = False):
         """Build the find-by-pattern index: a classical texture/colour descriptor per
         grid tile for every image. The worker computes the descriptors (web sends the
         image bytes); falls back to local compute if the worker is down. CPU-only."""
-        import threading
-        from media_manager import pattern_descriptor
-        from media_manager.indexer import SUPPORTED_EXTENSIONS
+        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
 
         if pattern_index_job['running']:
             return {'started': False, 'message': 'Pattern indexing already running.'}
@@ -2875,11 +2863,11 @@ def create_app(data_root: str) -> FastAPI:
                             db.insert_pattern_tiles(
                                 fid, [{'bbox': b, 'descriptor': d} for b, d in tiles],
                                 pattern_descriptor.ALGO_TAG)
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(abs_path, f'pattern-index: {exc}')
                     done += 1
                     pattern_index_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 pattern_index_job['error'] = str(exc)
             finally:
                 pattern_index_job['running'] = False
@@ -2918,7 +2906,6 @@ def create_app(data_root: str) -> FastAPI:
         if query is None:
             raise HTTPException(status_code=500, detail='Could not describe that region.')
 
-        import numpy as np
         q = np.asarray(query, dtype=np.float32)
         best = {}   # file_id -> best tile cosine
         for file_ids, matrix in db.iter_pattern_tiles():
@@ -3010,7 +2997,6 @@ def create_app(data_root: str) -> FastAPI:
         no stored person detections gets a lazy one-image YOLO-World pass (vocab
         pinned to 'person'; results are NOT written to the detections table — that
         would destructively replace the photo's real tag detections)."""
-        from media_manager import body_index
 
         own = db.get_body_embeddings_for_file(file_id)
         if own:
@@ -3038,7 +3024,6 @@ def create_app(data_root: str) -> FastAPI:
         """Cosine-rank all body crops against one query crop's embedding. Dedupes to
         the best crop per file (like search_by_face_image) and enriches each result
         with tags/sets/recognized people, same as every other card grid."""
-        import numpy as np
 
         query_emb = np.frombuffer(query_row[2], dtype=np.float32)
         # Cached, write-invalidated [N, D] body matrix — no per-request full
@@ -3143,7 +3128,6 @@ def create_app(data_root: str) -> FastAPI:
         and only counts detections labeled exactly 'person', so a person YOLO-World
         labeled as child/crowd/group/selfie/portrait is missed — this re-runs
         detection with the vocab pinned to 'person' to recover it."""
-        from media_manager import body_index
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
@@ -3152,7 +3136,7 @@ def create_app(data_root: str) -> FastAPI:
         detector.set_vocab(['person'])
         try:
             _, dets, err = detector.detect_images([abs_path])[0]
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — turn any failure into an HTTP error
             raise HTTPException(status_code=500, detail=f'Person detection failed: {exc}')
         if err:
             raise HTTPException(status_code=500, detail=f'Person detection failed: {err}')
@@ -3171,7 +3155,6 @@ def create_app(data_root: str) -> FastAPI:
         crop is ALSO written as a ground-truth body label (manual.db body_identities)
         so the person is findable by body — otherwise it stays an anonymous crop,
         exactly as before."""
-        from media_manager import body_index
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1, y1, x2, y2]')
         x1, y1, x2, y2 = body.bbox
@@ -3206,7 +3189,6 @@ def create_app(data_root: str) -> FastAPI:
         pre-pick when several people share the frame), this searches the precise body
         the user selected, so a multi-person photo gives good results. The query crop
         is transient — embedded and ranked, never saved."""
-        from media_manager import body_index
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1, y1, x2, y2]')
         x1, y1, x2, y2 = body.bbox
@@ -3257,7 +3239,6 @@ def create_app(data_root: str) -> FastAPI:
         this person (confirmed or rejected) and photos already carrying their body, plus
         whatever the client still holds (`exclude_refs`). Empty anchors → empty (there is
         nothing to rank against), same contract as the face stream's identity_filter."""
-        import numpy as np
         anchors = manual.get_body_embeddings_for_identity(name)
         if not anchors:
             return []
@@ -3346,7 +3327,6 @@ def create_app(data_root: str) -> FastAPI:
         contains the face (match_face_to_body returns None), and it never clobbers a
         body a human already decided (a manual label or a reject wins). Returns the
         linked media.db body id, or None. Images only: videos have no body rows here."""
-        from media_manager.body_index import match_face_to_body
         frow = db.get_file_by_checksum(checksum)
         if frow is None:
             return None
@@ -3416,7 +3396,6 @@ def create_app(data_root: str) -> FastAPI:
           3. body-match: rank the body crop against known body anchors (CLIP).
         Returns {name, source, score} or {name: None}. A suggestion only — nothing is
         written here; the user still confirms in the modal."""
-        from media_manager.body_index import crop_bodies
         if len(body.bbox) != 4:
             raise HTTPException(status_code=400, detail='bbox must be [x1,y1,x2,y2]')
         row = _file_or_404(file_id)
@@ -3463,7 +3442,6 @@ def create_app(data_root: str) -> FastAPI:
         #     head drawn above the torso, then match against known people.
         if abs_path is not None:
             try:
-                import cv2
                 img = cv2.imread(abs_path)
                 if img is not None:
                     bh = draw[3] - draw[1]
@@ -3475,13 +3453,12 @@ def create_app(data_root: str) -> FastAPI:
                         name, score = manual.find_matching_identity(res['embedding'].astype('float32').tobytes())
                         if name:
                             return {'name': name, 'source': 'face-match', 'score': round(float(score), 3)}
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — model inference; logged, best-effort
                 errors.log(f'[suggest-body-identity] face recognize failed on {file_id}: {exc}')
 
         # 3) Body match: the drawn crop vs known body anchors.
         if abs_path is not None:
             try:
-                import numpy as np
                 anchors = manual.get_all_body_label_embeddings()
                 pairs = crop_bodies(abs_path, [[int(draw[0]), int(draw[1]), int(draw[2]), int(draw[3])]])
                 if anchors and pairs:
@@ -3492,7 +3469,7 @@ def create_app(data_root: str) -> FastAPI:
                     bi = int(scores.argmax())
                     if float(scores[bi]) >= BODY_SUGGEST_THRESHOLD:
                         return {'name': names[bi], 'source': 'body-match', 'score': round(float(scores[bi]), 3)}
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — model inference; logged, best-effort
                 errors.log(f'[suggest-body-identity] body match failed on {file_id}: {exc}')
 
         return {'name': None}
@@ -3552,11 +3529,10 @@ def create_app(data_root: str) -> FastAPI:
                     try:
                         if _link_body_for_named_face(checksum, identity, bbox) is not None:
                             linked += 1
-                    except Exception as exc:  # one bad row must not abort the whole backfill
+                    except Exception as exc:  # hook-allow: broad — one bad row must not abort the whole backfill
                         errors.log(f'[face-body-link] {identity} @ {checksum[:12]}: {exc}')
                     face_body_link_job.update(done=i, linked=linked)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 face_body_link_job['error'] = str(exc)
                 print(f'[face-body-link] FAILED: {exc}', flush=True)
@@ -3578,8 +3554,6 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/body-index/start')
     def api_body_index_start(include_trashed: bool = False, retry_empty: bool = False):
-        import threading
-        from media_manager import body_index
 
         if body_index_job['running']:
             return {'started': False, 'message': 'Body index build already running.'}
@@ -3599,7 +3573,7 @@ def create_app(data_root: str) -> FastAPI:
                     db, errors, _get_clip_indexer(), _get_object_detector(), data_root,
                     on_progress=_progress,
                     exclude_ids=(None if include_trashed else _trashed_file_ids()))
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 body_index_job['error'] = str(exc)
             finally:
                 body_index_job['running'] = False
@@ -3625,8 +3599,7 @@ def create_app(data_root: str) -> FastAPI:
         equivalent of the /similar page's per-file "embed now". Mirrors
         MediaManager.embed_files but with progress + the web CLIP accessor (so it
         offloads to the worker when configured)."""
-        import threading
-        from media_manager.indexer import SUPPORTED_EXTENSIONS
+        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
 
         if index_job['running']:
             return {'started': False, 'message': 'Indexing already running.'}
@@ -3655,7 +3628,7 @@ def create_app(data_root: str) -> FastAPI:
                             db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
                         done += 1
                         index_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 index_job['error'] = str(exc)
             finally:
                 index_job['running'] = False
@@ -3689,8 +3662,6 @@ def create_app(data_root: str) -> FastAPI:
         pixel dimensions so a later merge can keep the highest-resolution copy. Ignores
         videos entirely — those are handled by the Capture-frames job, which this job
         then treats as already-present frames. CPU-only; no worker or model."""
-        import threading
-        from media_manager import phasher
 
         if phash_job['running']:
             return {'started': False, 'message': 'Perceptual hashing already running.'}
@@ -3698,7 +3669,6 @@ def create_app(data_root: str) -> FastAPI:
         phash_job.update(running=True, done=0, total=len(candidates), error=None)
 
         def _run():
-            from PIL import Image as PILImage
             try:
                 done = 0
                 for fid, rel_path in candidates:
@@ -3720,15 +3690,15 @@ def create_app(data_root: str) -> FastAPI:
                         try:
                             with PILImage.open(abs_path) as orig:  # header-only, true dims
                                 w, h = orig.width, orig.height
-                        except Exception:
+                        except Exception:  # hook-allow: broad — header read is best-effort
                             pass
                         db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
                                         w, h, phasher.ALGO_TAG)
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(rel_path, f'phash: {exc}')
                     done += 1
                     phash_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 phash_job['error'] = str(exc)
             finally:
                 phash_job['running'] = False
@@ -3761,8 +3731,6 @@ def create_app(data_root: str) -> FastAPI:
         detection (incl. screenshot↔video), with no separate 'phash frame' concept. A video
         with >=3 captured stills is skipped; if any of the five fails to decode the video is
         flagged damaged (files.broken). CPU-only."""
-        import threading
-        from media_manager import phasher
 
         if capture_frames_job['running']:
             return {'started': False, 'message': 'Frame capture already running.'}
@@ -3786,11 +3754,11 @@ def create_app(data_root: str) -> FastAPI:
                             db.mark_broken(fid)
                             errors.log(rel_path, 'capture-frames: video damaged — only '
                                        f'{len(frames)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(rel_path, f'capture-frames: {exc}')
                     done += 1
                     capture_frames_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 capture_frames_job['error'] = str(exc)
             finally:
                 capture_frames_job['running'] = False
@@ -3834,7 +3802,6 @@ def create_app(data_root: str) -> FastAPI:
         """Seed the per-video dedup: (known_identity_names:set, known_embeddings:list[np]).
         People already credited to the video (whole-photo assignments) + the faces on its
         existing captured stills, so a scan doesn't re-capture someone already found."""
-        import numpy as np
         known_names = set(manual.get_identities_assigned_to_photo(video_cs))
         child_css = [c['child_checksum'] for c in manual.get_frame_captures_for(video_cs)]
         known_embs = []
@@ -3863,9 +3830,6 @@ def create_app(data_root: str) -> FastAPI:
         are captured. `threshold` (confidence slider) is the auto-match cutoff. New people
         are deduped against those already on the video; captures are capped per video.
         Videos are marked scanned so re-runs skip them."""
-        import tempfile
-        import numpy as np
-        from media_manager import phasher
 
         if video_face_scan_job['running']:
             return {'started': False, 'message': 'Video face scan already running.'}
@@ -3975,11 +3939,11 @@ def create_app(data_root: str) -> FastAPI:
                             video_face_scan_job['captured'] += 1
 
                         manual.mark_video_frame_scanned(video_cs)
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(rel_path, f'scan-video-faces: {exc}')
                     done += 1
                     video_face_scan_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 video_face_scan_job['error'] = str(exc)
             finally:
                 video_face_scan_job['running'] = False
@@ -4009,8 +3973,6 @@ def create_app(data_root: str) -> FastAPI:
         """Estimate age/gender for every photo that has a named face but no estimate yet
         (MiVOLO in its isolated venv, via subprocess — see age_estimator.py). One pass per
         photo; skips photos already estimated."""
-        import threading
-        from media_manager.age_estimator import MODEL_ID
 
         if estimate_age_job['running']:
             return {'started': False, 'message': 'Age estimation already running.'}
@@ -4036,11 +3998,11 @@ def create_app(data_root: str) -> FastAPI:
                     try:
                         results = estimator.estimate(abs_path, faces)
                         manual.save_age_estimates(checksum, results, MODEL_ID)
-                    except Exception as exc:
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(row['path'], f'estimate-age: {exc}')
                     done += 1
                     estimate_age_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 estimate_age_job['error'] = str(exc)
             finally:
                 estimate_age_job['running'] = False
@@ -4133,7 +4095,6 @@ def create_app(data_root: str) -> FastAPI:
         auto-match each detected face to a known identity above `threshold` (cosine;
         defaults to AUTO_MATCH_THRESHOLD). The library-wide, background version of the
         per-photo detect button. Uses the worker when configured."""
-        import threading
 
         if detect_faces_job['running']:
             return {'started': False, 'message': 'Face detection already running.'}
@@ -4173,7 +4134,7 @@ def create_app(data_root: str) -> FastAPI:
                             _link_face_match_to_video(row['checksum'], name)
                             matched += 1
                             detect_faces_job['matched'] = matched
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 detect_faces_job['error'] = str(exc)
             finally:
                 detect_faces_job['running'] = False
@@ -4200,8 +4161,6 @@ def create_app(data_root: str) -> FastAPI:
         results for the /near-duplicates review page. Also caches czkawka's per-image
         width/height onto files. Excludes trashed content, user-dismissed ("not a duplicate")
         pairs, and clusters of sampled frames of the same video."""
-        from itertools import combinations
-        from media_manager import near_dup, czkawka
 
         if _czkawka is None:
             return {'started': False, 'message': 'czkawka not found, deduplication will not be available'}
@@ -4287,7 +4246,7 @@ def create_app(data_root: str) -> FastAPI:
                     db.insert_dup_group(c['label'], c['action'], c['keeper'], c['reason'], file_ids)
                     n += 1
                 near_dup_job['groups'] = n
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 near_dup_job['error'] = str(exc)
             finally:
                 near_dup_job['running'] = False
@@ -4311,7 +4270,6 @@ def create_app(data_root: str) -> FastAPI:
         """Scan the whole library for corrupt/undecodable files with czkawka and mark
         each one broken (→ Damaged bucket). FIND-ONLY: czkawka never deletes; we only
         flag. Complements the on-decode-failure marking + `media find_broken`."""
-        from media_manager import czkawka
 
         if _czkawka is None:
             return {'started': False, 'message': 'czkawka not found, deduplication will not be available'}
@@ -4334,7 +4292,7 @@ def create_app(data_root: str) -> FastAPI:
                     db.mark_broken(fid)
                     marked += 1
                     broken_scan_job['marked'] = marked
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 broken_scan_job['error'] = str(exc)
             finally:
                 broken_scan_job['running'] = False
@@ -4357,7 +4315,6 @@ def create_app(data_root: str) -> FastAPI:
         """Every computed near-dup group + member details for the review page. Includes
         per-photo tag/face counts + broken flag so the reviewer never trashes the copy
         that carries the annotations."""
-        from media_manager import near_dup
         still_cs = _frame_still_checksums()  # once per request, not once per member
         groups = []
         for g in db.list_dup_groups():
@@ -4463,8 +4420,6 @@ def create_app(data_root: str) -> FastAPI:
         non-image files are still stamped checked (update_file_metadata(fid, None,
         None, None)) so they don't resurface on every future run; image files get
         their real EXIF read via exif_reader.extract_exif_metadata."""
-        import threading
-        from media_manager import exif_reader
 
         if metadata_job['running']:
             return {'started': False, 'message': 'Metadata extraction already running.'}
@@ -4485,7 +4440,7 @@ def create_app(data_root: str) -> FastAPI:
                         db.update_file_metadata(fid, taken_at, gps_lat, gps_lon)
                     done += 1
                     metadata_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 metadata_job['error'] = str(exc)
             finally:
                 metadata_job['running'] = False
@@ -4509,7 +4464,6 @@ def create_app(data_root: str) -> FastAPI:
         GeoNames city (files.city_id). Requires the cities table to be loaded first
         (`media geo fetch-cities`) — fails loud with a hint otherwise, rather than
         silently doing nothing."""
-        import threading
 
         if cities_job['running']:
             return {'started': False, 'message': 'City matching already running.'}
@@ -4528,7 +4482,7 @@ def create_app(data_root: str) -> FastAPI:
                         db.set_file_city(fid, city['id'])
                     done += 1
                     cities_job['done'] = done
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 cities_job['error'] = str(exc)
             finally:
                 cities_job['running'] = False
@@ -4564,8 +4518,6 @@ def create_app(data_root: str) -> FastAPI:
         instead of treating it as 'nothing to do') and becomes the loaded city count on
         completion. Rebuilding clears every files.city_id (see replace_cities), so run
         'Match cities' afterwards."""
-        import threading
-        from media_manager import geonames
 
         if fetch_cities_job['running']:
             return {'started': False, 'message': 'City download already running.'}
@@ -4576,7 +4528,7 @@ def create_app(data_root: str) -> FastAPI:
                 count = geonames.fetch_cities(db)
                 fetch_cities_job['total'] = count
                 fetch_cities_job['done'] = count
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 fetch_cities_job['error'] = str(exc)
             finally:
                 fetch_cities_job['running'] = False
@@ -4602,8 +4554,6 @@ def create_app(data_root: str) -> FastAPI:
         matrices to the worker over RNS. Runs in a background thread; the host side
         streams from media.db chunk-by-chunk so this process never materializes the full
         matrix. Requires a configured worker (imdb lives ON the worker)."""
-        import threading
-        from media_manager import remote_index_builder
 
         if imdb_build_job['running']:
             return {'started': False, 'message': 'imdb rebuild already running.'}
@@ -4628,7 +4578,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 imdb_build_job['results'] = remote_index_builder.build_index(
                     data_root, progress=_progress)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 imdb_build_job['error'] = str(exc)
             finally:
                 imdb_build_job['running'] = False
@@ -4646,7 +4596,7 @@ def create_app(data_root: str) -> FastAPI:
         if _worker_client is not None and _worker_client.is_configured():
             try:
                 worker = _worker_client.imdb_status()
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
                 worker = {'error': str(exc)}
         # Time-left estimate: remaining rows ÷ the average shipping rate so far. Only
         # while running with real progress; None otherwise so the UI hides it.
@@ -4736,7 +4686,7 @@ def create_app(data_root: str) -> FastAPI:
                     _link_face_match_to_video(file_row['checksum'], name)
                     matched += 1
                     match_faces_job['matched'] = matched
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 match_faces_job['error'] = str(exc)
             finally:
                 match_faces_job['running'] = False
@@ -4761,8 +4711,6 @@ def create_app(data_root: str) -> FastAPI:
         an overlapping grid of crops embedded per photo. Same background-job shape
         as the body index; CLIP goes through _get_clip_indexer() so it offloads to
         the worker when configured."""
-        import threading
-        from media_manager import tile_index
 
         if tile_index_job['running']:
             return {'started': False, 'message': 'Region indexing already running.'}
@@ -4777,7 +4725,7 @@ def create_app(data_root: str) -> FastAPI:
                 tile_index.build_tile_index(
                     db, errors, _get_clip_indexer(), data_root, on_progress=_progress,
                     exclude_ids=(None if include_trashed else _trashed_file_ids()))
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 tile_index_job['error'] = str(exc)
             finally:
                 tile_index_job['running'] = False
@@ -4802,18 +4750,16 @@ def create_app(data_root: str) -> FastAPI:
         for object-exemplar location search. Background job; poll .../status. Refuses to
         run on CPU unless MEDIA_DEVICE=cpu (an undetected GPU is surfaced loudly, not a
         silent slow fallback)."""
-        import os as _os
-        from media_manager import compute, object_index
         if object_index_job['running']:
             return {'started': False, 'message': 'Object indexing already running.'}
-        if compute.torch_device() == 'cpu' and _os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
+        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
             return {'started': False, 'message':
                 'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
                 'Fix the GPU/driver, or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
         trashed = set() if include_trashed else set(_trashed_file_ids())
         candidates = [
             (fid, rel) for (fid, rel) in db.get_unobject_indexed_files()
-            if _os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
+            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
         ]
         object_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
 
@@ -4822,7 +4768,7 @@ def create_app(data_root: str) -> FastAPI:
                 enc = _get_object_encoder(data_root)
                 try:
                     object_index_job['device'] = enc.device_label()
-                except Exception:
+                except Exception:  # hook-allow: broad — device label is cosmetic
                     object_index_job['device'] = None
                 object_index.build_object_index(
                     db, enc, data_root,
@@ -4831,8 +4777,7 @@ def create_app(data_root: str) -> FastAPI:
                     candidates=candidates,
                     on_progress=lambda d, t: object_index_job.update(done=d, total=t),
                     log=errors.log)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 object_index_job['error'] = str(exc)
                 print(f'[object-index] FAILED: {exc}', flush=True)
@@ -4994,7 +4939,6 @@ def create_app(data_root: str) -> FastAPI:
             abs_path = os.path.join(data_root, row['path'])
             if not os.path.isfile(abs_path):
                 raise HTTPException(status_code=404, detail='Image file not found on disk')
-            from PIL import Image as PILImage
             with PILImage.open(abs_path) as img:
                 width, height = img.size
 
@@ -5037,7 +4981,6 @@ def create_app(data_root: str) -> FastAPI:
         if not os.path.isfile(abs_path):
             raise HTTPException(status_code=404, detail='Image file not found on disk')
 
-        from media_manager.detector import YOLOWorldDetector, load_vocab_from_file, merge_vocab
         vocab_path = os.path.join(media_dir, 'search_terms.txt')
         base_vocab = load_vocab_from_file(vocab_path)
         manual_labels = manual.get_all_positive_labels()
@@ -5139,7 +5082,6 @@ def create_app(data_root: str) -> FastAPI:
         no-op). Unlike the categorical identity-match bias faces use, this blends
         a continuous file-to-file similarity signal into the file-to-centroid
         score, since there's no discrete identity dimension to bias tags by."""
-        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
 
         member_checksums = manual.get_files_by_tag(label, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
@@ -5157,7 +5099,6 @@ def create_app(data_root: str) -> FastAPI:
         qualifying = [(row, score) for row, score in ranked if score >= TAG_SUGGEST_THRESHOLD]
 
         if bias_file_id is not None and bias in ('confirm', 'reject'):
-            import numpy as np
 
             bias_rows = db.get_embeddings_for_files([bias_file_id])
             if bias_rows:
@@ -5194,7 +5135,6 @@ def create_app(data_root: str) -> FastAPI:
         tiles = db.get_tiles_for_file(file_id)
         if not tiles:
             return None
-        import numpy as np
         w = max((t[2] for t in tiles), default=0) or 1.0
         h = max((t[3] for t in tiles), default=0) or 1.0
         best, best_score = None, -2.0
@@ -5237,7 +5177,6 @@ def create_app(data_root: str) -> FastAPI:
         here — WITHOUT rewriting the file — so the UI doesn't show
         "training…" forever after something goes wrong outside the normal
         try/except in the training script itself."""
-        from media_manager.clip_tag_classifier import classifier_dir
 
         path = os.path.join(classifier_dir(data_root, label, kind), 'metadata.json')
         if not os.path.isfile(path):
@@ -5313,8 +5252,6 @@ def create_app(data_root: str) -> FastAPI:
         """Everything tags.html/search.html need to render this tag's train
         buttons — one precomputed dict per model kind (see
         _classifier_button_state)."""
-        from media_manager.clip_tag_classifier import MIN_EXAMPLES_PER_CLASS
-        from media_manager.yolo_tag_classifier import MIN_BOXES
 
         polarities = manual.get_whole_image_tag_polarities(label)
         n_positive = sum(1 for p in polarities.values() if p == 'positive')
@@ -5353,7 +5290,6 @@ def create_app(data_root: str) -> FastAPI:
         could both pass the "already running?" check in api_train_*_classifier
         before either child has actually gotten far enough into Python
         startup/imports to write anything."""
-        from media_manager.clip_tag_classifier import classifier_dir, write_status
 
         # When a worker is configured, offload the heavy training: launch the
         # remote_tag_trainer driver (ships the data to the worker, polls it)
@@ -5386,7 +5322,6 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/tags/{label}/train-clip')
     def api_train_clip_classifier(label: str):
-        from media_manager.clip_tag_classifier import MIN_EXAMPLES_PER_CLASS
 
         existing = _read_classifier_status(label, 'clip_model')
         if existing and existing.get('status') == 'running':
@@ -5406,7 +5341,6 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/tags/{label}/train-yolo')
     def api_train_yolo_classifier(label: str):
-        from media_manager.yolo_tag_classifier import MIN_BOXES
 
         existing = _read_classifier_status(label, 'yolo_model')
         if existing and existing.get('status') == 'running':
@@ -5436,7 +5370,6 @@ def create_app(data_root: str) -> FastAPI:
         status read's dead-pid check, so the UI reflects the cancellation
         immediately instead of still saying "running" until someone happens
         to reload."""
-        from media_manager.clip_tag_classifier import classifier_dir
 
         model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
         status = _read_classifier_status(label, model_kind)
@@ -5449,7 +5382,6 @@ def create_app(data_root: str) -> FastAPI:
             except ProcessLookupError:
                 pass  # already gone — fine, we're marking it failed either way
         out_dir = classifier_dir(data_root, label, model_kind)
-        from media_manager.clip_tag_classifier import write_status
         write_status(out_dir, status='failed', error='Cancelled by user.', failed_at=int(time.time()))
         return {'status': 'failed'}
 
@@ -5459,7 +5391,6 @@ def create_app(data_root: str) -> FastAPI:
         see clip_tag_classifier.py's/yolo_tag_classifier.py's main()) — the
         only place per-run detail lives beyond the coarse running/done/failed
         status, e.g. ultralytics' own per-epoch loss table for a YOLO run."""
-        from media_manager.clip_tag_classifier import classifier_dir
 
         model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
         log_path = os.path.join(classifier_dir(data_root, label, model_kind), 'train.log')
@@ -5476,7 +5407,6 @@ def create_app(data_root: str) -> FastAPI:
         decided = manual.get_decided_checksums_for_tag(label)
 
         if model_kind == 'yolo':
-            from media_manager.clip_tag_classifier import classifier_dir, slugify
 
             # With a worker configured the checkpoint lives on the worker (kept
             # there so the heavy YOLO predict never runs on this host); gate on
@@ -5525,9 +5455,6 @@ def create_app(data_root: str) -> FastAPI:
                 # Offload each detection to the worker's fine-tuned checkpoint.
                 # Ship a downscaled JPEG (same 640px cap training used). tag_detect
                 # returns [(class, conf, x1,y1,x2,y2)] with NORMALIZED coords.
-                from media_manager.remote_tag_trainer import _downscale_jpeg
-                from media_manager.worker_client import WorkerError
-                from PIL import Image as PILImage
                 slug = slugify(label)
                 for file_id, abs_path in path_by_file_id.items():
                     try:
@@ -5540,7 +5467,7 @@ def create_app(data_root: str) -> FastAPI:
                         # loud, not silent, then stop scanning this fetch.
                         print(f'[tag classifier] worker tag_detect failed for tag "{label}": {exc}')
                         break
-                    except Exception:
+                    except Exception:  # hook-allow: broad — remote worker can fail any way; fall back/report
                         print(f'[tag classifier] worker tag_detect error for tag "{label}":')
                         traceback.print_exc()
                         break
@@ -5550,8 +5477,7 @@ def create_app(data_root: str) -> FastAPI:
                                        [round(x1, 4), round(y1, 4), round(x2, 4), round(y2, 4)]))
             else:
                 try:
-                    from ultralytics import YOLOWorld
-                    from . import compute
+                    from ultralytics import YOLOWorld  # hook-allow: lazy — heavy optional ML dep
                     model = YOLOWorld(checkpoint)
                     # Batched in one call (not one predict() per image) — batching
                     # amortizes real per-call model overhead. device= routes this
@@ -5559,7 +5485,7 @@ def create_app(data_root: str) -> FastAPI:
                     # the worker would use.
                     results_list = model.predict(list(path_by_file_id.values()), verbose=False,
                                                  device=compute.ultralytics_device())
-                except Exception:
+                except Exception:  # hook-allow: broad — model load/inference; reported loudly below
                     # Loud, not silent — a bad/incompatible checkpoint or a
                     # transient inference failure should show up in the server
                     # console immediately, not hang the request or look empty.
@@ -5580,7 +5506,6 @@ def create_app(data_root: str) -> FastAPI:
                 for fid, score, bbox in scored[:count]
             ])
 
-        from media_manager.clip_tag_classifier import load_probe, score_all
 
         all_embeddings = [
             row for row in db.get_all_embeddings()
@@ -5622,7 +5547,6 @@ def create_app(data_root: str) -> FastAPI:
         """Every label worth suggesting while typing a tag or a labeled region — the same
         merged vocabulary (search_terms.txt + manual.db's confirmed tags) that feeds
         YOLO-World's detector, so autocomplete only ever offers real, usable class names."""
-        from media_manager.detector import load_vocab_from_file, merge_vocab
         vocab_path = os.path.join(media_dir, 'search_terms.txt')
         base_vocab = load_vocab_from_file(vocab_path)
         vocab = merge_vocab(base_vocab, manual.get_all_positive_labels())
@@ -5907,7 +5831,6 @@ def create_app(data_root: str) -> FastAPI:
         recognized face at all is never dropped by this — there's nothing to
         judge a mismatch against. If the set has no confirmed people yet
         either, this is a no-op (same reason)."""
-        from media_manager.similarity import mean_normalized_centroid, adjusted_centroid, rank_by_similarity
 
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
@@ -5983,7 +5906,6 @@ def create_app(data_root: str) -> FastAPI:
         `avoid_existing` (default True — a UI toggle) hard-excludes photos that
         already carry ANY location, so the stack surfaces still-unplaced photos
         first instead of re-litigating ones already filed somewhere."""
-        from media_manager.similarity import mean_normalized_centroid, rank_by_similarity
 
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
@@ -6044,7 +5966,6 @@ def create_app(data_root: str) -> FastAPI:
         emb_bytes = db.get_embedding(file_id)
         if emb_bytes is None:
             return []
-        import numpy as np
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
 
         member_of = {s['id'] for s in manual.get_sets_for_checksums([checksum]).get(checksum, [])}
@@ -6215,8 +6136,6 @@ def create_app(data_root: str) -> FastAPI:
         """Generate a morph video from the set (Wan FLF2V between consecutive
         members) on the GPU box. Async; poll .../generate-video/status. Output is
         written under generated/ and recorded in generated_artifacts (origin=ai)."""
-        from . import set_video, set_render
-        from .gen_service import ComfyUIClient
         set_row = manual.get_set(set_id)
         if set_row is None:
             raise HTTPException(status_code=404, detail='Set not found')
@@ -6264,8 +6183,7 @@ def create_app(data_root: str) -> FastAPI:
                     params={'members': len(paths), 'fps': fps, 'prompt': prompt})
                 generate_video_job['artifact_id'] = aid
                 print(f"[web] set {set_id} morph video done: {out} (artifact {aid})", flush=True)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 generate_video_job['error'] = str(exc)
                 print(f"[web] set {set_id} video generation FAILED: {exc}", flush=True)
@@ -6293,8 +6211,6 @@ def create_app(data_root: str) -> FastAPI:
     def api_set_generate_image(set_id: int, prompt: str = '', limit: int = 8):
         """Generate a new image from the set (ComfyUI image workflow) on the GPU box.
         Async; poll .../generate-image/status. Result → generated/ + the AI tab."""
-        from . import set_image, set_render
-        from .gen_service import ComfyUIClient
         set_row = manual.get_set(set_id)
         if set_row is None:
             raise HTTPException(status_code=404, detail='Set not found')
@@ -6328,8 +6244,7 @@ def create_app(data_root: str) -> FastAPI:
                     params={'members': len(paths), 'prompt': prompt})
                 generate_image_job['artifact_id'] = aid
                 print(f"[web] set {set_id} image done: {out} (artifact {aid})", flush=True)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 generate_image_job['error'] = str(exc)
                 print(f"[web] set {set_id} image generation FAILED: {exc}", flush=True)
@@ -6388,8 +6303,6 @@ def create_app(data_root: str) -> FastAPI:
         consecutive images) on the GPU box. Mirrors api_set_generate_video but the
         source is a /files folder and the order is strictly BY FILENAME (not the
         set's CLIP-similarity chain). Async; poll .../folder-to-video/status."""
-        from . import set_video, set_render
-        from .gen_service import ComfyUIClient
         if folder_video_job['running']:
             return {'started': False, 'message': 'A folder video is already being generated.'}
         rows = _files_under_folder(path)
@@ -6432,8 +6345,7 @@ def create_app(data_root: str) -> FastAPI:
                     params={'images': len(paths), 'fps': fps, 'prompt': prompt, 'folder': path})
                 folder_video_job['artifact_id'] = aid
                 print(f"[web] folder '{path}' morph video done: {out} (artifact {aid})", flush=True)
-            except Exception as exc:
-                import traceback
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
                 folder_video_job['error'] = str(exc)
                 print(f"[web] folder '{path}' video generation FAILED: {exc}", flush=True)
@@ -6778,7 +6690,6 @@ def create_app(data_root: str) -> FastAPI:
         stacked resident (rows×dim×4) vs what's actually loaded in the caches right now.
         This is the number that decides imdb vs an mmap'd index; it never materializes a
         matrix, so it can't itself OOM the box."""
-        import gc
         gc.collect()
         emb = db.embedding_stats()
         loaded = db.loaded_matrix_bytes()
@@ -6912,9 +6823,6 @@ def create_app(data_root: str) -> FastAPI:
         offered here: auto-matches are provisional machine guesses, not human
         decisions, and confirming here always writes a manual assignment that
         outranks any auto-match per category_resolver.py's precedence rules."""
-        from media_manager.similarity import (mean_normalized_centroid, adjusted_centroid,
-                                               rank_by_similarity)
-        from media_manager.swipe_support import bias_reorder
 
         cat = manual.get_category(category_id)
         if cat is None:
@@ -7208,8 +7116,6 @@ def create_app(data_root: str) -> FastAPI:
         """Crop each location_objects row to its box on its photo and DINOv2-embed it.
         Returns {name: [vec, ...]} (positives grouped by name) — skips rows whose file or
         crop can't be loaded."""
-        import numpy as np
-        from PIL import Image
         enc = _get_object_encoder(data_root)
         crops, keys = [], []
         pil_cache = {}
@@ -7229,7 +7135,7 @@ def create_app(data_root: str) -> FastAPI:
                     continue
                 crops.append(im.crop(box))
                 keys.append(o['name'])
-            except Exception:
+            except Exception:  # hook-allow: broad — skip unreadable crop
                 continue
         if not crops:
             return {}
@@ -7244,7 +7150,6 @@ def create_app(data_root: str) -> FastAPI:
         """The cascade: embed the selected marked objects (positives) + the location's
         negatives, scan the DINOv2 region index, and rank/ localize candidates. Returns
         (cards, needs_object_index)."""
-        import numpy as np
         if db.count_object_indexed_files() == 0:
             return [], True
         all_pos = manual.get_location_objects(location_id, polarity='positive')
@@ -7309,10 +7214,9 @@ def create_app(data_root: str) -> FastAPI:
             ap = _live_abs_path(fr['id'], fr['path'])
             if ap:
                 try:
-                    from PIL import Image
                     with Image.open(ap) as im:
                         return int(im.width), int(im.height)
-                except Exception:
+                except Exception:  # hook-allow: broad — header read is best-effort
                     pass
             return None, None
 
@@ -7611,7 +7515,7 @@ def create_app(data_root: str) -> FastAPI:
         runs server-side in a daemon thread, so you can start it and close the tab — the
         page re-attaches to a running job (or shows a pending count) when you come back.
         AUTO_MATCH_THRESHOLD seeds the face auto-match confidence slider."""
-        from media_manager.manual_db import AUTO_MATCH_THRESHOLD
+        from media_manager.manual_db import AUTO_MATCH_THRESHOLD  # hook-allow: lazy — DB layer deferred (see create_app)
         return templates.TemplateResponse(request, 'bulk.html', {
             'auto_match_threshold': AUTO_MATCH_THRESHOLD,
             'all_tags': manual.list_all_tags(),
@@ -7630,7 +7534,6 @@ def create_app(data_root: str) -> FastAPI:
     def api_estimate_age(file_id: int):
         """Experimental — see age_estimator.py. Runs MiVOLO (in its own isolated venv,
         via subprocess) on every face already known for this photo."""
-        from media_manager.age_estimator import MODEL_ID
 
         row = _file_or_404(file_id)
         checksum = row['checksum']
@@ -7691,7 +7594,6 @@ def create_app(data_root: str) -> FastAPI:
         named = manual.get_named_face_embeddings()
         if not named:
             return {}
-        import numpy as np
         names = [n for n, _ in named]
         matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])
         suggestions = {}
@@ -7729,7 +7631,6 @@ def create_app(data_root: str) -> FastAPI:
         query_emb = _get_face_embedding(face_id)
         if query_emb is None:
             return []
-        import numpy as np
         query_vec = np.frombuffer(query_emb, dtype=np.float32)
 
         candidates = []  # (ref, file_id, path, identity, emb_bytes)
@@ -7795,7 +7696,6 @@ def create_app(data_root: str) -> FastAPI:
         unidentified = _unpromoted_auto_faces(limit=None)
         if not ref_embeddings or not unidentified:
             return {'results': [], 'total': 0}
-        import numpy as np
         ref_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
         scored = []
         for row in unidentified:
@@ -7884,7 +7784,6 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             by_identity.setdefault(identity, []).append((face_id_, checksum, emb_bytes, reviewed_ok))
 
-        import numpy as np
         scored = []  # (score, face_id_, checksum, identity, compare_face_id)
         for identity, faces_for_identity in by_identity.items():
             if len(faces_for_identity) < 2:
@@ -8223,9 +8122,6 @@ def create_app(data_root: str) -> FastAPI:
         meant its padded re-detect saw no face at all, so every call fell through to
         the last-resort UNALIGNED 112x112 resize — the worst embedding in the system —
         and the "rotate 90°" score this feature is judged on was itself meaningless."""
-        import cv2
-        import numpy as np
-        from media_manager.face_detector import _norm_angle
         info = _face_row_info(face_ref)
         if info is None:
             return None, 0.0
@@ -8279,7 +8175,6 @@ def create_app(data_root: str) -> FastAPI:
         non-zero `rotate` has no stored answer by definition, since it re-embeds the
         face at a different orientation. Each name carries a representative face ref
         so the UI can show that person's own crop."""
-        import numpy as np
         info = _face_row_info(face_ref)
         if info is None:
             raise HTTPException(status_code=404, detail='Face not found')
@@ -8400,7 +8295,6 @@ def create_app(data_root: str) -> FastAPI:
         is it?" is the whole pool against every named face. "Which unknown faces are
         Alice?" is one person wide and is scanned live instead — see
         _next_face_suggestions' identity_filter branch."""
-        import numpy as np
         # The pool must never offer a face manual.db already has a decision for, and
         # this is the one job that walks the whole library: reconcile the handled
         # mirror in bulk here, so a crashed request or an out-of-band manual.db edit
@@ -8411,7 +8305,6 @@ def create_app(data_root: str) -> FastAPI:
             return 0
         names = [n for n, _ in named]
         named_matrix = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in named])  # K×D
-        from media_manager import gpu_search
         done = 0
         for face_ids, vecs in db.iter_unsuggested_faces(chunk=5000):
             cand = np.frombuffer(vecs, dtype=np.float32).reshape(len(face_ids), -1)  # N×D
@@ -8446,7 +8339,6 @@ def create_app(data_root: str) -> FastAPI:
         are only ever asked about the handful of cards actually being shown, never
         about the library. A card whose blob is missing or came from another model is
         simply absent from `pairs`; ([], []) when nobody is named yet."""
-        import numpy as np
         identities, matrix = manual.get_named_face_matrix()
         if not cards or not identities or matrix.size == 0:
             return [], []
@@ -8465,7 +8357,6 @@ def create_app(data_root: str) -> FastAPI:
         faces, so the same name recurs down the sorted row and only its first (best)
         hit counts. The walk stops at `floor`, which also bounds it: everything past
         the first sub-floor entry is sub-floor too."""
-        import numpy as np
         ranked, seen = [], set()
         for j in np.argsort(-scores):
             score = float(scores[j])
@@ -8490,7 +8381,6 @@ def create_app(data_root: str) -> FastAPI:
         pairs, identities = _score_cards_against_named(cards)
         if not pairs:
             return cards
-        import numpy as np
         names = np.asarray(identities)
         for card, row in pairs:
             others = names != card['identity']
@@ -8556,7 +8446,6 @@ def create_app(data_root: str) -> FastAPI:
             ref_embeddings = manual.get_embeddings_for_identity(identity_filter)
             if not ref_embeddings:
                 return []
-            import numpy as np
             matrix = np.stack([np.frombuffer(e, dtype=np.float32) for e in ref_embeddings])
             # Faces a human said are NOT this person (cleanup broom) must never be
             # re-offered as them, no matter how well they score.
@@ -8594,7 +8483,6 @@ def create_app(data_root: str) -> FastAPI:
         # the same "compare everything with everyone" mistake, one layer up.
         if avoid_existing:
             cards = _deprioritize_files_with_named_face(cards, 'file_id')
-        from media_manager.swipe_support import bias_reorder
         cards = bias_reorder(cards, key_fn=lambda c: c['identity'],
                              bias_key=bias_identity, bias_action=bias)
         kept, cursor, block = [], 0, max(count * 3, 30)
@@ -8679,7 +8567,7 @@ def create_app(data_root: str) -> FastAPI:
                 face_suggest_job['total'] = db.count_unsuggested_faces()
                 face_suggest_job['scored'] = compute_face_suggestions(
                     progress=lambda d: face_suggest_job.__setitem__('done', d))
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 face_suggest_job['error'] = str(exc)
             finally:
                 face_suggest_job['running'] = False
@@ -8738,8 +8626,6 @@ def create_app(data_root: str) -> FastAPI:
         normalization over faces that were detected before the current pipeline
         existed. Rows arrive grouped so every face of a file is in one chunk; this
         loads each source image exactly once and writes back only what moved."""
-        import cv2
-        import numpy as np
         detector = _get_face_detector()
         refreshed_refs = 0
         for chunk in db.iter_unnormalized_faces(chunk=200):
@@ -8773,7 +8659,7 @@ def create_app(data_root: str) -> FastAPI:
                     raise RuntimeError(
                         'face worker cannot normalize faces (%s). Redeploy the worker with '
                         'this version — no rows were modified.' % exc) from exc
-                except Exception as exc:
+                except Exception as exc:  # hook-allow: broad — per-image failure; see below
                     # Per-image failure (undecodable region, bad stored bbox): skip this
                     # one file and advance it, or the job re-picks it forever and never
                     # reaches the faces it can fix.
@@ -8833,7 +8719,7 @@ def create_app(data_root: str) -> FastAPI:
         def _run():
             try:
                 _renormalize_faces()
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 renormalize_job['error'] = str(exc)
             finally:
                 renormalize_job['running'] = False
@@ -9066,7 +8952,6 @@ def create_app(data_root: str) -> FastAPI:
         if not os.path.isfile(abs_path):
             raise HTTPException(status_code=404, detail='Image file not found on disk')
 
-        import cv2
         img = cv2.imread(abs_path)
         if img is None:
             raise HTTPException(status_code=400, detail='Could not read image')
@@ -9151,7 +9036,6 @@ def create_app(data_root: str) -> FastAPI:
     _frame_scan_jobs = {}
 
     def _run_frame_scan_job(file_id, checksum, abs_path, frame_count):
-        import tempfile
         job = _frame_scan_jobs[file_id]
         face_detector = _get_face_detector()
         object_detector = _get_object_detector()
@@ -9196,7 +9080,7 @@ def create_app(data_root: str) -> FastAPI:
                 finally:
                     os.unlink(tmp_path)
                     job['frames_processed'] += 1
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
             job['error'] = str(exc)
         finally:
             job['done'] = True
@@ -9209,7 +9093,6 @@ def create_app(data_root: str) -> FastAPI:
         immediately — poll GET .../scan-all-frames/progress for status. Deliberately
         manual/opt-in and scoped to one image — see the plan doc for why automatic
         multi-frame indexing isn't done for the whole library."""
-        import threading
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
@@ -9221,7 +9104,7 @@ def create_app(data_root: str) -> FastAPI:
 
         try:
             frame_count = frames.get_frame_count(abs_path)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — turn any failure into an HTTP error
             raise HTTPException(status_code=400, detail=f'Could not read file: {exc}')
 
         if frame_count <= 1:
@@ -9275,7 +9158,7 @@ def create_app(data_root: str) -> FastAPI:
                 db.insert_embedding(file_id, embs[0].tobytes(), indexer.model_id(), frame_index=0)
                 return True
             errors.log(abs_path, f'ensure-embedding failed: {embed_failed}')
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — model inference; logged, best-effort
             errors.log(abs_path, f'ensure-embedding error: {exc}')
         return False
 
@@ -9285,7 +9168,6 @@ def create_app(data_root: str) -> FastAPI:
         Returns the new file id. Idempotent per identical frame (keyed by checksum) —
         recapturing the same frame reuses the row. Shared by both capture endpoints
         (client canvas upload for videos, server-side extract for animated images)."""
-        import xxhash
         checksum = xxhash.xxh64(jpeg_bytes).hexdigest()
         rel_path = 'captured_frames/' + checksum + '.jpg'
         abs_path = os.path.join(data_root, rel_path)
@@ -9366,8 +9248,7 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/search/face')
     async def api_search_by_face(file: UploadFile = File(...)):
-        import tempfile
-        from media_manager.media_manager import MediaManager
+        from media_manager.media_manager import MediaManager  # hook-allow: lazy — DB layer deferred (see create_app)
         contents = await file.read()
         suffix = os.path.splitext(file.filename or '.jpg')[1] or '.jpg'
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -9380,7 +9261,6 @@ def create_app(data_root: str) -> FastAPI:
             if error or not faces:
                 return {'results': [], 'message': 'No face detected in uploaded image.'}
 
-            import numpy as np
             query_face = max(faces, key=lambda f: f['det_score'])
             query_emb = query_face['embedding']
 

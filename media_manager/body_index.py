@@ -159,7 +159,7 @@ def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=
             if not os.path.isfile(abs_path):
                 raise FileNotFoundError('file missing on disk')
             embed_bodies_for_file(db, clip_indexer, file_id, abs_path, detector=detector)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — per-file resilience, logged
             errors.log(rel_path, f'body index: {exc}')
         processed += 1
         if on_progress:

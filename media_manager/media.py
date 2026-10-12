@@ -5,6 +5,12 @@ import subprocess
 import sys
 import os
 from media_manager import MediaManager
+from media_manager import geonames
+from media_manager import worker_config
+from media_manager.category_resolver import get_resolved_checksums_for_category
+from media_manager.database import Database
+from media_manager.formats import IMAGE_EXTENSIONS
+from media_manager.manual_db import run_migrations
 
 def _ensure_self_signed_cert(media_dir, host):
     """Return (certfile, keyfile), generating a self-signed cert via the
@@ -419,7 +425,6 @@ def main():
             return 1
         os.makedirs('.media', exist_ok=True)
         # initialise empty db file inside .media/
-        from media_manager.database import Database
         Database(os.path.join('.media', 'media.db')).close()
         print("Initialized media repository")
         return 0
@@ -428,7 +433,7 @@ def main():
         # Machine-level setup (like init, runs outside any media repo). MiVOLO can't be
         # a pip extra of this package — its pinned old ultralytics/timm conflict with
         # the main app's detector/indexer, so it gets its own venv + subprocess bridge.
-        from media_manager.age_estimator import setup_age_venv
+        from media_manager.age_estimator import setup_age_venv  # hook-allow: lazy — optional, self-contained feature
         try:
             setup_age_venv(dest=args.dest, force=args.force)
         except subprocess.CalledProcessError as exc:
@@ -446,7 +451,6 @@ def main():
         # ManualDB can't even be constructed until one's been applied. Operates on
         # the raw manual.db path directly; see media_manager/migrations/ for the
         # list of migrations this checks/runs, in order.
-        from media_manager.manual_db import run_migrations
         manual_db_path = os.path.join('.media', 'manual.db')
         try:
             reports = run_migrations(manual_db_path, apply=args.apply)
@@ -593,9 +597,8 @@ def main():
             m.db.conn.execute('DELETE FROM object_region_embeddings')
             m.db.conn.commit()
             print("Cleared existing object-region embeddings.")
-        from media_manager import object_index
-        from media_manager.object_encoder import ObjectEncoder
-        from media_manager.formats import IMAGE_EXTENSIONS
+        from media_manager import object_index  # hook-allow: lazy — numpy
+        from media_manager.object_encoder import ObjectEncoder  # hook-allow: lazy — numpy/PIL
         enc = ObjectEncoder(data_root=data_root)
         print(f"Object encoder: {enc.model_id()} on {enc.device_label()}")
 
@@ -661,8 +664,8 @@ def main():
                     print(file_row['path'])
 
         elif args.set_cmd == 'generate-video':
-            from . import set_video, set_render
-            from .gen_service import GenServiceUnavailable, GenServiceError
+            from . import set_video, set_render  # hook-allow: lazy — PIL/xxhash, generate only
+            from .gen_service import GenServiceUnavailable, GenServiceError  # hook-allow: lazy — requests
             row = m.manual.find_set(args.name, args.studio)
             if row is None:
                 print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
@@ -705,8 +708,8 @@ def main():
                   f"(added to set '{args.name}', flagged AI, in the /ai tab)")
 
         elif args.set_cmd == 'generate-image':
-            from . import set_image, set_render
-            from .gen_service import GenServiceUnavailable, GenServiceError
+            from . import set_image, set_render  # hook-allow: lazy — PIL/xxhash, generate only
+            from .gen_service import GenServiceUnavailable, GenServiceError  # hook-allow: lazy — requests
             row = m.manual.find_set(args.name, args.studio)
             if row is None:
                 print(f"ERROR: no set named '{args.name}'", file=sys.stderr)
@@ -793,9 +796,8 @@ def main():
         return exit_code
 
     elif args.cmd == 'folder-to-video':
-        from . import set_video, set_render
-        from .gen_service import GenServiceUnavailable, GenServiceError
-        from .formats import IMAGE_EXTENSIONS
+        from . import set_video, set_render  # hook-allow: lazy — PIL/xxhash, generate only
+        from .gen_service import GenServiceUnavailable, GenServiceError  # hook-allow: lazy — requests
         m = MediaManager()
         rel_path = os.path.relpath(
             os.path.join(m.data_root, args.path), m.data_root).replace(os.sep, '/').strip('/')
@@ -882,7 +884,6 @@ def main():
                 print(f"ERROR: no category named '{args.name}'", file=sys.stderr)
                 m.close()
                 sys.exit(1)
-            from media_manager.category_resolver import get_resolved_checksums_for_category
             checksums = get_resolved_checksums_for_category(m.manual, m.db, row['id'], row['name'], limit=args.limit)
             for checksum in checksums:
                 file_row = m.db.get_file_by_checksum(checksum)
@@ -924,7 +925,6 @@ def main():
 
     elif args.cmd == 'geo':
         if args.geo_cmd == 'fetch-cities':
-            from media_manager import geonames
             m = MediaManager()
             try:
                 count = geonames.fetch_cities(m.db)
@@ -949,13 +949,13 @@ def main():
         _ensure_repo()
         data_root = os.path.abspath('.')
         try:
-            import uvicorn
+            import uvicorn  # hook-allow: lazy — optional-dep probe
         except ImportError:
             print("ERROR: uvicorn is not installed. Run: pip install 'uvicorn[standard]'",
                   file=sys.stderr)
             return 1
         try:
-            from media_manager.web import create_app
+            from media_manager.web import create_app  # hook-allow: lazy — heavy, guarded import
         except ImportError as exc:
             print(f"ERROR: could not import web module: {exc}", file=sys.stderr)
             return 1
@@ -1007,12 +1007,11 @@ def main():
         return 0
 
     elif args.cmd == 'worker':
-        from .worker_server import run as worker_run
+        from .worker_server import run as worker_run  # hook-allow: lazy — separate worker process entry
         worker_run(host=args.host, port=args.port, preload=args.preload)
         return 0
 
     elif args.cmd == 'worker-connect':
-        from . import worker_config
         # Normalize/validate the URL before saving (raises loudly on bad input —
         # no silent acceptance of a garbage address).
         url = worker_config.normalize_url(args.address)

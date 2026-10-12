@@ -1,10 +1,13 @@
 """
 Database schema and operations for media management.
 """
+import json
 import os
 import sqlite3
 import threading
 import time
+
+from .geonames import haversine
 
 
 # Version of the face normalization pipeline (in-plane rotation recovery + aligned
@@ -83,7 +86,7 @@ class ThreadLocalDB:
                     if conn is not None:
                         conn.close()
                         closed += 1
-                except Exception:
+                except sqlite3.Error:
                     pass
         return closed
 
@@ -840,7 +843,6 @@ class Database(ThreadLocalDB):
         haversine scan to a handful of candidates instead of the whole table."""
         if lat is None or lon is None:
             return None
-        from media_manager.geonames import haversine
         cursor = self.conn.cursor()
         margin = 0.75
         cursor.execute(
@@ -984,7 +986,7 @@ class Database(ThreadLocalDB):
                 result = slot[1] if slot else None
                 if result is not None:
                     out[label] = int(result[idx].nbytes)
-            except Exception:
+            except Exception:  # hook-allow: broad — best-effort stats probe
                 pass
         return out
 
@@ -1092,7 +1094,7 @@ class Database(ThreadLocalDB):
         (matrix, keep) where keep is a bool list aligned with `blobs` marking
         which rows made it into the matrix, so the caller can filter its id
         arrays identically."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         keep = [False] * len(blobs)
         # Infer D from the first non-empty blob.
         D = None
@@ -1126,7 +1128,7 @@ class Database(ThreadLocalDB):
         full-table BLOB fetchall()+rebuild that drives the web-server OOM.
         `path` is intentionally not selected (resolved later for the top-K
         only)."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
             if self._emb_cache is not None and self._emb_cache[0] == self._emb_ver:
                 return self._emb_cache[1]
@@ -1160,8 +1162,8 @@ class Database(ThreadLocalDB):
         back to the exact numpy BLAS dot used everywhere else, so behavior is
         byte-identical off-GPU. `query` may be any array-like of the embedding
         dim; empty library → empty array (mirrors the callers' shape guard)."""
-        import numpy as np
-        from . import gpu_search
+        import numpy as np  # hook-allow: lazy — heavy
+        from . import gpu_search  # hook-allow: lazy — numpy/torch GPU path
         _file_ids, _checksums, matrix = self.get_embeddings_matrix()
         q = np.asarray(query, dtype=np.float32)
         if matrix.shape[0] == 0:
@@ -1177,8 +1179,8 @@ class Database(ThreadLocalDB):
         (same face_ids/file_ids order). GPU fast-path keeps the [N, D] face matrix
         resident (keyed by 'all_faces' + self._face_ver); numpy fallback otherwise.
         Empty → empty array."""
-        import numpy as np
-        from . import gpu_search
+        import numpy as np  # hook-allow: lazy — heavy
+        from . import gpu_search  # hook-allow: lazy — numpy/torch GPU path
         _face_ids, _file_ids, matrix = self.get_face_embeddings_matrix()
         q = np.asarray(query, dtype=np.float32)
         if matrix.shape[0] == 0:
@@ -2030,7 +2032,6 @@ class Database(ThreadLocalDB):
         Always writes at least one sentinel row so the file is never re-queued.
         The DELETE is scoped to frame_index IS NULL so re-running this never wipes
         out frame-specific rows written by the per-image 'scan all frames' action."""
-        import json
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         now = int(time.time())
@@ -2061,7 +2062,6 @@ class Database(ThreadLocalDB):
         `angle` is the same clockwise-from-upright roll insert_faces stores; the
         embedding passed in must already be the one computed at that orientation,
         which is why the row counts as normalized at the current version."""
-        import json
         cursor = self.conn.cursor()
         cursor.execute(
             'INSERT INTO faces (file_id, bbox, embedding, det_score, identity, indexed_at, '
@@ -2175,7 +2175,7 @@ class Database(ThreadLocalDB):
         (identity != '__indexed__' and embedding != b''). Built once and reused
         across requests until a faces write bumps self._face_ver. `path` is
         dropped (resolved later for the top-K only)."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
             if self._face_cache is not None and self._face_cache[0] == self._face_ver:
                 return self._face_cache[1]
@@ -2498,7 +2498,6 @@ class Database(ThreadLocalDB):
         Always writes at least one sentinel row (bbox='[]', empty blob) so the file
         is never re-queued. DELETE scoped to frame_index IS NULL, mirroring
         insert_faces."""
-        import json
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         now = int(time.time())
@@ -2521,7 +2520,6 @@ class Database(ThreadLocalDB):
         Clears the 'no people' sentinel (bbox='[]') first so the manual crop isn't
         masked, but keeps any real body rows (unlike insert_body_embeddings, which
         replaces them wholesale). Mirrors add_manual_face for find-by-body."""
-        import json
         cursor = self.conn.cursor()
         cursor.execute(
             "DELETE FROM body_embeddings WHERE file_id = ? AND bbox = '[]' AND frame_index IS NULL",
@@ -2568,7 +2566,7 @@ class Database(ThreadLocalDB):
         rows (bbox != '[]' and embedding != b''). Built once and reused across
         requests until a body write bumps self._body_ver. `path` is dropped
         (resolved later for the top-K only)."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
             if self._body_cache is not None and self._body_cache[0] == self._body_ver:
                 return self._body_cache[1]
@@ -2645,7 +2643,7 @@ class Database(ThreadLocalDB):
         insert_body_embeddings; unlike it there is no sentinel row — a file with no
         tiles simply gets no rows (get_untiled_files re-queues it), which is fine
         because the tile scan skips non-images rather than marking them done here."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM tile_embeddings WHERE file_id = ?', (file_id,))
         for tile_index, tile in enumerate(tiles):
@@ -2671,7 +2669,7 @@ class Database(ThreadLocalDB):
     def insert_pattern_tiles(self, file_id: int, tiles: list, algo: str) -> None:
         """Replace the pattern-tile rows for a file (idempotent re-index).
         tiles: [{'bbox': [x1,y1,x2,y2], 'descriptor': np.ndarray}, ...] in ORIGINAL px."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
         cursor.execute('DELETE FROM pattern_tiles WHERE file_id = ?', (file_id,))
         now = int(time.time())
@@ -2709,7 +2707,7 @@ class Database(ThreadLocalDB):
         """Yield (file_ids: int64[k], matrix: float32[k, D]) chunks over ALL pattern
         tiles — the RAM-bounded find-by-pattern search primitive (mirrors
         iter_tile_embeddings). Malformed blobs are skipped with a WARNING."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
         cursor.execute('SELECT id, file_id, descriptor FROM pattern_tiles ORDER BY id')
         batch_fids, batch_blobs, D = [], [], None
@@ -2873,7 +2871,7 @@ class Database(ThreadLocalDB):
         blob length // 4). A malformed/empty blob is skipped with a printed
         WARNING (the scan keeps going), and file_ids stay aligned to matrix rows
         because the skipped row is dropped from both."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
         cursor.execute('SELECT id, file_id, embedding FROM tile_embeddings ORDER BY id')
         batch_fids = []
@@ -2972,7 +2970,7 @@ class Database(ThreadLocalDB):
         length // 4). A malformed/empty blob is skipped with a printed WARNING (the
         scan keeps going), and file_ids/boxes stay aligned to matrix rows because the
         skipped row is dropped from all three."""
-        import numpy as np
+        import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
         cursor.execute('SELECT id, file_id, x1, y1, x2, y2, embedding '
                        'FROM object_region_embeddings ORDER BY id')

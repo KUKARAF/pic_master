@@ -23,7 +23,9 @@ Design notes:
 import os
 import io
 import time
+import random
 import shutil
+import signal
 import threading
 import tempfile
 import traceback
@@ -33,6 +35,8 @@ import numpy as np
 
 from . import worker_protocol
 from . import compute
+from . import clip_tag_classifier as ct
+from . import yolo_tag_classifier as yt
 
 
 DEFAULT_CONF_THRESHOLD = 0.15
@@ -55,21 +59,21 @@ class WorkerModels:
     def get_face_detector(self):
         if self._face_detector is None:
             print("[worker] loading FaceDetector...", flush=True)
-            from .face_detector import FaceDetector
+            from .face_detector import FaceDetector  # hook-allow: lazy — model load
             self._face_detector = FaceDetector()
         return self._face_detector
 
     def get_clip_indexer(self):
         if self._clip_indexer is None:
             print("[worker] loading CLIPIndexer...", flush=True)
-            from .indexer import CLIPIndexer
+            from .indexer import CLIPIndexer  # hook-allow: lazy — model load
             self._clip_indexer = CLIPIndexer()
         return self._clip_indexer
 
     def get_object_detector(self):
         if self._object_detector is None:
             print("[worker] loading YOLOWorldDetector...", flush=True)
-            from .detector import YOLOWorldDetector
+            from .detector import YOLOWorldDetector  # hook-allow: lazy — model load
             self._object_detector = YOLOWorldDetector(
                 model_size='s', conf_threshold=DEFAULT_CONF_THRESHOLD)
         return self._object_detector
@@ -104,7 +108,7 @@ _age_estimator = None
 def _get_age_estimator():
     global _age_estimator
     if _age_estimator is None:
-        from .age_estimator import AgeGenderEstimator
+        from .age_estimator import AgeGenderEstimator  # hook-allow: lazy — optional, self-contained feature
         _age_estimator = AgeGenderEstimator()
     return _age_estimator
 
@@ -128,7 +132,7 @@ def _write_temp(image_bytes, name):
     try:
         with os.fdopen(fd, 'wb') as f:
             f.write(image_bytes)
-    except Exception:
+    except Exception:  # hook-allow: broad — cleanup then re-raise
         try:
             os.unlink(path)
         except OSError:
@@ -161,7 +165,7 @@ def handle_ping(path, data, request_id, link_id, remote_identity, requested_at):
         print(f"[worker] handled {worker_protocol.PATH_PING} () -> ok "
               f"models={resp['models']}", flush=True)
         return worker_protocol.pack(resp)
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_PING} () -> ERROR {e}", flush=True)
         return worker_protocol.pack({"ok": False, "models": [], "error": str(e)})
@@ -173,7 +177,7 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
       req {image} (no boxes)  -> {tiles: [{bbox, descriptor}]} (auto grid; for indexing)"""
     name = None
     try:
-        from media_manager import pattern_descriptor as pd
+        from media_manager import pattern_descriptor as pd  # hook-allow: lazy — pulls cv2
         req = worker_protocol.unpack(data)
         name = req.get("name")
         bgr = pd.decode_bgr(req["image"])
@@ -187,7 +191,7 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
                   flush=True)
             return worker_protocol.pack({"descriptors": out, "algo": pd.ALGO_TAG, "error": None})
         # No boxes → index mode: lay down the shared tile grid and describe each tile.
-        from media_manager.tile_index import generate_tiles
+        from media_manager.tile_index import generate_tiles  # hook-allow: lazy — pulls PIL
         h, w = bgr.shape[:2]
         tiles = generate_tiles(w, h)
         descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
@@ -195,7 +199,7 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
                for i in range(len(tiles)) if descs[i] is not None]
         print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> {len(out)} tiles", flush=True)
         return worker_protocol.pack({"tiles": out, "algo": pd.ALGO_TAG, "error": None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> ERROR {e}", flush=True)
         return worker_protocol.pack({"error": str(e)})
@@ -223,7 +227,7 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> {summary}",
               flush=True)
         return worker_protocol.pack({"faces": out_faces, "error": error})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> ERROR {e}",
               flush=True)
@@ -236,7 +240,7 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
 def handle_embed_bbox(path, data, request_id, link_id, remote_identity, requested_at):
     name = None
     try:
-        import cv2
+        import cv2  # hook-allow: lazy — heavy
         req = worker_protocol.unpack(data)
         name = req.get("name")
         img = cv2.imdecode(np.frombuffer(req["image"], np.uint8), cv2.IMREAD_COLOR)
@@ -256,7 +260,7 @@ def handle_embed_bbox(path, data, request_id, link_id, remote_identity, requeste
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BBOX} ({name}) -> "
               f"det_score={resp['det_score']:.3f}", flush=True)
         return worker_protocol.pack(resp)
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BBOX} ({name}) -> ERROR {e}",
               flush=True)
@@ -273,7 +277,7 @@ def handle_normalize_faces(path, data, request_id, link_id, remote_identity, req
     positionally."""
     name = None
     try:
-        import cv2
+        import cv2  # hook-allow: lazy — heavy
         req = worker_protocol.unpack(data)
         name = req.get("name")
         img = cv2.imdecode(np.frombuffer(req["image"], np.uint8), cv2.IMREAD_COLOR)
@@ -307,7 +311,7 @@ def handle_normalize_faces(path, data, request_id, link_id, remote_identity, req
         print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> "
               f"{len(out_faces)} faces, {changed} re-angled", flush=True)
         return worker_protocol.pack({"faces": out_faces, "error": None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> ERROR {e}",
               flush=True)
@@ -332,7 +336,7 @@ def handle_embed_image(path, data, request_id, link_id, remote_identity, request
               f"embedded dim={emb.shape[1]}", flush=True)
         return worker_protocol.pack({
             "embedding": emb[0].astype(np.float32).tobytes(), "error": None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_EMBED_IMAGE} ({name}) -> ERROR {e}",
               flush=True)
@@ -353,7 +357,7 @@ def handle_embed_text(path, data, request_id, link_id, remote_identity, requeste
               f"embedded dim={v.shape[0]}", flush=True)
         return worker_protocol.pack({
             "embedding": v.astype(np.float32).tobytes(), "error": None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_EMBED_TEXT} ({text!r}) -> ERROR {e}",
               flush=True)
@@ -373,7 +377,7 @@ def handle_detect_objects(path, data, request_id, link_id, remote_identity, requ
         # is a shared singleton, so ALWAYS set the vocab for this request — falling
         # back to the default when the caller sent none, rather than silently reusing
         # whatever the previous request left on it.
-        from .detector import DEFAULT_VOCAB
+        from .detector import DEFAULT_VOCAB  # hook-allow: lazy — model module
         with models.lock:
             det = models.get_object_detector()
             det.set_vocab(vocab if vocab else list(DEFAULT_VOCAB))
@@ -385,7 +389,7 @@ def handle_detect_objects(path, data, request_id, link_id, remote_identity, requ
         print(f"[worker] handled {worker_protocol.PATH_DETECT_OBJECTS} ({name}) -> {summary}",
               flush=True)
         return worker_protocol.pack({"detections": out, "error": error})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_DETECT_OBJECTS} ({name}) -> ERROR {e}",
               flush=True)
@@ -413,7 +417,7 @@ def handle_estimate_age(path, data, request_id, link_id, remote_identity, reques
         print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> "
               f"{len(results)} face(s)", flush=True)
         return worker_protocol.pack({"results": results, "error": None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_ESTIMATE_AGE} ({name}) -> ERROR {e}",
               flush=True)
@@ -528,13 +532,11 @@ def _write_yolo_split(dataset_dir, split_name, examples):
 
 
 def _run_yolo_job(job):
-    from media_manager import yolo_tag_classifier as yt
     try:
         examples = job.yolo_examples
         if not examples:
             raise ValueError('no training images were uploaded')
         # 80/20 split by image (deterministic seed), same as the local trainer.
-        import random
         rng = random.Random(0)
         shuffled = examples[:]
         rng.shuffle(shuffled)
@@ -570,7 +572,7 @@ def _run_yolo_job(job):
         job.status = 'cancelled'
         job.error = 'Cancelled by user.'
         job.log('cancelled')
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         job.status = 'failed'
         job.error = str(e)
@@ -580,14 +582,13 @@ def _run_yolo_job(job):
 
 
 def _run_clip_job(job):
-    from media_manager import clip_tag_classifier as ct
     try:
         xs, ys = [], []
         for emb_bytes, label in job.clip_whole:
             xs.append(np.frombuffer(emb_bytes, dtype=np.float32))
             ys.append(label)
         if job.clip_regions:
-            from PIL import Image as PILImage
+            from PIL import Image as PILImage  # hook-allow: lazy — heavy
             crops, labels = [], []
             for crop_bytes, label in job.clip_regions:
                 crops.append(PILImage.open(io.BytesIO(crop_bytes)).convert('RGB'))
@@ -625,7 +626,7 @@ def _run_clip_job(job):
         job.metrics = {'cv_accuracy': round(cv, 4), 'n_positive': n_pos, 'n_negative': n_neg}
         job.status = 'done'
         job.log(f'done; cv_accuracy={round(cv, 4)}')
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         job.status = 'failed'
         job.error = str(e)
@@ -635,7 +636,7 @@ def _run_clip_job(job):
 def _get_tag_model(slug, checkpoint):
     """Load (cached, LRU) a per-tag YOLO checkpoint for inference. MUST be called
     while holding models.lock (mirrors the other inference paths)."""
-    from ultralytics import YOLOWorld
+    from ultralytics import YOLOWorld  # hook-allow: lazy — heavy model dep
     mtime = os.path.getmtime(checkpoint)
     cached = _tag_model_cache.get(slug)
     if cached is not None and cached[0] == mtime:
@@ -682,7 +683,7 @@ def handle_train_create(path, data, request_id, link_id, remote_identity, reques
         print(f"[worker] handled {worker_protocol.PATH_TRAIN_CREATE} ({kind} {slug}) "
               f"-> {job.job_id}", flush=True)
         return worker_protocol.pack({'job_id': job.job_id, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'job_id': None, 'error': str(e)})
 
@@ -717,7 +718,7 @@ def handle_train_add(path, data, request_id, link_id, remote_identity, requested
                 elif item.get('image') is not None:
                     job.clip_regions.append((item['image'], label))
         return worker_protocol.pack({'received': len(batch), 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'received': 0, 'error': str(e)})
 
@@ -737,7 +738,7 @@ def handle_train_run(path, data, request_id, link_id, remote_identity, requested
         print(f"[worker] handled {worker_protocol.PATH_TRAIN_RUN} ({job.job_id}) -> started",
               flush=True)
         return worker_protocol.pack({'ok': True, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'ok': False, 'error': str(e)})
 
@@ -761,7 +762,7 @@ def handle_train_status(path, data, request_id, link_id, remote_identity, reques
             'error': job.error,
             'artifact': job.artifact_bytes if (want_artifact and job.status == 'done') else None,
         })
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({
             'status': 'failed', 'error': str(e),
@@ -781,7 +782,7 @@ def handle_train_cancel(path, data, request_id, link_id, remote_identity, reques
             job.status = 'cancelled'
             job.error = 'Cancelled by user.'
         return worker_protocol.pack({'ok': True, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'ok': False, 'error': str(e)})
 
@@ -808,7 +809,7 @@ def handle_tag_detect(path, data, request_id, link_id, remote_identity, requeste
         print(f"[worker] handled {worker_protocol.PATH_TAG_DETECT} ({slug}/{name}) -> "
               f"{len(detections)} detections", flush=True)
         return worker_protocol.pack({'detections': detections, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_TAG_DETECT} ({name}) -> ERROR {e}",
               flush=True)
@@ -887,7 +888,7 @@ def handle_imdb_build_begin(path, data, request_id, link_id, remote_identity, re
         print(f"[worker] imdb build begin kind={kind} dim={req['dim']} total={req.get('total_rows')}",
               flush=True)
         return worker_protocol.pack({'ok': True, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'ok': False, 'error': str(e)})
 
@@ -897,7 +898,7 @@ def handle_imdb_build_chunk(path, data, request_id, link_id, remote_identity, re
         req = worker_protocol.unpack(data)
         received = imdb_index.add_chunk(req['kind'], req['ids'], req['vecs'])
         return worker_protocol.pack({'received': received, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'received': 0, 'error': str(e)})
 
@@ -909,7 +910,7 @@ def handle_imdb_build_end(path, data, request_id, link_id, remote_identity, requ
         print(f"[worker] imdb build end kind={req['kind']} rows={rows} dim={dim} "
               f"bytes={nbytes} ({nbytes / 1048576:.1f} MB)", flush=True)
         return worker_protocol.pack({'rows': rows, 'dim': dim, 'bytes': nbytes, 'error': None})
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'rows': 0, 'dim': 0, 'bytes': 0, 'error': str(e)})
 
@@ -919,7 +920,7 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
         resp = imdb_index.status()
         resp['error'] = None
         return worker_protocol.pack(resp)
-    except Exception as e:
+    except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         return worker_protocol.pack({'clip': {}, 'face': {}, 'error': str(e)})
 
@@ -960,8 +961,9 @@ def build_app():
     (connection/timeout) are the client's job to distinguish, not our status code.
     Blocking model work runs in a threadpool so the event loop stays free and the
     process-wide ``models.lock`` still serializes actual inference."""
+    # hook-allow: lazy — web stack only needed when serving
     from fastapi import FastAPI, Request, Response
-    from starlette.concurrency import run_in_threadpool
+    from starlette.concurrency import run_in_threadpool  # hook-allow: lazy
 
     app = FastAPI(title="media worker")
 
@@ -983,7 +985,6 @@ def run(host="127.0.0.1", port=4243, preload=False):
     # Treat SIGTERM like Ctrl-C during the pre-serve window (uvicorn installs its
     # own signal handlers once it's running) so a parent that spawned us
     # (`media web --with-worker`) can always shut us down cleanly.
-    import signal
     def _sigterm(signum, frame):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, _sigterm)
@@ -1004,7 +1005,7 @@ def run(host="127.0.0.1", port=4243, preload=False):
                     print(f"[worker] preloading {name}...", flush=True)
                     with models.lock:
                         getter()
-                except Exception:
+                except Exception:  # hook-allow: broad — a failed preload must not kill the worker
                     traceback.print_exc()
                     print(f"[worker] preload of {name} FAILED; continuing without it "
                           f"(its requests will error until it loads).", flush=True)
@@ -1024,7 +1025,7 @@ def run(host="127.0.0.1", port=4243, preload=False):
     print("=" * 64, flush=True)
     print("", flush=True)
 
-    import uvicorn
+    import uvicorn  # hook-allow: lazy — only needed when serving
     try:
         uvicorn.run(app, host=host, port=port, log_level="warning")
     except KeyboardInterrupt:

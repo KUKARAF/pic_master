@@ -158,7 +158,7 @@ def open_capture(path):
     selection, not validating the media).
     """
     global _engaged_backend
-    import cv2  # heavy; lazy like the rest of the decode path (and phasher.py)
+    import cv2  # hook-allow: lazy — heavy, like the rest of the decode path (and phasher.py)
 
     mode = hwaccel_requested()
 

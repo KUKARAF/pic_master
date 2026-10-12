@@ -16,8 +16,10 @@ import atexit
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
+import venv as venv_module
 from pathlib import Path
 
 MODEL_ID = "mivolo"
@@ -74,7 +76,6 @@ def _venv_python(venv_dir: Path) -> Path:
 def _find_compatible_python() -> str | None:
     """PATH lookup for a Python matching _AGE_VENV_PYTHON_SERIES (pip fallback path
     only — uv resolves/downloads interpreters itself)."""
-    import shutil
     return shutil.which(f"python{_AGE_VENV_PYTHON_SERIES}")
 
 
@@ -94,8 +95,6 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
     Backs `media age-setup`. Returns the venv's python executable path. Uses uv when
     available (much faster, shares its wheel cache), else stdlib venv + pip.
     """
-    import shutil
-
     venv_dir = Path(dest).expanduser() if dest else default_age_venv_dir()
     python = _venv_python(venv_dir)
     marker = venv_dir / _SETUP_COMPLETE_MARKER
@@ -141,7 +140,6 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
         )
     else:
         base_python = _find_compatible_python()
-        import venv as venv_module
         if base_python is None:
             raise RuntimeError(
                 f"No Python {_AGE_VENV_PYTHON_SERIES} interpreter found on PATH and uv is "
@@ -228,7 +226,7 @@ class AgeGenderEstimator:
         if self._proc is not None:
             try:
                 self._proc.kill()
-            except Exception:
+            except OSError:
                 pass
         self._proc = None
         self._responses = None
@@ -244,10 +242,10 @@ class AgeGenderEstimator:
             if proc.stdin:
                 proc.stdin.close()
             proc.wait(timeout=5)
-        except Exception:
+        except Exception:  # hook-allow: broad — best-effort atexit reap, OS reclaims anyway
             try:
                 proc.kill()
-            except Exception:
+            except OSError:
                 pass
 
     # -- request / response ---------------------------------------------------

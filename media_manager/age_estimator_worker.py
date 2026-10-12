@@ -18,6 +18,7 @@ appears in "results" with age/gender set to null, rather than being dropped sile
 import json
 import os
 import sys
+import traceback
 
 # torch >= 2.6 — required for Intel Arc Battlemage (B70) XPU support — defaults
 # torch.load to weights_only=True, which the old ultralytics/MiVOLO checkpoints
@@ -77,7 +78,7 @@ def load_person_detector():
     whose select_device() doesn't understand 'xpu' (it treats any non-cpu/non-cuda
     string as a CUDA request and raises "Invalid CUDA 'device=xpu'"), and it's a
     tiny model — only the MiVOLO transformer runs on the Arc GPU."""
-    from ultralytics import YOLO
+    from ultralytics import YOLO  # hook-allow: lazy — heavy; .age-venv only
     return YOLO(PERSON_MODEL_NAME)
 
 
@@ -122,8 +123,8 @@ def _pick_device(torch):
         # Native XPU (torch>=2.5) needs no IPEX, but older Intel stacks only
         # register the 'xpu' backend after importing IPEX — try it, guarded.
         try:
-            import intel_extension_for_pytorch  # noqa: F401
-        except Exception:
+            import intel_extension_for_pytorch  # noqa: F401  # hook-allow: lazy — optional IPEX
+        except Exception:  # hook-allow: broad — optional IPEX probe, any failure = absent
             pass
         return hasattr(torch, "xpu") and torch.xpu.is_available()
 
@@ -174,8 +175,8 @@ def load_models():
     host→GPU upload, ~1 s. The persistent daemon (serve()) pays it exactly once
     for its whole life instead of once per image, which is the entire point of the
     daemon: bulk age estimation was reloading all of this for EVERY photo."""
-    import torch
-    from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification
+    import torch  # hook-allow: lazy — after TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD is set
+    from transformers import AutoConfig, AutoImageProcessor, AutoModelForImageClassification  # hook-allow: lazy
 
     # Device for MiVOLO (the heavy transformer): the Arc GPU via 'xpu' when
     # available. The person detector stays on CPU (see load_person_detector). A
@@ -197,7 +198,7 @@ def infer(models, image_path, faces):
     """Age/gender for one image's faces, using already-loaded `models` (from
     load_models()). This is the only per-request work — everything heavy already
     happened once at load time."""
-    import cv2
+    import cv2  # hook-allow: lazy — heavy; .age-venv only
 
     torch = models["torch"]
     config = models["config"]
@@ -247,7 +248,7 @@ def infer(models, image_path, faces):
             age = round(output.age_output[0].item(), 1)
             gender = config.gender_id2label[output.gender_class_idx[0].item()]
             results.append({"face_ref": face_ref, "age": age, "gender": gender})
-        except Exception as exc:  # noqa: BLE001 - one bad face must not sink the batch
+        except Exception as exc:  # noqa: BLE001 - one bad face must not sink the batch  # hook-allow: broad
             results.append({"face_ref": face_ref, "age": None, "gender": None, "error": str(exc)})
 
     return results
@@ -292,8 +293,7 @@ def serve():
         try:
             req = json.loads(line)
             resp = {"results": infer(models, req["image_path"], req["faces"])}
-        except Exception as exc:  # noqa: BLE001 - report per-request, keep serving
-            import traceback
+        except Exception as exc:  # noqa: BLE001 - report per-request, keep serving  # hook-allow: broad
             traceback.print_exc()
             resp = {"error": str(exc)}
         real_out.write(json.dumps(resp) + "\n")
@@ -305,7 +305,7 @@ def main():
         payload = json.loads(sys.stdin.read())
         results = run(payload["image_path"], payload["faces"])
         json.dump({"results": results}, sys.stdout)
-    except Exception as exc:  # noqa: BLE001 - report, don't traceback, to the caller
+    except Exception as exc:  # noqa: BLE001 - report, don't traceback, to the caller  # hook-allow: broad
         json.dump({"error": str(exc)}, sys.stdout)
         sys.exit(1)
 

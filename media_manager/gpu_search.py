@@ -105,7 +105,7 @@ def matvec(key, version, matrix, query):
     matrix = np.asarray(matrix, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] == 0:
         return None
-    import torch
+    import torch  # hook-allow: lazy — heavy dep (torch), GPU path only
 
     resident = _resident_tensor(key, version, matrix, device, torch)
     q = torch.from_numpy(np.ascontiguousarray(query, dtype=np.float32)).to(device)
@@ -130,7 +130,7 @@ def gemm(a, b):
     b = np.asarray(b, dtype=np.float32)
     if a.size == 0 or b.size == 0:
         return None
-    import torch
+    import torch  # hook-allow: lazy — heavy dep (torch), GPU path only
 
     ta = torch.from_numpy(np.ascontiguousarray(a)).to(device)
     tb = torch.from_numpy(np.ascontiguousarray(b)).to(device)

@@ -15,12 +15,16 @@ write_status for the {running,done,failed} status contract.
 """
 import argparse
 import os
+import random
 import shutil
 import sys
 import tempfile
 import time
 
 from media_manager.clip_tag_classifier import classifier_dir, slugify, write_status
+from media_manager.database import Database
+from media_manager.detector import WEIGHTS_DIR
+from media_manager.manual_db import ManualDB
 
 MIN_BOXES = 10
 EPOCHS = 30
@@ -51,8 +55,7 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
     versions don't support it, model.train(device='xpu') raises loudly, which is
     acceptable per this project's no-silent-failures rule (better than silently
     falling back to CPU and running an order of magnitude slower unnoticed)."""
-    from media_manager.detector import WEIGHTS_DIR
-    from ultralytics import YOLOWorld
+    from ultralytics import YOLOWorld  # hook-allow: lazy — heavy dep (ultralytics)
 
     os.makedirs(out_dir, exist_ok=True)
     base_weights = os.path.join(WEIGHTS_DIR, 'yolov8s-worldv2.pt')
@@ -86,7 +89,7 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
     held_out_map = None
     try:
         held_out_map = float(results.results_dict.get('metrics/mAP50-95(B)'))
-    except Exception:
+    except Exception:  # hook-allow: broad — metric extraction is best-effort
         pass  # metric extraction is best-effort — a missing/renamed key shouldn't fail an otherwise-successful run
     return {'held_out_map': held_out_map, 'best_path': best_dst}
 
@@ -104,15 +107,13 @@ def train_for_tag(data_root, tag_label, device=None):
 
     try:
         _train(data_root, tag_label, out_dir, pid, started_at, device=device)
-    except Exception as exc:
+    except Exception as exc:  # hook-allow: broad — boundary records failure then re-raises
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
         raise
 
 
 def _train(data_root, tag_label, out_dir, pid, started_at, device=None):
-    from media_manager.database import Database
-    from media_manager.manual_db import ManualDB
 
     data_root = os.path.abspath(data_root)
     media_dir = os.path.join(data_root, '.media')
@@ -141,7 +142,7 @@ def _train(data_root, tag_label, out_dir, pid, started_at, device=None):
     # ultralytics reports that failure as a confusing "Image Not Found"
     # mid-training rather than a clean skip — so validate with the SAME
     # decoder ultralytics uses, up front.
-    import cv2
+    import cv2  # hook-allow: lazy — heavy dep (cv2)
 
     examples = []  # [(checksum, src_path, boxes), ...]
     for checksum in sorted(boxes_by_checksum):
@@ -162,7 +163,6 @@ def _train(data_root, tag_label, out_dir, pid, started_at, device=None):
 
     # 80/20 train/val split by IMAGE (not by box), so a multi-box image
     # doesn't leak between train and val.
-    import random
     rng = random.Random(0)
     shuffled = examples[:]
     rng.shuffle(shuffled)
@@ -244,9 +244,9 @@ def main():
     # ultralytics keep its own auto-selection rather than aborting the whole job.
     device = None
     try:
-        from . import compute
+        from . import compute  # hook-allow: lazy — deliberately inside the try per comment above
         device = compute.ultralytics_device()
-    except Exception as exc:  # noqa: BLE001 - device pick must not sink training
+    except Exception as exc:  # noqa: BLE001  # hook-allow: broad — device pick must not sink training
         print(f"[yolo_tag_classifier] could not resolve compute device "
               f"({exc!r}) — letting ultralytics auto-select.", file=sys.stderr)
 

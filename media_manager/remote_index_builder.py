@@ -15,13 +15,15 @@ torch/ultralytics/insightface.
 import os
 import time
 
+from media_manager.database import Database
+
 # ~10000 rows × 512 float32 ≈ 20 MB per chunk — modest enough for one RNS request,
 # big enough that the ~470 rows-per-MB overhead of many tiny requests doesn't dominate.
 _CHUNK_ROWS = 10000
 
 
 def _client(data_root):
-    from media_manager import worker_client
+    from media_manager import worker_client  # hook-allow: lazy — worker_client pulls cv2/requests
     return worker_client.get_client(data_root)
 
 
@@ -32,8 +34,6 @@ def build_index(data_root, kinds=('clip', 'face'), log=print, progress=None):
     seconds)` is an optional callback for a web job's live status. Raises if the
     worker is unavailable (no local fallback — that would reload the matrix here and
     OOM, defeating the purpose)."""
-    from media_manager.database import Database
-
     client = _client(data_root)
     if not client.is_available():
         raise RuntimeError('Worker unavailable — start/configure the media worker '

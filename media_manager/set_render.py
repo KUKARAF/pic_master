@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import time
 
+import xxhash
 from PIL import PngImagePlugin
 
 GENERATED_DIRNAME = "generated"
@@ -86,7 +87,6 @@ def register_generated_file(db, manual, data_root, abs_path, *, set_id=None,
       * assign it to its source set (so it shows in that set's grid);
       * record it in the generated_artifacts provenance registry.
     Returns (file_id, checksum, artifact_id)."""
-    import xxhash
     rel_path = os.path.relpath(abs_path, data_root)
     h = xxhash.xxh64()
     with open(abs_path, "rb") as f:

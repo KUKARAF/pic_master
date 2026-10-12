@@ -6,6 +6,7 @@ import open_clip
 import torch
 
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
+from . import compute
 
 
 class CLIPIndexer:
@@ -15,7 +16,6 @@ class CLIPIndexer:
         # with MEDIA_DEVICE. Was hardcoded 'cuda if torch.cuda.is_available() else
         # cpu', which silently left an Intel GPU idle. Downstream .to(self.device)
         # calls (embed batches, text tokens) inherit whatever we pick here.
-        from . import compute
         self.device = compute.torch_device()
         model, _, preprocess = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
         self.model = model.to(self.device).eval()
@@ -51,7 +51,7 @@ class CLIPIndexer:
                 tensor = self.preprocess(img)
                 batch_tensors.append(tensor)
                 batch_paths.append(path)
-            except Exception as exc:
+            except Exception as exc:  # hook-allow: broad — per-image decode resilience, reported as failed
                 failed.append((path, str(exc)))
                 continue
 
