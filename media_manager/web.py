@@ -46,10 +46,14 @@ from media_manager.body_index import crop_bodies, match_face_to_body
 from media_manager.clip_tag_classifier import (
     MIN_EXAMPLES_PER_CLASS, classifier_dir, load_probe, score_all, slugify, write_status,
 )
+from media_manager.database import FACE_NORM_VERSION, Database
 from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
+from media_manager.error_log import ErrorLog
 from media_manager.face_detector import FaceDetector, _norm_angle
 from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
 from media_manager.gen_service import ComfyUIClient
+from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
+from media_manager.media_manager import MediaManager, _parse_query
 from media_manager.object_encoder import ObjectEncoder
 from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
@@ -718,11 +722,6 @@ def create_app(data_root: str) -> FastAPI:
     thumbs_dir = os.path.join(media_dir, 'thumbs')
     os.makedirs(thumbs_dir, exist_ok=True)
 
-    # Import here so the module can be imported without heavy deps loaded
-    from media_manager.database import Database, FACE_NORM_VERSION  # hook-allow: lazy — deferred per comment above
-    from media_manager.error_log import ErrorLog  # hook-allow: lazy — deferred per comment above
-    from media_manager.manual_db import ManualDB  # hook-allow: lazy — DB layer deferred (see create_app)
-
     db = Database(db_path)
     errors = ErrorLog(os.path.join(media_dir, 'error.db'))
     manual = ManualDB(os.path.join(media_dir, 'manual.db'))
@@ -817,7 +816,6 @@ def create_app(data_root: str) -> FastAPI:
         """Best primary-frame row in `existing_rows` (from get_all_faces_for_checksum)
         whose box overlaps `bbox` at/above the same-face IoU, or None. Lets a re-detect
         recognise a face the human already saved instead of cloning it."""
-        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU  # hook-allow: lazy — DB layer deferred (see create_app)
         thresh = FACE_SAME_BOX_IOU if min_iou is None else min_iou
         best, best_iou = None, thresh
         for r in existing_rows:
@@ -832,7 +830,6 @@ def create_app(data_root: str) -> FastAPI:
         """Merge manual.db's rows for this file (hand-drawn + promoted/named, keyed by
         checksum) with media.db's auto-detected rows that haven't been named yet
         (keyed by file_id, since those live entirely inside this one media.db)."""
-        from media_manager.manual_db import _bbox_iou, FACE_SAME_BOX_IOU  # hook-allow: lazy — DB layer deferred (see create_app)
         manual_rows = manual.get_faces_for_file(checksum)
         promoted = {r['source_face_id'] for r in manual_rows if r['source_face_id']}
         out = [{'ref': f"manual:{r['id']}", 'bbox': [r['x1'], r['y1'], r['x2'], r['y2']],
@@ -2226,7 +2223,6 @@ def create_app(data_root: str) -> FastAPI:
             # YOLO-World object detection search, plus a filename/path substring
             # search — both kinds of matches are merged into one results grid.
             try:
-                from media_manager.media_manager import _parse_query  # hook-allow: lazy — DB layer deferred (see create_app)
                 tokens = _parse_query(q)
 
                 class_rows = db.search_by_classes(tokens, limit=50) if tokens else []
@@ -7552,7 +7548,6 @@ def create_app(data_root: str) -> FastAPI:
         runs server-side in a daemon thread, so you can start it and close the tab — the
         page re-attaches to a running job (or shows a pending count) when you come back.
         AUTO_MATCH_THRESHOLD seeds the face auto-match confidence slider."""
-        from media_manager.manual_db import AUTO_MATCH_THRESHOLD  # hook-allow: lazy — DB layer deferred (see create_app)
         return templates.TemplateResponse(request, 'bulk.html', {
             'auto_match_threshold': AUTO_MATCH_THRESHOLD,
             'all_tags': manual.list_all_tags(),
@@ -9295,7 +9290,6 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/search/face')
     async def api_search_by_face(file: UploadFile = File(...)):
-        from media_manager.media_manager import MediaManager  # hook-allow: lazy — DB layer deferred (see create_app)
         contents = await file.read()
         suffix = os.path.splitext(file.filename or '.jpg')[1] or '.jpg'
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
