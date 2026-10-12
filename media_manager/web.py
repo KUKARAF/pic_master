@@ -5920,7 +5920,7 @@ def create_app(data_root: str) -> FastAPI:
     LOCATION_SUGGEST_THRESHOLD = 0.75
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
-                                          avoid_existing=True):
+                                          avoid_existing=True, honor_negatives=False):
         """Images not yet at this location whose CLIP embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
@@ -5930,19 +5930,29 @@ def create_app(data_root: str) -> FastAPI:
 
         `avoid_existing` (default True — a UI toggle) hard-excludes photos that
         already carry ANY location, so the stack surfaces still-unplaced photos
-        first instead of re-litigating ones already filed somewhere."""
+        first instead of re-litigating ones already filed somewhere.
+
+        `honor_negatives` (a UI toggle): rejected photos are always hidden; this
+        additionally pulls the ranking centroid away from them (same Rocchio-style
+        adjusted_centroid as _find_similar_files_for_set), so photos that merely
+        LOOK like a rejected one rank lower too."""
 
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
         member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
 
-        centroid = mean_normalized_centroid(member_embeddings)
+        excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
+
+        if honor_negatives and excluded_checksum_set:
+            excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
+            excluded_embeddings = [e for _fid, e in db.get_embeddings_for_files(excluded_ids)]
+            centroid = adjusted_centroid(member_embeddings, excluded_embeddings)
+        else:
+            centroid = mean_normalized_centroid(member_embeddings)
         # A location with nothing placed at it yet has nothing to compare against
         # — no centroid, no suggestions (the page says exactly that).
         if centroid is None:
             return []
-
-        excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
         # Photos whose SET is already linked to this location: pressing `s` on one
         # card writes a single set_locations row rather than a file_locations row
         # per member, so this is what stops the rest of that shoot from coming
@@ -7058,14 +7068,16 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/locations/{location_id}/similar-files')
     def api_similar_files_for_location(location_id: int, body: SwipeExcludeBody,
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
-                                        limit: int = 12, offset: int = 0, avoid_existing: bool = True):
+                                        limit: int = 12, offset: int = 0, avoid_existing: bool = True,
+                                        honor_negatives: bool = False):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
         results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
-                                                    exclude_ids=exclude_ids, avoid_existing=avoid_existing)
+                                                    exclude_ids=exclude_ids, avoid_existing=avoid_existing,
+                                                    honor_negatives=honor_negatives)
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
         # is what swipe-core.js's fetchMoreUrl contract reads.
         return {'results': results, 'cards': results}

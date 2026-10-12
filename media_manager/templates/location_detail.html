@@ -65,6 +65,10 @@
   <input type="checkbox" id="location-avoid-existing-toggle" checked>
   Avoid photos that already have a location
 </label>
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+  <input type="checkbox" id="location-honor-negatives-toggle" checked>
+  Honor negatives (steer ranking away from rejected photos, not just hide them)
+</label>
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Keep searching until
   <input type="range" id="location-buffer-size-slider" min="10" max="200" step="10" value="10">
@@ -280,9 +284,11 @@
     // which would throw away a buffer you are part-way through and re-run the
     // whole-library scan on a stray click.
     const avoidToggle = document.getElementById('location-avoid-existing-toggle');
+    const honorNegativesToggle = document.getElementById('location-honor-negatives-toggle');
     return '/api/locations/' + locationId + '/similar-files?threshold=' + currentThreshold +
       '&limit=' + (need || 10) +
-      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked);
+      '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
+      '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked);
   }
 
   function setNames(card) {
