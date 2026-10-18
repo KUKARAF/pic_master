@@ -1,0 +1,5 @@
+{# Bare run of macros.card() items (no wrapping grid) — included by a page for its
+   first server-rendered page and rendered alone by an infinite-scroll API (e.g.
+   /api/videos) so lazily-appended cards share the exact same, autoescaped markup. #}
+{% import "_macros.html" as macros %}
+{% for f in files %}{{ macros.card(f, selectable=selectable) }}{% endfor %}

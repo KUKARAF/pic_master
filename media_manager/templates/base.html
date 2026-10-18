@@ -13,6 +13,7 @@
   <button type="button" class="nav-toggle" id="nav-toggle" aria-label="Menu" aria-expanded="false">☰</button>
   <div class="nav-links" id="nav-links">
     <a class="nav-link" href="/">Gallery</a>
+    <a class="nav-link {{ 'active' if request and request.url.path == '/videos' }}" href="/videos"{% if request and request.url.path == '/videos' %} aria-current="page"{% endif %}>Videos</a>
     <a class="nav-link" href="/files">Files</a>
     <a class="nav-link" href="/faces">Faces</a>
     <a class="nav-link" href="/tags">Tags</a>

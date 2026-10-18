@@ -1716,6 +1716,53 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    # Sorts the /videos grid offers (macros.sort_controls with filename + favorites).
+    # SQL-ordered ones page via LIMIT/OFFSET; the rest need manual.db or basenames, so
+    # they rank the whole (already filtered) video set in Python and slice after.
+    _VIDEO_SQL_SORTS = {'added', 'modified', 'date'}
+    _VIDEO_SORTS = _VIDEO_SQL_SORTS | {'age', 'filename', 'favorites'}
+    VIDEO_PAGE_SIZE = 60
+
+    def _video_page(sort, order, offset, limit):
+        """(cards, total) for one page of the Videos tab: non-hidden video files minus
+        the trash, filtered BEFORE pagination so every page is full."""
+        trashed = manual.get_trashed_checksums()
+        if sort in _VIDEO_SQL_SORTS:
+            rows = db.list_files_by_ext(VIDEO_EXTENSIONS, limit=limit, offset=offset,
+                                        sort=sort, order=order, exclude_checksums=trashed)
+        else:
+            every = db.list_files_by_ext(VIDEO_EXTENSIONS, exclude_checksums=trashed)
+            rows = _ordered_rows([r['checksum'] for r in every], sort, order)[offset:offset + limit]
+        total = db.count_files_by_ext(VIDEO_EXTENSIONS, exclude_checksums=trashed)
+        return _enrich_rows([(r['id'], r['path'], False, r['checksum']) for r in rows]), total
+
+    def _video_sort_args(sort, order):
+        return (sort if sort in _VIDEO_SORTS else 'added'), (order if order in ('asc', 'desc') else 'desc')
+
+    @app.get('/videos', response_class=HTMLResponse)
+    def videos_page(request: Request, sort: str = 'added', order: str = 'desc'):
+        """The Videos nav tab: every video in the library as a sortable grid. The first
+        page renders here; videos.html infinite-scrolls the rest from /api/videos."""
+        sort, order = _video_sort_args(sort, order)
+        files, total = _video_page(sort, order, 0, VIDEO_PAGE_SIZE)
+        return templates.TemplateResponse(request, 'videos.html', {
+            'files': files, 'total': total, 'sort': sort, 'order': order,
+            'page_size': VIDEO_PAGE_SIZE,
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
+
+    @app.get('/api/videos')
+    def api_videos(offset: int = 0, limit: int = VIDEO_PAGE_SIZE, sort: str = 'added', order: str = 'desc'):
+        """One infinite-scroll page of the Videos grid: the cards pre-rendered through the
+        same macros.card markup as the first page (so escaping, the ▶ badge the hover
+        frame rotation keys on, and selection checkboxes all stay identical), plus the
+        ids for callers that only need those."""
+        sort, order = _video_sort_args(sort, order)
+        files, total = _video_page(sort, order, max(offset, 0), max(1, min(limit, 500)))
+        html = templates.get_template('_card_items.html').render(files=files, selectable=True)
+        return {'html': html, 'ids': [f['id'] for f in files], 'count': len(files), 'total': total}
+
     @app.get('/ai', response_class=HTMLResponse)
     def ai_page(request: Request, limit: int = 500):
         """All AI-generated items (morph videos now, generated images later), newest

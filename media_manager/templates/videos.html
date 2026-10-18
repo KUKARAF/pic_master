@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}Videos — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>🎬 Videos</h1>
+  <span class="sub">{{ total }} video(s)</span>
+</div>
+
+{% if files %}
+<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-bottom:16px;">
+  <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
+    <button type="button" id="select-many-btn" class="btn-similar">Select many</button>
+    <button type="button" id="bulk-set-btn" class="btn-similar">+ Add to set</button>
+    <span id="bulk-set-status" class="sub"></span>
+  </div>
+  {{ macros.sort_controls(sort, order, show_filename=True, show_favorites=True) }}
+</div>
+
+{# data-sort/order/offset/total drive the infinite scroll below (/api/videos). #}
+<div class="grid" id="videos-grid" data-queue-source="Videos"
+     data-sort="{{ sort }}" data-order="{{ order }}" data-offset="{{ files | length }}"
+     data-total="{{ total }}" data-page-size="{{ page_size }}">
+  {% with selectable=True %}{% include "_card_items.html" %}{% endwith %}
+</div>
+<div id="videos-sentinel" style="height:1px;"></div>
+<p id="videos-loading" class="sub" style="text-align:center;margin-top:16px;display:none;">Loading…</p>
+{% else %}
+<div class="empty-state">
+  <div class="icon">🎬</div>
+  <p>No videos yet. Videos (.mp4, .mov, .webm, .m4v) show up here once scanned with <code>media add .</code></p>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
+  if (window.wireHeartButton) wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+
+/* Infinite scroll: appends the next page from /api/videos whenever the sentinel
+   nears the viewport. The API returns cards pre-rendered (and autoescaped) by the
+   same macros.card markup as the first page, so base.html's watch-queue click
+   capture (re-reads the grid at click time), app.js's delegated hover frame
+   rotation (keys on .video-badge) and the delegated select-mode below all cover
+   appended cards with no extra wiring. */
+(function () {
+  var grid = document.getElementById('videos-grid');
+  if (!grid) return;
+  var sentinel = document.getElementById('videos-sentinel');
+  var loadingEl = document.getElementById('videos-loading');
+  var offset = parseInt(grid.dataset.offset, 10) || 0;
+  var total = parseInt(grid.dataset.total, 10) || 0;
+  var limit = parseInt(grid.dataset.pageSize, 10) || 60;
+  var loading = false;
+  var done = offset >= total;
+  var failed = false;
+
+  function loadMore() {
+    if (loading || done) return;
+    loading = true;
+    loadingEl.style.display = 'block';
+    var params = new URLSearchParams({ offset: String(offset), limit: String(limit),
+                                       sort: grid.dataset.sort, order: grid.dataset.order });
+    fetch('/api/videos?' + params.toString())
+      .then(function (r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function (data) {
+        total = data.total;
+        // Server-rendered via Jinja autoescape (no raw user strings concatenated here).
+        var frag = document.createRange().createContextualFragment(data.html);
+        frag.querySelectorAll('.file-heart-btn').forEach(function (btn) {
+          if (window.wireHeartButton) wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+        });
+        grid.appendChild(frag);
+        offset += data.count;
+        if (!data.count || offset >= total) done = true;
+      })
+      .catch(function (err) {
+        done = failed = true;  // stop retry-looping; the message stays up
+        loadingEl.textContent = 'Failed to load more videos: ' + err.message;
+      })
+      .finally(function () {
+        loading = false;
+        if (!failed) loadingEl.style.display = 'none';
+        // Same re-check as person.html: a sentinel still inside the lookahead after a
+        // short page never flips intersection state, so keep pulling until it's past.
+        if (!done && sentinel) {
+          var rect = sentinel.getBoundingClientRect();
+          if (rect.top < window.innerHeight + 400) loadMore();
+        }
+      });
+  }
+
+  if (window.IntersectionObserver && sentinel) {
+    new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) { if (entry.isIntersecting) loadMore(); });
+    }, { rootMargin: '400px' }).observe(sentinel);
+  } else {
+    window.addEventListener('scroll', function () {
+      if (window.innerHeight + window.scrollY >= document.body.offsetHeight - 600) loadMore();
+    });
+  }
+})();
+
+/* Bulk selection — mirrors search.html's "Select many" / shift-click range-select,
+   retargeted at this grid. One delegated listener, so infinite-scroll cards count. */
+(function () {
+  var grid = document.getElementById('videos-grid');
+  if (!grid) return;
+  var selectManyBtn = document.getElementById('select-many-btn');
+  var lastClicked = null;
+
+  function setSelectMode(active) {
+    grid.classList.toggle('select-mode', active);
+    if (selectManyBtn) selectManyBtn.textContent = active ? 'Unselect many' : 'Select many';
+    if (!active) {
+      grid.querySelectorAll('.card-select-checkbox:checked').forEach(function (cb) { cb.checked = false; });
+      lastClicked = null;
+    }
+  }
+
+  if (selectManyBtn) {
+    selectManyBtn.addEventListener('click', function () {
+      setSelectMode(!grid.classList.contains('select-mode'));
+    });
+  }
+
+  grid.addEventListener('click', function (e) {
+    if (!grid.classList.contains('select-mode')) return;
+    var card = e.target.closest('.card');
+    var cb = card ? card.querySelector('.card-select-checkbox') : null;
+    if (!cb) return;
+    e.preventDefault();
+    if (e.shiftKey && lastClicked) {
+      var all = Array.from(grid.querySelectorAll('.card-select-checkbox'));
+      var start = all.indexOf(lastClicked);
+      var end = all.indexOf(cb);
+      if (start !== -1 && end !== -1) {
+        var lo = Math.min(start, end), hi = Math.max(start, end);
+        for (var i = lo; i <= hi; i++) all[i].checked = true;
+        lastClicked = cb;
+        return;
+      }
+    }
+    cb.checked = !cb.checked;
+    lastClicked = cb;
+  });
+
+  window.__videosGridSelectMode = { setSelectMode: setSelectMode };
+})();
+
+/* Bulk "Add to set" — same flow as search.html: pick/create a target set, check
+   cards, click again to add them (sequentially; see search.html for why). */
+(function () {
+  var bulkBtn = document.getElementById('bulk-set-btn');
+  var bulkStatus = document.getElementById('bulk-set-status');
+  var grid = document.getElementById('videos-grid');
+  if (!bulkBtn || !grid) return;
+  var targetSet = null;
+
+  bulkBtn.addEventListener('click', function () {
+    if (!targetSet) {
+      openSetSearchModal(function (set) {
+        targetSet = set;
+        bulkBtn.textContent = 'Add to "' + set.name + '"';
+        window.__videosGridSelectMode.setSelectMode(true);
+        bulkStatus.textContent = 'Select videos, then click the button again to add them.';
+      });
+      return;
+    }
+    var checked = Array.from(grid.querySelectorAll('.card-select-checkbox:checked'));
+    if (!checked.length) {
+      bulkStatus.textContent = 'Select at least one video first.';
+      return;
+    }
+    bulkBtn.disabled = true;
+    var addedCount = 0;
+    var firstError = null;
+    checked.reduce(function (chain, cb) {
+      return chain.then(function () {
+        return assignFileToSet(cb.dataset.fileId, targetSet.id)
+          .then(function () { addedCount++; cb.checked = false; })
+          .catch(function (err) { if (!firstError) firstError = err; });
+      });
+    }, Promise.resolve())
+      .then(function () {
+        bulkBtn.disabled = false;
+        bulkStatus.textContent = firstError
+          ? 'Added ' + addedCount + ' of ' + checked.length + ' video(s) to "' + targetSet.name +
+            '" — failed: ' + firstError.message
+          : 'Added ' + addedCount + ' video(s) to "' + targetSet.name + '".';
+      });
+  });
+})();
+</script>
+{% endblock %}

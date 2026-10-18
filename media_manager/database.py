@@ -1558,11 +1558,17 @@ class Database(ThreadLocalDB):
             return '0', []
         return '(' + ' OR '.join("lower(path) LIKE '%' || ?" for _ in exts) + ')', exts
 
-    def count_files_by_ext(self, exts):
-        """Count non-hidden files whose path ends with one of `exts` (e.g. images vs videos)."""
+    def count_files_by_ext(self, exts, exclude_checksums=None):
+        """Count non-hidden files whose path ends with one of `exts` (e.g. images vs videos).
+        `exclude_checksums` drops those (e.g. trash) — the total paired with
+        list_files_by_ext's pages."""
         clause, params = self._ext_like_clause(exts)
+        sql = f'SELECT COUNT(*) FROM files_with_path WHERE hidden = 0 AND {clause}'
+        if exclude_checksums:
+            sql += ' AND checksum NOT IN (SELECT value FROM json_each(?))'
+            params = params + [json.dumps(sorted(exclude_checksums))]
         cur = self.conn.cursor()
-        cur.execute(f'SELECT COUNT(*) FROM files_with_path WHERE hidden = 0 AND {clause}', params)
+        cur.execute(sql, params)
         row = cur.fetchone()
         return row[0] if row else 0
 
@@ -1581,6 +1587,29 @@ class Database(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute(f'SELECT id, path, checksum FROM files_with_path WHERE hidden = 0 AND {clause} '
                     f'ORDER BY RANDOM() LIMIT ?', params + [limit])
+        return cur.fetchall()
+
+    def list_files_by_ext(self, exts, limit=None, offset=0, sort='added', order='desc',
+                          exclude_checksums=None):
+        """(id, path, checksum) non-hidden files matching `exts`, ordered by
+        _GALLERY_SORT_COLUMNS (sort/order) and paginated by LIMIT/OFFSET — the /videos
+        grid. `exclude_checksums` (e.g. the manual.db trash set) is dropped IN the query,
+        bound as one JSON array via json_each so an unbounded set never hits SQLite's
+        parameter cap, and so every page comes back full. limit=None → every match
+        (for the Python-side age/favorites/filename sorts, which slice afterwards)."""
+        clause, params = self._ext_like_clause(exts)
+        column = self._GALLERY_SORT_COLUMNS.get(sort, 'f.first_seen')
+        direction = 'ASC' if order == 'asc' else 'DESC'
+        sql = (f'SELECT f.id, f.path, f.checksum FROM files_with_path f '
+               f'WHERE f.hidden = 0 AND {clause} '
+               f'AND f.checksum NOT IN (SELECT value FROM json_each(?)) '
+               f'ORDER BY {column} IS NULL, {column} {direction}, f.id {direction}')
+        params = params + [json.dumps(sorted(exclude_checksums or ()))]
+        if limit is not None:
+            sql += ' LIMIT ? OFFSET ?'
+            params += [limit, offset]
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
         return cur.fetchall()
 
     def get_files_by_size(self, limit, offset=0):
