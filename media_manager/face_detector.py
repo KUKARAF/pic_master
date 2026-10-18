@@ -1,6 +1,8 @@
 """InsightFace-based face detector and embedder."""
 import os
 import math
+import sys
+import traceback
 import numpy as np
 
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
@@ -162,6 +164,10 @@ def _inflate_square(bbox, pad_ratio):
     return [cx - half, cy - half, cx + half, cy + half]
 
 
+class PCNUnavailable(RuntimeError):
+    """normalize_faces was asked to run but the PCN rotation detector can't load."""
+
+
 class FaceDetector:
     def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=None):
         from insightface.app import FaceAnalysis  # hook-allow: lazy — heavy optional dep (insightface)
@@ -187,14 +193,28 @@ class FaceDetector:
     def _get_pcn(self):
         """Lazily construct the PCN rotation-invariant detector (onnxruntime, no
         torch). If it can't load, disable it and fall back to InsightFace-only
-        detection — PCN is a supplementary recall boost, never a hard requirement."""
+        detection — PCN is a supplementary recall boost for detection, never a hard
+        requirement there. The failure is reported loudly (once) so a silently
+        degraded pipeline can't masquerade as a healthy one; normalize_faces, which
+        cannot do its job without PCN, refuses to run (see pcn_available)."""
         if self._pcn is None and not self._pcn_failed:
             try:
                 from media_manager.pcn import PCNDetector  # hook-allow: lazy — optional PCN; load failure disables it
                 self._pcn = PCNDetector()
-            except Exception:  # hook-allow: broad — optional PCN, any load failure falls back to InsightFace-only
+            except Exception as exc:  # hook-allow: broad — optional PCN, any load failure falls back to InsightFace-only
                 self._pcn_failed = True
+                print(f"[faces] PCN rotation detector failed to load — rotated faces will NOT "
+                      f"be corrected/recovered: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+                traceback.print_exc()
         return self._pcn
+
+    def pcn_available(self) -> bool:
+        """True when the PCN rotation detector is loaded (loading it on first call).
+        Without it rotation normalization is a no-op, so callers that exist only to
+        normalize (the re-normalization backfill) must abort rather than stamp faces
+        as normalized."""
+        return self._get_pcn() is not None
 
     def detect_faces(self, paths: list) -> list:
         """Run detection + embedding on a list of image paths.
@@ -246,11 +266,18 @@ class FaceDetector:
         comes back byte-identical, and a second pass changes nothing. Backs the
         re-normalization backfill job.
 
+        Raises PCNUnavailable when the PCN detector can't load: normalizing without
+        it would return every face unchanged and the backfill would stamp them all
+        as done while repairing nothing.
+
         Same length and order as `faces` (the backfill maps results back to DB rows
         positionally), and the input dicts are never mutated. Faces InsightFace
         originally missed are NOT discovered here — inventing rows is detection's
         job; the backfill can only rewrite the rows it was handed.
         """
+        if not self.pcn_available():
+            raise PCNUnavailable('PCN rotation detector failed to load (see stderr) — '
+                                 'cannot normalize faces')
         working = []
         for face in faces:
             emb = face.get('embedding')
@@ -339,7 +366,11 @@ class FaceDetector:
                 })
                 claimed.add(len(faces) - 1)
             return claimed
-        except Exception:  # hook-allow: broad — PCN pass is best-effort by design
+        except Exception as exc:  # hook-allow: broad — PCN pass is best-effort by design, but never silent
+            print(f"[faces] PCN correct/recover pass failed — keeping InsightFace-only "
+                  f"results for this image: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            traceback.print_exc()
             return claimed
 
     def _correct_face(self, pcn, img, cand, angle, faces, hit, claimed):
@@ -457,8 +488,13 @@ class FaceDetector:
                 # which is exactly what 'angle' reports.
                 face['angle'] = _norm_angle(-90.0 * best_k)
                 claimed.add(i)
-            except Exception:  # hook-allow: broad — per-crop resilience
+            except (cv2.error, ValueError, IndexError):
                 continue  # one bad crop must not cost us the rest of the image
+            except Exception as exc:  # hook-allow: broad — unexpected per-crop error: log loudly, keep going
+                print(f"[faces] quarter-turn sweep: unexpected error on face {i}: "
+                      f"{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                traceback.print_exc()
+                continue
 
     def _centered_face(self, got, shape):
         """Pick the detection a padded crop was made FOR: the target sits at the

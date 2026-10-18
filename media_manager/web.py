@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import ctypes.util
+import errno
 import gc
 import io
 import json
@@ -34,6 +35,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from PIL import Image
 from PIL import Image as PILImage
+from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
@@ -43,6 +45,7 @@ from media_manager import (
 )
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
 from media_manager.body_index import crop_bodies, match_face_to_body
+from media_manager.broken_finder import is_decode_error
 from media_manager.clip_tag_classifier import (
     MIN_EXAMPLES_PER_CLASS, classifier_dir, load_probe, score_all, slugify, write_status,
 )
@@ -322,27 +325,56 @@ def _save_jpeg_atomic(img, dst_path: str, quality: int):
         raise
 
 
+# _make_thumbnail / _make_video_thumbnail status (first element of their result).
+# DAMAGED means the SOURCE's data is bad (→ mark broken); SAVE_FAILED means our side
+# failed (writing the thumbs dir — ENOSPC/EACCES/EIO — or an infra/unexpected error
+# reading the source): serve a placeholder, log it, and NEVER mark the source broken,
+# so it's simply retried on the next request.
+THUMB_OK = 'ok'
+THUMB_DAMAGED = 'damaged'
+THUMB_SAVE_FAILED = 'save_failed'
+
+
+def _decode_failure(exc) -> tuple:
+    """Map an exception raised while decoding a SOURCE to (status, message)."""
+    if is_decode_error(exc):
+        return THUMB_DAMAGED, str(exc)
+    return THUMB_SAVE_FAILED, f'thumbnail: could not read source ({type(exc).__name__}): {exc}'
+
+
+def _resize_and_save_thumb(img, dst_path: str) -> tuple:
+    """Shared tail: resize a decoded PIL image to 400 px wide and atomically save it.
+    Anything failing here is on our side (the source already decoded)."""
+    try:
+        w, h = img.size
+        new_w = 400
+        new_h = max(1, int(h * new_w / w))
+        img = img.resize((new_w, new_h), PILImage.LANCZOS)
+        _save_jpeg_atomic(img, dst_path, quality=80)
+    except Exception as exc:  # hook-allow: broad — save side; never blamed on the source
+        return THUMB_SAVE_FAILED, f'thumbnail: could not save ({type(exc).__name__}): {exc}'
+    return THUMB_OK, None
+
+
 def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
     """Resize src to 400 px wide, save as JPEG at dst_path.
-    Returns (success, message). message is a non-fatal decoder warning (e.g.
-    corrupt-but-recoverable JPEG data) when success=True, or the exception
-    text when success=False, or None when there's nothing to report."""
+    Returns (status, message), status one of THUMB_OK / THUMB_DAMAGED /
+    THUMB_SAVE_FAILED (see above). message is a non-fatal decoder warning (e.g.
+    corrupt-but-recoverable JPEG data) with THUMB_OK, the failure text otherwise,
+    or None when there's nothing to report."""
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
             with PILImage.open(src_path) as img:
-                img = img.convert('RGB')
-                w, h = img.size
-                if w == 0:
-                    return False, 'image has zero width'
-                new_w = 400
-                new_h = max(1, int(h * new_w / w))
-                img = img.resize((new_w, new_h), PILImage.LANCZOS)
-                _save_jpeg_atomic(img, dst_path, quality=80)
-        message = '; '.join(str(w.message) for w in caught) if caught else None
-        return True, message
-    except Exception as exc:  # hook-allow: broad — decode can raise anything; report failure
-        return False, str(exc)
+                img = img.convert('RGB')   # forces the full decode
+        if img.size[0] == 0:
+            return THUMB_DAMAGED, 'image has zero width'
+    except Exception as exc:  # hook-allow: broad — classified by _decode_failure
+        return _decode_failure(exc)
+    status, message = _resize_and_save_thumb(img, dst_path)
+    if status == THUMB_OK and caught:
+        message = '; '.join(str(w.message) for w in caught)
+    return status, message
 
 
 def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
@@ -350,8 +382,8 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
     video_decode, so the Arc media engine decodes it when available — unlike
     broken_finder, which stays on software decode on purpose), then reuse the image
     thumbnail's resize-to-400px + atomic-JPEG-save tail. Seeks ~1s in so the poster
-    isn't a black/leading frame, falling back to frame 0. Returns (success, message)
-    with the same shape as _make_thumbnail so serve_thumb treats them identically."""
+    isn't a black/leading frame, falling back to frame 0. Returns (status, message)
+    with the same contract as _make_thumbnail so serve_thumb treats them identically."""
     try:
         cap = video_decode.open_capture(src_path)
         # isOpened() check lives INSIDE the try so the finally always releases: FFmpeg
@@ -360,7 +392,7 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
         # leaks an fd on every uncached /thumb of a damaged video.
         try:
             if not cap.isOpened():
-                return False, 'could not open video'
+                return THUMB_DAMAGED, 'could not open video'
             cap.set(cv2.CAP_PROP_POS_MSEC, 1000)
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -369,20 +401,47 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ok, frame = cap.read()
             if not ok or frame is None:
-                return False, 'could not read a video frame'
+                return THUMB_DAMAGED, 'could not read a video frame'
         finally:
             cap.release()
         img = PILImage.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        w, h = img.size
-        if w == 0:
-            return False, 'video frame has zero width'
-        new_w = 400
-        new_h = max(1, int(h * new_w / w))
-        img = img.resize((new_w, new_h), PILImage.LANCZOS)
-        _save_jpeg_atomic(img, dst_path, quality=80)
-        return True, None
-    except Exception as exc:  # hook-allow: broad — decode can raise anything; report failure
-        return False, str(exc)
+        if img.size[0] == 0:
+            return THUMB_DAMAGED, 'video frame has zero width'
+    except Exception as exc:  # hook-allow: broad — classified by _decode_failure
+        return _decode_failure(exc)
+    return _resize_and_save_thumb(img, dst_path)
+
+
+# Bulk jobs abort after this many CONSECUTIVE failures that look like our side
+# (dead estimator/GPU/runtime) rather than per-file data — so a broken environment
+# stops the job with a clear message instead of churning through the whole library.
+MAX_CONSECUTIVE_FAILURES = 5
+
+
+def _split_age_results(results):
+    """Split estimator results into (good, failed). A result carrying 'error' is an
+    inference failure (the worker's per-face/body catch), NOT an estimate: saving it
+    would store a NULL row that marks the photo done forever. A None age WITHOUT
+    'error' (e.g. an unusable crop) is a genuine answer and stays in `good`."""
+    good, failed = [], []
+    for r in results or []:
+        (failed if r.get('error') else good).append(r)
+    return good, failed
+
+
+# Per-image DATA errors in the face re-normalization backfill: the image or a stored
+# row is bad, so the faces are stamped done (or the job re-picks them forever). cv2
+# is guarded because headless tests stub it with a MagicMock, not an exception type.
+_RENORM_DATA_ERRORS = (ValueError, json.JSONDecodeError, UnidentifiedImageError) + (
+    (cv2.error,) if isinstance(getattr(cv2, 'error', None), type) else ())
+
+
+def _is_renorm_data_error(exc) -> bool:
+    """True for a known per-image data error (see _RENORM_DATA_ERRORS), or the one
+    source file having vanished (ENOENT). Anything else is ours — don't stamp."""
+    if isinstance(exc, _RENORM_DATA_ERRORS):
+        return True
+    return isinstance(exc, OSError) and exc.errno == errno.ENOENT
 
 
 # Remote-worker offload. `_worker_client` is set by create_app() to the
@@ -1509,12 +1568,18 @@ def create_app(data_root: str) -> FastAPI:
             if abs_path is None:
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
             make_thumb = _make_video_thumbnail if is_video else _make_thumbnail
-            success, message = make_thumb(abs_path, thumb_path)
-            if not success:
+            status, message = make_thumb(abs_path, thumb_path)
+            if status == THUMB_DAMAGED:
                 # abs_path resolved (file IS on disk) but its pixels won't decode →
                 # it's damaged, not merely missing. Mark it so browsing the library
                 # naturally surfaces broken media into the Damaged bucket.
                 _mark_decode_failure(file_id, rel_path, message or 'thumbnail decode failed')
+                return Response(content=_gray_placeholder(), media_type='image/jpeg')
+            if status != THUMB_OK:
+                # Our side failed (thumbs dir unwritable/full, fd exhaustion, ...): the
+                # source may be perfectly healthy, so log and serve the placeholder
+                # WITHOUT marking it broken — the next request retries.
+                errors.log(rel_path, message or 'thumbnail generation failed')
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
             if message:
                 errors.log(rel_path, message)
@@ -2991,7 +3056,7 @@ def create_app(data_root: str) -> FastAPI:
     phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     video_face_scan_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'captured': 0, 'error': None}
-    estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'failed': 0}
     detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
     broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
@@ -3700,10 +3765,10 @@ def create_app(data_root: str) -> FastAPI:
                     try:
                         thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
                         if not os.path.isfile(thumb_path):
-                            ok, msg = _make_thumbnail(abs_path, thumb_path)
+                            status, msg = _make_thumbnail(abs_path, thumb_path)
                             if msg:
                                 errors.log(rel_path, msg)
-                            if not ok:
+                            if status != THUMB_OK:
                                 done += 1; phash_job['done'] = done; continue
                         with PILImage.open(thumb_path) as im:
                             ph, dh = phasher.compute_hashes(im)
@@ -4001,12 +4066,13 @@ def create_app(data_root: str) -> FastAPI:
         if not include_trashed:
             trashed = manual.get_trashed_checksums()
             candidates = [cs for cs in candidates if cs not in trashed]
-        estimate_age_job.update(running=True, done=0, total=len(candidates), error=None)
+        estimate_age_job.update(running=True, done=0, total=len(candidates), error=None, failed=0)
 
         def _run():
             try:
                 estimator = _get_age_estimator()
                 done = 0
+                consecutive_failures = 0
                 for checksum in candidates:
                     row = db.get_file_by_checksum(checksum)
                     if row is None:
@@ -4016,13 +4082,32 @@ def create_app(data_root: str) -> FastAPI:
                     faces = _combined_faces_for_file(file_id, checksum)
                     if abs_path is None or not faces:
                         done += 1; estimate_age_job['done'] = done; continue
+                    photo_failed = False
                     try:
                         results = estimator.estimate(abs_path, faces)
-                        manual.save_age_estimates(checksum, results, MODEL_ID)
+                        good, failed = _split_age_results(results)
+                        for r in failed:
+                            errors.log(row['path'], f"estimate-age {r.get('face_ref')}: {r['error']}")
+                        # Only real estimates are saved: an errored face stays un-estimated
+                        # and an all-error photo stays in _faces_needing_age for a retry.
+                        if good:
+                            manual.save_age_estimates(checksum, good, MODEL_ID)
+                        photo_failed = bool(failed) and not good
                     except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(row['path'], f'estimate-age: {exc}')
+                        photo_failed = True
                     done += 1
                     estimate_age_job['done'] = done
+                    if photo_failed:
+                        estimate_age_job['failed'] += 1
+                        consecutive_failures += 1
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            raise RuntimeError(
+                                f'Aborted: age estimation failed on {consecutive_failures} photos '
+                                'in a row — the estimator looks broken (see errors.log). '
+                                'Failed photos were not marked done and will be retried.')
+                    else:
+                        consecutive_failures = 0
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 estimate_age_job['error'] = str(exc)
             finally:
@@ -4038,6 +4123,7 @@ def create_app(data_root: str) -> FastAPI:
             'done': estimate_age_job['done'],
             'total': estimate_age_job['total'],
             'error': estimate_age_job['error'],
+            'failed': estimate_age_job['failed'],
             'pending': len(_faces_needing_age()),
         }
 
@@ -7585,6 +7671,12 @@ def create_app(data_root: str) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
+        results, failed = _split_age_results(results)
+        for r in failed:
+            errors.log(row['path'], f"estimate-age {r.get('face_ref')}: {r['error']}")
+        if failed and not results:
+            raise HTTPException(status_code=500,
+                                detail=f"Age estimation failed: {failed[0]['error']}")
         manual.save_age_estimates(checksum, results, MODEL_ID)
         identity_by_body = {b['ref']: b['identity'] for b in bodies}
         for r in results:
@@ -8669,7 +8761,17 @@ def create_app(data_root: str) -> FastAPI:
         existed. Rows arrive grouped so every face of a file is in one chunk; this
         loads each source image exactly once and writes back only what moved."""
         detector = _get_face_detector()
+        # Without PCN, normalization is a no-op: every face would come back unchanged
+        # and get stamped as normalized while nothing was repaired. Remote detectors
+        # don't expose this — the worker's normalize_faces raises instead, which the
+        # WorkerError carve-out below turns into the same abort.
+        pcn_available = getattr(detector, 'pcn_available', None)
+        if callable(pcn_available) and not pcn_available():
+            raise RuntimeError(
+                'PCN rotation detector is unavailable (it failed to load — see the server '
+                'log), so faces cannot be re-normalized. No rows were modified.')
         refreshed_refs = 0
+        consecutive_unexpected = 0
         for chunk in db.iter_unnormalized_faces(chunk=200):
             by_file = {}
             for row in chunk:
@@ -8685,11 +8787,11 @@ def create_app(data_root: str) -> FastAPI:
                     db.bump_face_norm_version(face_ids, FACE_NORM_VERSION)
                     renormalize_job['done'] += len(group)
                     continue
-                faces = [{'bbox': json.loads(r[3]),
-                          'embedding': np.frombuffer(r[4], dtype=np.float32),
-                          'det_score': float(r[5] or 0.0),
-                          'angle': float(r[6] or 0.0)} for r in group]
                 try:
+                    faces = [{'bbox': json.loads(r[3]),
+                              'embedding': np.frombuffer(r[4], dtype=np.float32),
+                              'det_score': float(r[5] or 0.0),
+                              'angle': float(r[6] or 0.0)} for r in group]
                     normalized = detector.normalize_faces(img, faces)
                 except (worker_client.WorkerError, worker_client.WorkerUnavailable) as exc:
                     # Infrastructure, not data: a worker that is unreachable — or too old
@@ -8698,17 +8800,39 @@ def create_app(data_root: str) -> FastAPI:
                     # nothing, and the job would report success with 0 changes. Abort
                     # instead, stamping nothing, so the run can be retried after the
                     # worker is redeployed.
+                    if refreshed_refs:
+                        db.clear_face_suggestions()  # see the end of this function
                     raise RuntimeError(
                         'face worker cannot normalize faces (%s). Redeploy the worker with '
                         'this version — no rows were modified.' % exc) from exc
-                except Exception as exc:  # hook-allow: broad — per-image failure; see below
-                    # Per-image failure (undecodable region, bad stored bbox): skip this
-                    # one file and advance it, or the job re-picks it forever and never
-                    # reaches the faces it can fix.
-                    errors.log(rel_path, f'renormalize-faces: {exc}')
-                    db.bump_face_norm_version(face_ids, FACE_NORM_VERSION)
+                except Exception as exc:  # hook-allow: broad — classified below; unknown errors don't stamp
+                    if _is_renorm_data_error(exc):
+                        # Per-image data failure (undecodable region, bad stored bbox):
+                        # skip this one file and advance it, or the job re-picks it
+                        # forever and never reaches the faces it can fix.
+                        errors.log(rel_path, f'renormalize-faces: {exc}')
+                        db.bump_face_norm_version(face_ids, FACE_NORM_VERSION)
+                        renormalize_job['done'] += len(group)
+                        consecutive_unexpected = 0
+                        continue
+                    # Anything else (GPU/runtime error, OOM, a bug) says nothing about
+                    # this file: log it and leave the faces un-stamped for a retry. A
+                    # run of these means the pipeline itself is broken — abort.
+                    traceback.print_exc()
+                    errors.log(rel_path, f'renormalize-faces: unexpected {type(exc).__name__}: '
+                                         f'{exc} (not stamped; will retry)')
                     renormalize_job['done'] += len(group)
+                    consecutive_unexpected += 1
+                    if consecutive_unexpected >= MAX_CONSECUTIVE_FAILURES:
+                        if refreshed_refs:
+                            db.clear_face_suggestions()  # see the end of this function
+                        raise RuntimeError(
+                            f'Aborted: {consecutive_unexpected} images in a row failed with '
+                            f'unexpected errors (last: {type(exc).__name__}: {exc}). Those '
+                            'faces were not stamped and will be retried — see errors.log.'
+                        ) from exc
                     continue
+                consecutive_unexpected = 0
 
                 updates, changed_ids, unchanged_ids, new_blobs = [], [], [], {}
                 for row, face in zip(group, normalized):

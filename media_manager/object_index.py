@@ -9,11 +9,19 @@ embedding is batched by the encoder. NO keypoints are extracted here: geometric
 verification (object_matcher) is a query-time step over a small shortlist only.
 
 SQLite safety: all DB access runs on the CALLER's thread; decode workers touch only PIL.
+
+Embed failures: only a per-image DATA error (ValueError — e.g. a degenerate image)
+writes the empty-blob sentinel that marks the file indexed. Anything else (GPU/runtime
+error, OOM, a bug) is logged and the file is left un-indexed for a retry; after
+MAX_CONSECUTIVE_EMBED_FAILURES of those in a row the build raises, so the job status
+shows the error instead of grinding through the library.
 """
 import os
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+
+MAX_CONSECUTIVE_EMBED_FAILURES = 5
 
 
 def _decode_draft(abs_path, long_side):
@@ -72,6 +80,7 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
         return p if os.path.isfile(p) else None
 
     done = 0
+    consecutive_failures = 0
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
         for i in range(0, total, batch):
@@ -98,11 +107,27 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
                 else:
                     try:
                         regions = encoder.embed_regions(im)  # [(box_in_decoded_px, vec), ...]
-                    except Exception as exc:  # hook-allow: broad — per-image inference resilience, logged
+                        consecutive_failures = 0
+                    except ValueError as exc:
+                        # The image itself is degenerate — retrying won't help.
                         db.insert_object_regions(fid, [((0.0, 0.0, 0.0, 0.0), b'')], enc_model)  # sentinel
                         if log:
                             log(rel, f'object-index embed error: {exc}')
                         regions = None
+                    except Exception as exc:  # hook-allow: broad — our-side failure: log, no sentinel, abort on a run
+                        # RuntimeError/MemoryError/anything else: not the image's fault.
+                        # Leave it un-indexed (retried next run) and stop if it keeps
+                        # happening — the encoder/GPU is broken, not the library.
+                        if log:
+                            log(rel, f'object-index embed failed ({type(exc).__name__}): {exc} '
+                                     '(not indexed; will retry)')
+                        regions = None
+                        consecutive_failures += 1
+                        if consecutive_failures >= MAX_CONSECUTIVE_EMBED_FAILURES:
+                            raise RuntimeError(
+                                f'Aborted: object embedding failed on {consecutive_failures} '
+                                f'images in a row (last: {type(exc).__name__}: {exc}). The '
+                                'encoder looks broken; those images stay un-indexed.') from exc
                     if regions is not None:
                         sx, sy = scale
                         rows = []
