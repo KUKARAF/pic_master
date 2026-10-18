@@ -5235,6 +5235,40 @@
     });
   }
 
+  /* ▶ mpv (video view's top-right pill): copy `mpv '<raw stream URL>'` for this
+     server, so the original file plays in a real player. navigator.clipboard needs
+     a secure context (https/localhost); over plain-http LAN fall back to execCommand. */
+  document.addEventListener('click', function (e) {
+    var btn = e.target.closest ? e.target.closest('.copy-mpv-btn') : null;
+    if (!btn) return;
+    e.preventDefault();
+    var cmd = "mpv '" + window.location.origin + '/image/' + btn.dataset.fileId + "'";
+    function flash(text) {
+      var label = btn.dataset.label || (btn.dataset.label = btn.textContent);
+      btn.textContent = text;
+      setTimeout(function () { btn.textContent = label; }, 1500);
+    }
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = cmd;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) flash('✓ copied');
+      else window.prompt('Copy this mpv command:', cmd);
+    }
+    if (navigator.clipboard && window.isSecureContext) {
+      navigator.clipboard.writeText(cmd).then(function () { flash('✓ copied'); }, fallback);
+    } else {
+      fallback();
+    }
+  });
+
   /* Manual age / gender edit — the 🎂 button on each face chip. Stores a manual
      value that overrides the ML estimate everywhere (see set_manual_age_gender).
      Delegated so it works for every chip; updates the ".face-age-gender" span in

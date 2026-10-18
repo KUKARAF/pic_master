@@ -40,6 +40,17 @@
     {% if file.is_image %}
     <button type="button" id="fit-mode-btn" class="stage-btn stage-btn-accent" title="cycle image fit (F)">▣ MODE · <span id="fit-mode-label">FIT</span></button>
     {% endif %}
+    {# Split pill: download the original (any file); for a video also copy an
+       `mpv '<raw stream URL>'` command (app.js fills in this server's origin). #}
+    <div class="stage-pod-btn stage-pod-split find-split" role="group" aria-label="File actions">
+      <a class="split-seg" href="/download/{{ file.id }}" download
+         title="Download the original file" aria-label="Download" style="text-decoration:none;">⬇</a>
+      {% if file.is_video %}
+      <span class="split-div"></span>
+      <button type="button" class="split-seg copy-mpv-btn" data-file-id="{{ file.id }}"
+              title="Copy an mpv command that plays the raw video" aria-label="Copy mpv command">▶ mpv</button>
+      {% endif %}
+    </div>
   </div>
 
   {% if file.is_image and file.frame_count and file.frame_count > 1 %}
@@ -423,8 +434,6 @@
                 title="Confirm this person appears in the video even with no detected face">
           ＋ This is… (no face)
         </button>
-        <a class="btn-similar" href="/download/{{ file.id }}" download style="font-size:7px;padding:6px 7px;text-decoration:none;"
-           title="Download the original video file">⬇ Download</a>
       </div>
       {% endif %}
       {% if file.is_image or file.is_video %}

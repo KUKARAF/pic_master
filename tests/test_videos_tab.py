@@ -104,6 +104,15 @@ def run():
     page = client.get('/photo/%d' % vid)
     assert page.status_code == 200, page.status_code
     assert 'href="/download/%d"' % vid in page.text
+    assert 'class="split-seg copy-mpv-btn" data-file-id="%d"' % vid in page.text
+    # Photos get ⬇ too, but no ▶ mpv.
+    pid = fid['p0.jpg']
+    with open(os.path.join(app.state.test_root, 'p0.jpg'), 'wb') as f:
+        f.write(b'fake-jpg-bytes')
+    assert client.get('/download/%d' % pid).content == b'fake-jpg-bytes'
+    ppage = client.get('/photo/%d' % pid).text
+    assert 'href="/download/%d"' % pid in ppage
+    assert 'copy-mpv-btn' not in ppage
     assert client.get('/download/999999').status_code == 404
 
     # Empty library -> empty state, no grid.
@@ -114,7 +123,7 @@ def run():
     print('OK  /videos ids:', sorted(expected))
     print('OK  /api/videos pagination (added desc/asc, filename)')
     print('OK  nav active + empty state')
-    print('OK  /download attachment + button on the video page')
+    print('OK  /download attachment; ⬇ on every /photo page, ▶ mpv on videos only')
     print('ALL ASSERTIONS PASSED')
 
 

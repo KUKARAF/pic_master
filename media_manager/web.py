@@ -1598,8 +1598,8 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/download/{file_id}')
     def download_file(file_id: int):
-        """The original file as an attachment under its own filename — the video
-        view's ⬇ Download button (/image streams inline for the <video> element)."""
+        """The original file as an attachment under its own filename — the /photo
+        view's ⬇ Download button (/image serves it inline for <img>/<video>)."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
