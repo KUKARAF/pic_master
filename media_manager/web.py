@@ -1596,6 +1596,18 @@ def create_app(data_root: str) -> FastAPI:
         media_type = VIDEO_MIME_TYPES.get(ext)   # None for images → FileResponse guesses
         return FileResponse(abs_path, media_type=media_type, headers=IMMUTABLE_CACHE_HEADERS)
 
+    @app.get('/download/{file_id}')
+    def download_file(file_id: int):
+        """The original file as an attachment under its own filename — the video
+        view's ⬇ Download button (/image streams inline for the <video> element)."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None:
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        ext = os.path.splitext(abs_path)[1].lower()
+        return FileResponse(abs_path, media_type=VIDEO_MIME_TYPES.get(ext),
+                            filename=os.path.basename(abs_path))
+
     @app.get('/api/files/{file_id}/neighbors')
     def api_file_neighbors(file_id: int):
         _file_or_404(file_id)

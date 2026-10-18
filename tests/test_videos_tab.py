@@ -25,7 +25,9 @@ from media_manager.web import create_app
 def _new_app():
     tmp = tempfile.mkdtemp()
     os.makedirs(os.path.join(tmp, '.media'), exist_ok=True)
-    return create_app(tmp)
+    app = create_app(tmp)
+    app.state.test_root = tmp   # where /download looks for the seeded files
+    return app
 
 
 def _seed(app):
@@ -88,6 +90,22 @@ def run():
     ids, _sizes, _total = _walk(client, 2, sort='filename', order='asc')
     assert ids == [fid[n] for n in ('v0.mp4', 'v2.mp4', 'v3.mp4', 'v4.mp4', 'v6.webm')], ids
 
+    # ⬇ Download: the original bytes as an attachment under the file's own name,
+    # and the button on the video's own page.
+    vid = fid['v0.mp4']
+    abs_path = os.path.join(app.state.test_root, 'v0.mp4')
+    with open(abs_path, 'wb') as f:
+        f.write(b'fake-mp4-bytes')
+    d = client.get('/download/%d' % vid)
+    assert d.status_code == 200, d.status_code
+    assert d.content == b'fake-mp4-bytes'
+    assert d.headers['content-disposition'].startswith('attachment'), d.headers
+    assert 'v0.mp4' in d.headers['content-disposition'], d.headers
+    page = client.get('/photo/%d' % vid)
+    assert page.status_code == 200, page.status_code
+    assert 'href="/download/%d"' % vid in page.text
+    assert client.get('/download/999999').status_code == 404
+
     # Empty library -> empty state, no grid.
     empty = TestClient(_new_app()).get('/videos')
     assert empty.status_code == 200 and 'No videos yet' in empty.text
@@ -96,6 +114,7 @@ def run():
     print('OK  /videos ids:', sorted(expected))
     print('OK  /api/videos pagination (added desc/asc, filename)')
     print('OK  nav active + empty state')
+    print('OK  /download attachment + button on the video page')
     print('ALL ASSERTIONS PASSED')
 
 
