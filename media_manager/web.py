@@ -1999,6 +1999,86 @@ def create_app(data_root: str) -> FastAPI:
             'all_categories': _all_categories_for_nav(),
         })
 
+    UPLOAD_CHUNK = 1 << 20
+
+    def _upload_target_dir(folder):
+        """Absolute dir for a /files upload into `folder` (relative to data_root, '' =
+        root). Refuses anything resolving outside data_root (../, symlink escapes) and
+        the app's own .media store, and a folder that isn't on disk."""
+        folder = (folder or '').strip('/')
+        root = os.path.realpath(data_root)
+        target = os.path.realpath(os.path.join(root, folder))
+        if target != root and not target.startswith(root + os.sep):
+            raise HTTPException(status_code=400, detail='Folder is outside the library')
+        rel = os.path.relpath(target, root)
+        if rel.split(os.sep)[0] == '.media':
+            raise HTTPException(status_code=400, detail="Can't upload into .media")
+        if not os.path.isdir(target):
+            raise HTTPException(status_code=404, detail='Folder not found on disk')
+        return target, ('' if rel == '.' else rel.replace(os.sep, '/'))
+
+    def _unique_upload_name(target_dir, name):
+        """`name`, or 'stem (1).ext', 'stem (2).ext', … — an upload never overwrites."""
+        stem, ext = os.path.splitext(name)
+        candidate, n = name, 0
+        while os.path.exists(os.path.join(target_dir, candidate)):
+            n += 1
+            candidate = f'{stem} ({n}){ext}'
+        return candidate
+
+    def _index_uploads_in_background(items):
+        """EXIF date/GPS + CLIP embedding for freshly uploaded files, off the request
+        thread so a big batch returns immediately (both are what a scan would do)."""
+        def _run():
+            for file_id, abs_path, is_image in items:
+                taken_at, gps_lat, gps_lon = exif_reader.extract_exif_metadata(abs_path)
+                db.update_file_metadata(file_id, taken_at, gps_lat, gps_lon)
+                if is_image:
+                    _ensure_file_embedding(file_id, abs_path)   # best-effort, logs
+        threading.Thread(target=_run, daemon=True, name='upload-index').start()
+
+    @app.post('/api/files/upload')
+    def api_upload_files(folder: str = Form(''), files: List[UploadFile] = File(...)):
+        """The /files page's ⬆ Upload: save each media file into `folder` (never
+        overwriting — a clash gets ' (n)'), track it with the same full-file xxh64
+        checksum a scan computes, then EXIF/CLIP-index it in the background.
+        Non-media files are skipped and reported."""
+        target_dir, rel_folder = _upload_target_dir(folder)
+        saved, skipped, to_index = [], [], []
+        for up in files:
+            name = os.path.basename((up.filename or '').replace('\\', '/')).strip()
+            ext = os.path.splitext(name)[1].lower()
+            if not name or name.startswith('.') or ext not in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS):
+                skipped.append({'name': up.filename or '', 'reason': 'not an image or video'})
+                continue
+            final_name = _unique_upload_name(target_dir, name)
+            abs_path = os.path.join(target_dir, final_name)
+            tmp_path = os.path.join(target_dir, f'.{final_name}.{os.getpid()}.upload')
+            hasher, size = xxhash.xxh64(), 0
+            try:
+                with open(tmp_path, 'wb') as out:
+                    while (chunk := up.file.read(UPLOAD_CHUNK)):
+                        hasher.update(chunk)
+                        out.write(chunk)
+                        size += len(chunk)
+                os.replace(tmp_path, abs_path)
+            except OSError as exc:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+                skipped.append({'name': name, 'reason': f'could not save: {exc.strerror or exc}'})
+                continue
+            checksum = hasher.hexdigest()
+            duplicate = db.get_file_by_checksum(checksum) is not None
+            rel_path = f'{rel_folder}/{final_name}' if rel_folder else final_name
+            file_id = db.upsert_file_path(rel_path, checksum, size=size,
+                                          modified_time=int(os.path.getmtime(abs_path)))
+            db.conn.commit()
+            saved.append({'id': file_id, 'name': final_name, 'duplicate': duplicate})
+            to_index.append((file_id, abs_path, ext in IMAGE_EXTENSIONS))
+        if to_index:
+            _index_uploads_in_background(to_index)
+        return {'saved': saved, 'skipped': skipped}
+
     # --- Phone-first swipe-down browse feeds (Unloved / Biggest / Random / Favorites) --
     def _feed_page(request, source, title, start_id=None):
         return templates.TemplateResponse(request, 'feed.html', {

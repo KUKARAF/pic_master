@@ -10,7 +10,11 @@
           title="Add every image/video under this folder to a set">＋ Use this folder…</button>
   <button type="button" id="folder-video-btn" data-folder="{{ folder }}" class="stage-btn-accent"
           title="Generate an AI morph video from every image in this folder, ordered by filename">🎬 Folder → video</button>
+  <button type="button" id="upload-btn" data-folder="{{ folder }}" class="stage-btn-accent"
+          title="Upload photos/videos into this folder (never overwrites — a name clash gets ' (1)')">⬆ Upload here</button>
+  <input type="file" id="upload-input" multiple accept="image/*,video/*" hidden>
 </div>
+<div id="upload-status" class="sub" style="display:none;margin-bottom:12px;"></div>
 
 <!-- Phone-first swipe-down browse feeds -->
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
@@ -88,6 +92,59 @@ function reloadWithFileFilters() {
 }
 document.getElementById('hide-with-face').addEventListener('change', reloadWithFileFilters);
 document.getElementById('hide-with-set').addEventListener('change', reloadWithFileFilters);
+
+// ⬆ Upload here — POST the picked files to /api/files/upload with this folder, show
+// upload progress (XHR: fetch has no upload-progress events), then reload so the new
+// files appear in the listing.
+(function () {
+  var btn = document.getElementById('upload-btn');
+  var input = document.getElementById('upload-input');
+  var status = document.getElementById('upload-status');
+  btn.addEventListener('click', function () { input.click(); });
+  input.addEventListener('change', function () {
+    if (!input.files.length) return;
+    var form = new FormData();
+    form.append('folder', btn.dataset.folder);
+    for (var i = 0; i < input.files.length; i++) form.append('files', input.files[i]);
+    var n = input.files.length;
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/files/upload');
+    btn.disabled = true;
+    status.style.display = 'block';
+    status.textContent = 'Uploading ' + n + ' file' + (n === 1 ? '' : 's') + '…';
+    xhr.upload.addEventListener('progress', function (e) {
+      if (e.lengthComputable) {
+        status.textContent = 'Uploading ' + n + ' file' + (n === 1 ? '' : 's') + '… ' +
+          Math.round(100 * e.loaded / e.total) + '%';
+      }
+    });
+    xhr.addEventListener('load', function () {
+      btn.disabled = false;
+      input.value = '';
+      var d = {};
+      try { d = JSON.parse(xhr.responseText); } catch (err) { d = {}; }
+      if (xhr.status !== 200) {
+        status.textContent = 'Upload failed: ' + (d.detail || xhr.status);
+        return;
+      }
+      var saved = d.saved || [], skipped = d.skipped || [];
+      var dups = saved.filter(function (f) { return f.duplicate; }).length;
+      var msg = 'Uploaded ' + saved.length + ' file' + (saved.length === 1 ? '' : 's');
+      if (dups) msg += ' (' + dups + ' already in the library elsewhere)';
+      if (skipped.length) {
+        msg += ' · skipped ' + skipped.length + ': ' +
+          skipped.map(function (f) { return f.name + ' (' + f.reason + ')'; }).join(', ');
+      }
+      status.textContent = msg;
+      if (saved.length) setTimeout(function () { window.location.reload(); }, skipped.length ? 4000 : 1200);
+    });
+    xhr.addEventListener('error', function () {
+      btn.disabled = false;
+      status.textContent = 'Upload failed: network error';
+    });
+    xhr.send(form);
+  });
+})();
 
 document.getElementById('use-folder-btn').addEventListener('click', function () {
   var folder = this.dataset.folder;
