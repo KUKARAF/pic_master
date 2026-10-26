@@ -226,6 +226,35 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
         return worker_protocol.pack({"error": str(e)})
 
 
+def handle_region(path, data, request_id, link_id, remote_identity, requested_at):
+    """Instance-level region search (region_index.py), DINOv2 on the worker's compute device.
+      req {image, box}  -> {vecs: float32 bytes (S, DIM), n: S, algo}                  (query)
+      req {image}       -> {windows: int8 bytes (n, DIM), n, pts: f16 bytes (k, 2),
+                            desc: u8 bytes (k, 128), nkp: k, algo}                      (index)"""
+    name = None
+    try:
+        from media_manager import region_index as ri  # hook-allow: lazy — pulls torch/cv2
+        req = worker_protocol.unpack(data)
+        name = req.get("name")
+        pil = ri.load_pil(req["image"])
+        if pil is None:
+            return worker_protocol.pack({"error": "could not decode image"})
+        with models.lock:
+            if req.get("box") is not None:
+                v = ri.describe_query(pil, req["box"])
+                out = {"vecs": v.tobytes(), "n": int(v.shape[0])}
+            else:
+                w, pts, desc = ri.describe_image(pil)
+                out = {"windows": w.tobytes(), "n": int(w.shape[0]),
+                       "pts": pts.tobytes(), "desc": desc.tobytes(), "nkp": int(pts.shape[0])}
+        print(f"[worker] handled {worker_protocol.PATH_REGION} ({name}) -> {out['n']} vectors", flush=True)
+        return worker_protocol.pack({**out, "algo": ri.ALGO_TAG, "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_REGION} ({name}) -> ERROR {e}", flush=True)
+        return worker_protocol.pack({"error": str(e)})
+
+
 def handle_detect_faces(path, data, request_id, link_id, remote_identity, requested_at):
     name = None
     tmp = None
@@ -951,6 +980,7 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
     worker_protocol.PATH_PATTERN: handle_pattern,
+    worker_protocol.PATH_REGION: handle_region,
     worker_protocol.PATH_DETECT_FACES: handle_detect_faces,
     worker_protocol.PATH_EMBED_BBOX: handle_embed_bbox,
     worker_protocol.PATH_NORMALIZE_FACES: handle_normalize_faces,

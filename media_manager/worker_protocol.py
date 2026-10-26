@@ -47,10 +47,14 @@ PATH_IMDB_BUILD_END = "imdb_build_end"
 PATH_IMDB_STATUS = "imdb_status"
 PATH_IMDB_SEARCH = "imdb_search"
 PATH_PATTERN = "pattern_descriptor"
+# Instance-level region search (region_index.py): DINOv2 windows + RootSIFT for indexing,
+# DINOv2 query vectors for searching.
+PATH_REGION = "region_descriptor"
 
 ALL_PATHS = [
     PATH_PING,
     PATH_PATTERN,
+    PATH_REGION,
     PATH_DETECT_FACES,
     PATH_EMBED_BBOX,
     PATH_NORMALIZE_FACES,

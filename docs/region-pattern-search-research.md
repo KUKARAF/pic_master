@@ -301,3 +301,44 @@ Higher-end follow-up (only if E1-E4 miss target on textured-but-wide-baseline ca
 - SigLIP2 (timm `timm/ViT-B-16-SigLIP2-256`, apache-2.0, ungated, verified): https://arxiv.org/abs/2502.14786
 - FAISS (`faiss-cpu` 1.15.1, MIT, verified on PyPI): https://github.com/facebookresearch/faiss ; hnswlib 0.8.0 (PyPI, builds from source).
 - Verification caveats: literature accuracy figures are from memory (web search tool credits were exhausted); PyPI lookups for `romatch` and `lightglue` returned no JSON (install via git/`uv pip install romatch` per README should be checked before use); `transformers` 5.20.2, `kornia` 0.9.0 (needs Python >= 3.11; venv is 3.12, fine).
+
+---
+
+## 7. Integration into the app (shipped)
+
+Date: 2026-10-26. Same benchmark harness (`bench/harness.py`, 1739-image corpus, 66 region + 61
+pattern cases); the integrated methods call the production modules (`bench/methods/pattern_integrated.py`,
+`bench/methods/region_integrated.py`). Corpus windows reuse the prototypes' cached ResNet/DINO tensors
+(identical to the production describe code up to fp16 cache noise, spot-checked), so only index
+*compression* and the query/scoring code are exercised end to end.
+
+| path | mAP (all) | real | synthetic | HN above pos | stored / image |
+|---|---|---|---|---|---|
+| old pattern (LBP+HSV+Gabor) | .365 | .398 | | .098 | 8 KB |
+| E3 deep prototype (512-d fp16, uncompressed) | .757 | .678 | | 0 | 261 KB |
+| **pattern shipped** (`pattern_deep.py`, PCA-96 int8) | **.731** | .652 | .804 | 0 | 24 KB (2.4 GB / 100k) |
+| PCA-128 / PCA-192 (not shipped) | .741 / .753 | | | 0 | 32 / 48 KB |
+| CLIP tiles (old region) | .646 | .868 | .282 | .227 | 29 KB |
+| E1 prototype (tuned, 600 SIFT, fp16) | .720 | .918 | .395 | .091 | 101 KB |
+| **region shipped** (`region_index.py`, 300 SIFT, int8) | **.681** | .912 | .301 | .152 | 53 KB (5.3 GB / 100k) |
+| region with `MEDIA_REGION_SIFT_NFEAT=600` | .715 | .917 | .383 | .106 | 92 KB (9.2 GB / 100k) |
+
+Decisions / gaps:
+- **Pattern**: deep windows only. The classical-window z-score fusion (+0.03 mAP, .790) is NOT shipped:
+  the classical windows are ~2.7k per image at stride 32 over a 1024-px pyramid (hundreds of KB/image);
+  coarsening them was not benchmarked. A fixed whitening+PCA projection (fit once on the bench corpus
+  with `bench/fit_pattern_projection.py`, shipped in `media_manager/data/`) replaces the corpus-fitted one
+  so indexing stays incremental; PCA-96 costs .026 mAP vs uncompressed. Latency p50 ~0.7 s on the
+  loaded 4-core box (query = 3 ResNet passes + int8 scan of 1.7k images; the scan is O(library)).
+- **Region**: 300 RootSIFT features instead of 600 cost .034 mAP (hard-negative-above-positive 10.6% ->
+  15.2%, entirely in the 25 small-object synthetic cases; real cases unchanged). The budget is
+  `MEDIA_REGION_SIFT_NFEAT` (part of the algo tag; worker and web must agree). Not tried: on-demand
+  SIFT for the shortlist (would add ~0.2 s x 200 candidates to first queries).
+  `object_encoder.py` was not reused for the encoder: it exposes only a fixed-224 CLS vector (and a
+  static-shape OpenVINO IR), while E1 needs dense 448-px token maps, so `region_index.py` loads the same
+  DINOv2-reg family (ViT-S/14) through torch.hub on the central compute device. Query p50 ~2.1 s on
+  this CPU-only box (DINO forward x3 dominates); the worker GPU should be faster.
+- The CLIP tile path stays as the fallback when no region index exists (response `mode: tiles|whole`;
+  the new path reports `mode: instance`). Existing CLIP tiles were computed on un-rotated pixels for
+  EXIF-rotated photos; re-run "Index regions (CLIP)" after clearing `tile_embeddings` if that matters.
+- Old `pattern_tiles` rows are left in place and ignored.

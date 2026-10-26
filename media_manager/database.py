@@ -443,6 +443,27 @@ class Database(ThreadLocalDB):
                 indexed_at INTEGER NOT NULL
             )
         ''')
+        # Region index (region_index.py, instance-level region search): int8 DINOv2 window
+        # descriptors (scanned on every query) and RootSIFT features (point-read for the
+        # shortlist) live in separate tables so the scan never walks SIFT overflow pages.
+        # One row per file, `algo`-versioned, n=0 = "indexed, nothing describable".
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS region_windows (
+                file_id INTEGER PRIMARY KEY,
+                algo TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS region_sift (
+                file_id INTEGER PRIMARY KEY,
+                n INTEGER NOT NULL,
+                pts BLOB NOT NULL,
+                desc BLOB NOT NULL
+            )
+        ''')
         # Place embeddings: one Visual-Place-Recognition descriptor per image for
         # "same physical location" retrieval, computed with people MASKED OUT (so a
         # location match keys on the scene/background, not who's in frame — unlike the
@@ -2042,7 +2063,8 @@ class Database(ThreadLocalDB):
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
                       'object_region_embeddings',
                       'place_embeddings', 'place_keypoints',
-                      'pattern_tiles', 'pattern_windows', 'file_category_matches'):
+                      'pattern_tiles', 'pattern_windows', 'region_windows', 'region_sift',
+                      'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
         cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
         self.conn.commit()
@@ -2760,6 +2782,65 @@ class Database(ThreadLocalDB):
             matrix = (np.frombuffer(b''.join(blobs), np.int8).reshape(-1, dim)
                       if blobs else np.zeros((0, dim), np.int8))
             yield np.array(fids, np.int64), np.array(counts, np.int64), matrix
+
+    # --- region index (instance-level region search, region_index.py) ----------------
+    def insert_region_index(self, file_id: int, windows, pts, desc, algo: str) -> None:
+        """Replace a file's region-index rows (idempotent re-index). windows int8 (n, DIM),
+        pts float16 (k, 2), desc uint8 (k, 128); n == 0 records "nothing describable"."""
+        import numpy as np  # hook-allow: lazy — heavy
+        w = np.ascontiguousarray(windows, dtype=np.int8)
+        p = np.ascontiguousarray(pts, dtype=np.float16)
+        d = np.ascontiguousarray(desc, dtype=np.uint8)
+        cur = self.conn.cursor()
+        cur.execute('INSERT OR REPLACE INTO region_windows (file_id, algo, n, data, indexed_at) '
+                    'VALUES (?,?,?,?,?)', (file_id, algo, int(w.shape[0]), w.tobytes(), int(time.time())))
+        cur.execute('INSERT OR REPLACE INTO region_sift (file_id, n, pts, desc) VALUES (?,?,?,?)',
+                    (file_id, int(p.shape[0]), p.tobytes(), d.tobytes()))
+        self.conn.commit()
+
+    def count_region_indexed(self, algo: str) -> int:
+        row = self.conn.execute('SELECT COUNT(*) FROM region_windows WHERE algo = ?', (algo,)).fetchone()
+        return row[0] if row else 0
+
+    def get_unregion_indexed_files(self, algo: str) -> list:
+        """(id, path) for tracked files with no CURRENT-algo region_windows row."""
+        return self.conn.execute('''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN region_windows r ON r.file_id = f.id AND r.algo = ?
+            WHERE r.file_id IS NULL AND f.hidden = 0
+        ''', (algo,)).fetchall()
+
+    def iter_region_windows(self, algo: str, dim: int, files_per_chunk=400):
+        """Yield (file_ids int64[k], counts int64[k], matrix int8[sum(counts), dim]) over every
+        current-algo indexed file — the RAM-bounded prefilter scan (cf. iter_pattern_windows)."""
+        import numpy as np  # hook-allow: lazy — heavy
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT file_id, n, data FROM region_windows WHERE algo = ?', (algo,))
+        while True:
+            rows = cursor.fetchmany(files_per_chunk)
+            if not rows:
+                return
+            fids, counts, blobs = [], [], []
+            for file_id, n, blob in rows:
+                if len(blob) != n * dim:
+                    print(f"[iter_region_windows] WARNING: skipping file {file_id}: bad blob")
+                    continue
+                fids.append(file_id)
+                counts.append(n)
+                blobs.append(blob)
+            matrix = (np.frombuffer(b''.join(blobs), np.int8).reshape(-1, dim)
+                      if blobs else np.zeros((0, dim), np.int8))
+            yield np.array(fids, np.int64), np.array(counts, np.int64), matrix
+
+    def get_region_sift(self, file_id: int):
+        """(pts float16 (k, 2), desc uint8 (k, 128)) for one file, or None if not indexed."""
+        import numpy as np  # hook-allow: lazy — heavy
+        row = self.conn.execute('SELECT n, pts, desc FROM region_sift WHERE file_id = ?', (file_id,)).fetchone()
+        if row is None:
+            return None
+        n, pts, desc = row
+        return (np.frombuffer(pts, np.float16).reshape(n, 2), np.frombuffer(desc, np.uint8).reshape(n, 128))
 
     def get_tiles_for_file(self, file_id):
         """(x1, y1, x2, y2, embedding_bytes) for every tile of one file, in tile

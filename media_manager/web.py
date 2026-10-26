@@ -40,7 +40,7 @@ from pydantic import BaseModel
 
 from media_manager import (
     body_index, compute, czkawka, exif_reader, frames, geonames, gpu_search, near_dup,
-    object_index, pattern_deep, phasher, remote_index_builder, set_image,
+    object_index, pattern_deep, phasher, region_index, remote_index_builder, set_image,
     set_render, set_video, tile_index, video_decode, worker_client, worker_config,
 )
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
@@ -2982,10 +2982,88 @@ def create_app(data_root: str) -> FastAPI:
                 break
         return {'results': results}
 
+    # Instance-level region search (region_index.py): DINOv2 windows + RootSIFT/MAGSAC.
+    # Same offload shape as find-by-pattern — worker first, local fallback.
+    def _region_index_payload(image_bytes, name):
+        """(windows int8, sift pts f16, sift desc u8) for an image, or None if undecodable."""
+        wc = _worker_client
+        if wc is not None and wc.is_configured():
+            try:
+                return wc.region_index(image_bytes, region_index.ALGO_TAG, region_index.DIM, name)
+            except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
+                errors.log('region-index', f'worker unavailable, computing locally: {exc}')
+        pil = region_index.load_pil(image_bytes)
+        return None if pil is None else region_index.describe_image(pil)
+
+    def _region_query_vectors(image_bytes, pil, box, name='<query>'):
+        """float32 (3, DIM) DINO query vectors for the drawn box — worker first, local fallback."""
+        wc = _worker_client
+        if wc is not None and wc.is_configured():
+            try:
+                return wc.region_query(image_bytes, box, region_index.ALGO_TAG, name)
+            except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
+                errors.log('region-search', f'worker unavailable, computing locally: {exc}')
+        return region_index.describe_query(pil, box)
+
+    def _region_pending_files():
+        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
+        return [(fid, rel) for fid, rel in db.get_unregion_indexed_files(region_index.ALGO_TAG)
+                if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
+
+    @app.post('/api/region-index/start')
+    def api_region_index_start(include_trashed: bool = False):
+        """Build the instance-level region index: 35 int8 DINOv2 window descriptors + ~300
+        RootSIFT features per image (the worker computes them; local fallback). Only files
+        lacking the CURRENT algo are processed, so an ALGO_TAG bump re-indexes the library."""
+        if region_index_job['running']:
+            return {'started': False, 'message': 'Region matching index already running.'}
+        candidates = _drop_trashed([
+            (fid, os.path.join(data_root, rel)) for fid, rel in _region_pending_files()
+        ], include_trashed)
+        region_index_job.update(running=True, done=0, total=len(candidates), error=None)
+
+        def _run():
+            try:
+                done = 0
+                for fid, abs_path in candidates:
+                    try:
+                        with open(abs_path, 'rb') as f:
+                            image_bytes = f.read()
+                        payload = _region_index_payload(image_bytes, os.path.basename(abs_path))
+                        if payload is None:
+                            _mark_decode_failure(fid, abs_path, 'could not decode image (region-index)')
+                        else:
+                            db.insert_region_index(fid, *payload, region_index.ALGO_TAG)
+                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+                        errors.log(abs_path, f'region-index: {exc}')
+                    done += 1
+                    region_index_job['done'] = done
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
+                region_index_job['error'] = str(exc)
+            finally:
+                region_index_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': region_index_job['total']}
+
+    @app.get('/api/region-index/status')
+    def api_region_index_status():
+        return {
+            'running': region_index_job['running'],
+            'done': region_index_job['done'],
+            'total': region_index_job['total'],
+            'error': region_index_job['error'],
+            'pending': len(_region_pending_files()),
+        }
+
     @app.post('/api/files/{file_id}/region-search')
     def api_region_search(file_id: int, body: RegionSearchBody, limit: int = 50):
-        """Semantic 'search by region': CLIP-embed the drawn crop and rank the library's
-        whole-image embeddings by cosine similarity. Opens matches in the watch-queue."""
+        """'Search by region'. With the region matching index built (bulk -> Index region
+        matching) this is instance-level: DINOv2 windows prefilter the library, then RootSIFT +
+        MAGSAC homography verifies the top candidates against the drawn box (mode 'instance').
+        Without it, falls back to the semantic CLIP path: CLIP-embed the crop and rank the tile
+        index (mode 'tiles') or whole-image embeddings (mode 'whole'). Opens matches in the
+        watch-queue."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None or not os.path.isfile(abs_path):
@@ -2993,7 +3071,27 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = [float(v) for v in body.bbox]
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
-        crop = open_upright_rgb(abs_path).crop((x1, y1, x2, y2))  # box is in the EXIF-rotated frame
+        upright = open_upright_rgb(abs_path)  # box is in the EXIF-rotated frame
+        if db.count_region_indexed(region_index.ALGO_TAG) > 0:
+            with open(abs_path, 'rb') as f:
+                image_bytes = f.read()
+            q = _region_query_vectors(image_bytes, upright, [x1, y1, x2, y2])
+            qp, qd = region_index.query_sift(upright, [x1, y1, x2, y2])
+            scored_fids, scored = [], []
+            for file_ids, counts, matrix in db.iter_region_windows(region_index.ALGO_TAG, region_index.DIM):
+                scored_fids.append(file_ids)
+                scored.append(region_index.score_windows(matrix, counts, q))
+            if not scored_fids:
+                return {'mode': 'instance', 'results': []}
+            fids, scores = np.concatenate(scored_fids), np.concatenate(scored)
+            scores[fids == file_id] = -2.0   # never match the query photo itself
+            fused, inliers = region_index.rerank(fids, scores, qp, qd, db.get_region_sift)
+            order = top_k_indices(fused, min(len(fused), max(1, limit) + 1))
+            results = [{'file_id': int(fids[i]), 'score': round(float(fused[i]), 4),
+                        'inliers': inliers.get(int(fids[i]), 0)}
+                       for i in order if int(fids[i]) != file_id and scores[i] > -1.0]
+            return {'mode': 'instance', 'results': results[:limit]}
+        crop = upright.crop((x1, y1, x2, y2))
         embs = _get_clip_indexer().embed_pil_images([crop])
         if len(embs) == 0:
             raise HTTPException(status_code=500, detail='Could not embed the region.')
@@ -3204,6 +3302,7 @@ def create_app(data_root: str) -> FastAPI:
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
     broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
     pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    region_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Set → morph video (Wan FLF2V). One generation at a time (heavy, minutes/clip);
     # 'done'/'total' are FLF2V pairs completed; 'artifact_id' is set on success.
     generate_video_job = {'running': False, 'set_id': None, 'done': 0, 'total': 0,

@@ -45,7 +45,7 @@ class WorkerError(Exception):
     (read timeout, non-200 status, or an undecodable body)."""
 
 
-def _check_pattern_algo(resp: dict, algo: str) -> None:
+def _check_algo(resp: dict, algo: str) -> None:
     """Raise WorkerError on a worker-side error or when it answered with a different
     descriptor algo (an un-redeployed worker still serving the legacy classical format)."""
     if resp.get("error"):
@@ -334,7 +334,7 @@ class WorkerClient:
         self.record("pattern_query", name)
         resp = self.request(worker_protocol.PATH_PATTERN,
                             {"name": name, "image": image_bytes, "deep": True, "box": list(box)})
-        _check_pattern_algo(resp, algo)
+        _check_algo(resp, algo)
         if not resp.get("n"):
             return None
         return np.frombuffer(resp["queries"], np.float32).reshape(resp["n"], -1).copy()
@@ -345,8 +345,29 @@ class WorkerClient:
         self.record("pattern_index", name)
         resp = self.request(worker_protocol.PATH_PATTERN,
                             {"name": name, "image": image_bytes, "deep": True})
-        _check_pattern_algo(resp, algo)
+        _check_algo(resp, algo)
         return np.frombuffer(resp["windows"], np.int8).reshape(resp["n"], dim).copy()
+
+    def region_query(self, image_bytes: bytes, box, algo: str, name: str = "<query>"):
+        """DINOv2 query vectors float32 (3, DIM) for one drawn region (instance-level region
+        search). `box` is [x1,y1,x2,y2] in EXIF-upright image px. Raises WorkerError on
+        failure or an algo mismatch (un-redeployed worker)."""
+        self.record("region_query", name)
+        resp = self.request(worker_protocol.PATH_REGION,
+                            {"name": name, "image": image_bytes, "box": list(box)})
+        _check_algo(resp, algo)
+        return np.frombuffer(resp["vecs"], np.float32).reshape(resp["n"], -1).copy()
+
+    def region_index(self, image_bytes: bytes, algo: str, dim: int, name: str = "<image>"):
+        """Region-index payload for one image: (windows int8 (n, dim), sift pts float16 (k, 2),
+        sift desc uint8 (k, 128)). Same failure contract as region_query."""
+        self.record("region_index", name)
+        resp = self.request(worker_protocol.PATH_REGION, {"name": name, "image": image_bytes})
+        _check_algo(resp, algo)
+        k = resp["nkp"]
+        return (np.frombuffer(resp["windows"], np.int8).reshape(resp["n"], dim).copy(),
+                np.frombuffer(resp["pts"], np.float16).reshape(k, 2).copy(),
+                np.frombuffer(resp["desc"], np.uint8).reshape(k, 128).copy())
 
     # -- imdb: resident search index ---------------------------------------
     # The host (remote_index_builder.py) streams a matrix to the worker in bounded
