@@ -12,9 +12,8 @@ whole-image CLIP search).
 """
 import os
 
-from PIL import Image
 
-from .formats import IMAGE_EXTENSIONS
+from .formats import IMAGE_EXTENSIONS, open_upright_rgb
 
 # Tiles smaller than this on either side embed to noise, so drop them (matches the
 # degenerate-crop guard in body_index.crop_bodies).
@@ -85,10 +84,9 @@ def embed_tiles_for_file(db, clip_indexer, file_id, abs_path, model=None):
     Returns the number of tiles stored. A degenerate image with no valid tiles
     still stores nothing but doesn't error (generate_tiles always yields the whole
     tile for any image at least MIN_TILE_PX on both sides)."""
-    with Image.open(abs_path) as img:
-        img = img.convert('RGB')
-        boxes = generate_tiles(img.width, img.height)
-        crops = [img.crop(box) for box in boxes]
+    img = open_upright_rgb(abs_path)  # EXIF-upright: the frame region-search boxes are drawn in
+    boxes = generate_tiles(img.width, img.height)
+    crops = [img.crop(box) for box in boxes]
     tiles = []
     if crops:
         embeddings = clip_indexer.embed_pil_images(crops)

@@ -53,7 +53,7 @@ from media_manager.database import FACE_NORM_VERSION, Database
 from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
 from media_manager.error_log import ErrorLog
 from media_manager.face_detector import FaceDetector, _norm_angle
-from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES
+from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES, open_upright_rgb
 from media_manager.gen_service import ComfyUIClient
 from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
 from media_manager.media_manager import MediaManager, _parse_query
@@ -2993,9 +2993,7 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = [float(v) for v in body.bbox]
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
-        with PILImage.open(abs_path) as im:
-            crop = im.convert('RGB').crop((x1, y1, x2, y2))
-            crop.load()
+        crop = open_upright_rgb(abs_path).crop((x1, y1, x2, y2))  # box is in the EXIF-rotated frame
         embs = _get_clip_indexer().embed_pil_images([crop])
         if len(embs) == 0:
             raise HTTPException(status_code=500, detail='Could not embed the region.')

@@ -17,3 +17,14 @@ VIDEO_MIME_TYPES = {
 }
 # Everything worth scanning into the index (the scan gate uses this).
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+
+
+def open_upright_rgb(path_or_file):
+    """Open an image as RGB with its EXIF orientation applied, i.e. in the frame the
+    browser displays. Region/pattern boxes are drawn on that rotated view, so every
+    crop made from them (and every tile laid down at indexing) must use this frame."""
+    from PIL import Image, ImageOps  # hook-allow: lazy — keep this module import-light
+    with Image.open(path_or_file) as im:
+        out = ImageOps.exif_transpose(im).convert('RGB')
+        out.load()
+    return out
