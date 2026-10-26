@@ -45,6 +45,16 @@ class WorkerError(Exception):
     (read timeout, non-200 status, or an undecodable body)."""
 
 
+def _check_pattern_algo(resp: dict, algo: str) -> None:
+    """Raise WorkerError on a worker-side error or when it answered with a different
+    descriptor algo (an un-redeployed worker still serving the legacy classical format)."""
+    if resp.get("error"):
+        raise WorkerError(resp["error"])
+    if resp.get("algo") != algo:
+        raise WorkerError(f"worker pattern algo {resp.get('algo')!r} != expected {algo!r} "
+                          "(redeploy the worker)")
+
+
 # TCP connect timeout (seconds) — how long to wait to establish the HTTP
 # connection before declaring the worker unreachable. Kept short so a
 # configured-but-down worker fails fast rather than stalling a web request. (The
@@ -316,6 +326,27 @@ class WorkerClient:
             raise WorkerError(resp["error"])
         return [(t["bbox"], np.frombuffer(t["descriptor"], np.float32).copy())
                 for t in (resp.get("tiles") or [])]
+
+    def pattern_deep_query(self, image_bytes: bytes, box, algo: str, name: str = "<query>"):
+        """Deep-texture query vectors for one region (find-by-pattern): float32 (S, DIM), or
+        None when the crop is too small. `box` is [x1,y1,x2,y2] in EXIF-upright image px.
+        Raises WorkerError on failure or when the worker runs a different algo (stale worker)."""
+        self.record("pattern_query", name)
+        resp = self.request(worker_protocol.PATH_PATTERN,
+                            {"name": name, "image": image_bytes, "deep": True, "box": list(box)})
+        _check_pattern_algo(resp, algo)
+        if not resp.get("n"):
+            return None
+        return np.frombuffer(resp["queries"], np.float32).reshape(resp["n"], -1).copy()
+
+    def pattern_deep_index(self, image_bytes: bytes, algo: str, dim: int, name: str = "<image>"):
+        """Deep-texture window descriptors for one image (find-by-pattern indexing): int8
+        (n, dim); (0, dim) when nothing describable. Same failure contract as above."""
+        self.record("pattern_index", name)
+        resp = self.request(worker_protocol.PATH_PATTERN,
+                            {"name": name, "image": image_bytes, "deep": True})
+        _check_pattern_algo(resp, algo)
+        return np.frombuffer(resp["windows"], np.int8).reshape(resp["n"], dim).copy()
 
     # -- imdb: resident search index ---------------------------------------
     # The host (remote_index_builder.py) streams a matrix to the worker in bounded

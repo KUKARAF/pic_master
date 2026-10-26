@@ -172,14 +172,35 @@ def handle_ping(path, data, request_id, link_id, remote_identity, requested_at):
 
 
 def handle_pattern(path, data, request_id, link_id, remote_identity, requested_at):
-    """Find-by-pattern descriptor(s). Pure numpy+OpenCV — no model/GPU, no models.lock.
+    """Find-by-pattern descriptors.
+      req {image, deep, box}      -> {queries: float32 bytes (S, DIM), n: S, algo}   (deep query)
+      req {image, deep}           -> {windows: int8 bytes (n, DIM), n, algo}         (deep index)
+    `deep` selects the pattern_deep.py (ResNet18 window) pipeline — torch/timm, runs under
+    models.lock on the worker's compute device. Without `deep` the legacy classical
+    descriptor is served (numpy+OpenCV only):
       req {image, boxes}      -> {descriptors: [bytes,...]}  (one per box; for the query)
       req {image} (no boxes)  -> {tiles: [{bbox, descriptor}]} (auto grid; for indexing)"""
     name = None
     try:
-        from media_manager import pattern_descriptor as pd  # hook-allow: lazy — pulls cv2
         req = worker_protocol.unpack(data)
         name = req.get("name")
+        if req.get("deep"):
+            from media_manager import pattern_deep as pdeep  # hook-allow: lazy — pulls torch/timm
+            rgb = pdeep.load_rgb(req["image"])
+            if rgb is None:
+                return worker_protocol.pack({"error": "could not decode image"})
+            with models.lock:
+                if req.get("box") is not None:
+                    q = pdeep.describe_query(rgb, req["box"])
+                    out = {"queries": q.tobytes() if q is not None else b"",
+                           "n": 0 if q is None else int(q.shape[0])}
+                else:
+                    w = pdeep.describe_image(rgb)
+                    out = {"windows": w.tobytes(), "n": int(w.shape[0])}
+            print(f"[worker] handled {worker_protocol.PATH_PATTERN} ({name}) -> deep {out['n']} vectors",
+                  flush=True)
+            return worker_protocol.pack({**out, "algo": pdeep.ALGO_TAG, "error": None})
+        from media_manager import pattern_descriptor as pd  # hook-allow: lazy — pulls cv2
         bgr = pd.decode_bgr(req["image"])
         if bgr is None:
             return worker_protocol.pack({"error": "could not decode image"})

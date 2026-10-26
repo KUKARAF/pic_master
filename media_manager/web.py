@@ -40,7 +40,7 @@ from pydantic import BaseModel
 
 from media_manager import (
     body_index, compute, czkawka, exif_reader, frames, geonames, gpu_search, near_dup,
-    object_index, pattern_descriptor, phasher, remote_index_builder, set_image,
+    object_index, pattern_deep, phasher, remote_index_builder, set_image,
     set_render, set_video, tile_index, video_decode, worker_client, worker_config,
 )
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
@@ -3036,54 +3036,51 @@ def create_app(data_root: str) -> FastAPI:
         return {'mode': 'whole', 'results': results}
 
     # ------------------------------------------------------------------
-    # Find-by-pattern: classical texture/colour matching (see pattern_descriptor.py).
-    # The WORKER does the descriptor compute (like the CLIP/face offloads); the web
-    # only orchestrates + stores. Falls back to local compute when the worker is
-    # unavailable (surfaced in the error log, per no-silent-failures).
+    # Find-by-pattern: native-scale deep texture windows (see pattern_deep.py). The WORKER
+    # does the compute (like the CLIP/face offloads); the web only orchestrates + stores.
+    # Falls back to local compute when the worker is unavailable or stale (surfaced in the
+    # error log, per no-silent-failures).
     # ------------------------------------------------------------------
-    def _pattern_index_tiles(image_bytes, name):
-        """[(bbox, descriptor np.ndarray)] for an image's auto tile grid — worker first,
-        local fallback. Returns None (not []) when the image can't be decoded at all, so
-        the caller can mark it damaged; [] means decoded-but-no-describable-tiles."""
+    def _pattern_index_windows(image_bytes, name):
+        """int8 (n, DIM) window descriptors for an image — worker first, local fallback.
+        Returns None (not an empty array) when the image can't be decoded at all, so the
+        caller can mark it damaged; (0, DIM) means decoded-but-too-small."""
         wc = _worker_client
         if wc is not None and wc.is_configured():
             try:
-                return wc.pattern_index(image_bytes, name)
+                return wc.pattern_deep_index(image_bytes, pattern_deep.ALGO_TAG, pattern_deep.DIM, name)
             except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
                 errors.log('pattern-index', f'worker unavailable, computing locally: {exc}')
-        bgr = pattern_descriptor.decode_bgr(image_bytes)
-        if bgr is None:
-            return None  # decode failure — distinct from [] (decoded, no tiles)
-        h, w = bgr.shape[:2]
-        tiles = generate_tiles(w, h)
-        descs = pattern_descriptor.descriptors_for_boxes(bgr, [list(t) for t in tiles])
-        return [(list(tiles[i]), descs[i]) for i in range(len(tiles)) if descs[i] is not None]
+        rgb = pattern_deep.load_rgb(image_bytes)
+        return None if rgb is None else pattern_deep.describe_image(rgb)
 
-    def _pattern_query_descriptor(image_bytes, box, name='<query>'):
-        """One region's pattern descriptor — worker first, local fallback."""
+    def _pattern_query_vectors(image_bytes, box, name='<query>'):
+        """float32 (S, DIM) query vectors for one region — worker first, local fallback."""
         wc = _worker_client
         if wc is not None and wc.is_configured():
             try:
-                return wc.pattern_query(image_bytes, box, name)
+                return wc.pattern_deep_query(image_bytes, box, pattern_deep.ALGO_TAG, name)
             except Exception as exc:  # hook-allow: broad — remote worker can fail any way; fall back/report
                 errors.log('pattern-search', f'worker unavailable, computing locally: {exc}')
-        bgr = pattern_descriptor.decode_bgr(image_bytes)
-        if bgr is None:
-            return None
-        return pattern_descriptor.descriptors_for_boxes(bgr, [box])[0]
+        rgb = pattern_deep.load_rgb(image_bytes)
+        return None if rgb is None else pattern_deep.describe_query(rgb, box)
+
+    def _pattern_pending_files():
+        """Image files with no current-algo pattern index (an ALGO_TAG bump re-queues all)."""
+        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
+        return [(fid, rel) for fid, rel in db.get_unpattern_indexed_files(pattern_deep.ALGO_TAG)
+                if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
 
     @app.post('/api/pattern-index/start')
     def api_pattern_index_start(include_trashed: bool = False):
-        """Build the find-by-pattern index: a classical texture/colour descriptor per
-        grid tile for every image. The worker computes the descriptors (web sends the
-        image bytes); falls back to local compute if the worker is down. CPU-only."""
-        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
-
+        """Build the find-by-pattern index: ~250 int8 deep-texture window descriptors per
+        image. The worker computes them (web sends the image bytes); falls back to local
+        compute if the worker is down. Only files lacking the CURRENT algo are processed,
+        so a new ALGO_TAG re-indexes the library."""
         if pattern_index_job['running']:
             return {'started': False, 'message': 'Pattern indexing already running.'}
         candidates = _drop_trashed([
-            (fid, os.path.join(data_root, rel)) for fid, rel in db.get_unpattern_indexed_files(limit=None)
-            if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS
+            (fid, os.path.join(data_root, rel)) for fid, rel in _pattern_pending_files()
         ], include_trashed)
         pattern_index_job.update(running=True, done=0, total=len(candidates), error=None)
 
@@ -3094,13 +3091,11 @@ def create_app(data_root: str) -> FastAPI:
                     try:
                         with open(abs_path, 'rb') as f:
                             image_bytes = f.read()
-                        tiles = _pattern_index_tiles(image_bytes, os.path.basename(abs_path))
-                        if tiles is None:
+                        windows = _pattern_index_windows(image_bytes, os.path.basename(abs_path))
+                        if windows is None:
                             _mark_decode_failure(fid, abs_path, 'could not decode image (pattern-index)')
-                        elif tiles:
-                            db.insert_pattern_tiles(
-                                fid, [{'bbox': b, 'descriptor': d} for b, d in tiles],
-                                pattern_descriptor.ALGO_TAG)
+                        else:
+                            db.insert_pattern_windows(fid, windows, pattern_deep.ALGO_TAG)
                     except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
                         errors.log(abs_path, f'pattern-index: {exc}')
                     done += 1
@@ -3120,15 +3115,15 @@ def create_app(data_root: str) -> FastAPI:
             'done': pattern_index_job['done'],
             'total': pattern_index_job['total'],
             'error': pattern_index_job['error'],
-            'pending': len(db.get_unpattern_indexed_files()),
+            'pending': len(_pattern_pending_files()),
         }
 
     @app.post('/api/files/{file_id}/pattern-search')
     def api_pattern_search(file_id: int, body: RegionSearchBody, limit: int = 50):
-        """Find-by-pattern: describe the drawn region's texture/colour and rank the
-        library by each photo's BEST-matching pattern tile. Different mechanism from
-        region-search (which is CLIP/semantic) — this finds the same *pattern*, not the
-        same *thing*. Needs the pattern index (run 'Index patterns' first)."""
+        """Find-by-pattern: describe the drawn region's texture at its native pixel scale
+        and rank the library by each photo's BEST-matching texture window. Different
+        mechanism from region-search (CLIP/semantic) — this finds the same *pattern*, not
+        the same *thing*. Needs the pattern index (run 'Index patterns' first)."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None or not os.path.isfile(abs_path):
@@ -3136,29 +3131,25 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = [float(v) for v in body.bbox]
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
-        if db.count_pattern_indexed() == 0:
+        if db.count_pattern_indexed(pattern_deep.ALGO_TAG) == 0:
             raise HTTPException(status_code=400, detail='No pattern index yet — run "Index patterns" on /bulk.')
         with open(abs_path, 'rb') as f:
             image_bytes = f.read()
-        query = _pattern_query_descriptor(image_bytes, [x1, y1, x2, y2])
-        if query is None:
-            raise HTTPException(status_code=500, detail='Could not describe that region.')
+        queries = _pattern_query_vectors(image_bytes, [x1, y1, x2, y2])
+        if queries is None:
+            raise HTTPException(status_code=400, detail='Region too small to describe a texture.')
 
-        q = np.asarray(query, dtype=np.float32)
-        best = {}   # file_id -> best tile cosine
-        for file_ids, matrix in db.iter_pattern_tiles():
-            if matrix.shape[0] == 0 or matrix.shape[1] != q.shape[0]:
-                continue   # dim mismatch = a stale-algo descriptor; skip it
-            scores = matrix.dot(q)
-            for idx in range(scores.shape[0]):
-                fid = int(file_ids[idx])
-                if fid == file_id:
-                    continue
-                s = float(scores[idx])
-                if s > best.get(fid, -1.0):
-                    best[fid] = s
-        ranked = sorted(best.items(), key=lambda kv: -kv[1])[:limit]
-        return {'mode': 'pattern', 'results': [{'file_id': fid, 'score': round(s, 4)} for fid, s in ranked]}
+        scored_fids, scored = [], []
+        for file_ids, counts, matrix in db.iter_pattern_windows(pattern_deep.ALGO_TAG, pattern_deep.DIM):
+            scored_fids.append(file_ids)
+            scored.append(pattern_deep.score_windows(matrix, counts, queries))
+        if not scored:
+            return {'mode': 'pattern', 'results': []}
+        fids, scores = np.concatenate(scored_fids), np.concatenate(scored)
+        order = [i for i in top_k_indices(scores, min(len(scores), max(1, limit) + 1))]
+        results = [{'file_id': int(fids[i]), 'score': round(float(scores[i]), 4)}
+                   for i in order if int(fids[i]) != file_id and scores[i] > -1.0]
+        return {'mode': 'pattern', 'results': results[:limit]}
 
     # ------------------------------------------------------------------
     # Find-by-body: person re-ID by outfit/build (see body_index.py).

@@ -24,6 +24,8 @@ open_clip_torch
 # no manual re-pin is needed. Bump these deliberately to move to a newer torch-xpu.
 torch==2.7.1
 torchvision==0.22.1
+# find-by-pattern deep texture windows (pattern_deep.py): ResNet18 a1_in1k weights via timm.
+timm
 # The `media worker` offload feature (worker_*.py): the worker is a local HTTP
 # service (FastAPI/uvicorn, above) and the client talks to it with `requests`;
 # both sides serialize msgpack dicts (raw bytes / float32 embeddings round-trip).

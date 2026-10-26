@@ -430,6 +430,19 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_file ON pattern_tiles(file_id)')
+        # Pattern windows: the current find-by-pattern index (pattern_deep.py) — ONE row per
+        # file holding all its int8 window descriptors back to back (n * DIM bytes), `algo`
+        # versioning it. n=0 marks "indexed, nothing describable" so it isn't retried.
+        # Supersedes pattern_tiles (left in place, ignored). Derived + rebuildable.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pattern_windows (
+                file_id INTEGER PRIMARY KEY,
+                algo TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
         # Place embeddings: one Visual-Place-Recognition descriptor per image for
         # "same physical location" retrieval, computed with people MASKED OUT (so a
         # location match keys on the scene/background, not who's in frame — unlike the
@@ -2029,7 +2042,7 @@ class Database(ThreadLocalDB):
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
                       'object_region_embeddings',
                       'place_embeddings', 'place_keypoints',
-                      'pattern_tiles', 'file_category_matches'):
+                      'pattern_tiles', 'pattern_windows', 'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
         cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
         self.conn.commit()
@@ -2695,75 +2708,58 @@ class Database(ThreadLocalDB):
         row = cursor.fetchone()
         return row[0] if row else 0
 
-    # --- pattern tiles (find-by-pattern) ---------------------------------------------
-    def insert_pattern_tiles(self, file_id: int, tiles: list, algo: str) -> None:
-        """Replace the pattern-tile rows for a file (idempotent re-index).
-        tiles: [{'bbox': [x1,y1,x2,y2], 'descriptor': np.ndarray}, ...] in ORIGINAL px."""
+    # --- pattern windows (find-by-pattern, pattern_deep.py) ---------------------------
+    def insert_pattern_windows(self, file_id: int, windows, algo: str) -> None:
+        """Replace a file's window descriptors (idempotent re-index).
+        windows: int8 ndarray (n, DIM); n == 0 records "indexed, nothing describable"."""
         import numpy as np  # hook-allow: lazy — heavy
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM pattern_tiles WHERE file_id = ?', (file_id,))
-        now = int(time.time())
-        for tile_index, tile in enumerate(tiles):
-            x1, y1, x2, y2 = tile['bbox']
-            cursor.execute(
-                'INSERT INTO pattern_tiles (file_id, tile_index, x1, y1, x2, y2, descriptor, algo, indexed_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?)',
-                (file_id, tile_index, x1, y1, x2, y2,
-                 np.asarray(tile['descriptor'], np.float32).tobytes(), algo, now))
+        arr = np.ascontiguousarray(windows, dtype=np.int8)
+        self.conn.execute(
+            'INSERT OR REPLACE INTO pattern_windows (file_id, algo, n, data, indexed_at) VALUES (?,?,?,?,?)',
+            (file_id, algo, int(arr.shape[0]), arr.tobytes(), int(time.time())))
         self.conn.commit()
 
-    def count_pattern_indexed(self) -> int:
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM pattern_tiles')
-        row = cursor.fetchone()
+    def count_pattern_indexed(self, algo: str) -> int:
+        """Files with a current-algo pattern index row (stale-algo rows don't count)."""
+        row = self.conn.execute(
+            'SELECT COUNT(*) FROM pattern_windows WHERE algo = ?', (algo,)).fetchone()
         return row[0] if row else 0
 
-    def get_unpattern_indexed_files(self, limit=None) -> list:
-        """(id, path) for tracked files with NO pattern_tiles row. Caller skips non-images."""
-        cursor = self.conn.cursor()
+    def get_unpattern_indexed_files(self, algo: str, limit=None) -> list:
+        """(id, path) for tracked files with no CURRENT-algo pattern_windows row — so an
+        algorithm bump re-queues everything. Caller skips non-images."""
         sql = '''
             SELECT f.id, f.path
             FROM files_with_path f
-            LEFT JOIN pattern_tiles p ON p.file_id = f.id
+            LEFT JOIN pattern_windows p ON p.file_id = f.id AND p.algo = ?
             WHERE p.file_id IS NULL AND f.hidden = 0
         '''
         if limit is not None:
-            cursor.execute(sql + ' LIMIT ?', (limit,))
-        else:
-            cursor.execute(sql)
-        return cursor.fetchall()
+            return self.conn.execute(sql + ' LIMIT ?', (algo, limit)).fetchall()
+        return self.conn.execute(sql, (algo,)).fetchall()
 
-    def iter_pattern_tiles(self, batch_size=20000):
-        """Yield (file_ids: int64[k], matrix: float32[k, D]) chunks over ALL pattern
-        tiles — the RAM-bounded find-by-pattern search primitive (mirrors
-        iter_tile_embeddings). Malformed blobs are skipped with a WARNING."""
+    def iter_pattern_windows(self, algo: str, dim: int, files_per_chunk=400):
+        """Yield (file_ids: int64[k], counts: int64[k], matrix: int8[sum(counts), dim]) over
+        every current-algo indexed file — the RAM-bounded find-by-pattern scan primitive.
+        Malformed blobs are skipped with a WARNING."""
         import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
-        cursor.execute('SELECT id, file_id, descriptor FROM pattern_tiles ORDER BY id')
-        batch_fids, batch_blobs, D = [], [], None
-
-        def _flush():
-            fids = np.array(batch_fids, dtype=np.int64)
-            matrix = np.frombuffer(b''.join(batch_blobs), np.float32).reshape(len(batch_blobs), D)
-            return fids, matrix
-
-        for row_id, file_id, blob in cursor:
-            if not blob or (len(blob) % 4) != 0:
-                print(f"[iter_pattern_tiles] WARNING: skipping row {row_id} (file {file_id}): bad blob")
-                continue
-            row_D = len(blob) // 4
-            if D is None:
-                D = row_D
-            elif row_D != D:
-                print(f"[iter_pattern_tiles] WARNING: skipping row {row_id} (file {file_id}): D={row_D}!={D}")
-                continue
-            batch_fids.append(file_id)
-            batch_blobs.append(blob)
-            if len(batch_blobs) >= batch_size:
-                yield _flush()
-                batch_fids, batch_blobs = [], []
-        if batch_blobs:
-            yield _flush()
+        cursor.execute('SELECT file_id, n, data FROM pattern_windows WHERE algo = ?', (algo,))
+        while True:
+            rows = cursor.fetchmany(files_per_chunk)
+            if not rows:
+                return
+            fids, counts, blobs = [], [], []
+            for file_id, n, blob in rows:
+                if len(blob) != n * dim:
+                    print(f"[iter_pattern_windows] WARNING: skipping file {file_id}: bad blob")
+                    continue
+                fids.append(file_id)
+                counts.append(n)
+                blobs.append(blob)
+            matrix = (np.frombuffer(b''.join(blobs), np.int8).reshape(-1, dim)
+                      if blobs else np.zeros((0, dim), np.int8))
+            yield np.array(fids, np.int64), np.array(counts, np.int64), matrix
 
     def get_tiles_for_file(self, file_id):
         """(x1, y1, x2, y2, embedding_bytes) for every tile of one file, in tile
