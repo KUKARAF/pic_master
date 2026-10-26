@@ -80,4 +80,27 @@ Baseline timings are CPU (CLIP: `device=cpu`, no GPU locally).
 
 ## Baseline results
 
-BASELINE_TABLE
+Corpus 1739 images; 66 region cases (41 real, 25 synthetic), 61 pattern cases (29 real, 32 synthetic).
+CPU only, measured while the machine was heavily loaded (index times are pessimistic).
+
+Region, `baseline_clip_tiles` (index ~5 s/img under load, 28 KiB/img; query p50 179 ms, p95 200 ms):
+
+| split | R@1 | R@5 | R@10 | R@50 | H@1 | MRR | mAP | HN@10 | HN>pos | conf@10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| all | 0.144 | 0.571 | 0.720 | 0.821 | 0.682 | 0.778 | 0.646 | 0.470 | 0.227 | 0.083 |
+| real | 0.201 | 0.718 | 0.885 | 0.925 | 0.976 | 0.982 | 0.868 | 0.268 | 0.000 | 0.032 |
+| synthetic | 0.050 | 0.330 | 0.450 | 0.650 | 0.200 | 0.444 | 0.282 | 0.800 | 0.600 | 0.168 |
+
+Pattern, `baseline_pattern_lbp` (index 87 ms/img, 8 KiB/img; query p50 19 ms, p95 34 ms):
+
+| split | R@1 | R@5 | R@10 | R@50 | H@1 | MRR | mAP | HN@10 | HN>pos | conf@10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| all | 0.121 | 0.307 | 0.393 | 0.616 | 0.689 | 0.738 | 0.365 | 0.180 | 0.098 | 0.030 |
+| real | 0.099 | 0.300 | 0.395 | 0.554 | 0.828 | 0.830 | 0.398 | 0.310 | 0.172 | 0.055 |
+| synthetic | 0.141 | 0.312 | 0.391 | 0.672 | 0.562 | 0.656 | 0.334 | 0.062 | 0.031 | 0.006 |
+
+Reading: the real region cases are same-landmark photos against other-landmark hard
+negatives, which CLIP's category-level semantics already solve (H@1 0.98); the synthetic
+cut-out-pasted-on-clutter cases are the discriminating ones (H@1 0.20, hard negatives
+beat positives in 60% of cases). Full per-case results: `results/baseline_*.json`.
+

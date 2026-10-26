@@ -4,8 +4,8 @@
  "index": {
   "index_s_per_image": 0.08679196968141921,
   "index_bytes_per_image": 8240.293271995399,
-  "cached": false,
-  "load_s": 150.931235275988
+  "cached": true,
+  "load_s": 0.0176198479894083
  },
  "tasks": {
   "pattern": {
@@ -59,8 +59,8 @@
      "hardneg_above_pos": 0.03125
     }
    },
-   "latency_p50_s": 0.029637319006724283,
-   "latency_p95_s": 0.05071481998311356,
+   "latency_p50_s": 0.019434881018241867,
+   "latency_p95_s": 0.03385044899187051,
    "per_case": [
     {
      "recall@1": 0.0,

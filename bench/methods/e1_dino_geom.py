@@ -21,9 +21,9 @@ from harness import BENCH_DIR, Method, top_k
 from proto_e1 import core
 
 WORK = os.path.join(BENCH_DIR, '.cache_e1_work')
-N_CAND = int(os.environ.get('E1_N', 150))
+N_CAND = int(os.environ.get('E1_N', 200))
 MIN_INL = float(os.environ.get('E1_MININL', 8))
-W_INL = float(os.environ.get('E1_W', 0.25))
+W_INL = float(os.environ.get('E1_W', 1.0))
 QMODE = os.environ.get('E1_QMODE', 'crop224,crop448,ctx')
 SIFT_ONLY = os.environ.get('E1_SIFTONLY') == '1'
 QUERY_SIFT_LONG = 640

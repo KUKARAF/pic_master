@@ -18,7 +18,7 @@ class E2(Method):
     kind = 'both'
 
     def __init__(self):
-        self.variant = os.environ.get('E2_VARIANT', 'trim+vote')
+        self.variant_env = os.environ.get('E2_VARIANT')
         self.ix = None
 
     def warmup(self):
@@ -30,7 +30,8 @@ class E2(Method):
         self.ix.build(self.paths, SCRATCH)
 
     def query(self, image_path, bbox, k):
-        ix, v = self.ix, self.variant
+        ix = self.ix
+        v = self.variant_env or {'region': 'maxsim+vote', 'pattern': 'trim+vote'}[self.task]
         ql = ix.query_tokens(image_path, bbox, **CFG[self.task])
         if v.startswith('shortlist'):
             co = ix.maxsim_scores(ql, coarse=True)
