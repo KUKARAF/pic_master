@@ -123,7 +123,11 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
-      <button type="button" class="bulk-action-btn" data-start="/api/tile-index/start" data-status="/api/tile-index/status">▦ Index regions</button>
+      <button type="button" class="bulk-action-btn" data-start="/api/tile-index/start" data-status="/api/tile-index/status" title="CLIP crops per photo: semantic 'same kind of thing' region search (fallback when region matching isn't indexed)">▦ Index regions (CLIP)</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/region-index/start" data-status="/api/region-index/status" title="DINOv2 windows + SIFT features per photo: 🔲 region search finds the same object/region (verified by geometry), not just the same category">🎯 Index region matching</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
@@ -131,7 +135,7 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
-      <button type="button" class="bulk-action-btn" data-start="/api/pattern-index/start" data-status="/api/pattern-index/status">🧩 Index patterns</button>
+      <button type="button" class="bulk-action-btn" data-start="/api/pattern-index/start" data-status="/api/pattern-index/status" title="Deep texture windows per photo for 🧩 pattern search. Re-run after an update: stale descriptors are ignored until re-indexed">🧩 Index patterns</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">

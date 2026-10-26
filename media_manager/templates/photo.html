@@ -546,10 +546,10 @@
       {% if file.is_image %}
       <span class="split-div"></span>
       <button type="button" class="split-seg find-by-region-btn" data-file-id="{{ file.id }}"
-              title="Search a region — click, then drag a box around a thing (e.g. a wall) to find it in other photos"
+              title="Search a region — click, then drag a box around an object to find that same object in other photos (build /bulk → Index region matching for exact-instance matches; otherwise similar things are returned)"
               aria-label="Search a region">🔲</button>
       <button type="button" class="split-seg find-by-pattern-btn" data-file-id="{{ file.id }}"
-              title="Search a pattern — drag a box around a texture/pattern (e.g. a wallpaper) to find the same pattern elsewhere"
+              title="Search a pattern — drag a box around a texture/pattern (e.g. a wallpaper) to find the same surface elsewhere, matched at the pixel scale you drew (needs /bulk → Index patterns)"
               aria-label="Search a pattern">🧩</button>
       {% endif %}
     </div>

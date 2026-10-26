@@ -4012,9 +4012,11 @@
   if (labelPersonState) boxDrawStates.push(labelPersonState);
 
   /* Find pill — 🔲 region segment: click to enter draw mode (segment shows ✏️ +
-     the photo gets a crosshair), then drag a box around a thing (e.g. a wall);
-     the crop is CLIP-embedded and ranked (tile index if built, else whole-image),
-     opening the matches in the browsable watch-queue. */
+     the photo gets a crosshair), then drag a box around a thing. With the region
+     matching index built (/bulk → Index region matching) the box is matched as an
+     INSTANCE (DINOv2 windows, SIFT/homography verified — same object, not same
+     category); otherwise the crop is CLIP-embedded and ranked (tile index if built,
+     else whole-image). Matches open in the browsable watch-queue. */
   const searchRegionBtn = document.querySelector('.find-by-region-btn');
   const searchRegionState = wireBoxDraw(searchRegionBtn, '✏️', '🔲', function (bbox) {
     openMatchesAsQueue({
@@ -4029,9 +4031,10 @@
   if (searchRegionState) boxDrawStates.push(searchRegionState);
 
   /* Find pill — 🧩 pattern segment: same drag-a-box UX as 🔲, but a DIFFERENT
-     mechanism — the crop's texture/colour is matched (see pattern_descriptor.py),
-     so it finds the same *pattern* (a wallpaper, a fabric) rather than the same
-     *thing*. Needs the pattern index built (/bulk → Index patterns). */
+     mechanism — deep texture windows of the crop at its native pixel scale are
+     matched (see pattern_deep.py), so it finds the same *pattern* (a wallpaper, a
+     fabric) rather than the same *thing*. Needs the pattern index built
+     (/bulk → Index patterns; re-run after an algorithm update). */
   const searchPatternBtn = document.querySelector('.find-by-pattern-btn');
   const searchPatternState = wireBoxDraw(searchPatternBtn, '✏️', '🧩', function (bbox) {
     openMatchesAsQueue({

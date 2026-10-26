@@ -224,6 +224,26 @@ Like the other offloads it is **worker-only, no local fallback**: if the worker
 is unreachable — or you skipped `media age-setup` on it — an Estimate click fails
 loudly rather than running MiVOLO on the host.
 
+### Region and pattern search on the worker
+
+The photo view's 🔲 **region** and 🧩 **pattern** searches are backed by two
+library-wide indexes built from the **/bulk → Photos & indexing** page (both run
+on the worker when one is configured, with local fallback):
+
+- **🎯 Index region matching** — per photo: DINOv2 ViT-S/14 window descriptors
+  (int8) + ~300 RootSIFT features. 🔲 then finds the *same object/region* (DINO
+  prefilter, SIFT + MAGSAC geometric verification of the top 200). Without it, 🔲
+  falls back to the semantic CLIP tile index (**▦ Index regions (CLIP)**), which
+  returns similar *kinds* of things. ~53 KB per photo.
+- **🧩 Index patterns** — per photo: ~250 native-scale deep texture windows
+  (ResNet18 early features, fixed PCA-96, int8) for 🧩 to find the same surface
+  (wallpaper, fabric). ~24 KB per photo. Descriptors carry an algorithm tag, so
+  after an update that changes it the button re-indexes the whole library.
+
+Both need `timm`/`torch` (and the cached DINOv2 hub weights for region matching) on
+whichever side computes them, so redeploy the worker after updating. Benchmarks:
+`bench/README.md`, `docs/region-pattern-search-research.md`.
+
 ## Project Structure
 
 ```
