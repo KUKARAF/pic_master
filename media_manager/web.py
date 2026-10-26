@@ -1596,6 +1596,101 @@ def create_app(data_root: str) -> FastAPI:
         media_type = VIDEO_MIME_TYPES.get(ext)   # None for images → FileResponse guesses
         return FileResponse(abs_path, media_type=media_type, headers=IMMUTABLE_CACHE_HEADERS)
 
+    # Browser-playable fallback for videos the <video> element can't decode (HEVC,
+    # ProRes, odd audio, ...): transcode once to H.264/AAC mp4 into .media/playable/
+    # and serve that (FileResponse gives it Range/seek support). Jobs run one at a time.
+    playable_dir = os.path.join(media_dir, 'playable')
+    playable_jobs = {}   # file_id -> {'state': 'running'|'error', 'progress': 0..1, 'error': str}
+    playable_lock = threading.Lock()      # guards playable_jobs
+    playable_run_lock = threading.Lock()  # serialises the ffmpeg runs
+
+    def _playable_path(file_id: int, abs_path: str) -> str:
+        st = os.stat(abs_path)
+        return os.path.join(playable_dir, f'{file_id}-{int(st.st_mtime)}-{st.st_size}.mp4')
+
+    def _transcode_playable(file_id: int, abs_path: str, out_path: str):
+        job = playable_jobs[file_id]
+        tmp_path = out_path + '.part.mp4'
+        try:
+            with playable_run_lock:
+                duration = 0.0
+                try:
+                    probe = subprocess.run(
+                        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+                         '-of', 'default=nw=1:nk=1', abs_path],
+                        capture_output=True, text=True, timeout=60)
+                    duration = float(probe.stdout.strip() or 0)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    pass
+                os.makedirs(playable_dir, exist_ok=True)
+                cmd = ['ffmpeg', '-v', 'error', '-y', '-nostdin', '-i', abs_path,
+                       '-map', '0:v:0', '-map', '0:a:0?', '-sn',
+                       '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p',
+                       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                       '-c:a', 'aac', '-b:a', '160k', '-movflags', '+faststart',
+                       '-progress', 'pipe:1', tmp_path]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                for line in proc.stdout:
+                    if duration and line.startswith('out_time_us='):
+                        try:
+                            job['progress'] = min(0.99, int(line.split('=')[1]) / 1e6 / duration)
+                        except ValueError:
+                            pass
+                err = proc.stderr.read()
+                if proc.wait() != 0:
+                    raise RuntimeError(err.strip()[-300:] or f'ffmpeg exited {proc.returncode}')
+                os.replace(tmp_path, out_path)
+            with playable_lock:
+                playable_jobs.pop(file_id, None)
+        except Exception as exc:
+            errors.log(abs_path, f'playable transcode: {exc}')
+            job.update(state='error', error=str(exc))
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
+
+    @app.post('/api/files/{file_id}/playable')
+    def api_playable(file_id: int):
+        """Ensure a browser-playable H.264 copy of a video exists; starts a background
+        transcode if needed. Poll the same URL (GET) for state/progress."""
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None or not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        if not _ffmpeg:
+            raise HTTPException(status_code=501, detail='ffmpeg is not installed on the server.')
+        out_path = _playable_path(file_id, abs_path)
+        if os.path.isfile(out_path):
+            return {'state': 'ready', 'progress': 1.0}
+        with playable_lock:
+            job = playable_jobs.get(file_id)
+            if job is None or job['state'] == 'error':   # (re)start; errors are retryable
+                job = playable_jobs[file_id] = {'state': 'running', 'progress': 0.0}
+                threading.Thread(target=_transcode_playable, args=(file_id, abs_path, out_path),
+                                 daemon=True).start()
+            return dict(job)
+
+    @app.get('/api/files/{file_id}/playable')
+    def api_playable_status(file_id: int):
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None or not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        if os.path.isfile(_playable_path(file_id, abs_path)):
+            return {'state': 'ready', 'progress': 1.0}
+        with playable_lock:
+            return dict(playable_jobs.get(file_id) or {'state': 'none', 'progress': 0.0})
+
+    @app.get('/playable/{file_id}')
+    def serve_playable(file_id: int):
+        row = _file_or_404(file_id)
+        abs_path = _live_abs_path(file_id, row['path'])
+        if abs_path is None or not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        out_path = _playable_path(file_id, abs_path)
+        if not os.path.isfile(out_path):
+            raise HTTPException(status_code=404, detail='No playable copy yet.')
+        return FileResponse(out_path, media_type='video/mp4', headers=IMMUTABLE_CACHE_HEADERS)
+
     @app.get('/download/{file_id}')
     def download_file(file_id: int):
         """The original file as an attachment under its own filename — the /photo

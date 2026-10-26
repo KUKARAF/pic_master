@@ -5796,4 +5796,42 @@
     renumber();
   })();
 
+  // Video the browser can't decode ("No video with supported format and MIME type
+  // found"): ask the server for an H.264 transcode, show progress, then swap it in.
+  (function () {
+    var video = document.getElementById('photo-video');
+    if (!video) return;
+    var id = location.pathname.split('/').pop();
+    var wrap = document.getElementById('photo-image-wrap');
+    var started = false;
+    var note = document.createElement('div');
+    note.className = 'alert';
+    note.style.display = 'none';
+    wrap.appendChild(note);
+    function poll() {
+      fetch('/api/files/' + id + '/playable').then(function (r) { return r.json(); }).then(function (d) {
+        if (d.state === 'ready') {
+          note.style.display = 'none';
+          video.src = '/playable/' + id;
+          video.load();
+        } else if (d.state === 'error') {
+          note.textContent = 'Could not convert this video: ' + (d.error || 'unknown error');
+        } else {
+          note.textContent = 'Converting for browser playback… ' + Math.round((d.progress || 0) * 100) + '%';
+          setTimeout(poll, 1500);
+        }
+      }).catch(function () { setTimeout(poll, 3000); });
+    }
+    video.addEventListener('error', function () {
+      if (started || video.src.indexOf('/playable/') !== -1) return;
+      started = true;
+      note.style.display = '';
+      note.textContent = 'Converting for browser playback…';
+      fetch('/api/files/' + id + '/playable', { method: 'POST' }).then(function (r) {
+        if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || r.status); });
+        poll();
+      }).catch(function (e) { note.textContent = 'Cannot play this video: ' + e.message; });
+    });
+  })();
+
 })();
