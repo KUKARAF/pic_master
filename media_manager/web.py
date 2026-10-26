@@ -1826,7 +1826,7 @@ def create_app(data_root: str) -> FastAPI:
     # Sorts the /videos grid offers (macros.sort_controls with filename + favorites).
     # SQL-ordered ones page via LIMIT/OFFSET; the rest need manual.db or basenames, so
     # they rank the whole (already filtered) video set in Python and slice after.
-    _VIDEO_SQL_SORTS = {'added', 'modified', 'date'}
+    _VIDEO_SQL_SORTS = {'added', 'modified', 'date', 'size'}
     _VIDEO_SORTS = _VIDEO_SQL_SORTS | {'age', 'filename', 'favorites'}
     VIDEO_PAGE_SIZE = 60
 

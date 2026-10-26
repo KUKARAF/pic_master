@@ -119,7 +119,7 @@
 {# Sort control shared by gallery/search/set-detail — a plain GET form so it works
    without JS, preserving whatever other query params the page already has via
    hidden inputs passed in `extra_params` (a dict). #}
-{% macro sort_controls(sort, order, extra_params={}, show_filename=False, show_manual=False, show_favorites=False) %}
+{% macro sort_controls(sort, order, extra_params={}, show_filename=False, show_manual=False, show_favorites=False, show_size=False) %}
 <form class="sort-controls" method="get" style="display:inline-flex;align-items:center;gap:6px;">
   {% for key, value in extra_params.items() %}
   {% if value %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endif %}
@@ -130,6 +130,7 @@
     <option value="modified" {{ 'selected' if sort == 'modified' }}>Date modified</option>
     <option value="age" {{ 'selected' if sort == 'age' }}>Estimated age</option>
     {% if show_filename %}<option value="filename" {{ 'selected' if sort == 'filename' }}>Filename</option>{% endif %}
+    {% if show_size %}<option value="size" {{ 'selected' if sort == 'size' }}>File size</option>{% endif %}
     {% if show_manual %}<option value="manual" {{ 'selected' if sort == 'manual' }}>Manual order</option>{% endif %}
     {% if show_favorites %}<option value="favorites" {{ 'selected' if sort == 'favorites' }}>Most favorited</option>{% endif %}
   </select>
@@ -139,6 +140,9 @@
     {% if sort == 'filename' %}
     <option value="asc" {{ 'selected' if order == 'asc' }}>A → Z</option>
     <option value="desc" {{ 'selected' if order == 'desc' }}>Z → A</option>
+    {% elif sort == 'size' %}
+    <option value="desc" {{ 'selected' if order == 'desc' }}>Largest first</option>
+    <option value="asc" {{ 'selected' if order == 'asc' }}>Smallest first</option>
     {% elif sort == 'favorites' %}
     <option value="desc" {{ 'selected' if order == 'desc' }}>Most favorited</option>
     <option value="asc" {{ 'selected' if order == 'asc' }}>Least favorited</option>

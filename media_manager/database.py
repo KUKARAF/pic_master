@@ -1481,7 +1481,8 @@ class Database(ThreadLocalDB):
     # live in the separate manual.db — this SQL-level sort only ever sees 'added'/
     # 'modified'.
     # 'date' = EXIF capture date (taken_at); NULLs (no EXIF) sort last in DESC.
-    _GALLERY_SORT_COLUMNS = {'added': 'f.first_seen', 'modified': 'f.modified_time', 'date': 'f.taken_at'}
+    _GALLERY_SORT_COLUMNS = {'added': 'f.first_seen', 'modified': 'f.modified_time', 'date': 'f.taken_at',
+                              'size': 'f.size'}
 
     def list_files_with_embedding_flag(self, limit=200, offset=0, sort='added', order='desc'):
         """Return (id, path, has_embedding, checksum) rows for gallery browsing.
