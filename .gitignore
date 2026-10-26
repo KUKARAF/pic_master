@@ -59,3 +59,4 @@ howto_start_worker_on_bigboy.md
 .claude/worktrees/
 bench/.cache/
 __pycache__/
+bench/.cache*/
