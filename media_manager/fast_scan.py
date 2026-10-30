@@ -11,7 +11,8 @@ from .ignore import IgnoreRules
 from .formats import MEDIA_EXTENSIONS
 from .hasher import FileHasher
 
-def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False, manual=None):
+def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False, manual=None,
+              *, progress=None, use_pv=True):
     """
     Call GNU find, parse '%p|%s|%T@\n' lines, hash each candidate, upsert into DB.
     Reads .mediaignore (git-ignore syntax) in repo-root if present.
@@ -35,6 +36,14 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
                      existing face detections untouched by the clear below. Optional —
                      omitting it (or passing reindex=False) just means nothing is
                      locked, matching the old unconditional-clear behavior.
+    progress:        optional callable(dict) for callers that show their own progress
+                     (the web's "Track this folder" job). Called with partial updates
+                     of {'phase': 'listing'|'hashing'|'saving', 'done', 'total',
+                     'ignored', 'added', 'already', 'duplicates'}. None (the CLI) means
+                     no calls at all — the scan behaves exactly as without it.
+    use_pv:          pipe find through `pv -l` when pv is installed (the CLI's progress
+                     bar). The web job passes False: no pv subprocess, the callback is
+                     its progress source.
     Returns (written_count, duplicate_count, already_indexed_count).
     """
     root_path = os.path.abspath(root_path)
@@ -47,8 +56,13 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     # Build find command
     find_cmd = ['find', root_path] + depth_args + ['-type', 'f', '-printf', '%p|%s|%T@\n']
 
+    def _report(**fields):
+        if progress is not None:
+            progress(fields)
+
     # optional pv pipe
-    if shutil.which('pv'):
+    pv_proc = None
+    if use_pv and shutil.which('pv'):
         find_proc = subprocess.Popen(find_cmd, stdout=subprocess.PIPE)
         pv_proc = subprocess.Popen(['pv', '-l'],
                                      stdin=find_proc.stdout,
@@ -60,6 +74,9 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         stream = find_proc.stdout
 
     candidates = []  # (rel_path, abs_path, size, mtime)
+    listed = 0
+    ignored = 0  # media-extension files skipped as system dirs or by .mediaignore
+    _report(phase='listing', done=0, total=0, ignored=0)
 
     for raw in stream:
         raw = raw.rstrip('\n')
@@ -73,6 +90,9 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
             print(f"fast_scan: bad line '{raw[:80]}...'  ({e})", file=sys.stderr)
             continue
 
+        listed += 1
+        if progress is not None and listed % 500 == 0:
+            _report(done=listed, ignored=ignored)
         ext = os.path.splitext(full_path)[1].lower()
         if ext not in MEDIA_EXTENSIONS:
             continue
@@ -81,19 +101,23 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         # .media/ holds our own cache/db files (thumbnails, face crops, media.db, ...) —
         # never treat it as photo content, regardless of .mediaignore.
         if rel_path == '.media' or rel_path.startswith('.media/'):
+            ignored += 1
             continue
         # captured_frames/ holds manually-grabbed video stills we register ourselves
         # (as hidden files) — skip so a re-scan never re-adds them as normal photos.
         if rel_path == 'captured_frames' or rel_path.startswith('captured_frames/'):
+            ignored += 1
             continue
         # generated/ holds app-produced artifacts (collages, slideshows, and later
         # AI-generated images/video). They are deliberately kept OUT of the library —
         # tracked separately in manual.db's generated_artifacts registry and browsed
         # from their own view — so a scan must never fold them back in as originals.
         if rel_path == 'generated' or rel_path.startswith('generated/'):
+            ignored += 1
             continue
         # respect .mediaignore
         if rules.is_ignored(rel_path):
+            ignored += 1
             continue
 
         candidates.append((rel_path, full_path, size, mtime))
@@ -101,6 +125,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     exit_code = find_proc.wait()
     if exit_code != 0:
         raise RuntimeError(f"find exited with code {exit_code}")
+    _report(phase='hashing', done=0, total=len(candidates), ignored=ignored)
 
     # Content hash is the file's identity now (see database.py's files/file_paths split) —
     # every candidate has to be hashed before we can write anything, since the hash is
@@ -112,10 +137,14 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         return rel_path, size, mtime, hasher.get_xxhash(abs_path)
 
     hashed = []
+    hashed_count = 0  # completed hashes, readable or not
     with ThreadPoolExecutor(max_workers=max_workers) as exe:
         futures = [exe.submit(_hash, c) for c in candidates]
         for fut in as_completed(futures):
             rel_path, size, mtime, checksum = fut.result()
+            hashed_count += 1
+            if progress is not None:
+                _report(done=hashed_count)
             if checksum is None:
                 # unreadable (permissions, vanished mid-scan, etc.) — skip, matching the
                 # old scanner's silent OSError handling
@@ -138,7 +167,11 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     # Computed once up front, not per file — a big rescan shouldn't turn into an
     # extra manual.db query per already-tracked file just to check this.
     locked_checksums = manual.get_all_checksums_with_manual_face_decision() if (reindex and manual is not None) else set()
+    _report(phase='saving', done=0, total=len(hashed), added=0, already=0, duplicates=0)
     for rel_path, size, mtime, checksum in hashed:
+        if progress is not None:
+            _report(done=written + already_indexed + len(duplicates),
+                    added=written, already=already_indexed, duplicates=len(duplicates))
         existing_file_id = db.find_file_id_by_checksum(checksum)
         if existing_file_id is not None:
             known_paths = [p for p, _ in db.get_paths_for_file(existing_file_id)]
@@ -153,6 +186,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
         written += 1
     db.conn.commit()
+    _report(done=len(hashed), added=written, already=already_indexed, duplicates=len(duplicates))
 
     if duplicates:
         report_path = dup_report_path or os.path.join(os.getcwd(), 'duplicates.txt')
@@ -165,6 +199,6 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
             file=sys.stderr,
         )
 
-    if shutil.which('pv'):
+    if pv_proc is not None:
         pv_proc.wait()
     return written, len(duplicates), already_indexed

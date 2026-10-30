@@ -2501,9 +2501,57 @@ a.stat-tile .sub { text-decoration: none; }
 .fm-card .fm-meta { display: block; font-size: 13px; }
 .fm-s-missing .fm-meta { color: var(--fm-missing); }
 
+/* Track / ML job panels (#fm-jobs) and the ML stage picker */
+.fm-jobs { display: flex; flex-direction: column; gap: 10px; margin-bottom: 16px; }
+.fm-jobs:empty { display: none; }
+.fm-job {
+  border: 1px solid var(--border-accent);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.fm-job-title { color: var(--accent); overflow-wrap: anywhere; }
+.fm-job-body { display: flex; flex-direction: column; gap: 6px; }
+.fm-job-line { font-size: 15px; overflow-wrap: anywhere; }
+.fm-job-error { color: var(--danger); overflow-wrap: anywhere; }
+.fm-job-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.fm-job-actions:empty { display: none; }
+.fm-job-cancel:disabled { opacity: .5; cursor: progress; }
+.fm-job-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--divider);
+  overflow: hidden;
+}
+.fm-job-bar > span { display: block; height: 100%; background: var(--accent); transition: width .3s; }
+.fm-ml-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 3px 10px;
+  align-items: center;
+  font-size: 15px;
+}
+.fm-ml-row .fm-job-bar { grid-column: 1 / -1; }
+.fm-ml-row .fm-ml-msg { grid-column: 1 / -1; font-size: 13px; overflow-wrap: anywhere; }
+.fm-ml-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fm-ml-status { white-space: nowrap; color: var(--text-mid); }
+.fm-ml-running .fm-ml-status { color: var(--accent); }
+.fm-ml-error .fm-ml-status, .fm-ml-error .fm-job-bar > span { color: var(--danger); background: var(--danger); }
+.fm-ml-cancelled .fm-ml-status, .fm-ml-skipped .fm-ml-status { color: var(--text-muted); }
+.fm-ml-skipped .fm-job-bar, .fm-ml-pending .fm-job-bar > span { opacity: .45; }
+.fm-ml-pick { display: flex; flex-direction: column; gap: 6px; margin: 10px 0 14px; }
+.fm-ml-opt { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.fm-ml-opt .fm-ml-opt-name { flex: 1 1 auto; min-width: 0; }
+.fm-ml-opt:has(input:disabled) { opacity: .5; cursor: default; }
+#fm-track-btn:disabled, #fm-ml-btn:disabled { opacity: .5; cursor: progress; }
+
 @media (max-width: 760px) {
   .fm-folder-row { flex-wrap: wrap; }
   .fm-folder-meta { width: 100%; }
   .fm-bar { flex: 1 1 auto; width: auto; }
+  .fm-ml-row { grid-template-columns: 1fr; }
 }
 /* ======================== end File manager ======================== */

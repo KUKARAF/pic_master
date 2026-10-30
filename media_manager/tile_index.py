@@ -96,19 +96,25 @@ def embed_tiles_for_file(db, clip_indexer, file_id, abs_path, model=None):
     return len(tiles)
 
 
-def build_tile_index(db, errors, clip_indexer, data_root, on_progress=None, exclude_ids=None):
+def build_tile_index(db, errors, clip_indexer, data_root, on_progress=None, exclude_ids=None,
+                     files=None, should_stop=None):
     """Tile-index every tracked file that has no tile row yet — the background
     corpus build behind the web UI. Non-image files are counted as processed but
     skipped (get_untiled_files doesn't filter by kind). `exclude_ids` (e.g. trashed
     file ids) are dropped up front. Failures go to the error log (same policy as the
     batch ML passes); a failed file is left un-tiled so a rebuild retries it.
-    Returns (processed, total)."""
-    files = db.get_untiled_files()
+    `files` [(file_id, rel_path)] restricts the build to those (the file manager's
+    folder job; default: every un-tiled file). `should_stop()` is checked before each
+    file — True ends the build early. Returns (processed, total)."""
+    if files is None:
+        files = db.get_untiled_files()
     if exclude_ids:
         files = [f for f in files if f[0] not in exclude_ids]
     total = len(files)
     processed = 0
     for file_id, rel_path in files:
+        if should_stop is not None and should_stop():
+            break
         if os.path.splitext(rel_path)[1].lower() not in IMAGE_EXTENSIONS:
             processed += 1
             if on_progress:

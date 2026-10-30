@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 import warnings
 from itertools import combinations
 from urllib.parse import quote
@@ -40,7 +41,7 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    body_index, compute, czkawka, exif_reader, file_inventory, frames, geonames, gpu_search,
+    body_index, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
     near_dup, object_index, pattern_deep, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
@@ -59,7 +60,7 @@ from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME
 from media_manager.gen_service import ComfyUIClient
 from media_manager.ignore import IgnoreRules
 from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
-from media_manager.media_manager import MediaManager, _parse_query
+from media_manager.media_manager import MediaManager, _parse_query, scan_folder
 from media_manager.object_encoder import ObjectEncoder
 from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
@@ -110,8 +111,16 @@ class SetBody(BaseModel):
     confirm_merge: bool = False
     confirm_studio_merge: bool = False
 
+class FmTrackBody(BaseModel):
+    path: str = ''   # library folder to track, relative to data_root ('' = root)
+
+
 class AddFolderBody(BaseModel):
     path: str
+
+class FmMLBody(BaseModel):
+    path: str = ''                       # library folder ('' = root), recursive
+    stages: Optional[List[str]] = None   # stage keys; None = every required stage with work
 
 class ReorderBody(BaseModel):
     file_ids: List[int]
@@ -419,6 +428,12 @@ def _make_video_thumbnail(src_path: str, dst_path: str) -> tuple:
 # (dead estimator/GPU/runtime) rather than per-file data — so a broken environment
 # stops the job with a clear message instead of churning through the whole library.
 MAX_CONSECUTIVE_FAILURES = 5
+
+
+def _never():
+    """Default should_stop for the per-file stage functions the /bulk jobs and the file
+    manager's folder ML job share: never stop early."""
+    return False
 
 
 def _split_age_results(results):
@@ -2183,6 +2198,77 @@ def create_app(data_root: str) -> FastAPI:
         """{running, done, total, error, started_at, finished_at, refreshed_at}."""
         return inventory_job.status()
 
+    # --- "Track this folder": the CLI's `media add <folder>` as a background job ---
+    # Runs media_manager.scan_folder — the exact body of MediaManager.start_scan, so the
+    # same find → .mediaignore/system-dir gate → xxh64 → duplicates-not-tracked rules
+    # and folder markers — with a progress callback instead of pv. Duplicates are
+    # appended to <data_root>/duplicates.txt (where `media add` run from the library
+    # root writes them). One at a time; allowed alongside the inventory walk (that is
+    # stat + short batched disk_files writes; the scan writes file_paths in one final
+    # transaction and busy_timeout covers the overlap).
+    track_lock = threading.Lock()
+    track_job = {'running': False, 'path': None, 'phase': None, 'done': 0, 'total': 0,
+                 'added': 0, 'already': 0, 'duplicates': 0, 'ignored': 0, 'error': None,
+                 'started_at': None, 'finished_at': None}
+
+    def _track_refresh_inventory(abs_dir, rel):
+        """Bring disk_files up to date for the scanned subtree (upsert what's on disk,
+        drop rows under it that vanished) so the folder rollups reflect the scan."""
+        stamp = int(time.time())
+        entries = [(f'{rel}/{p}' if rel else p, size, mtime)
+                   for p, size, mtime in file_inventory.walk_media_files(abs_dir)]
+        conn = db.conn
+        for i in range(0, len(entries), 2000):
+            file_inventory.record_files(conn, entries[i:i + 2000])
+            conn.commit()
+        if rel:
+            conn.execute('DELETE FROM disk_files WHERE path GLOB ? AND seen_at < ?',
+                         (f'{file_inventory.glob_escape(rel)}/*', stamp))
+        else:
+            conn.execute('DELETE FROM disk_files WHERE seen_at < ?', (stamp,))
+        conn.commit()
+
+    @app.post('/api/fm/track/start')
+    def api_fm_track_start(body: FmTrackBody):
+        """Track every untracked media file under {"path": rel folder, '' = root},
+        recursively. {"started": true, ...status}; 409 while a track job runs."""
+        abs_dir, rel = _library_path(body.path or '')
+        if not os.path.isdir(abs_dir):
+            raise HTTPException(status_code=404, detail='Folder not found on disk')
+        with track_lock:
+            if track_job['running']:
+                raise HTTPException(status_code=409,
+                                    detail=f"Already tracking '{track_job['path'] or '/'}'")
+            track_job.update(running=True, path=rel, phase='listing', done=0, total=0,
+                             added=0, already=0, duplicates=0, ignored=0, error=None,
+                             started_at=int(time.time()), finished_at=None)
+
+        def _progress(fields):
+            track_job.update(fields)
+
+        def _run():
+            try:
+                scan_folder(db, manual, data_root, rel, recursive=True, progress=_progress,
+                            use_pv=False,
+                            dup_report_path=os.path.join(data_root, 'duplicates.txt'))
+                _track_refresh_inventory(abs_dir, rel)
+                track_job['phase'] = 'done'
+            except Exception as exc:  # hook-allow: broad — reported via the job's error field
+                traceback.print_exc()
+                track_job['error'] = str(exc) or exc.__class__.__name__
+            finally:
+                scan_status.invalidate()
+                track_job['finished_at'] = int(time.time())
+                track_job['running'] = False
+        _spawn_job(_run)
+        return {'started': True, **track_job}
+
+    @app.get('/api/fm/track/status')
+    def api_fm_track_status():
+        """{running, path, phase: listing|hashing|saving|markers|done|None, done, total,
+        added, already, duplicates, ignored, error, started_at, finished_at}."""
+        return dict(track_job)
+
     fm_thumbs_dir = os.path.join(media_dir, 'fm_thumbs')
 
     @app.get('/api/fm/preview')
@@ -3337,6 +3423,30 @@ def create_app(data_root: str) -> FastAPI:
         return [(fid, rel) for fid, rel in db.get_unregion_indexed_files(region_index.ALGO_TAG)
                 if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
 
+    def _process_region_index(candidates, on_progress, should_stop=_never):
+        """Region-index each (fid, abs_path) — the per-file loop shared by the /bulk job
+        and the folder ML job. on_progress(done, failed) after each file, should_stop()
+        before each. Returns (done, failed)."""
+        done = failed = 0
+        for fid, abs_path in candidates:
+            if should_stop():
+                break
+            try:
+                with open(abs_path, 'rb') as f:
+                    image_bytes = f.read()
+                payload = _region_index_payload(image_bytes, os.path.basename(abs_path))
+                if payload is None:
+                    _mark_decode_failure(fid, abs_path, 'could not decode image (region-index)')
+                    failed += 1
+                else:
+                    db.insert_region_index(fid, *payload, region_index.ALGO_TAG)
+            except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+                errors.log(abs_path, f'region-index: {exc}')
+                failed += 1
+            done += 1
+            on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/region-index/start')
     def api_region_index_start(include_trashed: bool = False):
         """Build the instance-level region index: 35 int8 DINOv2 window descriptors + ~300
@@ -3348,23 +3458,12 @@ def create_app(data_root: str) -> FastAPI:
             (fid, os.path.join(data_root, rel)) for fid, rel in _region_pending_files()
         ], include_trashed)
         region_index_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('region', region_index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                done = 0
-                for fid, abs_path in candidates:
-                    try:
-                        with open(abs_path, 'rb') as f:
-                            image_bytes = f.read()
-                        payload = _region_index_payload(image_bytes, os.path.basename(abs_path))
-                        if payload is None:
-                            _mark_decode_failure(fid, abs_path, 'could not decode image (region-index)')
-                        else:
-                            db.insert_region_index(fid, *payload, region_index.ALGO_TAG)
-                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
-                        errors.log(abs_path, f'region-index: {exc}')
-                    done += 1
-                    region_index_job['done'] = done
+                _process_region_index(candidates, lambda d, _f: region_index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 region_index_job['error'] = str(exc)
             finally:
@@ -3496,6 +3595,29 @@ def create_app(data_root: str) -> FastAPI:
         return [(fid, rel) for fid, rel in db.get_unpattern_indexed_files(pattern_deep.ALGO_TAG)
                 if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
 
+    def _process_pattern_index(candidates, on_progress, should_stop=_never):
+        """Pattern-index each (fid, abs_path) — the per-file loop shared by the /bulk job
+        and the folder ML job. Same hooks/return as _process_region_index."""
+        done = failed = 0
+        for fid, abs_path in candidates:
+            if should_stop():
+                break
+            try:
+                with open(abs_path, 'rb') as f:
+                    image_bytes = f.read()
+                windows = _pattern_index_windows(image_bytes, os.path.basename(abs_path))
+                if windows is None:
+                    _mark_decode_failure(fid, abs_path, 'could not decode image (pattern-index)')
+                    failed += 1
+                else:
+                    db.insert_pattern_windows(fid, windows, pattern_deep.ALGO_TAG)
+            except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+                errors.log(abs_path, f'pattern-index: {exc}')
+                failed += 1
+            done += 1
+            on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/pattern-index/start')
     def api_pattern_index_start(include_trashed: bool = False):
         """Build the find-by-pattern index: ~250 int8 deep-texture window descriptors per
@@ -3508,23 +3630,12 @@ def create_app(data_root: str) -> FastAPI:
             (fid, os.path.join(data_root, rel)) for fid, rel in _pattern_pending_files()
         ], include_trashed)
         pattern_index_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('pattern', pattern_index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                done = 0
-                for fid, abs_path in candidates:
-                    try:
-                        with open(abs_path, 'rb') as f:
-                            image_bytes = f.read()
-                        windows = _pattern_index_windows(image_bytes, os.path.basename(abs_path))
-                        if windows is None:
-                            _mark_decode_failure(fid, abs_path, 'could not decode image (pattern-index)')
-                        else:
-                            db.insert_pattern_windows(fid, windows, pattern_deep.ALGO_TAG)
-                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
-                        errors.log(abs_path, f'pattern-index: {exc}')
-                    done += 1
-                    pattern_index_job['done'] = done
+                _process_pattern_index(candidates, lambda d, _f: pattern_index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 pattern_index_job['error'] = str(exc)
             finally:
@@ -4218,6 +4329,9 @@ def create_app(data_root: str) -> FastAPI:
         cleared = db.clear_body_sentinels() if retry_empty else 0
         body_index_job.update(
             running=True, done=0, total=len(db.get_unbody_indexed_files()), error=None)
+        # 'tags' too: both drive the shared YOLO-World detector's vocab.
+        if (busy := _folder_ml_holds(('bodies', 'tags'), body_index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
@@ -4248,6 +4362,34 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
+    def _process_clip_index(candidates, on_progress, should_stop=_never):
+        """CLIP-embed each (fid, abs_path), 32 per model call — the loop shared by the
+        /bulk index job and the folder ML job. on_progress(done, failed) after each
+        file; should_stop() before each batch and each file's write (the rest of a
+        stopped batch stays un-embedded). Returns (done, failed)."""
+        indexer = _get_clip_indexer()
+        model_id = indexer.model_id()
+        done = failed = 0
+        for start in range(0, len(candidates), 32):
+            if should_stop():
+                break
+            batch = candidates[start:start + 32]
+            paths = [p for _fid, p in batch]
+            embeddings, failed_list = indexer.embed_images(paths)
+            failed_messages = dict(failed_list)
+            emb_iter = iter(embeddings)
+            for fid, fpath in batch:
+                if should_stop():
+                    return done, failed
+                if fpath in failed_messages:
+                    errors.log(fpath, failed_messages[fpath])
+                    failed += 1
+                else:
+                    db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
+                done += 1
+                on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/index/start')
     def api_index_start(include_trashed: bool = False):
         """Bulk-embed every photo that has no CLIP embedding yet — the library-wide
@@ -4264,25 +4406,12 @@ def create_app(data_root: str) -> FastAPI:
             if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS
         ], include_trashed)
         index_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('clip', index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                indexer = _get_clip_indexer()
-                model_id = indexer.model_id()
-                done = 0
-                for start in range(0, len(candidates), 32):
-                    batch = candidates[start:start + 32]
-                    paths = [p for _fid, p in batch]
-                    embeddings, failed = indexer.embed_images(paths)
-                    failed_messages = dict(failed)
-                    emb_iter = iter(embeddings)
-                    for fid, fpath in batch:
-                        if fpath in failed_messages:
-                            errors.log(fpath, failed_messages[fpath])
-                        else:
-                            db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
-                        done += 1
-                        index_job['done'] = done
+                _process_clip_index(candidates, lambda d, _f: index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 index_job['error'] = str(exc)
             finally:
@@ -4310,6 +4439,50 @@ def create_app(data_root: str) -> FastAPI:
             if os.path.splitext(rel_path)[1].lower() in IMAGE_EXTENSIONS
         ]
 
+    def _phash_one(fid, rel_path):
+        """pHash one image from its cached thumbnail (made if absent) + record the
+        original's dimensions. True when the phash row was written."""
+        abs_path = _live_abs_path(fid, rel_path)
+        if abs_path is None:
+            errors.log(rel_path, 'phash: file not on disk')
+            return False
+        try:
+            thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
+            if not os.path.isfile(thumb_path):
+                status, msg = _make_thumbnail(abs_path, thumb_path)
+                if msg:
+                    errors.log(rel_path, msg)
+                if status != THUMB_OK:
+                    return False
+            with PILImage.open(thumb_path) as im:
+                ph, dh = phasher.compute_hashes(im)
+            w = h = None
+            try:
+                with PILImage.open(abs_path) as orig:  # header-only, true dims
+                    w, h = orig.width, orig.height
+            except Exception:  # hook-allow: broad — header read is best-effort
+                pass
+            db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
+                            w, h, phasher.ALGO_TAG)
+            return True
+        except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+            errors.log(rel_path, f'phash: {exc}')
+            return False
+
+    def _process_phash(candidates, on_progress, should_stop=_never):
+        """pHash each (fid, rel_path) — the loop shared by the /bulk job and the folder
+        ML job. on_progress(done, failed) after each file, should_stop() before each.
+        Returns (done, failed)."""
+        done = failed = 0
+        for fid, rel_path in candidates:
+            if should_stop():
+                break
+            if not _phash_one(fid, rel_path):
+                failed += 1
+            done += 1
+            on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/phash/start')
     def api_phash_start(include_trashed: bool = False):
         """Perceptual-hash every IMAGE with none yet (near-duplicate detection). Hashes
@@ -4322,37 +4495,12 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Perceptual hashing already running.'}
         candidates = _drop_trashed(_unphashed_images(), include_trashed)
         phash_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('phash', phash_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                done = 0
-                for fid, rel_path in candidates:
-                    abs_path = _live_abs_path(fid, rel_path)
-                    if abs_path is None:
-                        errors.log(rel_path, 'phash: file not on disk')
-                        done += 1; phash_job['done'] = done; continue
-                    try:
-                        thumb_path = os.path.join(thumbs_dir, f'{fid}.jpg')
-                        if not os.path.isfile(thumb_path):
-                            status, msg = _make_thumbnail(abs_path, thumb_path)
-                            if msg:
-                                errors.log(rel_path, msg)
-                            if status != THUMB_OK:
-                                done += 1; phash_job['done'] = done; continue
-                        with PILImage.open(thumb_path) as im:
-                            ph, dh = phasher.compute_hashes(im)
-                        w = h = None
-                        try:
-                            with PILImage.open(abs_path) as orig:  # header-only, true dims
-                                w, h = orig.width, orig.height
-                        except Exception:  # hook-allow: broad — header read is best-effort
-                            pass
-                        db.insert_phash(fid, ph.to_bytes(8, 'big'), dh.to_bytes(8, 'big'),
-                                        w, h, phasher.ALGO_TAG)
-                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
-                        errors.log(rel_path, f'phash: {exc}')
-                    done += 1
-                    phash_job['done'] = done
+                _process_phash(candidates, lambda d, _f: phash_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 phash_job['error'] = str(exc)
             finally:
@@ -4377,6 +4525,36 @@ def create_app(data_root: str) -> FastAPI:
         return [(fid, path, cs) for fid, path, cs in db.get_video_files(list(VIDEO_EXTENSIONS))
                 if counts.get(cs, 0) < 3]
 
+    def _process_capture_frames(candidates, on_progress, should_stop=_never):
+        """Capture the stills of each (fid, rel_path) video — the loop shared by the
+        /bulk job and the folder ML job. on_progress(done, failed) after each video
+        (a missing, damaged or erroring one counts as failed), should_stop() before
+        each. Returns (done, failed)."""
+        done = failed = 0
+        for fid, rel_path in candidates:
+            if should_stop():
+                break
+            abs_path = _live_abs_path(fid, rel_path)
+            if abs_path is None:
+                errors.log(rel_path, 'capture-frames: file not on disk')
+                done += 1; failed += 1; on_progress(done, failed); continue
+            try:
+                parent_row = db.get_file_by_id(fid)
+                frames, all_ok = phasher.extract_video_frames(abs_path)
+                for time_ms, jpeg in frames:
+                    _save_captured_still(parent_row, jpeg, time_ms)
+                if not all_ok:
+                    db.mark_broken(fid)
+                    errors.log(rel_path, 'capture-frames: video damaged — only '
+                               f'{len(frames)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
+                    failed += 1
+            except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+                errors.log(rel_path, f'capture-frames: {exc}')
+                failed += 1
+            done += 1
+            on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/capture-frames/start')
     def api_capture_frames_start(include_trashed: bool = False):
         """Capture real still frames from every video at 10/25/50/75/90% of playback,
@@ -4391,28 +4569,13 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Frame capture already running.'}
         candidates = _drop_trashed(_videos_needing_frames(), include_trashed)
         capture_frames_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('stills', capture_frames_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                done = 0
-                for fid, rel_path, _cs in candidates:
-                    abs_path = _live_abs_path(fid, rel_path)
-                    if abs_path is None:
-                        errors.log(rel_path, 'capture-frames: file not on disk')
-                        done += 1; capture_frames_job['done'] = done; continue
-                    try:
-                        parent_row = db.get_file_by_id(fid)
-                        frames, all_ok = phasher.extract_video_frames(abs_path)
-                        for time_ms, jpeg in frames:
-                            _save_captured_still(parent_row, jpeg, time_ms)
-                        if not all_ok:
-                            db.mark_broken(fid)
-                            errors.log(rel_path, 'capture-frames: video damaged — only '
-                                       f'{len(frames)}/{len(phasher.VIDEO_FRACTIONS)} frames captured')
-                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
-                        errors.log(rel_path, f'capture-frames: {exc}')
-                    done += 1
-                    capture_frames_job['done'] = done
+                _process_capture_frames([(fid, rel) for fid, rel, _cs in candidates],
+                                        lambda d, _f: capture_frames_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 capture_frames_job['error'] = str(exc)
             finally:
@@ -4473,6 +4636,122 @@ def create_app(data_root: str) -> FastAPI:
                         known_embs.append(np.frombuffer(eb, dtype=np.float32))
         return known_names, known_embs
 
+    def _process_video_face_scan(candidates, detector, counters, on_progress, should_stop=_never,
+                                 capture_unmatched=True, threshold=None):
+        """Face-scan each (fid, rel_path, checksum) video — the per-video loop shared by
+        the /bulk job and the folder ML job (see api_scan_video_faces_start for what a
+        scan does). counters['matched'] / counters['captured'] are bumped per capture;
+        on_progress(done, failed) after each video, should_stop() before each. A video
+        is marked scanned only when its scan completed (or its file is gone). Returns
+        (done, failed)."""
+        done = failed = 0
+        for fid, rel_path, video_cs in candidates:
+            if should_stop():
+                break
+            abs_path = _live_abs_path(fid, rel_path)
+            if abs_path is None:
+                errors.log(rel_path, 'scan-video-faces: file not on disk')
+                manual.mark_video_frame_scanned(video_cs)  # don't retry a missing file
+                done += 1; failed += 1; on_progress(done, failed); continue
+            try:
+                video_row = db.get_file_by_id(fid)
+                known_names, known_embs = _known_people_for_video(video_cs)
+
+                # --- Pass 1: cluster quality faces across all sampled frames. ---
+                # Each cluster tracks its count (recurrence) and keeps the SINGLE
+                # best-quality frame as the representative to capture + match on.
+                clusters = []  # {emb, count, best_score, jpeg, bbox, time_ms}
+
+                def _add_face(f, jpeg, time_ms):
+                    bbox = f['bbox']
+                    if f['det_score'] < VIDEO_FACE_DET_MIN:
+                        return  # weak/blurry detection
+                    if min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < VIDEO_FACE_MIN_PX:
+                        return  # tiny background face
+                    vec = np.frombuffer(f['embedding'].tobytes(), dtype=np.float32)
+                    best_i, best_sim = -1, VIDEO_FACE_CLUSTER_SIM
+                    for i, c in enumerate(clusters):
+                        sim = float(c['emb'].dot(vec))
+                        if sim >= best_sim:
+                            best_sim, best_i = sim, i
+                    if best_i >= 0:
+                        c = clusters[best_i]
+                        c['count'] += 1
+                        if f['det_score'] > c['best_score']:
+                            c.update(emb=vec, best_score=f['det_score'], jpeg=jpeg,
+                                     bbox=bbox, time_ms=time_ms)
+                    elif len(clusters) < VIDEO_FACE_MAX_CLUSTERS:
+                        clusters.append({'emb': vec, 'count': 1, 'best_score': f['det_score'],
+                                         'jpeg': jpeg, 'bbox': bbox, 'time_ms': time_ms})
+
+                batch = []  # (time_ms, jpeg, tmp_path)
+
+                def _flush():
+                    if not batch:
+                        return
+                    try:
+                        results = detector.detect_faces([b[2] for b in batch])
+                    finally:
+                        for b in batch:
+                            try: os.unlink(b[2])
+                            except OSError: pass
+                    for (t_ms, jpeg, _p), res in zip(batch, results):
+                        _, faces, ferr = res
+                        if ferr or not faces:
+                            continue
+                        for f in faces:
+                            _add_face(f, jpeg, t_ms)
+                    batch.clear()
+
+                for time_ms, jpeg in phasher.iter_video_frames_sampled(abs_path):
+                    tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+                    tmp.write(jpeg); tmp.close()
+                    batch.append((time_ms, jpeg, tmp.name))
+                    if len(batch) >= 8:
+                        _flush()
+                _flush()
+
+                # --- Pass 2: capture the recurring people, best cluster first. ---
+                captured_here = 0
+                for c in sorted(clusters, key=lambda c: (c['count'], c['best_score']), reverse=True):
+                    if c['count'] < VIDEO_FACE_MIN_APPEARANCES:
+                        continue  # one-frame blip → trash, skip
+                    if captured_here >= VIDEO_FACE_MAX_CAPTURES:
+                        break
+                    emb_bytes = c['emb'].tobytes()
+                    name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
+                    if name is not None:
+                        if name in known_names:
+                            continue  # already have this person on the video
+                    else:
+                        if not capture_unmatched:
+                            continue
+                        if any(float(e.dot(c['emb'])) >= VIDEO_FACE_DEDUP_THRESHOLD for e in known_embs):
+                            continue  # same unknown person already on the video
+                    child_id = _save_captured_still(video_row, c['jpeg'], c['time_ms'])
+                    child = db.get_file_by_id(child_id)
+                    face_db_id = db.add_manual_face(child_id, c['bbox'], emb_bytes, c['best_score'])
+                    if name is not None:
+                        manual.promote_auto_face(face_db_id, child['checksum'], c['bbox'],
+                                                 emb_bytes, name, None, None)
+                        # Keep media.db's handled mirror in step with the new
+                        # decision (see _confirm_auto_face).
+                        db.mark_faces_handled([face_db_id])
+                        _link_face_match_to_video(child['checksum'], name)
+                        known_names.add(name)
+                        counters['matched'] += 1
+                    known_embs.append(c['emb'])
+                    captured_here += 1
+                    counters['captured'] += 1
+
+                manual.mark_video_frame_scanned(video_cs)
+            except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
+                errors.log(rel_path, f'scan-video-faces: {exc}')
+                failed += 1
+            done += 1
+            on_progress(done, failed)
+        return done, failed
+
     @app.post('/api/scan-video-faces/start')
     def api_scan_video_faces_start(include_trashed: bool = False, capture_unmatched: bool = True,
                                    threshold: float = None):
@@ -4491,113 +4770,15 @@ def create_app(data_root: str) -> FastAPI:
         candidates = _drop_trashed(_videos_needing_face_scan(), include_trashed)
         video_face_scan_job.update(running=True, done=0, total=len(candidates),
                                    matched=0, captured=0, error=None)
+        if (busy := _folder_ml_holds('video_faces', video_face_scan_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                detector = _get_face_detector()
-                done = 0
-                for fid, rel_path, video_cs in candidates:
-                    abs_path = _live_abs_path(fid, rel_path)
-                    if abs_path is None:
-                        errors.log(rel_path, 'scan-video-faces: file not on disk')
-                        manual.mark_video_frame_scanned(video_cs)  # don't retry a missing file
-                        done += 1; video_face_scan_job['done'] = done; continue
-                    try:
-                        video_row = db.get_file_by_id(fid)
-                        known_names, known_embs = _known_people_for_video(video_cs)
-
-                        # --- Pass 1: cluster quality faces across all sampled frames. ---
-                        # Each cluster tracks its count (recurrence) and keeps the SINGLE
-                        # best-quality frame as the representative to capture + match on.
-                        clusters = []  # {emb, count, best_score, jpeg, bbox, time_ms}
-
-                        def _add_face(f, jpeg, time_ms):
-                            bbox = f['bbox']
-                            if f['det_score'] < VIDEO_FACE_DET_MIN:
-                                return  # weak/blurry detection
-                            if min(bbox[2] - bbox[0], bbox[3] - bbox[1]) < VIDEO_FACE_MIN_PX:
-                                return  # tiny background face
-                            vec = np.frombuffer(f['embedding'].tobytes(), dtype=np.float32)
-                            best_i, best_sim = -1, VIDEO_FACE_CLUSTER_SIM
-                            for i, c in enumerate(clusters):
-                                sim = float(c['emb'].dot(vec))
-                                if sim >= best_sim:
-                                    best_sim, best_i = sim, i
-                            if best_i >= 0:
-                                c = clusters[best_i]
-                                c['count'] += 1
-                                if f['det_score'] > c['best_score']:
-                                    c.update(emb=vec, best_score=f['det_score'], jpeg=jpeg,
-                                             bbox=bbox, time_ms=time_ms)
-                            elif len(clusters) < VIDEO_FACE_MAX_CLUSTERS:
-                                clusters.append({'emb': vec, 'count': 1, 'best_score': f['det_score'],
-                                                 'jpeg': jpeg, 'bbox': bbox, 'time_ms': time_ms})
-
-                        batch = []  # (time_ms, jpeg, tmp_path)
-
-                        def _flush():
-                            if not batch:
-                                return
-                            try:
-                                results = detector.detect_faces([b[2] for b in batch])
-                            finally:
-                                for b in batch:
-                                    try: os.unlink(b[2])
-                                    except OSError: pass
-                            for (t_ms, jpeg, _p), res in zip(batch, results):
-                                _, faces, ferr = res
-                                if ferr or not faces:
-                                    continue
-                                for f in faces:
-                                    _add_face(f, jpeg, t_ms)
-                            batch.clear()
-
-                        for time_ms, jpeg in phasher.iter_video_frames_sampled(abs_path):
-                            tmp = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-                            tmp.write(jpeg); tmp.close()
-                            batch.append((time_ms, jpeg, tmp.name))
-                            if len(batch) >= 8:
-                                _flush()
-                        _flush()
-
-                        # --- Pass 2: capture the recurring people, best cluster first. ---
-                        captured_here = 0
-                        for c in sorted(clusters, key=lambda c: (c['count'], c['best_score']), reverse=True):
-                            if c['count'] < VIDEO_FACE_MIN_APPEARANCES:
-                                continue  # one-frame blip → trash, skip
-                            if captured_here >= VIDEO_FACE_MAX_CAPTURES:
-                                break
-                            emb_bytes = c['emb'].tobytes()
-                            name, _score = manual.find_matching_identity(emb_bytes, threshold=threshold)
-                            if name is not None:
-                                if name in known_names:
-                                    continue  # already have this person on the video
-                            else:
-                                if not capture_unmatched:
-                                    continue
-                                if any(float(e.dot(c['emb'])) >= VIDEO_FACE_DEDUP_THRESHOLD for e in known_embs):
-                                    continue  # same unknown person already on the video
-                            child_id = _save_captured_still(video_row, c['jpeg'], c['time_ms'])
-                            child = db.get_file_by_id(child_id)
-                            face_db_id = db.add_manual_face(child_id, c['bbox'], emb_bytes, c['best_score'])
-                            if name is not None:
-                                manual.promote_auto_face(face_db_id, child['checksum'], c['bbox'],
-                                                         emb_bytes, name, None, None)
-                                # Keep media.db's handled mirror in step with the new
-                                # decision (see _confirm_auto_face).
-                                db.mark_faces_handled([face_db_id])
-                                _link_face_match_to_video(child['checksum'], name)
-                                known_names.add(name)
-                                video_face_scan_job['matched'] += 1
-                            known_embs.append(c['emb'])
-                            captured_here += 1
-                            video_face_scan_job['captured'] += 1
-
-                        manual.mark_video_frame_scanned(video_cs)
-                    except Exception as exc:  # hook-allow: broad — per-item; one bad file must not sink the batch
-                        errors.log(rel_path, f'scan-video-faces: {exc}')
-                    done += 1
-                    video_face_scan_job['done'] = done
+                _process_video_face_scan(
+                    candidates, _get_face_detector(), video_face_scan_job,
+                    lambda d, _f: video_face_scan_job.update(done=d),
+                    capture_unmatched=capture_unmatched, threshold=threshold)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 video_face_scan_job['error'] = str(exc)
             finally:
@@ -4765,6 +4946,49 @@ def create_app(data_root: str) -> FastAPI:
             return cap['parent_checksum']
         return checksum
 
+    def _process_detect_faces(candidates, detector, counters, on_progress, should_stop=_never,
+                              threshold=None):
+        """Detect + auto-match faces on each (fid, rel_path), 8 per model call — the loop
+        shared by the /bulk job and the folder ML job. counters['matched'] is bumped per
+        auto-match; on_progress(done, failed) after each file; should_stop() before each
+        batch and each file's write (the rest of a stopped batch stays undetected).
+        Returns (done, failed)."""
+        model_id = detector.model_id(detector._model_name)
+        done = failed = 0
+        for start in range(0, len(candidates), 8):
+            if should_stop():
+                break
+            batch = candidates[start:start + 8]
+            paths = [os.path.join(data_root, rel) for _fid, rel in batch]
+            results = detector.detect_faces(paths)
+            for (fid, rel_path), (_p, faces, error) in zip(batch, results):
+                if should_stop():
+                    return done, failed
+                done += 1
+                if error:
+                    errors.log(rel_path, f'detect-faces: {error}')
+                    failed += 1
+                    on_progress(done, failed)
+                    continue
+                on_progress(done, failed)
+                db.insert_faces(fid, faces, model_id)
+                row = db.get_file_by_id(fid)
+                for face_row in db.get_faces_for_file(fid):
+                    emb = db.get_face_embedding(face_row['id'])
+                    if not emb:
+                        continue
+                    name, _score = manual.find_matching_identity(emb, threshold=threshold)
+                    if name is None:
+                        continue
+                    if manual.is_face_negated(face_row['id'], name):
+                        continue  # a human said this face is not this person
+                    manual.promote_auto_face(face_row['id'], row['checksum'],
+                                             json.loads(face_row['bbox']), emb, name, None, None)
+                    db.mark_faces_handled([face_row['id']])
+                    _link_face_match_to_video(row['checksum'], name)
+                    counters['matched'] += 1
+        return done, failed
+
     @app.post('/api/detect-faces/start')
     def api_detect_faces_start(threshold: float = None, include_trashed: bool = False):
         """Run face detection (InsightFace) on every image that has no faces yet, then
@@ -4776,40 +5000,14 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Face detection already running.'}
         candidates = _drop_trashed(_faceless_images(), include_trashed)
         detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None)
+        if (busy := _folder_ml_holds('faces', detect_faces_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                detector = _get_face_detector()
-                model_id = detector.model_id(detector._model_name)
-                done = 0
-                matched = 0
-                for start in range(0, len(candidates), 8):
-                    batch = candidates[start:start + 8]
-                    paths = [os.path.join(data_root, rel) for _fid, rel in batch]
-                    results = detector.detect_faces(paths)
-                    for (fid, rel_path), (_p, faces, error) in zip(batch, results):
-                        done += 1
-                        detect_faces_job['done'] = done
-                        if error:
-                            errors.log(rel_path, f'detect-faces: {error}')
-                            continue
-                        db.insert_faces(fid, faces, model_id)
-                        row = db.get_file_by_id(fid)
-                        for face_row in db.get_faces_for_file(fid):
-                            emb = db.get_face_embedding(face_row['id'])
-                            if not emb:
-                                continue
-                            name, _score = manual.find_matching_identity(emb, threshold=threshold)
-                            if name is None:
-                                continue
-                            if manual.is_face_negated(face_row['id'], name):
-                                continue  # a human said this face is not this person
-                            manual.promote_auto_face(face_row['id'], row['checksum'],
-                                                     json.loads(face_row['bbox']), emb, name, None, None)
-                            db.mark_faces_handled([face_row['id']])
-                            _link_face_match_to_video(row['checksum'], name)
-                            matched += 1
-                            detect_faces_job['matched'] = matched
+                _process_detect_faces(candidates, _get_face_detector(), detect_faces_job,
+                                      lambda d, _f: detect_faces_job.update(done=d),
+                                      threshold=threshold)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 detect_faces_job['error'] = str(exc)
             finally:
@@ -5089,6 +5287,27 @@ def create_app(data_root: str) -> FastAPI:
 
         raise HTTPException(status_code=400, detail=f'unknown action {body.action!r}')
 
+    def _process_metadata(candidates, on_progress, should_stop=_never):
+        """Extract/stamp metadata for each (fid, rel_path) — the loop shared by the /bulk
+        job and the folder ML job. on_progress(done, failed) after each file (failed is
+        always 0: an unreadable EXIF is just "no metadata"), should_stop() before each.
+        Returns (done, failed)."""
+        done = 0
+        for fid, rel_path in candidates:
+            if should_stop():
+                break
+            ext = os.path.splitext(rel_path)[1].lower()
+            if ext not in IMAGE_EXTENSIONS:
+                # Not an image — nothing to extract, but stamp it checked.
+                db.update_file_metadata(fid, None, None, None)
+            else:
+                taken_at, gps_lat, gps_lon = exif_reader.extract_exif_metadata(
+                    os.path.join(data_root, rel_path))
+                db.update_file_metadata(fid, taken_at, gps_lat, gps_lon)
+            done += 1
+            on_progress(done, 0)
+        return done, 0
+
     @app.post('/api/metadata/start')
     def api_metadata_start():
         """Bulk-extract EXIF capture time + GPS for every file whose metadata has
@@ -5101,21 +5320,12 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Metadata extraction already running.'}
         candidates = db.get_files_without_metadata()  # [(id, path), ...]
         metadata_job.update(running=True, done=0, total=len(candidates), error=None)
+        if (busy := _folder_ml_holds('exif', metadata_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
-                done = 0
-                for fid, rel_path in candidates:
-                    ext = os.path.splitext(rel_path)[1].lower()
-                    if ext not in IMAGE_EXTENSIONS:
-                        # Not an image — nothing to extract, but stamp it checked.
-                        db.update_file_metadata(fid, None, None, None)
-                    else:
-                        taken_at, gps_lat, gps_lon = exif_reader.extract_exif_metadata(
-                            os.path.join(data_root, rel_path))
-                        db.update_file_metadata(fid, taken_at, gps_lat, gps_lon)
-                    done += 1
-                    metadata_job['done'] = done
+                _process_metadata(candidates, lambda d, _f: metadata_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 metadata_job['error'] = str(exc)
             finally:
@@ -5392,6 +5602,8 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Region indexing already running.'}
         tile_index_job.update(
             running=True, done=0, total=len(db.get_untiled_files()), error=None)
+        if (busy := _folder_ml_holds('tiles', tile_index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
@@ -5438,6 +5650,8 @@ def create_app(data_root: str) -> FastAPI:
             if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
         ]
         object_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
+        if (busy := _folder_ml_holds('objects', object_index_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
             try:
@@ -5473,6 +5687,237 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(db.get_unobject_indexed_files()),
             'device': object_index_job.get('device'),
         }
+
+    # ------------------------------------------------------------------
+    # File manager "Run missing ML here": every stage a folder's files lack
+    # ------------------------------------------------------------------
+    # The per-file work is the /bulk jobs' own loops (the _process_* functions above,
+    # body/tile builders' files= and object_index's candidates=), run by folder_ml over
+    # each stage's missing files only. Concurrency with /bulk: each stage maps to the
+    # bulk job state dict(s) it collides with (FOLDER_ML_BULK). Both sides SET their own
+    # flag first and THEN read the other's — the folder job sets current_stage then
+    # claim() reads the bulk dict's 'running'; a /bulk start sets running=True then
+    # _folder_ml_holds() reads current_stage (and un-sets on refusal) — so of two racing
+    # starters at least one sees the other and backs off; a stage never runs twice at
+    # once. 'tags' also collides with the bulk body index: both set the vocab of the
+    # shared YOLO-World detector. There are no GPU/model locks between bulk jobs (they
+    # already run side by side), so none to share here.
+    folder_ml_job = folder_ml.FolderMLJob()
+    FOLDER_ML_BULK = {
+        'exif': ((metadata_job, 'metadata'),),
+        'clip': ((index_job, 'CLIP index'),),
+        'tags': ((body_index_job, 'body index (shares the object detector)'),),
+        'faces': ((detect_faces_job, 'face detection'),),
+        'bodies': ((body_index_job, 'body index'),),
+        'objects': ((object_index_job, 'object index'),),
+        'region': ((region_index_job, 'region matching index'),),
+        'pattern': ((pattern_index_job, 'pattern index'),),
+        'phash': ((phash_job, 'perceptual hashing'),),
+        'tiles': ((tile_index_job, 'tile index'),),
+        'stills': ((capture_frames_job, 'frame capture'),),
+        'video_faces': ((video_face_scan_job, 'video face scan'),),
+    }
+
+    def _folder_ml_holds(keys, job):
+        """For a /bulk start that has just set job['running']: if the folder ML job is
+        processing one of stage `keys`, un-claim the bulk job and return the refusal
+        message; else None (see the concurrency note above)."""
+        keys = (keys,) if isinstance(keys, str) else keys
+        st = folder_ml_job.state
+        cur = st['current_stage'] if st['running'] else None
+        if cur not in keys:
+            return None
+        job['running'] = False
+        return (f"The file manager is running {folder_ml.STAGE_INFO[cur][0]} on "
+                f"'{st['path'] or '/'}' — try again when it finishes.")
+
+    def _folder_ml_claim(key):
+        """folder_ml claim hook: a skip message while a colliding /bulk job runs."""
+        for job, name in FOLDER_ML_BULK.get(key, ()):
+            if job['running']:
+                return f'Skipped: the /bulk {name} job is running.'
+        return None
+
+    def _process_detections(candidates, detector, vocab, on_progress, should_stop=_never):
+        """YOLO-World auto-tag each (fid, rel_path), 32 per model call — what `media
+        index` does (same merged vocab and model_id; a failed image is logged without a
+        sentinel so it retries). No /bulk job runs this stage; the folder ML job does.
+        The vocab is re-set before every batch because the detector singleton is shared
+        with the body index's person-only pass. Hooks/return as _process_clip_index."""
+        model_id = YOLOWorldDetector.model_id()
+        done = failed = 0
+        for start in range(0, len(candidates), 32):
+            if should_stop():
+                break
+            batch = candidates[start:start + 32]
+            detector.set_vocab(vocab)
+            results = detector.detect_images([os.path.join(data_root, rel) for _fid, rel in batch])
+            for (fid, rel_path), (_p, detections, error) in zip(batch, results):
+                if should_stop():
+                    return done, failed
+                if error is not None:
+                    errors.log(rel_path, f'auto-tag: {error}')
+                    failed += 1
+                else:
+                    db.insert_detections(fid, detections, model_id)
+                done += 1
+                on_progress(done, failed)
+        return done, failed
+
+    def _folder_ml_runners():
+        """{stage key: folder_ml.Runner} — prepare() builds the model the bulk job would
+        (raising = backend unavailable → stage skipped), process() runs the shared loop."""
+        def _abs(files):
+            return [(fid, os.path.join(data_root, rel)) for fid, rel in files]
+
+        def _tags_prepare():
+            vocab = merge_vocab(load_vocab_from_file(os.path.join(media_dir, 'search_terms.txt')),
+                                manual.get_all_positive_labels())
+            return _get_object_detector(), vocab
+
+        def _bodies(files, ctx, progress, stop):
+            log = folder_ml.CountingLog(errors)
+            processed, _total = body_index.build_body_index(
+                db, log, ctx[0], ctx[1], data_root,
+                on_progress=lambda d, _t: progress(d, log.count), files=files, should_stop=stop)
+            return processed, log.count
+
+        def _tiles(files, ctx, progress, stop):
+            log = folder_ml.CountingLog(errors)
+            processed, _total = tile_index.build_tile_index(
+                db, log, ctx, data_root,
+                on_progress=lambda d, _t: progress(d, log.count), files=files, should_stop=stop)
+            return processed, log.count
+
+        def _objects_prepare():
+            # The /bulk start's GPU guard, verbatim.
+            if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
+                raise folder_ml.StageUnavailable(
+                    'the GPU is not detected (torch reports 0 devices); set MEDIA_DEVICE=cpu '
+                    'to index on CPU deliberately.')
+            return _get_object_encoder(data_root)
+
+        def _objects(files, enc, progress, stop):
+            log = folder_ml.CountingLog(errors)
+            done = [0]
+
+            def _prog(d, _t):
+                done[0] = d
+                progress(d, log.count)
+            object_index.build_object_index(
+                db, enc, data_root, image_exts=IMAGE_EXTENSIONS, abs_path_fn=_live_abs_path,
+                candidates=files, on_progress=_prog, log=log.log, should_stop=stop)
+            return done[0], log.count
+
+        def _video_faces(files, detector, progress, stop):
+            triples = []
+            for fid, rel in files:
+                row = db.get_file_by_id(fid)
+                if row is not None:
+                    triples.append((fid, rel, row['checksum']))
+            return _process_video_face_scan(triples, detector, {'matched': 0, 'captured': 0},
+                                            progress, stop)
+
+        R = folder_ml.Runner
+        return {
+            'exif': R(lambda f, _c, p, s: _process_metadata(f, p, s)),
+            'clip': R(lambda f, _c, p, s: _process_clip_index(_abs(f), p, s), _get_clip_indexer),
+            'tags': R(lambda f, c, p, s: _process_detections(f, c[0], c[1], p, s), _tags_prepare),
+            'faces': R(lambda f, c, p, s: _process_detect_faces(f, c, {'matched': 0}, p, s),
+                       _get_face_detector),
+            'bodies': R(_bodies, lambda: (_get_clip_indexer(), _get_object_detector())),
+            'objects': R(_objects, _objects_prepare),
+            'region': R(lambda f, _c, p, s: _process_region_index(_abs(f), p, s)),
+            'pattern': R(lambda f, _c, p, s: _process_pattern_index(_abs(f), p, s)),
+            'phash': R(lambda f, _c, p, s: _process_phash(f, p, s)),
+            'tiles': R(_tiles, _get_clip_indexer),
+            'stills': R(lambda f, _c, p, s: _process_capture_frames(f, p, s)),
+            'video_faces': R(_video_faces, _get_face_detector),
+        }
+
+    def _folder_ml_files(rel):
+        """([(file_id, rel_path)], scan_status statuses) for every tracked file under
+        folder `rel`, recursively — one path per file (the first under the folder),
+        trashed files dropped like the /bulk jobs' default. Broken files stay in the
+        list (their status says so; folder_ml never plans them)."""
+        tracked = _fm_tracked_under(rel)
+        by_id = {}
+        for path in sorted(tracked):
+            by_id.setdefault(tracked[path]['file_id'], path)
+        trashed = _trashed_file_ids()
+        files = [(fid, p) for fid, p in by_id.items() if fid not in trashed]
+        return files, scan_status.status_for_files(db, manual, files)
+
+    def _folder_ml_scope(path):
+        """(rel, files, statuses) for a request's folder; 404 if it's neither on disk
+        nor has anything tracked under it."""
+        abs_dir, rel = _library_path((path or '').strip('/'))
+        files, statuses = _folder_ml_files(rel)
+        if not files and not os.path.isdir(abs_dir):
+            raise HTTPException(status_code=404, detail='Folder not found')
+        return rel, files, statuses
+
+    @app.get('/api/fm/ml/preview')
+    def api_fm_ml_preview(path: str = ''):
+        """What "Run missing ML here" would do under `path` (recursive):
+          {path, files: n tracked non-broken files,
+           stages: [{key, label, required, missing: n files lacking it}]} in run order."""
+        rel, files, statuses = _folder_ml_scope(path)
+        missing = folder_ml.missing_by_stage(files, statuses)
+        return {
+            'path': rel,
+            'files': sum(1 for fid, _p in files
+                         if statuses.get(fid, {}).get('state') != 'broken'),
+            'stages': [{'key': k, 'label': folder_ml.STAGE_INFO[k][0],
+                        'required': folder_ml.STAGE_INFO[k][1], 'missing': len(missing[k])}
+                       for k in folder_ml.STAGE_ORDER],
+        }
+
+    @app.post('/api/fm/ml/start')
+    def api_fm_ml_start(body: FmMLBody):
+        """Run every missing stage over the folder's files, each stage only over the
+        files lacking it (folder_ml.plan; stages=None → required stages with work, the
+        optional tiles only when named). 400 unknown stage, 404 no such folder, 409 while
+        a folder ML job runs. Returns {started: true, ...status}."""
+        if folder_ml_job.state['running']:
+            raise HTTPException(status_code=409, detail=(
+                f"Already running ML on '{folder_ml_job.state['path'] or '/'}'"))
+        rel, files, statuses = _folder_ml_scope(body.path)
+        try:
+            stage_plan = folder_ml.plan(files, statuses, body.stages)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if not folder_ml_job.try_begin(rel, stage_plan):
+            raise HTTPException(status_code=409, detail=(
+                f"Already running ML on '{folder_ml_job.state['path'] or '/'}'"))
+
+        def _run():
+            error = None
+            try:
+                error = folder_ml.run_plan(
+                    folder_ml_job, stage_plan, _folder_ml_runners(), claim=_folder_ml_claim,
+                    invalidate=scan_status.invalidate,
+                    unavailable=(folder_ml.StageUnavailable, WorkerError))
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
+                traceback.print_exc()
+                error = str(exc) or type(exc).__name__
+            finally:
+                folder_ml_job.finish(error)
+        _spawn_job(_run)
+        return {'started': True, **folder_ml_job.status()}
+
+    @app.get('/api/fm/ml/status')
+    def api_fm_ml_status():
+        """{running, path, started_at, finished_at, current_stage, error, cancelled,
+        stages: [{key, label, total, done, failed,
+                  status: pending|running|done|skipped|error|cancelled, message}]}."""
+        return folder_ml_job.status()
+
+    @app.post('/api/fm/ml/cancel')
+    def api_fm_ml_cancel():
+        """Cooperative cancel: the job stops after the file in hand. {cancel_requested:
+        bool (False = nothing was running), ...status}."""
+        return {'cancel_requested': folder_ml_job.cancel(), **folder_ml_job.status()}
 
     # ------------------------------------------------------------------
     # JSON API

@@ -10,11 +10,24 @@
           title="Add every image/video under this folder to a set">＋ Use this folder…</button>
   <button type="button" id="folder-video-btn" data-folder="{{ folder }}" class="stage-btn-accent"
           title="Generate an AI morph video from every image in this folder, ordered by filename">🎬 Folder → video</button>
-  <button type="button" id="upload-btn" data-folder="{{ folder }}" class="stage-btn-accent"
-          title="Upload photos/videos into this folder (never overwrites — a name clash gets ' (1)')">⬆ Upload here</button>
+  <button type="button" id="upload-btn" class="stage-btn-accent"
+          title="Upload photos/videos into uploads/ (spread over 256 subfolders). Files already in the library are rejected. From a shell: curl -F file=@photo.jpg {{ request.base_url }}api/files/upload">⬆ Upload</button>
   <input type="file" id="upload-input" multiple accept="image/*,video/*" hidden>
+  {% if fm %}
+  {# Untracked media under this folder: its own files + every subfolder's recursive
+     rollup (the rollups come from the disk inventory, so they can be stale). #}
+  {% set fm_ns = namespace(untracked=(fm.counts or {}).get('untracked', 0) or 0) %}
+  {% for sub in fm.folders %}{% set fm_ns.untracked = fm_ns.untracked + ((sub.counts or {}).get('untracked', 0) or 0) %}{% endfor %}
+  <button type="button" id="fm-track-btn" class="stage-btn-accent"
+          data-folder="{{ folder }}" data-untracked="{{ fm_ns.untracked }}"
+          data-inventory="{{ '1' if (fm.inventory or {}).refreshed_at else '0' }}"
+          title="Add the untracked photos/videos under this folder (and its subfolders) to the library — the same as running `media add` on it. Duplicates of files already in the library and .mediaignore'd files are skipped.">📥 Track this folder</button>
+  <button type="button" id="fm-ml-btn" class="stage-btn-accent" data-folder="{{ folder }}"
+          title="Run the scan stages (objects, CLIP, faces, …) that are still missing for tracked files under this folder — you pick which stages first.">🧠 Run missing ML here</button>
+  {% endif %}
 </div>
 <div id="upload-status" class="sub" style="display:none;margin-bottom:12px;"></div>
+{% if fm %}<div id="fm-jobs" class="fm-jobs" aria-live="polite"></div>{% endif %}
 
 <!-- Phone-first swipe-down browse feeds -->
 <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
@@ -258,7 +271,6 @@ document.getElementById('hide-with-set').addEventListener('change', reloadWithFi
   input.addEventListener('change', function () {
     if (!input.files.length) return;
     var form = new FormData();
-    form.append('folder', btn.dataset.folder);
     for (var i = 0; i < input.files.length; i++) form.append('files', input.files[i]);
     var n = input.files.length;
     var xhr = new XMLHttpRequest();

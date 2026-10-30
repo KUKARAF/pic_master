@@ -51,10 +51,13 @@ def _decode_draft(abs_path, long_side):
 
 
 def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
-                       exclude_ids=None, candidates=None, on_progress=None, log=None):
+                       exclude_ids=None, candidates=None, on_progress=None, log=None,
+                       should_stop=None):
     """Encode + store DINOv2 region embeddings for every image lacking an object-region
     index row. `encoder` must expose model_id() and embed_regions(pil) -> list of
     ((x1,y1,x2,y2) in the passed image's pixels, float32 L2-normalized vector).
+    `should_stop()` is checked before each image's write — True ends the build early
+    (images already decoded in that batch are left un-indexed).
 
     Returns the number of candidates processed.
     """
@@ -82,8 +85,11 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
     done = 0
     consecutive_failures = 0
     pool = ThreadPoolExecutor(max_workers=workers)
+    stopped = False
     try:
         for i in range(0, total, batch):
+            if stopped:
+                break
             chunk = candidates[i:i + batch]
             # path resolution on this thread
             resolved = [(fid, rel, _resolve(fid, rel)) for fid, rel in chunk]
@@ -98,6 +104,9 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
                 return (fid, rel, 'ok', im, scale)
 
             for fid, rel, status, im, scale in pool.map(_decode, resolved):
+                if should_stop is not None and should_stop():
+                    stopped = True
+                    break
                 if status == 'nopath':
                     pass  # offline/moved — leave un-indexed so it retries later
                 elif status == 'decodefail':
