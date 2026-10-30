@@ -2022,7 +2022,7 @@ def create_app(data_root: str) -> FastAPI:
                 print(f"[web] photo {file_id} {kind} done: {out} (artifact {aid})", flush=True)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                generate_photo_job['error'] = str(exc)
+                generate_photo_job['error'] = compute.job_error_text(exc)
                 print(f"[web] photo {file_id} {kind} generation FAILED: {exc}", flush=True)
             finally:
                 generate_photo_job['running'] = False
@@ -2306,7 +2306,7 @@ def create_app(data_root: str) -> FastAPI:
                 track_job['phase'] = 'done'
             except Exception as exc:  # hook-allow: broad — reported via the job's error field
                 traceback.print_exc()
-                track_job['error'] = str(exc) or exc.__class__.__name__
+                track_job['error'] = compute.job_error_text(exc) or exc.__class__.__name__
             finally:
                 scan_status.invalidate()
                 track_job['finished_at'] = int(time.time())
@@ -3583,7 +3583,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_region_index(candidates, lambda d, _f: region_index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                region_index_job['error'] = str(exc)
+                region_index_job['error'] = compute.job_error_text(exc)
             finally:
                 region_index_job['running'] = False
 
@@ -3755,7 +3755,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_pattern_index(candidates, lambda d, _f: pattern_index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                pattern_index_job['error'] = str(exc)
+                pattern_index_job['error'] = compute.job_error_text(exc)
             finally:
                 pattern_index_job['running'] = False
 
@@ -4418,7 +4418,7 @@ def create_app(data_root: str) -> FastAPI:
                     face_body_link_job.update(done=i, linked=linked)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                face_body_link_job['error'] = str(exc)
+                face_body_link_job['error'] = compute.job_error_text(exc)
                 print(f'[face-body-link] FAILED: {exc}', flush=True)
             finally:
                 face_body_link_job['running'] = False
@@ -4461,7 +4461,7 @@ def create_app(data_root: str) -> FastAPI:
                     on_progress=_progress,
                     exclude_ids=(None if include_trashed else _trashed_file_ids()))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                body_index_job['error'] = str(exc)
+                body_index_job['error'] = compute.job_error_text(exc)
             finally:
                 body_index_job['running'] = False
 
@@ -4525,6 +4525,7 @@ def create_app(data_root: str) -> FastAPI:
                 db.insert_embedding(fid, _video_clip_embedding(fpath, indexer).tobytes(), model_id)
             except (ValueError, OSError, cv2.error) as exc:
                 errors.log(fpath, f'video embedding: {exc}')
+                compute.raise_if_gpu_fatal(exc)
                 failed += 1
             done += 1
             on_progress(done, failed)
@@ -4541,6 +4542,7 @@ def create_app(data_root: str) -> FastAPI:
                     return done, failed
                 if fpath in failed_messages:
                     errors.log(fpath, failed_messages[fpath])
+                    compute.raise_if_gpu_fatal(failed_messages[fpath])
                     failed += 1
                 else:
                     db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
@@ -4571,7 +4573,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_clip_index(candidates, lambda d, _f: index_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                index_job['error'] = str(exc)
+                index_job['error'] = compute.job_error_text(exc)
             finally:
                 index_job['running'] = False
 
@@ -4660,7 +4662,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_phash(candidates, lambda d, _f: phash_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                phash_job['error'] = str(exc)
+                phash_job['error'] = compute.job_error_text(exc)
             finally:
                 phash_job['running'] = False
 
@@ -4735,7 +4737,7 @@ def create_app(data_root: str) -> FastAPI:
                 _process_capture_frames([(fid, rel) for fid, rel, _cs in candidates],
                                         lambda d, _f: capture_frames_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                capture_frames_job['error'] = str(exc)
+                capture_frames_job['error'] = compute.job_error_text(exc)
             finally:
                 capture_frames_job['running'] = False
 
@@ -4938,7 +4940,7 @@ def create_app(data_root: str) -> FastAPI:
                     lambda d, _f: video_face_scan_job.update(done=d),
                     capture_unmatched=capture_unmatched, threshold=threshold)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                video_face_scan_job['error'] = str(exc)
+                video_face_scan_job['error'] = compute.job_error_text(exc)
             finally:
                 video_face_scan_job['running'] = False
 
@@ -5017,7 +5019,7 @@ def create_app(data_root: str) -> FastAPI:
                     else:
                         consecutive_failures = 0
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                estimate_age_job['error'] = str(exc)
+                estimate_age_job['error'] = compute.job_error_text(exc)
             finally:
                 estimate_age_job['running'] = False
 
@@ -5124,6 +5126,7 @@ def create_app(data_root: str) -> FastAPI:
                 done += 1
                 if error:
                     errors.log(rel_path, f'detect-faces: {error}')
+                    compute.raise_if_gpu_fatal(error)
                     failed += 1
                     on_progress(done, failed)
                     continue
@@ -5166,7 +5169,7 @@ def create_app(data_root: str) -> FastAPI:
                                       lambda d, _f: detect_faces_job.update(done=d),
                                       threshold=threshold)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                detect_faces_job['error'] = str(exc)
+                detect_faces_job['error'] = compute.job_error_text(exc)
             finally:
                 detect_faces_job['running'] = False
 
@@ -5289,7 +5292,7 @@ def create_app(data_root: str) -> FastAPI:
                     n += 1
                 near_dup_job['groups'] = n
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                near_dup_job['error'] = str(exc)
+                near_dup_job['error'] = compute.job_error_text(exc)
             finally:
                 near_dup_job['running'] = False
 
@@ -5336,7 +5339,7 @@ def create_app(data_root: str) -> FastAPI:
                     marked += 1
                     broken_scan_job['marked'] = marked
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                broken_scan_job['error'] = str(exc)
+                broken_scan_job['error'] = compute.job_error_text(exc)
             finally:
                 broken_scan_job['running'] = False
 
@@ -5657,7 +5660,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_metadata(candidates, lambda d, _f: metadata_job.update(done=d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                metadata_job['error'] = str(exc)
+                metadata_job['error'] = compute.job_error_text(exc)
             finally:
                 metadata_job['running'] = False
 
@@ -5699,7 +5702,7 @@ def create_app(data_root: str) -> FastAPI:
                     done += 1
                     cities_job['done'] = done
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                cities_job['error'] = str(exc)
+                cities_job['error'] = compute.job_error_text(exc)
             finally:
                 cities_job['running'] = False
 
@@ -5745,7 +5748,7 @@ def create_app(data_root: str) -> FastAPI:
                 fetch_cities_job['total'] = count
                 fetch_cities_job['done'] = count
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                fetch_cities_job['error'] = str(exc)
+                fetch_cities_job['error'] = compute.job_error_text(exc)
             finally:
                 fetch_cities_job['running'] = False
 
@@ -5795,7 +5798,7 @@ def create_app(data_root: str) -> FastAPI:
                 imdb_build_job['results'] = remote_index_builder.build_index(
                     data_root, progress=_progress)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                imdb_build_job['error'] = str(exc)
+                imdb_build_job['error'] = compute.job_error_text(exc)
             finally:
                 imdb_build_job['running'] = False
 
@@ -5903,7 +5906,7 @@ def create_app(data_root: str) -> FastAPI:
                     matched += 1
                     match_faces_job['matched'] = matched
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                match_faces_job['error'] = str(exc)
+                match_faces_job['error'] = compute.job_error_text(exc)
             finally:
                 match_faces_job['running'] = False
 
@@ -5944,7 +5947,7 @@ def create_app(data_root: str) -> FastAPI:
                     db, errors, _get_clip_indexer(), data_root, on_progress=_progress,
                     exclude_ids=(None if include_trashed else _trashed_file_ids()))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                tile_index_job['error'] = str(exc)
+                tile_index_job['error'] = compute.job_error_text(exc)
             finally:
                 tile_index_job['running'] = False
 
@@ -5999,7 +6002,7 @@ def create_app(data_root: str) -> FastAPI:
                     log=errors.log)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                object_index_job['error'] = str(exc)
+                object_index_job['error'] = compute.job_error_text(exc)
                 print(f'[object-index] FAILED: {exc}', flush=True)
             finally:
                 object_index_job['running'] = False
@@ -6087,6 +6090,7 @@ def create_app(data_root: str) -> FastAPI:
                     return done, failed
                 if error is not None:
                     errors.log(rel_path, f'auto-tag: {error}')
+                    compute.raise_if_gpu_fatal(error)
                     failed += 1
                 else:
                     db.insert_detections(fid, detections, model_id)
@@ -7745,7 +7749,7 @@ def create_app(data_root: str) -> FastAPI:
                 print(f"[web] set {set_id} morph video done: {out} (artifact {aid})", flush=True)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                generate_video_job['error'] = str(exc)
+                generate_video_job['error'] = compute.job_error_text(exc)
                 print(f"[web] set {set_id} video generation FAILED: {exc}", flush=True)
             finally:
                 generate_video_job['running'] = False
@@ -7806,7 +7810,7 @@ def create_app(data_root: str) -> FastAPI:
                 print(f"[web] set {set_id} image done: {out} (artifact {aid})", flush=True)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                generate_image_job['error'] = str(exc)
+                generate_image_job['error'] = compute.job_error_text(exc)
                 print(f"[web] set {set_id} image generation FAILED: {exc}", flush=True)
             finally:
                 generate_image_job['running'] = False
@@ -7907,7 +7911,7 @@ def create_app(data_root: str) -> FastAPI:
                 print(f"[web] folder '{path}' morph video done: {out} (artifact {aid})", flush=True)
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 traceback.print_exc()
-                folder_video_job['error'] = str(exc)
+                folder_video_job['error'] = compute.job_error_text(exc)
                 print(f"[web] folder '{path}' video generation FAILED: {exc}", flush=True)
             finally:
                 folder_video_job['running'] = False
@@ -10212,7 +10216,7 @@ def create_app(data_root: str) -> FastAPI:
                 face_suggest_job['scored'] = compute_face_suggestions(
                     progress=lambda d: face_suggest_job.__setitem__('done', d))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                face_suggest_job['error'] = str(exc)
+                face_suggest_job['error'] = compute.job_error_text(exc)
             finally:
                 face_suggest_job['running'] = False
 
@@ -10396,7 +10400,7 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _renormalize_faces()
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                renormalize_job['error'] = str(exc)
+                renormalize_job['error'] = compute.job_error_text(exc)
             finally:
                 renormalize_job['running'] = False
 
@@ -10757,7 +10761,7 @@ def create_app(data_root: str) -> FastAPI:
                     os.unlink(tmp_path)
                     job['frames_processed'] += 1
         except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-            job['error'] = str(exc)
+            job['error'] = compute.job_error_text(exc)
         finally:
             job['done'] = True
 

@@ -24,7 +24,7 @@ left half-written. The cancelled stage and every later one are marked 'cancelled
 import threading
 import time
 
-from . import scan_status
+from . import compute, scan_status
 
 # Execution order: images first (embedding/detection before the indexes that reuse
 # them — bodies reuse tags' person boxes), videos last with the face scan after the
@@ -221,7 +221,7 @@ def _run_stage(job, entry, files, runner, claim, invalidate, unavailable):
         entry.update(status='skipped', message=f'Unavailable: {exc}')
         return None
     except Exception as exc:  # hook-allow: broad — stage abort; surfaced in status, run stops
-        msg = str(exc) or type(exc).__name__
+        msg = compute.job_error_text(exc)
         entry.update(status='error', message=msg)
         return f'{entry["label"]}: {msg}'
     finally:

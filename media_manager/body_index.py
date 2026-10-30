@@ -32,6 +32,7 @@ import os
 
 from PIL import Image
 
+from . import compute
 from .formats import IMAGE_EXTENSIONS
 
 # Fraction of the face box's area that must fall inside a person box to call that
@@ -167,6 +168,7 @@ def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=
             embed_bodies_for_file(db, clip_indexer, file_id, abs_path, detector=detector)
         except Exception as exc:  # hook-allow: broad — per-file resilience, logged
             errors.log(rel_path, f'body index: {exc}')
+            compute.raise_if_gpu_fatal(exc)   # GPU gone: stop, don't fail every remaining file
         processed += 1
         if on_progress:
             on_progress(processed, total)

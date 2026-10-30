@@ -13,6 +13,7 @@ whole-image CLIP search).
 import os
 
 
+from . import compute
 from .formats import IMAGE_EXTENSIONS, open_upright_rgb
 
 # Tiles smaller than this on either side embed to noise, so drop them (matches the
@@ -127,6 +128,7 @@ def build_tile_index(db, errors, clip_indexer, data_root, on_progress=None, excl
             embed_tiles_for_file(db, clip_indexer, file_id, abs_path)
         except Exception as exc:  # hook-allow: broad — per-file resilience, logged
             errors.log(rel_path, f'tile index: {exc}')
+            compute.raise_if_gpu_fatal(exc)   # GPU gone: stop, don't fail every remaining file
         processed += 1
         if on_progress:
             on_progress(processed, total)

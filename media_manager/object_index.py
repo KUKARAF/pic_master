@@ -21,6 +21,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
+from . import compute
+
 MAX_CONSECUTIVE_EMBED_FAILURES = 5
 
 
@@ -131,6 +133,7 @@ def build_object_index(db, encoder, data_root, *, image_exts, abs_path_fn=None,
                             log(rel, f'object-index embed failed ({type(exc).__name__}): {exc} '
                                      '(not indexed; will retry)')
                         regions = None
+                        compute.raise_if_gpu_fatal(exc)
                         consecutive_failures += 1
                         if consecutive_failures >= MAX_CONSECUTIVE_EMBED_FAILURES:
                             raise RuntimeError(

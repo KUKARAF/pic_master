@@ -189,3 +189,47 @@ def _warn_missing_ep(device: str, want: str) -> None:
         f"InsightFace/PCN will run on CPU. Install it to accelerate faces too.",
         file=sys.stderr,
     )
+
+
+# --- GPU-fatal errors -------------------------------------------------------------
+# Messages the GPU stack produces when the device itself is out of memory or lost
+# (Intel Arc via OpenVINO / Level Zero / OpenCL, CUDA). After one of these the driver
+# is unreliable until the process restarts ("any subsequent OpenCL API call may cause
+# the application to hang"), so every following file would fail too: bulk jobs stop on
+# the first one with GPU_FATAL_HINT instead of logging a failure per remaining file.
+GPU_FATAL_MARKERS = (
+    'CL_OUT_OF_RESOURCES', 'CL_OUT_OF_HOST_MEMORY', 'CL_MEM_OBJECT_ALLOCATION_FAILURE',
+    'CL_DEVICE_NOT_AVAILABLE', 'DEVICE_LOST', 'UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY',
+    'Native API failed', 'XPU out of memory', 'CUDA out of memory', 'CUDA error',
+)
+GPU_FATAL_HINT = ('The GPU ran out of memory or was lost, so the job stopped. Restart the '
+                  'server (media web) to reset the GPU; files not processed yet are picked '
+                  'up by the next run.')
+
+
+class GPUFatalError(RuntimeError):
+    """The GPU is out of memory / lost — stop the job; the message says what to do."""
+
+
+def is_gpu_fatal(error) -> bool:
+    text = str(error or '')
+    return any(marker in text for marker in GPU_FATAL_MARKERS)
+
+
+def raise_if_gpu_fatal(error):
+    """Raise GPUFatalError (GPU_FATAL_HINT + the original message's first line) when
+    `error` (an exception or a per-file error string) is a GPU-fatal one."""
+    if is_gpu_fatal(error):
+        first = next((ln.strip() for ln in str(error).splitlines() if ln.strip()), '')
+        raise GPUFatalError(f'{GPU_FATAL_HINT} ({first[:200]})')
+
+
+def job_error_text(exc) -> str:
+    """What a bulk job shows for the exception that ended it: the GPU hint for
+    GPU-fatal errors, otherwise the exception text."""
+    if isinstance(exc, GPUFatalError):
+        return str(exc)
+    if is_gpu_fatal(exc):
+        first = next((ln.strip() for ln in str(exc).splitlines() if ln.strip()), '')
+        return f'{GPU_FATAL_HINT} ({first[:200]})'
+    return str(exc) or exc.__class__.__name__

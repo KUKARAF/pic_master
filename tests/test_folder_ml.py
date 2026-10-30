@@ -360,7 +360,7 @@ def test_object_infra_abort_does_not_stamp():
     with tempfile.TemporaryDirectory() as tmp:
         paths = tuple(f'o/{i}.png' for i in range(7))
         db, manual, client, ids = _lib(tmp, paths)
-        enc = RaisingEncoder(RuntimeError('CUDA error: device lost'))
+        enc = RaisingEncoder(RuntimeError('encoder blew up'))
         with patch.object(webmod, '_get_object_encoder', lambda _root: enc), \
                 patch.object(webmod.compute, 'torch_device', lambda: 'cuda'), \
                 patch.dict(os.environ, {'MEDIA_OBJECT_DECODE_BATCH': '1'}):
@@ -374,6 +374,24 @@ def test_object_infra_abort_does_not_stamp():
         n = db.conn.execute('SELECT COUNT(*) FROM object_region_embeddings').fetchone()[0]
         assert n == 0, 'infra failure stamped a sentinel'
         assert not any(s['stages']['objects'] for s in _status(db, manual, ids).values())
+
+
+def test_object_gpu_fatal_stops_at_once():
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = tuple(f'o/{i}.png' for i in range(7))
+        db, manual, client, ids = _lib(tmp, paths)
+        enc = RaisingEncoder(RuntimeError('CUDA error: device lost'))
+        with patch.object(webmod, '_get_object_encoder', lambda _root: enc), \
+                patch.object(webmod.compute, 'torch_device', lambda: 'cuda'), \
+                patch.dict(os.environ, {'MEDIA_OBJECT_DECODE_BATCH': '1'}):
+            client.post('/api/fm/ml/start', json={'path': 'o', 'stages': ['objects', 'phash']})
+            st = _wait(client, '/api/fm/ml/status')
+        by = _stages(st)
+        assert enc.calls == 1, enc.calls                         # no point trying the rest
+        assert by['objects']['status'] == 'error'
+        assert by['objects']['message'].startswith('The GPU ran out of memory or was lost'), by['objects']
+        assert by['phash']['status'] == 'pending', by['phash']
+        assert db.conn.execute('SELECT COUNT(*) FROM object_region_embeddings').fetchone()[0] == 0
 
 
 def test_unavailable_backends_skip_and_continue():
@@ -424,7 +442,7 @@ if __name__ == '__main__':
               test_folder_scope_only_missing_and_preview,
               test_cancel_stops_between_files,
               test_concurrency_refusals,
-              test_object_infra_abort_does_not_stamp,
+              test_object_infra_abort_does_not_stamp, test_object_gpu_fatal_stops_at_once,
               test_unavailable_backends_skip_and_continue,
               test_bulk_jobs_still_work):
         t()
