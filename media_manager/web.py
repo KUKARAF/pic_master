@@ -8,6 +8,7 @@ import ctypes
 import ctypes.util
 import errno
 import gc
+import hashlib
 import io
 import json
 import math
@@ -39,9 +40,10 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    body_index, compute, czkawka, exif_reader, frames, geonames, gpu_search, near_dup,
-    object_index, pattern_deep, phasher, region_index, remote_index_builder, set_image,
-    set_render, set_video, tile_index, video_decode, worker_client, worker_config,
+    body_index, compute, czkawka, exif_reader, file_inventory, frames, geonames, gpu_search,
+    near_dup, object_index, pattern_deep, phasher, region_index, remote_index_builder,
+    scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
+    worker_config,
 )
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
 from media_manager.body_index import crop_bodies, match_face_to_body
@@ -55,6 +57,7 @@ from media_manager.error_log import ErrorLog
 from media_manager.face_detector import FaceDetector, _norm_angle
 from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES, open_upright_rgb
 from media_manager.gen_service import ComfyUIClient
+from media_manager.ignore import IgnoreRules
 from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
 from media_manager.media_manager import MediaManager, _parse_query
 from media_manager.object_encoder import ObjectEncoder
@@ -800,10 +803,22 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 target()
             finally:
+                # Most bulk jobs write pipeline-stage rows; drop the file manager's
+                # cached stage snapshot so its colours catch up right away instead of
+                # after scan_status.CACHE_TTL.
+                scan_status.invalidate()
                 db.close()
                 manual.close()
                 errors.close()
         threading.Thread(target=_wrapped, daemon=True).start()
+
+    # On-disk inventory behind the /files file manager's recursive folder rollups (see
+    # file_inventory.py). First start on a library: walk it once in the background —
+    # stat only, no hashing — so the rollups have data without anyone asking.
+    file_inventory.ensure_schema(db.conn)
+    inventory_job = file_inventory.InventoryJob(db, data_root)
+    if inventory_job.should_autostart():
+        inventory_job.start(_spawn_job)
 
     app = FastAPI(title='media gallery')
     app.state.dbs = (db, errors, manual)  # observability / manual-reap hook (see _start_fd_reaper)
@@ -1642,7 +1657,7 @@ def create_app(data_root: str) -> FastAPI:
                 os.replace(tmp_path, out_path)
             with playable_lock:
                 playable_jobs.pop(file_id, None)
-        except Exception as exc:
+        except Exception as exc:  # hook-allow: broad — logged + surfaced via the job's error state
             errors.log(abs_path, f'playable transcode: {exc}')
             job.update(state='error', error=str(exc))
             with contextlib.suppress(OSError):
@@ -1962,15 +1977,253 @@ def create_app(data_root: str) -> FastAPI:
                 'error': j['error'] if mine else None,
                 'artifact_id': j['artifact_id'] if mine else None}
 
+    # ------------------------------------------------------------------
+    # /files file manager: every file on disk, coloured by tracking/scan state
+    # ------------------------------------------------------------------
+
+    def _library_path(rel):
+        """Shared realpath jail for every library path a request names. `rel` is
+        relative to data_root ('' = the root). Refuses absolute paths, NULs, anything
+        resolving outside data_root (../, symlink escapes) and the app's own .media
+        store. Returns (abs_path, rel_posix) with rel_posix normalized ('' for the
+        root, '/'-separated like file_paths.path). Existence is NOT checked."""
+        rel = rel or ''
+        if '\x00' in rel or os.path.isabs(rel):
+            raise HTTPException(status_code=400, detail='Path must be relative to the library')
+        root = os.path.realpath(data_root)
+        target = os.path.realpath(os.path.join(root, rel))
+        if target != root and not target.startswith(root + os.sep):
+            raise HTTPException(status_code=400, detail='Path is outside the library')
+        rel_posix = '' if target == root else os.path.relpath(target, root).replace(os.sep, '/')
+        if rel_posix.split('/', 1)[0] == '.media':
+            raise HTTPException(status_code=400, detail="Paths inside .media are off limits")
+        return target, rel_posix
+
+    FM_COUNT_KEYS = ('untracked', 'tracked', 'partial', 'scanned', 'broken', 'missing', 'ignored')
+    # Untracked files: classify_path category → file-manager state.
+    FM_UNTRACKED_STATE = {'media': 'untracked', 'system': 'ignored', 'ignored': 'ignored',
+                          'other': 'other'}
+    FM_STAGES = {kind: [{'key': k, 'label': label, 'required': req} for k, label, req in stages]
+                 for kind, stages in scan_status.STAGES.items()}
+
+    def _fm_tracked_under(rel):
+        """{path: row} for every tracked path anywhere under folder `rel` — one GLOB
+        range scan on file_paths' path index (the whole table at the root)."""
+        sql = ('SELECT fp.path, fp.file_id, fp.modified_time, fp.last_seen_at, '
+               'f.hidden, f.checksum, f.size FROM file_paths fp JOIN files f ON f.id = fp.file_id')
+        if rel:
+            cur = db.conn.execute(sql + ' WHERE fp.path GLOB ?',
+                                  (f'{file_inventory.glob_escape(rel)}/*',))
+        else:
+            cur = db.conn.execute(sql)
+        return {r['path']: r for r in cur}
+
+    def fm_listing(rel_folder='', show_other=False, hide_with_face=False, hide_with_set=False):
+        """One folder of the file manager (shape documented on GET /api/fm/list).
+
+        Files come from a live scandir of the folder; folder rollups from the
+        disk_files inventory (recursive, possibly stale) joined with tracking. Hidden
+        tracked files (captured stills, AI output) are listed with their scan state
+        but card=None, since the photo grid has never shown them; every other tracked
+        file (missing ones too) gets its grid card. A tracked file
+        that's in neither the live listing nor the inventory is 'missing' — except,
+        in rollups, one tracked after the last walk (last_seen_at > refreshed_at),
+        which the inventory simply hasn't seen yet. hide_with_face / hide_with_set
+        drop matching tracked files from `files` only (counts stay unfiltered).
+        Query count is fixed: one file_paths range scan, one disk_files range scan,
+        one direct-children sync, one scan_status batch, one card batch."""
+        abs_dir, rel = _library_path(rel_folder)
+        conn = db.conn
+        live_dirs, live_files = file_inventory.list_folder_live(data_root, rel, conn=conn)
+        tracked = _fm_tracked_under(rel)
+        statuses = scan_status.status_for_files(
+            db, manual, {r['file_id']: p for p, r in tracked.items()}.items())
+        rules = IgnoreRules(data_root)
+        inv_at = file_inventory.refreshed_at(conn)
+
+        def _join(name):
+            return f'{rel}/{name}' if rel else name
+
+        def _untracked_state(path):
+            return FM_UNTRACKED_STATE[file_inventory.classify_path(path, rules)[0]]
+
+        def _tracked_state(row):
+            st = statuses.get(row['file_id'])
+            return st['state'] if st else 'tracked'
+
+        base = len(rel) + 1 if rel else 0
+        direct_tracked, child_tracked = {}, {}
+        for path, r in tracked.items():
+            rest = path[base:]
+            slash = rest.find('/')
+            if slash < 0:
+                direct_tracked[path] = r
+            else:
+                child_tracked.setdefault(rest[:slash], {})[path] = r
+
+        # --- this folder's own files: live disk ∪ tracked-but-missing ---
+        counts = dict.fromkeys(FM_COUNT_KEYS + ('other',), 0)
+        files = []
+
+        def _entry(name, path, size, mtime, state, row):
+            st = statuses.get(row['file_id']) if row is not None else None
+            return {'name': name, 'path': path,
+                    'kind': file_inventory.media_kind(path) or 'other',
+                    'size': size, 'mtime': mtime, 'state': state,
+                    'file_id': row['file_id'] if row is not None else None,
+                    'stages': st['stages'] if st else None,
+                    'missing': st['missing'] if st else [], 'card': None}
+
+        live_paths = set()
+        for f in live_files:
+            path = _join(f['name'])
+            live_paths.add(path)
+            row = direct_tracked.get(path)
+            state = _tracked_state(row) if row is not None else _untracked_state(path)
+            counts[state] += 1
+            if state == 'other' and not show_other:
+                continue
+            files.append(_entry(f['name'], path, f['size'], f['mtime'], state, row))
+        for path, row in direct_tracked.items():
+            if path not in live_paths:
+                counts['missing'] += 1
+                files.append(_entry(path[base:], path, row['size'], row['modified_time'],
+                                    'missing', row))
+
+        if hide_with_face or hide_with_set:
+            drop = set()
+            if hide_with_face:
+                drop |= db.get_all_checksums_with_face() | manual.get_all_checksums_with_named_face()
+            if hide_with_set:
+                drop |= manual.get_all_set_member_checksums()
+            files = [f for f in files if f['file_id'] is None
+                     or direct_tracked[f['path']]['checksum'] not in drop]
+
+        # Grid cards for every tracked, non-hidden file — 'missing' ones included, as
+        # the tracked-only grid always showed them — in one _enrich_rows batch.
+        card_files = [f for f in files if f['file_id'] is not None
+                      and not direct_tracked[f['path']]['hidden']]
+        cards = _enrich_rows([(f['file_id'], f['path'], False, direct_tracked[f['path']]['checksum'])
+                              for f in card_files])
+        for f, card in zip(card_files, cards):
+            f['card'] = card
+        files.sort(key=lambda f: (f['name'].lower(), f['name']))
+
+        # --- immediate subfolders, with recursive rollups ---
+        disk_children = (file_inventory.subfolder_media_paths(conn, rel)
+                         if inv_at is not None else {})
+        live_dir_set = set(live_dirs)
+        folders = []
+        for name in sorted(live_dir_set | set(child_tracked), key=lambda n: (n.lower(), n)):
+            c = dict.fromkeys(FM_COUNT_KEYS, 0)
+            on_disk = name in live_dir_set
+            ctracked = child_tracked.get(name, {})
+            disk_paths = disk_children.get(name, ()) if on_disk else ()
+            for path in disk_paths:
+                row = ctracked.get(path)
+                state = _tracked_state(row) if row is not None else _untracked_state(path)
+                if state in c:
+                    c[state] += 1
+            disk_set = set(disk_paths)
+            for path, row in ctracked.items():
+                if path in disk_set:
+                    continue
+                if on_disk and (inv_at is None or row['last_seen_at'] > inv_at):
+                    c[_tracked_state(row)] += 1     # inventory can't vouch either way
+                else:
+                    c['missing'] += 1
+            folders.append({'name': name, 'path': _join(name), 'counts': c,
+                            'total': sum(c.values()),
+                            'system': not rel and name in file_inventory.SYSTEM_DIRS})
+
+        return {
+            'path': rel,
+            'parent': None if not rel else (rel.rsplit('/', 1)[0] if '/' in rel else ''),
+            'inventory': {
+                'refreshed_at': inv_at,
+                'running': inventory_job.state['running'],
+                'stale': inv_at is None or time.time() - inv_at > file_inventory.STALE_AFTER,
+            },
+            'stages': FM_STAGES,
+            'folders': folders,
+            'files': files,
+            'counts': counts,
+        }
+
+    @app.get('/api/fm/list')
+    def api_fm_list(path: str = '', show_other: bool = False,
+                    hide_with_face: bool = False, hide_with_set: bool = False):
+        """The file manager's folder listing:
+          {path, parent ('' = root, None at the root itself),
+           inventory: {refreshed_at|None, running, stale},
+           stages: {'image'|'video': [{key, label, required}]},
+           folders: [{name, path, counts: {untracked, tracked, partial, scanned, broken,
+                      missing, ignored}, total, system}],
+           files: [{name, path, kind: image|video|other, size, mtime,
+                    state: untracked|tracked|partial|scanned|broken|missing|ignored|other,
+                    file_id|None, stages|None, missing: [labels], card|None}],
+           counts: {state: n} for this folder's direct files ('other' always counted,
+                   listed only with show_other)}
+        404 when the folder is neither on disk nor has anything tracked under it."""
+        fm = fm_listing(path, show_other=show_other, hide_with_face=hide_with_face,
+                        hide_with_set=hide_with_set)
+        if not fm['files'] and not fm['folders'] and not any(fm['counts'].values()) \
+                and not os.path.isdir(_library_path(path)[0]):
+            raise HTTPException(status_code=404, detail='Folder not found')
+        return fm
+
+    @app.post('/api/fm/inventory/start')
+    def api_fm_inventory_start():
+        """Start the background full disk walk (no-op if one is already running)."""
+        started = inventory_job.start(_spawn_job)
+        return {'started': started, **inventory_job.status()}
+
+    @app.get('/api/fm/inventory/status')
+    def api_fm_inventory_status():
+        """{running, done, total, error, started_at, finished_at, refreshed_at}."""
+        return inventory_job.status()
+
+    fm_thumbs_dir = os.path.join(media_dir, 'fm_thumbs')
+
+    @app.get('/api/fm/preview')
+    def api_fm_preview(path: str = Query(...)):
+        """400 px JPEG preview for an image by library path — meant for UNTRACKED
+        images, which have no file_id and so no /thumb. Cached under
+        .media/fm_thumbs/<sha1[:2]>/<sha1(path)>_<mtime_ns>_<size>.jpg, so an edited
+        file gets a fresh preview (its older cache entries are dropped). A file that
+        won't decode gets the gray placeholder; nothing is ever marked broken here."""
+        abs_path, rel = _library_path(path)
+        if file_inventory.media_kind(rel) != 'image':
+            raise HTTPException(status_code=400, detail='Previews are for images only')
+        try:
+            st = os.stat(abs_path)
+        except OSError:
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        if not os.path.isfile(abs_path):
+            raise HTTPException(status_code=404, detail='File not found on disk')
+        key = hashlib.sha1(rel.encode('utf-8')).hexdigest()
+        shard = os.path.join(fm_thumbs_dir, key[:2])
+        dst = os.path.join(shard, f'{key}_{st.st_mtime_ns}_{st.st_size}.jpg')
+        if not os.path.isfile(dst):
+            with contextlib.suppress(OSError):
+                for old in os.listdir(shard):
+                    if old.startswith(key + '_'):
+                        os.remove(os.path.join(shard, old))
+            if _make_thumbnail(abs_path, dst)[0] != THUMB_OK:
+                return Response(_gray_placeholder(), media_type='image/jpeg',
+                                headers={'Cache-Control': 'no-store'})
+        return FileResponse(dst, media_type='image/jpeg',
+                            headers={'Cache-Control': 'private, max-age=300'})
+
     @app.get('/files', response_class=HTMLResponse)
     @app.get('/files/{subpath:path}', response_class=HTMLResponse)
     def files_page(request: Request, subpath: str = '',
                    hide_with_face: bool = False, hide_with_set: bool = False):
-        """Browse the tracked library as a folder tree. `subpath` (via the {path}
-        converter, so it may contain slashes) is the current folder relative to
-        data_root; '' is the root. Shows immediate subfolders + the media directly
-        in this folder, and a "Use this folder" button that adds the whole subtree
-        to a set.
+        """Browse the library as a folder tree. `subpath` (via the {path} converter,
+        so it may contain slashes) is the current folder relative to data_root; ''
+        is the root. `fm` is the file manager listing (see fm_listing / GET
+        /api/fm/list) — every file on disk, not just tracked ones; the older
+        `subfolders` / `files` keys are derived from it for the tracked-only grid.
 
         Two independent listing filters (off by default, toggled from the toolbar
         and reloaded via ?hide_with_face=1 / ?hide_with_set=1): drop any file that
@@ -1978,21 +2231,22 @@ def create_app(data_root: str) -> FastAPI:
         manual.db), and/or any file that belongs to at least one set. The two
         library-wide checksum sets are fetched once and filtered in-memory — same
         shape as the /unloved feed's exclusion filter, no per-file queries."""
-        folder = subpath.strip('/')
-        subfolders, file_rows = db.browse_folder(folder)
-        rows = [(r['id'], r['path'], False, r['checksum']) for r in file_rows]
-        files = _enrich_rows(rows)
-        if hide_with_face:
-            with_face = (db.get_all_checksums_with_face()
-                         | manual.get_all_checksums_with_named_face())
-            files = [f for f in files if f['checksum'] not in with_face]
-        if hide_with_set:
-            with_set = manual.get_all_set_member_checksums()
-            files = [f for f in files if f['checksum'] not in with_set]
+        fm = fm_listing(subpath.strip('/'), hide_with_face=hide_with_face,
+                        hide_with_set=hide_with_set)
+        seen = set()
+        files = []
+        for f in fm['files']:
+            if f['card'] is not None and f['file_id'] not in seen:
+                seen.add(f['file_id'])
+                files.append(f['card'])
+        subfolders = [{'name': d['name'], 'path': d['path'],
+                       'count': sum(d['counts'][k] for k in ('tracked', 'partial', 'scanned', 'broken'))}
+                      for d in fm['folders']]
         return templates.TemplateResponse(request, 'files.html', {
-            'folder': folder,
+            'folder': fm['path'],
             'subfolders': subfolders,
             'files': files,
+            'fm': fm,
             'hide_with_face': hide_with_face,
             'hide_with_set': hide_with_set,
             'all_tags': manual.list_all_tags(),
@@ -2003,20 +2257,11 @@ def create_app(data_root: str) -> FastAPI:
 
     def _upload_target_dir(folder):
         """Absolute dir for a /files upload into `folder` (relative to data_root, '' =
-        root). Refuses anything resolving outside data_root (../, symlink escapes) and
-        the app's own .media store, and a folder that isn't on disk."""
-        folder = (folder or '').strip('/')
-        root = os.path.realpath(data_root)
-        target = os.path.realpath(os.path.join(root, folder))
-        if target != root and not target.startswith(root + os.sep):
-            raise HTTPException(status_code=400, detail='Folder is outside the library')
-        rel = os.path.relpath(target, root)
-        if rel.split(os.sep)[0] == '.media':
-            raise HTTPException(status_code=400, detail="Can't upload into .media")
+        root) — the _library_path jail, plus the folder has to exist on disk."""
+        target, rel = _library_path((folder or '').strip('/'))
         if not os.path.isdir(target):
             raise HTTPException(status_code=404, detail='Folder not found on disk')
-        return target, ('' if rel == '.' else rel.replace(os.sep, '/'))
-
+        return target, rel
     def _unique_upload_name(target_dir, name):
         """`name`, or 'stem (1).ext', 'stem (2).ext', … — an upload never overwrites."""
         stem, ext = os.path.splitext(name)
@@ -2070,8 +2315,10 @@ def create_app(data_root: str) -> FastAPI:
             checksum = hasher.hexdigest()
             duplicate = db.get_file_by_checksum(checksum) is not None
             rel_path = f'{rel_folder}/{final_name}' if rel_folder else final_name
-            file_id = db.upsert_file_path(rel_path, checksum, size=size,
-                                          modified_time=int(os.path.getmtime(abs_path)))
+            mtime = os.path.getmtime(abs_path)
+            file_id = db.upsert_file_path(rel_path, checksum, size=size, modified_time=int(mtime))
+            # Into the disk inventory too, so folder rollups count it before the next walk.
+            file_inventory.record_files(db.conn, [(rel_path, size, mtime)])
             db.conn.commit()
             saved.append({'id': file_id, 'name': final_name, 'duplicate': duplicate})
             to_index.append((file_id, abs_path, ext in IMAGE_EXTENSIONS))
