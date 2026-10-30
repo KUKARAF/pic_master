@@ -651,6 +651,16 @@ class Database(ThreadLocalDB):
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_file ON faces (file_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_identity ON faces (identity)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_sets_studio ON sets (studio)')
+        # Pipeline-state lookups (scan_status.py + the get_un*_files pending queries) ask
+        # "which file_ids have a primary-frame row" / "a current-algo row". Composite
+        # (file_id, frame_index) makes those covering index scans instead of table walks
+        # (body_embeddings had no file_id index at all); region/pattern_windows rows carry
+        # multi-KB blobs, so filtering on algo without an index reads every row's pages.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_detections_file_frame ON detections (file_id, frame_index)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_faces_file_frame ON faces (file_id, frame_index)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_body_file_frame ON body_embeddings (file_id, frame_index)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_region_windows_algo ON region_windows (algo)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_windows_algo ON pattern_windows (algo)')
         self.conn.commit()
 
     def upsert_file_path(self, path, checksum, size=None, modified_time=None, seen_at=None):
