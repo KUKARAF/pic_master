@@ -1,11 +1,10 @@
 """CLIP-based image indexer."""
 import os
 import numpy as np
-from PIL import Image
 import open_clip
 import torch
 
-from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
+from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS, open_rgb
 from . import compute
 
 
@@ -47,7 +46,7 @@ class CLIPIndexer:
                 failed.append((path, f'unsupported extension: {ext}'))
                 continue
             try:
-                img = Image.open(path).convert('RGB')
+                img = open_rgb(path)
                 tensor = self.preprocess(img)
                 batch_tensors.append(tensor)
                 batch_paths.append(path)

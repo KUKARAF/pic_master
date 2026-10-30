@@ -29,6 +29,10 @@
   Files flagged damaged (e.g. a video whose frames won't decode). Fetch the list as JSON:
 </p>
 <pre class="curl-example" id="damaged-curl"></pre>
+<p style="margin:0 0 10px;">
+  <button type="button" id="damaged-recheck" title="Decode every damaged file again and un-flag the ones that open fine">🔁 Re-check damaged files</button>
+  <span class="sub" id="damaged-recheck-status"></span>
+</p>
 <div class="trash-grid" id="damaged-grid" data-queue-source="Damaged"></div>
 <div id="damaged-status" class="sub"></div>
 
@@ -151,6 +155,32 @@
   function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
 
   curlEl.textContent = 'curl ' + window.location.origin + '/api/broken';
+
+  var recheckBtn = document.getElementById('damaged-recheck');
+  var recheckStatus = document.getElementById('damaged-recheck-status');
+  function pollRecheck(first) {
+    fetch('/api/broken/recheck/status').then(function (r) { return r.json(); }).then(function (s) {
+      if (s.running) {
+        recheckBtn.disabled = true;
+        recheckStatus.textContent = 'Checking ' + s.done + '/' + s.total + '… ' + s.cleared + ' fine so far';
+        setTimeout(pollRecheck, 1500);
+        return;
+      }
+      recheckBtn.disabled = false;
+      if (s.error) { recheckStatus.textContent = 'Re-check failed: ' + s.error; return; }
+      if (!first) {
+        recheckStatus.textContent = 'Done — ' + s.cleared + ' of ' + s.total + ' decode fine and are no longer marked damaged.';
+        if (s.cleared) setTimeout(function () { location.reload(); }, 1500);
+      }
+    }).catch(function () { setTimeout(pollRecheck, 3000); });
+  }
+  recheckBtn.addEventListener('click', function () {
+    recheckBtn.disabled = true;
+    fetch('/api/broken/recheck/start', { method: 'POST' }).then(function (r) { return r.json(); })
+      .then(function () { pollRecheck(false); })
+      .catch(function (e) { recheckBtn.disabled = false; recheckStatus.textContent = 'Failed: ' + e.message; });
+  });
+  pollRecheck(true);
 
   status.textContent = 'Loading…';
   fetch('/api/broken')

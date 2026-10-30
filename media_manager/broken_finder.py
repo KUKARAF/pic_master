@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image, UnidentifiedImageError
 import cv2
 
+from .formats import open_rgb
+
 # recognised extensions (case-insensitive)
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
 VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v', '.mpg', '.mpeg'}
@@ -62,10 +64,7 @@ def verify_image(path):
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
-            with Image.open(path) as img:
-                img.verify()      # check header
-            with Image.open(path) as img:
-                img.load()          # actually decode pixel data
+            open_rgb(path)      # full pixel decode; lenient on PNG metadata like viewers
         if caught:
             return True, '; '.join(str(w.message) for w in caught)
         return True, None

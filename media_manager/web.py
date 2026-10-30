@@ -41,7 +41,7 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    background_tiles, body_index, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
+    background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
     near_dup, object_index, pattern_deep, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
@@ -61,6 +61,7 @@ from media_manager.formats import (
     TRANSCODE_EXTENSIONS,
     VIDEO_EXTENSIONS,
     VIDEO_MIME_TYPES,
+    open_rgb,
     open_upright_rgb,
 )
 from media_manager.gen_service import ComfyUIClient
@@ -414,8 +415,7 @@ def _make_thumbnail(src_path: str, dst_path: str) -> tuple:
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter('always')
-            with PILImage.open(src_path) as img:
-                img = img.convert('RGB')   # forces the full decode
+            img = open_rgb(src_path)   # full decode; lenient on PNG metadata (formats.open_rgb)
         if img.size[0] == 0:
             return THUMB_DAMAGED, 'image has zero width'
     except Exception as exc:  # hook-allow: broad — classified by _decode_failure
@@ -5335,6 +5335,15 @@ def create_app(data_root: str) -> FastAPI:
                     fid = path_to_id.get(rel)
                     if fid is None:
                         continue
+                    reason = e.get('error_string') or 'czkawka: broken'
+                    # czkawka's decoders are stricter than viewers (e.g. a bad CRC on a PNG
+                    # metadata chunk): only mark what our own decoder can't read either.
+                    if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS:
+                        healthy, _msg = broken_finder.verify_image(e['path'])
+                        if healthy is not False:
+                            errors.log(rel, f'czkawka flagged it ({reason}) but it decodes — not marked damaged')
+                            continue
+                    errors.log(rel, f'czkawka → marked damaged: {reason}')
                     db.mark_broken(fid)
                     marked += 1
                     broken_scan_job['marked'] = marked
@@ -5345,6 +5354,47 @@ def create_app(data_root: str) -> FastAPI:
 
         _spawn_job(_run)
         return {'started': True, 'total': broken_scan_job['total']}
+
+    recheck_job = {'running': False, 'done': 0, 'total': 0, 'cleared': 0, 'error': None}
+
+    @app.post('/api/broken/recheck/start')
+    def api_broken_recheck_start():
+        """Re-verify every file flagged damaged with the current decoders and clear the
+        flag on the ones that decode now — e.g. PNGs flagged before the decoders learned
+        to ignore oversized / bad-CRC metadata chunks the way image viewers do. Files
+        that can't be checked (missing, unreadable) keep their flag."""
+        if recheck_job['running']:
+            return {'started': False, 'message': 'Re-check already running.'}
+        rows = db.get_broken_files(limit=1_000_000)
+        recheck_job.update(running=True, done=0, total=len(rows), cleared=0, error=None)
+
+        def _run():
+            try:
+                for r in rows:
+                    abs_path = _live_abs_path(r['id'], r['path'])
+                    ext = os.path.splitext(r['path'])[1].lower()
+                    healthy = None
+                    if abs_path is not None and ext in IMAGE_EXTENSIONS:
+                        healthy, _msg = broken_finder.verify_image(abs_path)
+                    elif abs_path is not None and ext in VIDEO_EXTENSIONS:
+                        healthy, _msg = broken_finder.verify_video(abs_path)
+                    if healthy is True:
+                        db.conn.execute('UPDATE files SET broken = NULL WHERE id = ?', (r['id'],))
+                        db.conn.commit()
+                        errors.log(r['path'], 're-check: decodes fine → no longer marked damaged')
+                        recheck_job['cleared'] += 1
+                    recheck_job['done'] += 1
+            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
+                recheck_job['error'] = compute.job_error_text(exc)
+            finally:
+                recheck_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': recheck_job['total']}
+
+    @app.get('/api/broken/recheck/status')
+    def api_broken_recheck_status():
+        return dict(recheck_job)
 
     @app.get('/api/broken/scan/status')
     def api_broken_scan_status():
