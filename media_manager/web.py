@@ -64,6 +64,7 @@ from media_manager.formats import (
     open_upright_rgb,
 )
 from media_manager.gen_service import ComfyUIClient
+from media_manager.hasher import FileHasher
 from media_manager.ignore import IgnoreRules
 from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
 from media_manager.media_manager import MediaManager, _parse_query, scan_folder
@@ -2024,7 +2025,8 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=400, detail="Paths inside .media are off limits")
         return target, rel_posix
 
-    FM_COUNT_KEYS = ('untracked', 'tracked', 'partial', 'scanned', 'broken', 'missing', 'ignored')
+    FM_COUNT_KEYS = ('untracked', 'tracked', 'partial', 'scanned', 'broken', 'missing', 'trashed',
+                     'ignored')
     # Untracked files: classify_path category → file-manager state.
     FM_UNTRACKED_STATE = {'media': 'untracked', 'system': 'ignored', 'ignored': 'ignored',
                           'other': 'other'}
@@ -2065,11 +2067,14 @@ def create_app(data_root: str) -> FastAPI:
             db, manual, {r['file_id']: p for p, r in tracked.items()}.items())
         rules = IgnoreRules(data_root)
         inv_at = file_inventory.refreshed_at(conn)
+        trashed_paths = manual.get_trashed_paths_under(rel)  # untracked duplicate copies
 
         def _join(name):
             return f'{rel}/{name}' if rel else name
 
         def _untracked_state(path):
+            if path in trashed_paths:
+                return 'trashed'
             return FM_UNTRACKED_STATE[file_inventory.classify_path(path, rules)[0]]
 
         def _tracked_state(row):
@@ -2211,9 +2216,9 @@ def create_app(data_root: str) -> FastAPI:
     # --- "Track this folder": the CLI's `media add <folder>` as a background job ---
     # Runs media_manager.scan_folder — the exact body of MediaManager.start_scan, so the
     # same find → .mediaignore/system-dir gate → xxh64 → duplicates-not-tracked rules
-    # and folder markers — with a progress callback instead of pv. Duplicates are
-    # appended to <data_root>/duplicates.txt (where `media add` run from the library
-    # root writes them). One at a time; allowed alongside the inventory walk (that is
+    # and folder markers — with a progress callback instead of pv. Duplicates (bytes
+    # already tracked at another path) go into the path-level trash (see /trash)
+    # instead of the CLI's duplicates.txt; nothing is deleted. One at a time; allowed alongside the inventory walk (that is
     # stat + short batched disk_files writes; the scan writes file_paths in one final
     # transaction and busy_timeout covers the overlap).
     track_lock = threading.Lock()
@@ -2259,8 +2264,7 @@ def create_app(data_root: str) -> FastAPI:
         def _run():
             try:
                 scan_folder(db, manual, data_root, rel, recursive=True, progress=_progress,
-                            use_pv=False,
-                            dup_report_path=os.path.join(data_root, 'duplicates.txt'))
+                            use_pv=False, on_duplicates=manual.add_trashed_paths)
                 _track_refresh_inventory(abs_dir, rel)
                 track_job['phase'] = 'done'
             except Exception as exc:  # hook-allow: broad — reported via the job's error field
@@ -8676,6 +8680,50 @@ def create_app(data_root: str) -> FastAPI:
                 'is_video': os.path.splitext(note or '')[1].lower() in VIDEO_EXTENSIONS,
             })
         return {'items': items, 'total': manual.count_trash()}
+
+    @app.get('/api/trash/duplicates')
+    def api_trash_duplicates(limit: int = 500, offset: int = 0):
+        """The path-level trash: on-disk copies of content the library already tracks
+        at `kept_path` (put here by "Track this folder"). Entries whose file is gone
+        from disk are dropped. file_id is the kept original (same bytes → its thumb)."""
+        rows = manual.list_trashed_paths(limit, offset)
+        gone = [r['path'] for r in rows if not os.path.isfile(os.path.join(data_root, r['path']))]
+        if gone:
+            manual.remove_trashed_paths(gone)
+        gone = set(gone)
+        kept = {k['checksum']: k for k in db.get_files_by_checksums(list({r['checksum'] for r in rows}))}
+        items = []
+        for r in rows:
+            if r['path'] in gone:
+                continue
+            krow = kept.get(r['checksum'])
+            items.append({**r, 'file_id': krow['id'] if krow else None,
+                          'is_video': os.path.splitext(r['path'])[1].lower() in VIDEO_EXTENSIONS})
+        return {'items': items, 'total': manual.count_trashed_paths()}
+
+    @app.post('/api/trash/duplicates/restore')
+    def api_trash_duplicate_restore(body: FmTrackBody):
+        """Take one duplicate copy {"path"} out of the trash by tracking it as a second
+        location of the same content (the scan's duplicate rule is bypassed on purpose)."""
+        abs_path, rel = _library_path(body.path or '')
+        entry = manual.get_trashed_path(rel)
+        if entry is None:
+            raise HTTPException(status_code=404, detail='Not in the trash')
+        if not os.path.isfile(abs_path):
+            manual.remove_trashed_paths([rel])
+            raise HTTPException(status_code=404, detail='File is gone from disk')
+        st = os.stat(abs_path)
+        checksum = FileHasher(db).get_xxhash(abs_path)
+        if not checksum:
+            raise HTTPException(status_code=500, detail='Could not read the file')
+        db.upsert_file_path(rel, checksum, size=st.st_size, modified_time=st.st_mtime)
+        db.conn.commit()
+        file_inventory.record_files(db.conn, [(rel, st.st_size, st.st_mtime)])
+        db.conn.commit()
+        manual.remove_trashed_paths([rel])
+        scan_status.invalidate()
+        return {'restored': True, 'path': rel, 'file_id': db.find_file_id_by_checksum(checksum),
+                'changed': checksum != entry['checksum']}
 
     @app.get('/api/broken')
     def api_broken_list(limit: int = 500):

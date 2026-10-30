@@ -68,6 +68,7 @@
   ('untracked', 'untracked', 'On disk but not added to the library yet'),
   ('broken',    'broken',    'Unreadable or failed to scan'),
   ('missing',   'missing',   'In the library but the file is gone from disk'),
+  ('trashed',   'trashed',   'A copy of a file already in the library, put in the Trash (not deleted)'),
   ('ignored',   'ignored',   'Skipped on purpose (app folders, ignore rules)'),
   ('other',     'non-media', 'Not an image or video (shown with “Show non-media files”)'),
 ] %}
@@ -140,7 +141,7 @@
     <span class="folder-name">📁 {{ sub.name }}{% if sub.system %} <span class="fm-tag">app folder</span>{% endif %}</span>
     <span class="fm-folder-meta">
       <span class="fm-bar" role="img" aria-label="{{ tip | join(', ') if tip else 'empty' }}">
-        {% for key in ['scanned', 'partial', 'tracked', 'untracked', 'broken', 'missing'] %}
+        {% for key in ['scanned', 'partial', 'tracked', 'untracked', 'broken', 'missing', 'trashed'] %}
         {% if c.get(key) %}<span class="fm-seg fm-s-{{ key }}" style="flex-grow:{{ c.get(key) }}"></span>{% endif %}
         {% endfor %}
       </span>
@@ -156,7 +157,8 @@
 <div class="grid fm-grid" data-queue-source="Files: /{{ folder }}">
   {% for f in fm.files %}
   {% set label = {'untracked': 'untracked', 'tracked': 'tracked', 'partial': 'partial', 'scanned': 'scanned',
-                  'broken': 'broken', 'missing': 'missing', 'ignored': 'ignored', 'other': 'non-media'}.get(f.state, f.state) %}
+                  'broken': 'broken', 'missing': 'missing', 'trashed': 'trashed', 'ignored': 'ignored',
+                  'other': 'non-media'}.get(f.state, f.state) %}
   {% set req = (fm.stages or {}).get(f.kind) or [] %}
   {% set ns = namespace(total=0, done=0) %}
   {% if f.stages and f.kind in ('image', 'video') %}
@@ -167,7 +169,7 @@
   <div class="fm-tile fm-s-{{ f.state }}" data-state="{{ f.state }}" title="{{ tip }}">
     {% if f.card %}
       {{ macros.card(f.card) }}
-    {% elif f.state == 'untracked' and f.kind == 'image' %}
+    {% elif f.state in ('untracked', 'trashed') and f.kind == 'image' %}
       <div class="card fm-card">
         <div class="fm-thumb"><img src="/api/fm/preview?path={{ f.path | urlencode }}" alt="{{ f.name }}" loading="lazy"></div>
         <div class="card-body"><span class="fm-name">{{ f.name }}</span></div>

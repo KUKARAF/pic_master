@@ -21,16 +21,17 @@ def _parse_query(query):
 
 
 def scan_folder(db, manual, data_root, path, recursive=True, reindex=False, *,
-                progress=None, use_pv=True, dup_report_path=None):
+                progress=None, use_pv=True, dup_report_path=None, on_duplicates=None):
     """MediaManager.start_scan's body (fast_scan, then folder markers), callable with
     an existing db/manual pair — the web's "Track this folder" job runs exactly this
     with the web's own ThreadLocalDB handles. `path` is joined onto data_root like the
     CLI's `media add <path>`. The keyword-only extras default to the CLI behaviour:
     progress — fast_scan's callback, plus {'phase': 'markers'} before markers apply;
-    use_pv / dup_report_path — passed to fast_scan."""
+    use_pv / dup_report_path / on_duplicates — passed to fast_scan."""
     abs_path = os.path.join(data_root, path)
     result = fast_scan(abs_path, db, data_root, recursive, dup_report_path=dup_report_path,
-                       reindex=reindex, manual=manual, progress=progress, use_pv=use_pv)
+                       reindex=reindex, manual=manual, progress=progress, use_pv=use_pv,
+                       on_duplicates=on_duplicates)
     if progress is not None:
         progress({'phase': 'markers'})
     markers = discover_folder_markers(abs_path)

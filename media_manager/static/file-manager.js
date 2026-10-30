@@ -46,7 +46,7 @@
     var visible = 0, total = 0;
     document.querySelectorAll('.fm-tile').forEach(function (tile) {
       var st = tile.getAttribute('data-state');
-      var hide = on && (st === 'scanned' || st === 'ignored');
+      var hide = on && (st === 'scanned' || st === 'ignored' || st === 'trashed');
       tile.hidden = hide;
       total++;
       if (!hide) visible++;
@@ -207,7 +207,7 @@
   function trackSummary(s) {
     var msg = 'Tracked ' + folderLabel(s.path) + ': ' + plural(s.added || 0, 'new file') + ' added';
     if (s.already) msg += ', ' + s.already + ' already tracked';
-    if (s.duplicates) msg += ', ' + plural(s.duplicates, 'duplicate') + ' NOT tracked (see duplicates.txt)';
+    if (s.duplicates) msg += ', ' + plural(s.duplicates, 'duplicate') + ' moved to Trash (nothing deleted)';
     if (s.ignored) msg += ', ' + s.ignored + ' ignored';
     return msg + '.';
   }
@@ -239,7 +239,7 @@
       ? 'Track ' + plural(n, 'untracked file') + ' under ' + folderLabel(folder) + ' (subfolders included)?'
       : 'No untracked files are counted under ' + folderLabel(folder) + '. Scan it anyway?';
     msg += '\n\nSame as `media add`: new photos/videos are added to the library; copies of files ' +
-           'already in it are reported as duplicates and not tracked; .mediaignore is respected.';
+           'already in it are not tracked but put in the Trash (nothing is deleted); .mediaignore is respected.';
     if (trackBtn.dataset.inventory !== '1') msg += '\n(Subfolder counts are incomplete until the inventory has run.)';
     if (!confirm(msg)) return;
     trackBtn.disabled = true;

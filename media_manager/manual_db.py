@@ -272,6 +272,20 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
+        # Path-level trash for exact duplicates: an on-disk copy whose bytes the library
+        # already tracks at another path (`kept_path`). The checksum-keyed `trash` above
+        # can't hold these — trashing the shared checksum would trash the kept original
+        # too. Filled by the web's "Track this folder" instead of duplicates.txt; nothing
+        # is deleted. Restoring one tracks it as a second location of the same content.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS trashed_paths (
+                path TEXT PRIMARY KEY,
+                checksum TEXT NOT NULL,
+                kept_path TEXT,
+                reason TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
         # generated_artifacts: images/videos this app produced FROM a set (collages,
         # slideshows, and later AI-generated media). Kept out of the `files` library
         # (their `path` is under generated/, which scans skip) and recorded here so
@@ -1283,6 +1297,56 @@ class ManualDB(ThreadLocalDB):
             (checksum, reason, kept_checksum, source_file_id, note, int(time.time()))
         )
         self.conn.commit()
+
+    def add_trashed_paths(self, rows, reason='duplicate'):
+        """Put on-disk duplicate copies in the path-level trash. `rows` are
+        (path, existing_path, checksum); re-adding a path refreshes its kept_path and
+        checksum but keeps its original created_at. Returns how many were new."""
+        cur = self.conn.cursor()
+        before = cur.execute('SELECT COUNT(*) FROM trashed_paths').fetchone()[0]
+        now = int(time.time())
+        cur.executemany(
+            'INSERT INTO trashed_paths (path, checksum, kept_path, reason, created_at) '
+            'VALUES (?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET '
+            'checksum = excluded.checksum, kept_path = excluded.kept_path, reason = excluded.reason',
+            [(path, checksum, kept, reason, now) for path, kept, checksum in rows])
+        self.conn.commit()
+        return cur.execute('SELECT COUNT(*) FROM trashed_paths').fetchone()[0] - before
+
+    def list_trashed_paths(self, limit=500, offset=0):
+        """Path-level trash rows (dicts), newest first, for the /trash page."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT path, checksum, kept_path, reason, created_at FROM trashed_paths '
+                    'ORDER BY created_at DESC, path LIMIT ? OFFSET ?', (limit, offset))
+        return [dict(zip(('path', 'checksum', 'kept_path', 'reason', 'created_at'), r))
+                for r in cur.fetchall()]
+
+    def count_trashed_paths(self):
+        return self.conn.execute('SELECT COUNT(*) FROM trashed_paths').fetchone()[0]
+
+    def get_trashed_path(self, path):
+        row = self.conn.execute('SELECT path, checksum, kept_path, reason, created_at '
+                                'FROM trashed_paths WHERE path = ?', (path,)).fetchone()
+        return dict(zip(('path', 'checksum', 'kept_path', 'reason', 'created_at'), row)) if row else None
+
+    def get_trashed_paths_under(self, rel_folder=''):
+        """set() of trashed paths anywhere under folder `rel_folder` ('' = all)."""
+        cur = self.conn.cursor()
+        if rel_folder:
+            escaped = ''.join('[' + c + ']' if c in '*?[' else c for c in rel_folder)
+            cur.execute('SELECT path FROM trashed_paths WHERE path GLOB ?', (escaped + '/*',))
+        else:
+            cur.execute('SELECT path FROM trashed_paths')
+        return {r[0] for r in cur.fetchall()}
+
+    def remove_trashed_paths(self, paths):
+        """Drop paths from the path-level trash. Returns how many were there."""
+        cur = self.conn.cursor()
+        removed = 0
+        for path in paths:
+            removed += cur.execute('DELETE FROM trashed_paths WHERE path = ?', (path,)).rowcount
+        self.conn.commit()
+        return removed
 
     def restore_from_trash(self, checksum):
         """Take a file back out of the trash. Returns True if it was trashed."""

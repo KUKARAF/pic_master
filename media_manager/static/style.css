@@ -2363,6 +2363,7 @@ a.stat-tile .sub { text-decoration: none; }
   --fm-broken:    var(--danger);      /* red */
   --fm-missing:   var(--sort-chip);   /* purple */
   --fm-ignored:   var(--text-muted);  /* dimmed */
+  --fm-trashed:   #8a6d5a;            /* brown, dimmed tile */
 }
 .fm-s-untracked { --fm-c: var(--fm-untracked); }
 .fm-s-tracked   { --fm-c: var(--fm-tracked); }
@@ -2370,6 +2371,7 @@ a.stat-tile .sub { text-decoration: none; }
 .fm-s-scanned   { --fm-c: var(--fm-scanned); }
 .fm-s-broken    { --fm-c: var(--fm-broken); }
 .fm-s-missing   { --fm-c: var(--fm-missing); }
+.fm-s-trashed   { --fm-c: var(--fm-trashed); }
 .fm-s-ignored,
 .fm-s-other     { --fm-c: var(--fm-ignored); }
 
@@ -2451,6 +2453,7 @@ a.stat-tile .sub { text-decoration: none; }
 }
 .fm-tile > .card { border: 0; border-radius: 0; flex: 1 1 auto; }
 .fm-tile.fm-s-ignored,
+.fm-tile.fm-s-trashed,
 .fm-tile.fm-s-other { opacity: .55; }
 .fm-tile[hidden],
 .fm-folder-row[hidden],

@@ -12,7 +12,7 @@ from .formats import MEDIA_EXTENSIONS
 from .hasher import FileHasher
 
 def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_report_path=None, reindex=False, manual=None,
-              *, progress=None, use_pv=True):
+              *, progress=None, use_pv=True, on_duplicates=None):
     """
     Call GNU find, parse '%p|%s|%T@\n' lines, hash each candidate, upsert into DB.
     Reads .mediaignore (git-ignore syntax) in repo-root if present.
@@ -44,6 +44,9 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     use_pv:          pipe find through `pv -l` when pv is installed (the CLI's progress
                      bar). The web job passes False: no pv subprocess, the callback is
                      its progress source.
+    on_duplicates:   optional callable(list of (new_path, existing_path, checksum)) that
+                     takes the duplicates instead of the dup_report_path file (the web
+                     job puts them in the path-level trash). None = write the file.
     Returns (written_count, duplicate_count, already_indexed_count).
     """
     root_path = os.path.abspath(root_path)
@@ -176,7 +179,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         if existing_file_id is not None:
             known_paths = [p for p, _ in db.get_paths_for_file(existing_file_id)]
             if rel_path not in known_paths:
-                duplicates.append((rel_path, known_paths[0] if known_paths else '(unknown)'))
+                duplicates.append((rel_path, known_paths[0] if known_paths else '(unknown)', checksum))
                 continue
             already_indexed += 1
             db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
@@ -188,10 +191,12 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     db.conn.commit()
     _report(done=len(hashed), added=written, already=already_indexed, duplicates=len(duplicates))
 
-    if duplicates:
+    if duplicates and on_duplicates is not None:
+        on_duplicates(duplicates)
+    elif duplicates:
         report_path = dup_report_path or os.path.join(os.getcwd(), 'duplicates.txt')
         with open(report_path, 'a') as f:
-            for new_path, existing_path in duplicates:
+            for new_path, existing_path, _checksum in duplicates:
                 f.write(f"{new_path}\t{existing_path}\n")
         print(
             f"fast_scan: {len(duplicates)} duplicate file(s) found and NOT tracked — "

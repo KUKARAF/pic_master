@@ -15,6 +15,15 @@
 <div class="trash-grid" id="trash-grid" data-queue-source="Trash"></div>
 <div id="trash-status" class="sub"></div>
 
+<div class="section-title" style="margin:28px 0 4px;">📑 Duplicate copies <span class="sub" id="dupes-count"></span></div>
+<p class="sub" style="margin:0 0 10px;">
+  Files “Track this folder” found that are byte-for-byte copies of something already in the
+  library, so they weren't added. They're still on disk. Restore tracks a copy as a second
+  location of the same photo/video.
+</p>
+<div class="trash-grid" id="dupes-grid"></div>
+<div id="dupes-status" class="sub"></div>
+
 <div class="section-title" style="margin:28px 0 4px;">💥 Damaged <span class="sub" id="damaged-count"></span></div>
 <p class="sub" style="margin:0 0 10px;">
   Files flagged damaged (e.g. a video whose frames won't decode). Fetch the list as JSON:
@@ -82,6 +91,53 @@
   fetch('/api/trash')
     .then(function (r) { return r.json(); })
     .then(function (d) { status.textContent = ''; render(d.items || [], d.total || 0); })
+    .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
+})();
+
+/* Duplicate copies: the path-level trash (/api/trash/duplicates). The thumbnail is the
+   kept original's — same bytes. */
+(function () {
+  var grid = document.getElementById('dupes-grid');
+  var status = document.getElementById('dupes-status');
+  var countEl = document.getElementById('dupes-count');
+  if (!grid) return;
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; }
+
+  status.textContent = 'Loading…';
+  fetch('/api/trash/duplicates')
+    .then(function (r) { return r.json(); })
+    .then(function (d) {
+      status.textContent = '';
+      var items = d.items || [];
+      countEl.textContent = d.total ? ('(' + d.total + ')') : '';
+      if (!items.length) { status.textContent = 'No duplicate copies.'; return; }
+      items.forEach(function (it) {
+        var card = document.createElement('div');
+        card.className = 'trash-card';
+        var base = it.path.split('/').pop();
+        card.innerHTML =
+          (it.file_id ? '<a href="/photo/' + it.file_id + '" title="Open the kept original">' +
+                        '<img src="/thumb/' + it.file_id + '" alt="" loading="lazy"></a>' : '') +
+          '<div class="trash-meta">' +
+            '<span class="trash-reason">' + (it.is_video ? '▶ duplicate' : 'duplicate') + '</span><br>' +
+            '<span class="trash-note" title="' + esc(it.path) + '">' + esc(base) + '</span>' +
+            '<div class="sub trash-note" title="' + esc(it.kept_path) + '">copy of ' + esc(it.kept_path) + '</div>' +
+            '<button type="button" class="trash-restore">Restore</button>' +
+          '</div>';
+        var btn = card.querySelector('.trash-restore');
+        btn.addEventListener('click', function () {
+          btn.disabled = true;
+          fetch('/api/trash/duplicates/restore', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: it.path }),
+          })
+            .then(function (r) { return r.json().then(function (j) { if (!r.ok) throw new Error(j.detail || r.status); return j; }); })
+            .then(function () { card.remove(); if (window.showToast) showToast('Restored — now tracked'); })
+            .catch(function (e) { btn.disabled = false; if (window.showToast) showToast('Failed: ' + e.message); });
+        });
+        grid.appendChild(card);
+      });
+    })
     .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
 })();
 

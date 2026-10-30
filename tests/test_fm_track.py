@@ -213,10 +213,29 @@ def check_track_job():
     paths = {r[0] for r in _db_rows(db)}
     assert paths == {'keep/orig.png', 'trips/a.png', 'trips/rome/b.png', 'trips/rome/deep/c.png'}, paths
     assert 'trips/copy.png' not in paths and 'trips/skip_me.png' not in paths, paths
-    with open(j('duplicates.txt')) as fh:
-        assert fh.read() == 'trips/copy.png\tkeep/orig.png\n'
+    # The duplicate goes to the path-level trash, not duplicates.txt; nothing deleted.
+    assert not os.path.exists(j('duplicates.txt'))
+    assert os.path.isfile(j('trips/copy.png'))
+    dupes = client.get('/api/trash/duplicates').json()
+    assert dupes['total'] == 1, dupes
+    item = dupes['items'][0]
+    assert (item['path'], item['kept_path']) == ('trips/copy.png', 'keep/orig.png'), item
+    assert item['file_id'] == db.find_file_id_by_checksum(item['checksum'])
+    assert not manual.is_trashed(item['checksum'])   # the kept original is NOT trashed
     assert _noface(db, 'trips/rome/deep/c.png') == 1 and _noface(db, 'trips/a.png') == 0
-    print('OK  track: subtree tracked, duplicate + ignored not tracked, .noface applied')
+    print('OK  track: subtree tracked, duplicate -> Trash (not tracked), ignored, .noface applied')
+
+    # Restore = track that copy as a second location of the same content.
+    r = client.post('/api/trash/duplicates/restore', json={'path': 'trips/copy.png'})
+    assert r.status_code == 200 and r.json()['file_id'] == item['file_id'], r.text
+    assert 'trips/copy.png' in {r[0] for r in _db_rows(db)}
+    assert client.get('/api/trash/duplicates').json()['total'] == 0
+    assert client.post('/api/trash/duplicates/restore', json={'path': 'trips/copy.png'}).status_code == 404
+    # Re-tracking doesn't re-trash it (it's a known path now).
+    client.post('/api/fm/track/start', json={'path': 'trips'})
+    st = _wait_track(client)
+    assert st['duplicates'] == 0 and st['already'] == 4, st
+    print('OK  restore tracks the copy as a second location; re-track leaves it alone')
 
 
 def check_track_job_fields():
@@ -248,10 +267,10 @@ def check_track_job_fields():
     paths = {r[0] for r in _db_rows(db)}
     assert paths == {'keep/orig.png', 'trips/a.png', 'trips/rome/b.png', 'trips/rome/deep/c.png'}, paths
 
-    # fm_listing now shows them tracked; the duplicate stays untracked, ignored stays ignored.
+    # fm_listing now shows them tracked; the duplicate is 'trashed', ignored stays ignored.
     files = {f['name']: f for f in client.get('/api/fm/list', params={'path': 'trips'}).json()['files']}
     assert files['a.png']['state'] in TRACKED_STATES and files['a.png']['file_id'], files['a.png']
-    assert files['copy.png']['state'] == 'untracked', files['copy.png']
+    assert files['copy.png']['state'] == 'trashed', files['copy.png']
     assert files['skip_me.png']['state'] == 'ignored'
     deep = {f['name']: f for f in client.get('/api/fm/list', params={'path': 'trips/rome/deep'}).json()['files']}
     assert deep['c.png']['state'] in TRACKED_STATES
@@ -260,7 +279,8 @@ def check_track_job_fields():
     root_fm = client.get('/api/fm/list').json()
     folders = {f['name']: f for f in root_fm['folders']}
     t = folders['trips']['counts']
-    assert t['untracked'] == 1 and t['ignored'] == 1 and sum(t[k] for k in TRACKED_STATES) == 3, t
+    assert t['untracked'] == 0 and t['trashed'] == 1 and t['ignored'] == 1 \
+        and sum(t[k] for k in TRACKED_STATES) == 3, t
     assert folders['other']['counts']['untracked'] == 1
     print('OK  track: status fields (phase done, added 3, duplicates 1, ignored 1), listing states')
 
@@ -293,7 +313,7 @@ def check_track_job_fields():
 
     page = client.get('/files/trips')
     assert page.status_code == 200 and 'id="fm-track-btn"' in page.text and 'id="fm-ml-btn"' in page.text
-    assert 'data-untracked="1"' in page.text, 'untracked count on the Track button'
+    assert 'data-untracked="0"' in page.text, 'trashed duplicate not counted as untracked'
     assert client.get('/files').status_code == 200
     print('OK  track: root scan, /files renders both buttons with the untracked count')
 
