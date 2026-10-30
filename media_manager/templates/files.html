@@ -45,6 +45,158 @@
   </label>
 </div>
 
+{% if fm %}
+{# ================= File manager (all files on disk, colour-coded by state) =================
+   Colour is never the only signal: every tile/chip also carries the state as text. #}
+{% set fm_states = [
+  ('scanned',   'scanned',   'In the library and every required scan stage is done'),
+  ('partial',   'partial',   'In the library but some required scan stages are missing'),
+  ('tracked',   'tracked',   'In the library, no scan stages done yet'),
+  ('untracked', 'untracked', 'On disk but not added to the library yet'),
+  ('broken',    'broken',    'Unreadable or failed to scan'),
+  ('missing',   'missing',   'In the library but the file is gone from disk'),
+  ('ignored',   'ignored',   'Skipped on purpose (app folders, ignore rules)'),
+  ('other',     'non-media', 'Not an image or video (shown with “Show non-media files”)'),
+] %}
+{% set fm_counts = fm.counts or {} %}
+<div class="fm-panel">
+  <div class="fm-legend" role="list" aria-label="File states in this folder">
+    {% for key, label, desc in fm_states %}
+    {% set n = fm_counts.get(key, 0) or 0 %}
+    {% if key != 'other' or n %}
+    <span class="fm-chip fm-s-{{ key }}{{ ' is-zero' if not n }}" role="listitem"
+          title="{{ label }}: {{ desc }} ({{ n }})">
+      <span class="fm-dot" aria-hidden="true"></span>{{ label }} <b>{{ n }}</b>
+    </span>
+    {% endif %}
+    {% endfor %}
+  </div>
+  <details class="fm-legend-help">
+    <summary class="sub">What do the colours mean?</summary>
+    <dl>
+      {% for key, label, desc in fm_states %}
+      <dt><span class="fm-chip fm-s-{{ key }}"><span class="fm-dot" aria-hidden="true"></span>{{ label }}</span></dt>
+      <dd>{{ desc }}</dd>
+      {% endfor %}
+    </dl>
+  </details>
+
+  {% set inv = fm.inventory or {} %}
+  <div class="fm-inventory sub" id="fm-inventory"
+       data-running="{{ '1' if inv.running else '0' }}">
+    <span id="fm-inv-text">
+      {% if inv.running %}
+      Inventory running…
+      {% elif inv.refreshed_at %}
+      Folder totals as of <span class="fm-ts" data-fm-ts="{{ inv.refreshed_at }}">{{ inv.refreshed_at }}</span>
+      {% else %}
+      Inventory never run — totals show tracked files only
+      {% endif %}
+    </span>
+    {% if inv.stale and not inv.running %}
+    <span class="fm-stale" title="Files changed on disk since the last inventory">· stale, refresh recommended</span>
+    {% endif %}
+    <button type="button" id="fm-inv-refresh" class="btn-similar fm-inv-btn"
+            title="Walk the whole library on disk and recount every folder"
+            {% if inv.running %}disabled{% endif %}>↻ Refresh inventory</button>
+  </div>
+
+  <div class="fm-toggles sub">
+    <label>
+      <input type="checkbox" id="fm-show-other">
+      Show non-media files
+    </label>
+    <label>
+      <input type="checkbox" id="fm-only-unscanned">
+      Only not fully scanned
+    </label>
+  </div>
+</div>
+
+{% if fm.folders %}
+<div class="folder-list fm-folder-list">
+  {% for sub in fm.folders %}
+  {% set c = sub.counts or {} %}
+  {% set open_n = (c.get('untracked', 0) or 0) + (c.get('tracked', 0) or 0) + (c.get('partial', 0) or 0)
+                + (c.get('broken', 0) or 0) + (c.get('missing', 0) or 0) %}
+  {% set tip = [] %}
+  {% for key, label, desc in fm_states %}{% if c.get(key) %}{% set _ = tip.append(label ~ ': ' ~ c.get(key)) %}{% endif %}{% endfor %}
+  <a class="folder-row fm-folder-row{{ ' is-system' if sub.system }}" href="/files/{{ sub.path | urlencode }}"
+     data-done="{{ '0' if open_n else '1' }}"
+     title="{{ sub.name }} — {{ tip | join(', ') if tip else 'empty' }}">
+    <span class="folder-name">📁 {{ sub.name }}{% if sub.system %} <span class="fm-tag">app folder</span>{% endif %}</span>
+    <span class="fm-folder-meta">
+      <span class="fm-bar" role="img" aria-label="{{ tip | join(', ') if tip else 'empty' }}">
+        {% for key in ['scanned', 'partial', 'tracked', 'untracked', 'broken', 'missing'] %}
+        {% if c.get(key) %}<span class="fm-seg fm-s-{{ key }}" style="flex-grow:{{ c.get(key) }}"></span>{% endif %}
+        {% endfor %}
+      </span>
+      <span class="sub fm-folder-total">{{ sub.total }} file{{ '' if sub.total == 1 else 's' }}</span>
+    </span>
+  </a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if fm.files %}
+<div class="section-title" style="margin:22px 0 10px;">In this folder</div>
+<div class="grid fm-grid" data-queue-source="Files: /{{ folder }}">
+  {% for f in fm.files %}
+  {% set label = {'untracked': 'untracked', 'tracked': 'tracked', 'partial': 'partial', 'scanned': 'scanned',
+                  'broken': 'broken', 'missing': 'missing', 'ignored': 'ignored', 'other': 'non-media'}.get(f.state, f.state) %}
+  {% set req = (fm.stages or {}).get(f.kind) or [] %}
+  {% set ns = namespace(total=0, done=0) %}
+  {% if f.stages and f.kind in ('image', 'video') %}
+    {% for st in req %}{% if st.required %}{% set ns.total = ns.total + 1 %}{% if f.stages.get(st.key) %}{% set ns.done = ns.done + 1 %}{% endif %}{% endif %}{% endfor %}
+  {% endif %}
+  {% set tip = f.name ~ ' — ' ~ label ~ ((' · ' ~ ns.done ~ '/' ~ ns.total ~ ' stages') if ns.total else '')
+             ~ ((' · missing: ' ~ (f.missing | join(', '))) if f.missing else '') %}
+  <div class="fm-tile fm-s-{{ f.state }}" data-state="{{ f.state }}" title="{{ tip }}">
+    {% if f.card %}
+      {{ macros.card(f.card) }}
+    {% elif f.state == 'untracked' and f.kind == 'image' %}
+      <div class="card fm-card">
+        <div class="fm-thumb"><img src="/api/fm/preview?path={{ f.path | urlencode }}" alt="{{ f.name }}" loading="lazy"></div>
+        <div class="card-body"><span class="fm-name">{{ f.name }}</span></div>
+      </div>
+    {% else %}
+      <div class="card fm-card">
+        {% if f.file_id %}<a class="fm-thumb fm-icon" href="/photo/{{ f.file_id }}" aria-hidden="true" tabindex="-1">{% else %}<div class="fm-thumb fm-icon" aria-hidden="true">{% endif %}
+          {%- if f.state == 'missing' %}⚠{% elif f.kind == 'video' %}🎞{% elif f.kind == 'image' %}🖼{% else %}📄{% endif -%}
+        {% if f.file_id %}</a>{% else %}</div>{% endif %}
+        <div class="card-body">
+          {% if f.file_id %}<a class="fm-name card-name" href="/photo/{{ f.file_id }}">{{ f.name }}</a>{% else %}<span class="fm-name">{{ f.name }}</span>{% endif %}
+          <span class="fm-meta sub">
+            {%- if f.state == 'missing' %}missing on disk{% elif f.size is not none %}{{ f.size | filesizeformat }}{% endif -%}
+          </span>
+        </div>
+      </div>
+    {% endif %}
+    <div class="fm-status">
+      <span class="fm-dot" aria-hidden="true"></span>
+      <span class="fm-state-text">{{ label }}</span>
+      {% if ns.total %}<span class="fm-stages" title="{{ ns.done }} of {{ ns.total }} required scan stages done">{{ ns.done }}/{{ ns.total }}</span>{% endif %}
+      {% if f.missing %}<span class="fm-missing-list">needs: {{ f.missing | join(', ') }}</span>{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not fm.folders and not fm.files %}
+<div class="empty-state">
+  <div class="icon">📂</div>
+  <p>This folder is empty.</p>
+</div>
+{% else %}
+<div class="empty-state" id="fm-all-done" hidden>
+  <div class="icon">✅</div>
+  <p>Everything here is fully scanned.</p>
+</div>
+{% endif %}
+
+{% else %}
+{# ---- Legacy listing (tracked files only) — used until the backend passes `fm`. ---- #}
 {% if subfolders %}
 <div class="folder-list">
   {% for sub in subfolders %}
@@ -71,9 +223,11 @@
   <p>No tracked media in this folder.</p>
 </div>
 {% endif %}
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
+{% if fm %}<script src="/static/file-manager.js"></script>{% endif %}
 <script>
 document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
