@@ -35,6 +35,18 @@ from . import worker_protocol
 from . import worker_config
 
 
+
+def _read_for_upload(path):
+    """(bytes, None), or (None, error) when the file can't be read (moved, deleted,
+    unmounted drive, permissions) — so one unreadable file in a batch becomes that
+    file's own error result, like the local models report it, instead of an
+    exception that takes down the whole bulk job."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(), None
+    except OSError as exc:
+        return None, f"cannot read file: {exc.strerror or exc}"
+
 class WorkerUnavailable(Exception):
     """The worker could not be reached (connection refused, DNS/route failure,
     or ping failed) — i.e. no HTTP service answering at the configured URL."""
@@ -465,8 +477,10 @@ class RemoteFaceDetector:
         results = []
         for path in paths:
             basename = os.path.basename(path)
-            with open(path, "rb") as f:
-                image_bytes = f.read()
+            image_bytes, read_error = _read_for_upload(path)
+            if read_error:
+                results.append((path, [], read_error))
+                continue
             self.client.record("detect_faces", basename)
             resp = self.client.request(
                 worker_protocol.PATH_DETECT_FACES,
@@ -562,8 +576,10 @@ class RemoteCLIPIndexer:
         failed = []
         for path in paths:
             basename = os.path.basename(path)
-            with open(path, "rb") as f:
-                image_bytes = f.read()
+            image_bytes, read_error = _read_for_upload(path)
+            if read_error:
+                failed.append((path, read_error))
+                continue
             self.client.record("embed_image", basename)
             resp = self.client.request(
                 worker_protocol.PATH_EMBED_IMAGE,
@@ -671,8 +687,10 @@ class RemoteYOLODetector:
         results_out = []
         for path in paths:
             basename = os.path.basename(path)
-            with open(path, "rb") as f:
-                image_bytes = f.read()
+            image_bytes, read_error = _read_for_upload(path)
+            if read_error:
+                results_out.append((path, [], read_error))
+                continue
             self.client.record("detect_objects", basename)
             resp = self.client.request(
                 worker_protocol.PATH_DETECT_OBJECTS,

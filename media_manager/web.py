@@ -938,6 +938,17 @@ def create_app(data_root: str) -> FastAPI:
                 return other_abs
         return None
 
+    def _batch_abs_paths(batch):
+        """Absolute paths for a bulk-job batch of (file_id, rel_path): each file's live
+        copy (_live_abs_path — another tracked copy if the primary one was moved or
+        deleted), else its primary path, so the model reports that one file as an error
+        and the job carries on (a missing file is not damaged — it's never marked
+        broken). Raises when the library folder itself is gone (unmounted drive): then
+        every file would fail, so stop with a message that says why."""
+        if not os.path.isdir(data_root):
+            raise RuntimeError(f'library folder {data_root} is not available — is the drive mounted?')
+        return [_live_abs_path(fid, rel) or os.path.join(data_root, rel) for fid, rel in batch]
+
     def _match_existing_face(existing_rows, bbox, min_iou=None):
         """Best primary-frame row in `existing_rows` (from get_all_faces_for_checksum)
         whose box overlaps `bbox` at/above the same-face IoU, or None. Lets a re-detect
@@ -5106,8 +5117,7 @@ def create_app(data_root: str) -> FastAPI:
             if should_stop():
                 break
             batch = candidates[start:start + 8]
-            paths = [os.path.join(data_root, rel) for _fid, rel in batch]
-            results = detector.detect_faces(paths)
+            results = detector.detect_faces(_batch_abs_paths(batch))
             for (fid, rel_path), (_p, faces, error) in zip(batch, results):
                 if should_stop():
                     return done, failed
@@ -6071,7 +6081,7 @@ def create_app(data_root: str) -> FastAPI:
                 break
             batch = candidates[start:start + 32]
             detector.set_vocab(vocab)
-            results = detector.detect_images([os.path.join(data_root, rel) for _fid, rel in batch])
+            results = detector.detect_images(_batch_abs_paths(batch))
             for (fid, rel_path), (_p, detections, error) in zip(batch, results):
                 if should_stop():
                     return done, failed
