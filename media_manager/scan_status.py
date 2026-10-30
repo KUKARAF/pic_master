@@ -51,7 +51,7 @@ STAGES = {
         ('region', 'Region index', True),
         ('pattern', 'Pattern index', True),
         ('phash', 'pHash', True),
-        ('tiles', 'Tiles', False),
+        ('tiles', 'Tiles (location / region matching)', False),
     ],
     'video': [
         # One CLIP vector per video (mean of a few sampled frames), in the same

@@ -3015,6 +3015,76 @@ class Database(ThreadLocalDB):
         ).fetchone()
         return row[0] if row else None
 
+    def get_tile_boxes(self):
+        """(ids, file_ids, tile_idx, boxes (n,4)) numpy arrays over every tile row —
+        the geometry background_tiles needs to decide which tiles are background."""
+        import numpy as np  # hook-allow: lazy — heavy
+        rows = self.conn.execute('SELECT id, file_id, tile_index, x1, y1, x2, y2 '
+                                 'FROM tile_embeddings ORDER BY id').fetchall()
+        if not rows:
+            return (np.zeros(0, np.int64),) * 3 + (np.zeros((0, 4), np.float32),)
+        arr = np.array([tuple(r) for r in rows], dtype=np.float64)
+        return (arr[:, 0].astype(np.int64), arr[:, 1].astype(np.int64),
+                arr[:, 2].astype(np.int64), np.nan_to_num(arr[:, 3:7]).astype(np.float32))
+
+    def iter_tile_embeddings_with_ids(self, batch_size=20000, file_ids=None):
+        """Yield (tile_ids, file_ids, matrix) chunks over all tile rows (or only the
+        given files'), ordered by id; malformed blobs are skipped from all three."""
+        import numpy as np  # hook-allow: lazy — heavy
+        cursor = self.conn.cursor()
+        if file_ids is not None:
+            file_ids = list(file_ids)
+            if not file_ids:
+                return
+            for chunk in self._chunked(file_ids):
+                ph = ','.join('?' * len(chunk))
+                cursor.execute(f'SELECT id, file_id, embedding FROM tile_embeddings '
+                               f'WHERE file_id IN ({ph}) ORDER BY id', tuple(chunk))
+                yield from self._tile_chunks(cursor, batch_size, np)
+            return
+        cursor.execute('SELECT id, file_id, embedding FROM tile_embeddings ORDER BY id')
+        yield from self._tile_chunks(cursor, batch_size, np)
+
+    @staticmethod
+    def _tile_chunks(cursor, batch_size, np):
+        ids, fids, blobs, dim = [], [], [], None
+        for row_id, file_id, blob in cursor:
+            if not blob or len(blob) % 4:
+                continue
+            if dim is None:
+                dim = len(blob) // 4
+            if len(blob) // 4 != dim:
+                continue
+            ids.append(row_id)
+            fids.append(file_id)
+            blobs.append(blob)
+            if len(blobs) >= batch_size:
+                yield (np.array(ids, np.int64), np.array(fids, np.int64),
+                       np.frombuffer(b''.join(blobs), np.float32).reshape(len(blobs), dim))
+                ids, fids, blobs = [], [], []
+        if blobs:
+            yield (np.array(ids, np.int64), np.array(fids, np.int64),
+                   np.frombuffer(b''.join(blobs), np.float32).reshape(len(blobs), dim))
+
+    def tile_background_signature(self):
+        """Changes whenever tiles or detections are added/removed — the cache key for
+        the background-tile mask (two cheap aggregate queries)."""
+        t = self.conn.execute('SELECT COUNT(*), MAX(id) FROM tile_embeddings').fetchone()
+        d = self.conn.execute('SELECT COUNT(*), MAX(id) FROM detections').fetchone()
+        return tuple(t) + tuple(d)
+
+    def get_person_boxes_by_file(self, class_names=('person',), min_conf=0.3):
+        """{file_id: [[x1,y1,x2,y2], ...]} person boxes (primary frame) for every file
+        — the batched counterpart of get_person_detections_for_file."""
+        placeholders = ','.join('?' for _ in class_names)
+        out = {}
+        for fid, x1, y1, x2, y2 in self.conn.execute(f'''
+                SELECT file_id, x1, y1, x2, y2 FROM detections
+                WHERE class_name IN ({placeholders}) AND confidence >= ?
+                  AND frame_index IS NULL AND x1 IS NOT NULL''', (*class_names, min_conf)):
+            out.setdefault(fid, []).append([x1, y1, x2, y2])
+        return out
+
     def iter_tile_embeddings(self, batch_size=20000):
         """Yield (file_ids: np.ndarray[int64], matrix: np.ndarray[k, D] float32)
         chunks over ALL tile rows, ordered by id, up to batch_size rows per chunk.

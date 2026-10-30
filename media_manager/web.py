@@ -41,7 +41,7 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    body_index, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
+    background_tiles, body_index, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
     near_dup, object_index, pattern_deep, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
@@ -7351,8 +7351,62 @@ def create_app(data_root: str) -> FastAPI:
     # rank almost nothing.
     LOCATION_SUGGEST_THRESHOLD = 0.75
 
+    bg_tile_cache = {'sig': None, 'ids': None}   # background tile ids (sorted), per signature
+    bg_rank_cache = {}                           # ranking key -> [(file_id, score)]
+    bg_lock = threading.Lock()
+
+    def _background_tile_ids():
+        """Sorted tile ids that are background (background_tiles.background_mask over
+        every tile + every person box), rebuilt only when tiles/detections change."""
+        sig = db.tile_background_signature()
+        with bg_lock:
+            if bg_tile_cache['sig'] == sig:
+                return sig, bg_tile_cache['ids']
+            ids, fids, tidx, boxes = db.get_tile_boxes()
+            persons = db.get_person_boxes_by_file(body_index.PERSON_LIKE_CLASSES)
+            mask = background_tiles.background_mask(fids, tidx, boxes, persons)
+            bg_tile_cache.update(sig=sig, ids=np.sort(ids[mask]))
+            bg_rank_cache.clear()
+            return sig, bg_tile_cache['ids']
+
+    def _background_tiles_of(file_ids, bg_ids):
+        """(k,D) background-tile matrix of the given files (empty when none)."""
+        parts = [m[np.isin(tids, bg_ids, assume_unique=True)]
+                 for tids, _f, m in db.iter_tile_embeddings_with_ids(file_ids=file_ids)]
+        parts = [p for p in parts if len(p)]
+        return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
+
+    def _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives):
+        """[(file_id, score)] best first by background tiles, or None when the
+        location's own photos have no background tiles to compare (tiles not built for
+        them yet, or every tile is mostly person). Cached per location + inputs, so the
+        swipe stack's refills page through one ranking instead of rescanning."""
+        sig, bg_ids = _background_tile_ids()
+        key = (location_id, honor_negatives, tuple(sorted(member_ids)),
+               tuple(sorted(excluded_ids)) if honor_negatives else (), sig)
+        with bg_lock:
+            if key in bg_rank_cache:
+                return bg_rank_cache[key]
+        query = _background_tiles_of(member_ids, bg_ids)
+        if len(query) == 0:
+            return None
+        negatives = _background_tiles_of(excluded_ids, bg_ids) if honor_negatives and excluded_ids else None
+
+        def chunks():
+            for tids, fids, m in db.iter_tile_embeddings_with_ids():
+                keep = np.isin(tids, bg_ids, assume_unique=True)
+                yield fids[keep], m[keep]
+
+        ranked = background_tiles.rank_files(chunks(), query, negatives)
+        with bg_lock:
+            if len(bg_rank_cache) > 16:
+                bg_rank_cache.clear()
+            bg_rank_cache[key] = ranked
+        return ranked
+
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
-                                          avoid_existing=True, honor_negatives=False):
+                                          avoid_existing=True, honor_negatives=False, background=True,
+                                          info=None):
         """Images not yet at this location whose CLIP embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
@@ -7367,13 +7421,54 @@ def create_app(data_root: str) -> FastAPI:
         `honor_negatives` (a UI toggle): rejected photos are always hidden; this
         additionally pulls the ranking centroid away from them (same Rocchio-style
         adjusted_centroid as _find_similar_files_for_set), so photos that merely
-        LOOK like a rejected one rank lower too."""
+        LOOK like a rejected one rank lower too.
+
+        `background` (a UI toggle, default on): rank by BACKGROUND tiles only (the tile
+        index minus tiles covered by person boxes — see background_tiles.py), so the
+        place counts and the people in it don't. Falls back to the whole-image ranking
+        when the location's photos have no background tiles yet. `info`, when a dict,
+        receives {'mode': 'background'|'whole'}."""
 
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
-        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
-
         excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
+        set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
+
+        if background and member_ids:
+            excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
+            ranked = _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives)
+            if ranked is not None:
+                if info is not None:
+                    info['mode'] = 'background'
+                placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
+                skip = set(member_ids) | set(exclude_ids or ())
+                want = limit if exclude_ids else offset + limit
+                passing = []   # (row, score) in rank order, filtered like the whole-image path
+                for start in range(0, len(ranked), 500):
+                    block = ranked[start:start + 500]
+                    chunk = [(fid, s) for fid, s in block if s >= threshold and fid not in skip]
+                    rows = {r['id']: r for r in db.get_files_by_ids([fid for fid, _s in chunk])}
+                    for fid, s in chunk:
+                        r = rows.get(fid)
+                        if r is None or r['hidden']:
+                            continue
+                        cs = r['checksum']
+                        if (cs in member_checksums or cs in excluded_checksum_set
+                                or cs in set_settled_checksums or cs in placed_anywhere):
+                            continue
+                        passing.append((r, s))
+                    if len(passing) >= want or block[-1][1] < threshold:   # ranked best-first
+                        break
+                page = passing[:limit] if exclude_ids else passing[offset:offset + limit]
+                cards = _enrich_rows([(r['id'], r['path'], True, r['checksum']) for r, _s in page],
+                                     scores={r['id']: round(s, 3) for r, s in page})
+                for card in cards:
+                    card['ref'] = str(card['id'])
+                return cards
+        if info is not None:
+            info['mode'] = 'whole'
+
+        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
 
         if honor_negatives and excluded_checksum_set:
             excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
@@ -7385,12 +7480,10 @@ def create_app(data_root: str) -> FastAPI:
         # — no centroid, no suggestions (the page says exactly that).
         if centroid is None:
             return []
-        # Photos whose SET is already linked to this location: pressing `s` on one
-        # card writes a single set_locations row rather than a file_locations row
-        # per member, so this is what stops the rest of that shoot from coming
-        # back around the stack one photo at a time.
-        set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
-
+        # Photos whose SET is already linked to this location (set_settled_checksums):
+        # pressing `s` on one card writes a single set_locations row rather than a
+        # file_locations row per member, so this is what stops the rest of that shoot
+        # from coming back around the stack one photo at a time.
         candidates = [
             row for row in db.get_all_embeddings()
             if row[3] not in member_checksums and row[3] not in excluded_checksum_set
@@ -8501,18 +8594,38 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_files_for_location(location_id: int, body: SwipeExcludeBody,
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
-                                        honor_negatives: bool = False):
+                                        honor_negatives: bool = False, background: bool = True):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
+        info = {}
         results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
                                                     exclude_ids=exclude_ids, avoid_existing=avoid_existing,
-                                                    honor_negatives=honor_negatives)
+                                                    honor_negatives=honor_negatives, background=background,
+                                                    info=info)
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
-        # is what swipe-core.js's fetchMoreUrl contract reads.
-        return {'results': results, 'cards': results}
+        # is what swipe-core.js's fetchMoreUrl contract reads. `mode` says whether the
+        # background-tile ranking ran or it fell back to whole images.
+        return {'results': results, 'cards': results, 'mode': info.get('mode'),
+                'tiled_files': db.count_tiled_files()}
+
+    @app.get('/api/locations/{location_id}/background-status')
+    def api_location_background_status(location_id: int):
+        """How much of the background-tile ranking can work: this location's photos
+        with tiles, and tiled vs all images in the library (tiles are the optional
+        "Tiles" ML stage)."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        member_ids = [r['id'] for r in db.get_files_by_checksums(
+            list(manual.get_checksums_for_location(location_id)))]
+        tiled_members = set()
+        for _t, fids, _m in db.iter_tile_embeddings_with_ids(file_ids=member_ids):
+            tiled_members.update(int(f) for f in fids)
+        return {'members': len(member_ids), 'tiled_members': len(tiled_members),
+                'tiled_files': db.count_tiled_files(),
+                'images': db.count_files_by_ext(IMAGE_EXTENSIONS)}
 
     @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
     def api_exclude_file_location(file_id: int, location_id: int):

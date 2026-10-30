@@ -66,6 +66,11 @@
   Avoid photos that already have a location
 </label>
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+  <input type="checkbox" id="location-background-toggle" checked>
+  Match the background only (ignore the people in the photos)
+</label>
+<div class="sub" id="location-background-status" style="margin:-2px 0 8px 24px;font-size:0.85em;"></div>
+<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
   <input type="checkbox" id="location-honor-negatives-toggle" checked>
   Honor negatives (steer ranking away from rejected photos, not just hide them)
 </label>
@@ -288,8 +293,30 @@
     return '/api/locations/' + locationId + '/similar-files?threshold=' + currentThreshold +
       '&limit=' + (need || 10) +
       '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
-      '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked);
+      '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked) +
+      '&background=' + String(!bgToggle || bgToggle.checked);
   }
+
+  // Background matching runs on the (optional) Tiles index — say how much of it exists.
+  const bgToggle = document.getElementById('location-background-toggle');
+  (function () {
+    const el = document.getElementById('location-background-status');
+    if (!el) return;
+    fetch('/api/locations/' + locationId + '/background-status')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) return;
+        if (!d.tiled_members) {
+          el.innerHTML = 'None of the photos here have tiles yet, so this falls back to whole-image matching ' +
+            '(people dominate). Build tiles: <a href="/files">Files</a> → 🧠 Run missing ML → Tiles, or <a href="/bulk">Bulk</a> → Tile index.';
+        } else {
+          el.textContent = 'Using tiles: ' + d.tiled_members + ' of ' + d.members + ' photos here, ' +
+            d.tiled_files + ' of ' + d.images + ' images in the library (untiled photos can\'t be suggested — ' +
+            'build tiles via Run missing ML → Tiles).';
+        }
+      })
+      .catch(function () {});
+  })();
 
   function setNames(card) {
     return ((card && card.sets) || []).map(function(s) { return s.name; });
