@@ -89,6 +89,11 @@ from media_manager.category_resolver import (
 
 THUMB_SIZE = (400, 400)
 
+# /near-duplicates scan tolerance → czkawka similar-images max hamming difference (at
+# hash size 16) and similar-videos tolerance.
+SIMILAR_TOLERANCE = {'strict': 2, 'normal': 6, 'loose': 12}
+VIDEO_TOLERANCE = {'strict': 4, 'normal': 10, 'loose': 16}
+
 # Applied to /thumb, /image, /face-crop, /body-crop's successful responses only
 # (never the gray-placeholder fallbacks) — each of those is served from a path
 # that's content-addressed by file_id/face_id/body_id and never mutated in
@@ -186,6 +191,27 @@ class TrashBody(BaseModel):
     reason: Optional[str] = None
     kept_checksum: Optional[str] = None
     note: Optional[str] = None
+
+class DupScanBody(BaseModel):
+    # Similar-duplicate czkawka scan options. tolerance: strict | normal | loose.
+    images: bool = True
+    videos: bool = True
+    tolerance: str = 'normal'
+
+
+class ExactDupTrashBody(BaseModel):
+    # Trash some tracked paths of one exact-duplicate file (same bytes), or keep all.
+    file_id: int
+    trash: List[str] = []
+
+
+class SimilarDupResolveBody(BaseModel):
+    # One human decision on a similar group: trash these member file ids (the rest
+    # are kept). Empty trash = "not duplicates" (dismiss, keep all).
+    group_id: int
+    trash: List[int] = []
+    carry_labels: bool = True
+
 
 class NearDupResolveBody(BaseModel):
     # Resolve one near-duplicate group. action: merge (keep keeper_file_id, trash the
@@ -5109,7 +5135,7 @@ def create_app(data_root: str) -> FastAPI:
         }
 
     @app.post('/api/near-dup/compute/start')
-    def api_near_dup_compute_start():
+    def api_near_dup_compute_start(body: Optional[DupScanBody] = None):
         """Find near-duplicate groups with czkawka (FIND-ONLY — nothing is ever deleted).
         Runs czkawka's similar-images, similar-videos (if ffmpeg) and exact-duplicate scans,
         maps each reported path back to a file_id, pre-classifies every group, and stores the
@@ -5121,7 +5147,14 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'czkawka not found, deduplication will not be available'}
         if near_dup_job['running']:
             return {'started': False, 'message': 'Near-duplicate scan already running.'}
-        near_dup_job.update(running=True, done=0, total=0, groups=0, error=None)
+        opts = body or DupScanBody()
+        if not (opts.images or opts.videos):
+            return {'started': False, 'message': 'Pick images, videos or both.'}
+        max_diff = SIMILAR_TOLERANCE.get(opts.tolerance)
+        if max_diff is None:
+            raise HTTPException(status_code=400, detail=f'unknown tolerance {opts.tolerance!r}')
+        near_dup_job.update(running=True, done=0, total=0, groups=0, error=None,
+                            options=opts.model_dump())
 
         def _run():
             try:
@@ -5136,10 +5169,14 @@ def create_app(data_root: str) -> FastAPI:
 
                 # czkawka similarity scans (FIND-ONLY — never deletes; we only parse its
                 # JSON). Each group is a list of member dicts carrying 'path' (+ width/
-                # height/size/difference for images/videos).
-                scans = [('image', czkawka.similar_images([data_root])),
-                         ('video', czkawka.similar_videos([data_root])),
-                         ('exact', czkawka.exact_duplicates([data_root]))]
+                # height/size/difference for images/videos). Exact (same-bytes) copies
+                # come from our own checksums instead — see /api/duplicates/exact.
+                scans = []
+                if opts.images:
+                    scans.append(('image', czkawka.similar_images([data_root], max_difference=max_diff)))
+                if opts.videos:
+                    scans.append(('video', czkawka.similar_videos([data_root],
+                                                                  tolerance=VIDEO_TOLERANCE[opts.tolerance])))
 
                 dims = []        # (w, h, file_id) to cache on files.width/height
                 raw_groups = []  # (kind, [(file_id, entry), ...])
@@ -5218,6 +5255,7 @@ def create_app(data_root: str) -> FastAPI:
             'error': near_dup_job['error'],
             'pending': db.count_dup_groups(),   # groups awaiting review
             'groups': near_dup_job['groups'],
+            'options': near_dup_job.get('options'),
         }
 
     @app.post('/api/broken/scan/start')
@@ -5309,6 +5347,167 @@ def create_app(data_root: str) -> FastAPI:
                            'keeper_file_id': g['keeper_file_id'], 'reason': g['reason'],
                            'members': members})
         return {'groups': groups}
+
+    def _media_facts(row):
+        """{width, height, duration} for a files row, probing (and caching on files)
+        whatever is still unknown: image size from the header, video size + length via
+        cv2. Unreadable files just stay None."""
+        w, h, dur = row['width'], row['height'], row['duration']
+        is_video = os.path.splitext(row['path'])[1].lower() in VIDEO_EXTENSIONS
+        if (w and h) and (dur is not None or not is_video):
+            return {'width': w, 'height': h, 'duration': dur}
+        abs_path = os.path.join(data_root, row['path'])
+        if is_video:
+            cap = cv2.VideoCapture(abs_path)
+            try:
+                if cap.isOpened():
+                    w = w or int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or None
+                    h = h or int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or None
+                    fps = cap.get(cv2.CAP_PROP_FPS) or 0
+                    frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+                    if dur is None and fps > 0 and frames > 0:
+                        dur = round(frames / fps, 2)
+                        db.set_file_duration(row['id'], dur)
+            finally:
+                cap.release()
+        elif not (w and h):
+            try:
+                with Image.open(abs_path) as im:
+                    w, h = im.size
+            except (OSError, ValueError, Image.DecompressionBombError):
+                pass
+        if w and h and not (row['width'] and row['height']):
+            db.set_file_dimensions_batch([(w, h, row['id'])])
+        return {'width': w, 'height': h, 'duration': dur}
+
+    def _dup_quality_key(m):
+        """Best copy first: biggest resolution, then longest, then largest file,
+        then not damaged, then lowest id."""
+        return ((m['width'] or 0) * (m['height'] or 0), m['duration'] or 0, m['size'] or 0,
+                not m['broken'], -m['id'])
+
+    def _dup_member(row, tags_map, ids_map):
+        cs = row['checksum']
+        ext = os.path.splitext(row['path'])[1].lower()
+        return {'id': row['id'], 'checksum': cs, 'path': row['path'],
+                'filename': os.path.basename(row['path']),
+                'format': ext.lstrip('.').upper(), 'is_video': ext in VIDEO_EXTENSIONS,
+                **_media_facts(row), 'size': row['size'],
+                'taken_at': row['taken_at'], 'modified_time': row['modified_time'],
+                'broken': row['broken'] is not None,
+                'favorite': manual.get_file_favorite_count(cs),
+                'tag_count': len(tags_map.get(cs, [])), 'people_count': len(ids_map.get(cs, []))}
+
+    @app.get('/api/duplicates/exact')
+    def api_duplicates_exact(offset: int = 0, limit: int = 50):
+        """Exact duplicates from our own checksums: one file (same xxh64 bytes) tracked
+        at several paths. Same bytes → same resolution/length/format/size, so the copies
+        differ only by path and file date; `keep` pre-ticks the oldest copy outside
+        uploads/. Groups a human chose to keep entirely are skipped until a new copy
+        shows up."""
+        kept_all = manual.get_exact_dup_kept()
+        groups = []
+        for fid, n in db.list_exact_duplicate_files(limit=limit, offset=offset):
+            row = db.get_file_by_id(fid)
+            if row is None or kept_all.get(row['checksum'], 0) >= n:
+                continue
+            cs = row['checksum']
+            member = _dup_member(row, manual.list_tags_for_checksums([cs]),
+                                 manual.get_identities_for_checksums([cs]))
+            copies = [{'path': p, 'modified_time': mt,
+                       'on_disk': os.path.isfile(os.path.join(data_root, p))}
+                      for p, mt, _seen in db.get_path_rows_for_file(fid)]
+            keep = min(copies, key=lambda c: (not c['on_disk'], c['path'].startswith('uploads/'),
+                                              c['modified_time'] or float('inf'), len(c['path']),
+                                              c['path']))
+            groups.append({**member, 'copies': copies, 'keep': [keep['path']]})
+        return {'groups': groups, 'total': db.count_exact_duplicate_files(),
+                'offset': offset, 'limit': limit}
+
+    @app.post('/api/duplicates/exact/resolve')
+    def api_duplicates_exact_resolve(body: ExactDupTrashBody):
+        """One human decision on an exact group: the listed paths stop being tracked and
+        go to the path-level Trash (files stay on disk; Restore re-tracks them). An
+        empty list = "keep all copies" (the group stops being shown). At least one
+        tracked path always remains."""
+        row = db.get_file_by_id(body.file_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail='file not found')
+        paths = [p for p, _mt, _seen in db.get_path_rows_for_file(body.file_id)]
+        trash = list(dict.fromkeys(body.trash))
+        unknown = [p for p in trash if p not in paths]
+        if unknown:
+            raise HTTPException(status_code=400, detail=f'not a copy of this file: {unknown[0]}')
+        kept = [p for p in paths if p not in trash]
+        if not kept:
+            raise HTTPException(status_code=400, detail='keep at least one copy')
+        if not trash:
+            manual.mark_exact_dup_kept(row['checksum'], len(paths))
+            return {'ok': True, 'trashed': [], 'kept': kept}
+        for p in trash:
+            db.untrack_path(p)
+        manual.add_trashed_paths([(p, kept[0], row['checksum']) for p in trash])
+        scan_status.invalidate()
+        return {'ok': True, 'trashed': trash, 'kept': kept}
+
+    @app.get('/api/duplicates/similar')
+    def api_duplicates_similar():
+        """The czkawka similar-images/videos groups from the last scan, members with
+        resolution / length / format / date / size / path and `keep` = the best copy
+        (_dup_quality_key) pre-ticked. Members trashed since the scan are dropped, and a
+        group left with fewer than two is removed."""
+        trashed = manual.get_trashed_checksums()
+        groups = []
+        for g in db.list_dup_groups():
+            rows = [r for r in (db.get_file_by_id(fid) for fid in g['file_ids'])
+                    if r is not None and r['checksum'] not in trashed]
+            if len(rows) < 2 or len(rows) > near_dup.MAX_GROUP:
+                db.delete_dup_group(g['group_id'])
+                continue
+            css = [r['checksum'] for r in rows]
+            tags_map = manual.list_tags_for_checksums(css)
+            ids_map = manual.get_identities_for_checksums(css)
+            members = [_dup_member(r, tags_map, ids_map) for r in rows]
+            for m in members:
+                m['path_count'] = len(db.get_paths_for_file(m['id']))
+            members.sort(key=_dup_quality_key, reverse=True)
+            groups.append({'group_id': g['group_id'], 'label': g['label'], 'reason': g['reason'],
+                           'members': members, 'keep': [members[0]['id']]})
+        return {'groups': groups, 'total': len(groups)}
+
+    @app.post('/api/duplicates/similar/resolve')
+    def api_duplicates_similar_resolve(body: SimilarDupResolveBody):
+        """One human decision on a similar group: trash the listed members (reversible,
+        reason 'duplicate', kept_checksum = the best kept copy), optionally carrying
+        their tags / people / sets onto that copy first. Kept members are marked "not
+        duplicates" of each other so they don't come back. Empty trash = keep all."""
+        g = db.get_dup_group(body.group_id)
+        if g is None:
+            raise HTTPException(status_code=404, detail='group not found')
+        rows = {r['id']: r for r in (db.get_file_by_id(fid) for fid in g['file_ids']) if r is not None}
+        bad = [fid for fid in body.trash if fid not in rows]
+        if bad:
+            raise HTTPException(status_code=400, detail=f'file {bad[0]} is not in this group')
+        trash = set(body.trash)
+        kept = [rows[fid] for fid in rows if fid not in trash]
+        if not kept:
+            raise HTTPException(status_code=400, detail='keep at least one copy')
+        if trash:
+            facts = {r['id']: {'id': r['id'], 'size': r['size'], 'broken': r['broken'] is not None,
+                               **_media_facts(r)} for r in kept}
+            keeper = rows[max(facts.values(), key=_dup_quality_key)['id']]
+            for fid in trash:
+                loser = rows[fid]
+                note = f"{loser['path']} | similar to {keeper['path']}"
+                if body.carry_labels:
+                    summary = manual.merge_labels(keeper['checksum'], loser['checksum'], same_image=False)
+                    note += ' | carried ' + ' '.join(f'{k}={v}' for k, v in summary.items())
+                manual.add_to_trash(loser['checksum'], reason='duplicate',
+                                    kept_checksum=keeper['checksum'], source_file_id=fid, note=note)
+        if len(kept) > 1:
+            manual.add_not_duplicate_group([r['checksum'] for r in kept])
+        db.delete_dup_group(body.group_id)
+        return {'ok': True, 'trashed': sorted(trash), 'kept': [r['id'] for r in kept]}
 
     def _frame_still_checksums():
         # Small memo per-request would be ideal; the map is one cheap query.
@@ -6865,15 +7064,14 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/duplicates', response_class=HTMLResponse)
     def duplicates_page(request: Request):
-        """Content seen at more than one path — the point of content-addressable
-        identity: surfaces real duplicates for manual review instead of silently
-        tracking (and letting a user separately tag/sort) each copy. Deliberately no
-        delete action here — that's destructive on real files and stays human-driven."""
-        groups = [
-            {'file_id': file_id, 'paths': [p for p, _ in db.get_paths_for_file(file_id)]}
-            for file_id, _path_count in db.find_duplicates(limit=200)
-        ]
-        return templates.TemplateResponse(request, 'duplicates.html', {'groups': groups})
+        """Exact duplicates — the same bytes (our own xxh64 checksum) tracked at several
+        paths. One decision per group by a human: tick the copies to keep, the rest go
+        to the path-level Trash (untracked, never deleted). Similar-looking files are
+        /near-duplicates (czkawka)."""
+        return templates.TemplateResponse(request, 'duplicates.html', {
+            'all_tags': manual.list_all_tags(),
+            'all_categories': _all_categories_for_nav(),
+        })
 
     @app.get('/sets', response_class=HTMLResponse)
     def sets_page(request: Request, favorite: bool = False, studio: str = '',
@@ -8759,10 +8957,13 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/near-duplicates', response_class=HTMLResponse)
     def near_duplicates_page(request: Request):
-        """Review near-duplicate groups (Phase 2/3): merge lower-quality/damaged copies,
-        keep bursts, link screenshots. Groups are computed by the /bulk 'Find
-        near-duplicates' job and read here via /api/near-dup/groups."""
+        """Similar-looking images/videos, found by a background czkawka scan (options:
+        images / videos / tolerance). Same review shape as /duplicates: resolution /
+        length / format / date / size / path per member, best copy pre-ticked to keep,
+        one human decision per group, trash only."""
         return templates.TemplateResponse(request, 'near_duplicates.html', {
+            'czkawka_available': _czkawka is not None,
+            'ffmpeg_available': _ffmpeg,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })

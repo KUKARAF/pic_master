@@ -1,0 +1,27 @@
+{# Styles for static/dup-review.js groups — shared by duplicates.html and near_duplicates.html. #}
+<style>
+  .dup-group { background:var(--panel, #111); border:1px solid var(--border, #333);
+    border-radius:var(--radius, 8px); padding:12px 14px; margin-bottom:16px; }
+  .dup-group.is-done { opacity:.6; padding:8px 14px; }
+  .dup-group-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+  .dup-hint { background:rgba(255,255,255,.1); border-radius:10px; padding:1px 8px; font-size:.85em; }
+  .dup-table { width:100%; border-collapse:collapse; font-size:.9em; }
+  .dup-table th { text-align:left; font-weight:normal; color:var(--text-muted, #999); padding:4px 8px;
+    border-bottom:1px solid var(--border, #333); white-space:nowrap; }
+  .dup-table td { padding:6px 8px; border-bottom:1px solid var(--border, #222); vertical-align:middle; white-space:nowrap; }
+  .dup-table tr:not(.is-keep) td { opacity:.55; }
+  .dup-table tr:not(.is-keep) td:first-child { opacity:1; }
+  .dup-table tr.is-keep td:first-child { box-shadow: inset 3px 0 0 var(--accent, #6c6); }
+  .dup-keep { width:18px; height:18px; cursor:pointer; }
+  .dup-thumb img { width:72px; height:72px; object-fit:cover; border-radius:4px; display:block; background:#000; }
+  .dup-path { white-space:normal !important; word-break:break-all; min-width:220px; }
+  .dup-best { font-weight:700; color:var(--accent, #6c6); }
+  .dup-badge { display:inline-block; font-size:.8em; background:rgba(255,255,255,.08); border-radius:8px;
+    padding:0 6px; margin:2px 4px 0 0; }
+  .dup-bad { background:rgba(220,60,60,.25); }
+  .dup-actions { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin-top:10px; }
+  .dup-go { cursor:pointer; }
+  .dup-go-trash { background:var(--danger, #b33); color:#fff; border-color:transparent; }
+  .dup-scan { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:0 0 16px;
+    padding:10px 14px; border:1px solid var(--border, #333); border-radius:var(--radius, 8px); }
+</style>

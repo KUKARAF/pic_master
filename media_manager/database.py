@@ -207,6 +207,10 @@ class Database(ThreadLocalDB):
             cursor.execute('ALTER TABLE files ADD COLUMN width INTEGER')
         if 'height' not in files_cols:
             cursor.execute('ALTER TABLE files ADD COLUMN height INTEGER')
+        # duration: a video's length in seconds, probed (cv2) on demand for the
+        # /duplicates review and cached here. NULL = not probed yet / not a video.
+        if 'duration' not in files_cols:
+            cursor.execute('ALTER TABLE files ADD COLUMN duration REAL')
         # file_paths: every location this content has been seen at. One-to-many — this
         # is where duplicates (same checksum, multiple paths) live. last_seen_at is
         # bumped on every scan that still finds the path on disk, so a path whose
@@ -788,6 +792,40 @@ class Database(ThreadLocalDB):
         cursor = self.conn.cursor()
         cursor.execute('SELECT path, file_id FROM file_paths')
         return cursor.fetchall()
+
+    def list_exact_duplicate_files(self, limit=50, offset=0):
+        """[(file_id, path_count)] for content tracked at more than one path (same
+        xxh64), most copies first — the /duplicates "Exact" view."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT file_id, COUNT(*) AS n FROM file_paths GROUP BY file_id '
+                       'HAVING n > 1 ORDER BY n DESC, file_id LIMIT ? OFFSET ?', (limit, offset))
+        return cursor.fetchall()
+
+    def count_exact_duplicate_files(self):
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM (SELECT file_id FROM file_paths GROUP BY file_id '
+                       'HAVING COUNT(*) > 1)')
+        return cursor.fetchone()[0]
+
+    def get_path_rows_for_file(self, file_id):
+        """[(path, modified_time, last_seen_at)] for every tracked path of one file."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT path, modified_time, last_seen_at FROM file_paths '
+                       'WHERE file_id = ? ORDER BY path', (file_id,))
+        return cursor.fetchall()
+
+    def untrack_path(self, path):
+        """Forget one tracked path (the file on disk is untouched). Never removes the
+        content's last path — callers keep at least one. Returns True if removed."""
+        cursor = self.conn.cursor()
+        cursor.execute('DELETE FROM file_paths WHERE path = ?', (path,))
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def set_file_duration(self, file_id, duration):
+        cursor = self.conn.cursor()
+        cursor.execute('UPDATE files SET duration = ? WHERE id = ?', (duration, file_id))
+        self.conn.commit()
 
     def find_duplicates(self, limit=200):
         """Return [(file_id, path_count), ...] for content seen at more than one path —

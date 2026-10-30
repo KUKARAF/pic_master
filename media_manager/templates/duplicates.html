@@ -5,32 +5,62 @@
 {% block content %}
 <div class="page-heading">
   <h1>Duplicates</h1>
-  <span class="sub">{{ groups | length }} group(s) of identical content</span>
+  <span class="sub" id="dup-count"></span>
 </div>
 
-<p class="sub" style="margin-bottom:20px;">
-  Same file content (byte-for-byte) found at more than one path. Review and delete the
-  extras yourself — nothing here is deleted automatically.
+<p class="sub" style="margin-bottom:16px;">
+  The exact same file (byte-for-byte, by its checksum) tracked at more than one path.
+  The oldest copy outside <code>uploads/</code> is ticked to keep — change the ticks, then press the
+  group's button. Unticked copies stop being tracked and go to the <a href="/trash">Trash</a>
+  (still on disk; Restore tracks them again). Every group is your call — nothing happens on its own.
+  Similar-looking files are on <a href="/near-duplicates">Near-dups</a>.
 </p>
 
-{% if groups %}
-{% for g in groups %}
-<div class="section-title" style="margin-top:24px;">{{ g.paths | length }} copies</div>
-<div class="face-chips">
-  {% for path in g.paths %}
-  <div class="face-chip">
-    <a href="/photo/{{ g.file_id }}">
-      <img src="/thumb/{{ g.file_id }}" alt="thumb" width="120" height="120" style="object-fit:cover;">
-    </a>
-    <span class="face-name" title="{{ path }}">{{ path }}</span>
-  </div>
-  {% endfor %}
-</div>
-{% endfor %}
-{% else %}
-<div class="empty-state">
-  <div class="icon">✨</div>
-  <p>No duplicates found — every tracked file has unique content.</p>
-</div>
-{% endif %}
+<div id="dup-groups"></div>
+<div id="dup-status" class="sub" style="margin:16px 0;"></div>
+<button type="button" id="dup-more" class="btn-similar" hidden>Load more</button>
+
+{% include "_dup_review_style.html" %}
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/dup-review.js"></script>
+<script>
+(function () {
+  var box = document.getElementById('dup-groups');
+  var status = document.getElementById('dup-status');
+  var more = document.getElementById('dup-more');
+  var countEl = document.getElementById('dup-count');
+  var offset = 0, limit = 50, open = 0;
+
+  function resolve(group, paths) {
+    return DupReview.postJson('/api/duplicates/exact/resolve', { file_id: group.id, trash: paths });
+  }
+  function onDone() {
+    open--;
+    if (!open && more.hidden) status.textContent = 'All groups on this page decided. Reload to check for more.';
+  }
+
+  function load() {
+    more.hidden = true;
+    status.textContent = 'Loading…';
+    fetch('/api/duplicates/exact?offset=' + offset + '&limit=' + limit)
+      .then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+      .then(function (d) {
+        countEl.textContent = d.total ? d.total + ' file(s) tracked at more than one path' : '';
+        d.groups.forEach(function (g) {
+          box.appendChild(DupReview.renderGroup(g, { kind: 'exact', resolve: resolve, onDone: onDone }));
+          open++;
+        });
+        offset += limit;
+        more.hidden = offset >= d.total;
+        status.textContent = (!d.total) ? 'No exact duplicates — every tracked file lives at one path. ✨'
+          : (!open ? 'Nothing left to decide here.' : '');
+      })
+      .catch(function (e) { status.textContent = 'Failed: ' + e.message; });
+  }
+  more.addEventListener('click', load);
+  load();
+})();
+</script>
 {% endblock %}

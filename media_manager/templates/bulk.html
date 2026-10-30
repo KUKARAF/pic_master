@@ -169,10 +169,10 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <p class="sub" style="margin:6px 2px 0;">
-      czkawka scans the library for look-alike images{% if ffmpeg_available %}, similar videos{% endif %},
-      byte-identical copies and corrupt files — it only <em>lists</em>; nothing is ever deleted.
-      Review near-duplicates <a href="/near-duplicates">here</a> (merge copies, keep bursts, link
-      screenshots); damaged files land in the <a href="/browse/broken">Damaged</a> bucket.
+      czkawka scans the library for look-alike images{% if ffmpeg_available %}, similar videos{% endif %}
+      and corrupt files — it only <em>lists</em>; nothing is ever deleted. Review (and pick images /
+      videos / tolerance) on <a href="/near-duplicates">Near-dups</a>; byte-identical copies are on
+      <a href="/duplicates">Duplicates</a>; damaged files land in the <a href="/browse/broken">Damaged</a> bucket.
       {% if not ffmpeg_available %}<br><span class="sub">Install ffmpeg + ffprobe to also scan videos.</span>{% endif %}
     </p>
   </section>

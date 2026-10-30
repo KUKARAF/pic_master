@@ -286,6 +286,15 @@ class ManualDB(ThreadLocalDB):
                 created_at INTEGER NOT NULL
             )
         ''')
+        # Exact duplicates (same bytes at several paths) a human decided to keep in full
+        # on /duplicates — hidden there until the content shows up at more paths.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS exact_dup_kept (
+                checksum TEXT PRIMARY KEY,
+                path_count INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        ''')
         # generated_artifacts: images/videos this app produced FROM a set (collages,
         # slideshows, and later AI-generated media). Kept out of the `files` library
         # (their `path` is under generated/, which scans skip) and recorded here so
@@ -1347,6 +1356,18 @@ class ManualDB(ThreadLocalDB):
             removed += cur.execute('DELETE FROM trashed_paths WHERE path = ?', (path,)).rowcount
         self.conn.commit()
         return removed
+
+    def mark_exact_dup_kept(self, checksum, path_count):
+        """A human kept every copy of this exact duplicate (/duplicates "Keep all").
+        Hidden until more than `path_count` copies are tracked."""
+        self.conn.execute('INSERT INTO exact_dup_kept (checksum, path_count, created_at) VALUES (?, ?, ?) '
+                          'ON CONFLICT(checksum) DO UPDATE SET path_count = excluded.path_count',
+                          (checksum, path_count, int(time.time())))
+        self.conn.commit()
+
+    def get_exact_dup_kept(self):
+        """{checksum: path_count} for every exact duplicate kept in full."""
+        return dict(self.conn.execute('SELECT checksum, path_count FROM exact_dup_kept').fetchall())
 
     def restore_from_trash(self, checksum):
         """Take a file back out of the trash. Returns True if it was trashed."""
