@@ -207,6 +207,7 @@
   function trackSummary(s) {
     var msg = 'Tracked ' + folderLabel(s.path) + ': ' + plural(s.added || 0, 'new file') + ' added';
     if (s.already) msg += ', ' + s.already + ' already tracked';
+    if (s.relinked) msg += ', ' + s.relinked + ' re-linked (replacing a damaged or missing copy)';
     if (s.duplicates) msg += ', ' + plural(s.duplicates, 'duplicate') + ' moved to Trash (nothing deleted)';
     if (s.ignored) msg += ', ' + s.ignored + ' ignored';
     return msg + '.';

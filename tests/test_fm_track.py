@@ -237,6 +237,27 @@ def check_track_job():
     assert st['duplicates'] == 0 and st['already'] == 4, st
     print('OK  restore tracks the copy as a second location; re-track leaves it alone')
 
+    # A copy of content whose tracked copy is flagged damaged is relinked, not trashed,
+    # and the damaged flag is cleared for a re-check. Same when the tracked copy is gone.
+    orig_id = db.find_file_id_by_checksum(item['checksum'])
+    db.mark_broken(orig_id)
+    with open(j('keep/orig.png'), 'rb') as fh:
+        data = fh.read()
+    _write(j('trips/again/copy2.png'), data)
+    client.post('/api/fm/track/start', json={'path': 'trips'})
+    st = _wait_track(client)
+    assert st['relinked'] == 1 and st['duplicates'] == 0, st
+    assert 'trips/again/copy2.png' in {r[0] for r in _db_rows(db)}
+    assert db.get_file_by_id(orig_id)['broken'] is None
+    for p in ('keep/orig.png', 'trips/copy.png', 'trips/again/copy2.png'):
+        os.remove(j(p))                       # every tracked copy gone from disk
+    _write(j('other/back.png'), data)
+    client.post('/api/fm/track/start', json={'path': 'other'})
+    st = _wait_track(client)
+    assert st['relinked'] == 1 and st['duplicates'] == 0, st
+    assert 'other/back.png' in {r[0] for r in _db_rows(db)}
+    print('OK  damaged or vanished tracked copy -> new copy relinked, damaged flag cleared')
+
 
 def check_track_job_fields():
     """A clean run (no race with a second start) for exact counts and listing states."""

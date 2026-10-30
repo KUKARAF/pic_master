@@ -102,6 +102,13 @@ def check_similar(client, db, manual, root):
     v = {x['id']: x for x in groups[g2]['members']}[v_id]
     assert v['is_video'] and v['format'] == 'AVI' and abs(v['duration'] - 2.0) < 0.2, v
 
+    # A damaged copy is never pre-ticked over a healthy one, however big it is.
+    db.mark_broken(big)
+    g = {g['group_id']: g for g in client.get('/api/duplicates/similar').json()['groups']}[g1]
+    assert g['keep'] == [small], g['keep']
+    db.conn.execute('UPDATE files SET broken = NULL WHERE id = ?', (big,))
+    db.conn.commit()
+
     url = '/api/duplicates/similar/resolve'
     assert client.post(url, json={'group_id': g1, 'trash': [big, small]}).status_code == 400
     assert client.post(url, json={'group_id': g1, 'trash': [999999]}).status_code == 400

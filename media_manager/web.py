@@ -2249,8 +2249,8 @@ def create_app(data_root: str) -> FastAPI:
     # transaction and busy_timeout covers the overlap).
     track_lock = threading.Lock()
     track_job = {'running': False, 'path': None, 'phase': None, 'done': 0, 'total': 0,
-                 'added': 0, 'already': 0, 'duplicates': 0, 'ignored': 0, 'error': None,
-                 'started_at': None, 'finished_at': None}
+                 'added': 0, 'already': 0, 'duplicates': 0, 'relinked': 0, 'ignored': 0,
+                 'error': None, 'started_at': None, 'finished_at': None}
 
     def _track_refresh_inventory(abs_dir, rel):
         """Bring disk_files up to date for the scanned subtree (upsert what's on disk,
@@ -2281,7 +2281,7 @@ def create_app(data_root: str) -> FastAPI:
                 raise HTTPException(status_code=409,
                                     detail=f"Already tracking '{track_job['path'] or '/'}'")
             track_job.update(running=True, path=rel, phase='listing', done=0, total=0,
-                             added=0, already=0, duplicates=0, ignored=0, error=None,
+                             added=0, already=0, duplicates=0, relinked=0, ignored=0, error=None,
                              started_at=int(time.time()), finished_at=None)
 
         def _progress(fields):
@@ -5381,10 +5381,10 @@ def create_app(data_root: str) -> FastAPI:
         return {'width': w, 'height': h, 'duration': dur}
 
     def _dup_quality_key(m):
-        """Best copy first: biggest resolution, then longest, then largest file,
-        then not damaged, then lowest id."""
-        return ((m['width'] or 0) * (m['height'] or 0), m['duration'] or 0, m['size'] or 0,
-                not m['broken'], -m['id'])
+        """Best copy first: never a damaged one over a healthy one, then biggest
+        resolution, then longest, then largest file, then lowest id."""
+        return (not m['broken'], (m['width'] or 0) * (m['height'] or 0), m['duration'] or 0,
+                m['size'] or 0, -m['id'])
 
     def _dup_member(row, tags_map, ids_map):
         cs = row['checksum']

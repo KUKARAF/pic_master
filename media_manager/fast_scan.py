@@ -39,7 +39,7 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     progress:        optional callable(dict) for callers that show their own progress
                      (the web's "Track this folder" job). Called with partial updates
                      of {'phase': 'listing'|'hashing'|'saving', 'done', 'total',
-                     'ignored', 'added', 'already', 'duplicates'}. None (the CLI) means
+                     'ignored', 'added', 'already', 'duplicates', 'relinked'}. None (the CLI) means
                      no calls at all — the scan behaves exactly as without it.
     use_pv:          pipe find through `pv -l` when pv is installed (the CLI's progress
                      bar). The web job passes False: no pv subprocess, the callback is
@@ -163,8 +163,14 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     # A checksum that already belongs to *this same path* isn't a duplicate at all —
     # it's just the same file being rescanned. Count it separately as
     # "already indexed" instead of lumping it in with genuinely new files.
+    # Exception: when the tracked copy of that content is flagged damaged, or none of its
+    # tracked paths exist on disk any more, the new copy is NOT a duplicate to set aside —
+    # it's the way back to that content. It gets tracked ("relinked") and the damaged flag
+    # is cleared so the next thumbnail/scan re-checks the bytes (re-flagging them if the
+    # damage is really in the content).
     hashed.sort()  # deterministic order when two brand-new files in this same scan collide
     duplicates = []
+    relinked = 0
     written = 0
     already_indexed = 0
     # Computed once up front, not per file — a big rescan shouldn't turn into an
@@ -173,12 +179,20 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
     _report(phase='saving', done=0, total=len(hashed), added=0, already=0, duplicates=0)
     for rel_path, size, mtime, checksum in hashed:
         if progress is not None:
-            _report(done=written + already_indexed + len(duplicates),
+            _report(done=written + already_indexed + len(duplicates) + relinked,
                     added=written, already=already_indexed, duplicates=len(duplicates))
         existing_file_id = db.find_file_id_by_checksum(checksum)
         if existing_file_id is not None:
             known_paths = [p for p, _ in db.get_paths_for_file(existing_file_id)]
             if rel_path not in known_paths:
+                existing = db.get_file_by_id(existing_file_id)
+                damaged = existing is not None and existing['broken'] is not None
+                gone = not any(os.path.isfile(os.path.join(data_root, p)) for p in known_paths)
+                if damaged or gone:
+                    db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
+                    db.conn.execute('UPDATE files SET broken = NULL WHERE id = ?', (existing_file_id,))
+                    relinked += 1
+                    continue
                 duplicates.append((rel_path, known_paths[0] if known_paths else '(unknown)', checksum))
                 continue
             already_indexed += 1
@@ -189,7 +203,11 @@ def fast_scan(root_path, db, data_root, recursive=True, max_workers=8, dup_repor
         db.upsert_file_path(rel_path, checksum, size=size, modified_time=mtime)
         written += 1
     db.conn.commit()
-    _report(done=len(hashed), added=written, already=already_indexed, duplicates=len(duplicates))
+    _report(done=len(hashed), added=written, already=already_indexed, duplicates=len(duplicates),
+            relinked=relinked)
+    if relinked:
+        print(f"fast_scan: {relinked} file(s) relinked — their tracked copy was damaged or gone "
+              f"from disk, so this copy is tracked now", file=sys.stderr)
 
     if duplicates and on_duplicates is not None:
         on_duplicates(duplicates)
