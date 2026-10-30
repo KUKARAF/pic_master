@@ -58,7 +58,8 @@ FIND_ARGS=("$FOLDER")
 [ "$RECURSIVE" -eq 0 ] && FIND_ARGS+=(-maxdepth 1)
 FIND_ARGS+=(-type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif'
     -o -iname '*.bmp' -o -iname '*.webp' -o -iname '*.tif' -o -iname '*.tiff'
-    -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v' \)
+    -o -iname '*.mp4' -o -iname '*.mov' -o -iname '*.webm' -o -iname '*.m4v'
+    -o -iname '*.avi' -o -iname '*.mpg' -o -iname '*.mpeg' \)
     -not -path '*/.media/*' -print0)
 
 RESP="$(mktemp)"

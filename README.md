@@ -112,7 +112,8 @@ Upload a whole folder with `upload_folder.sh` from the project root:
 | `--dry-run` | List the files that would be uploaded and exit |
 
 Only the media types the library tracks are sent (`.jpg .jpeg .png .gif .bmp .webp
-.tif .tiff .mp4 .mov .webm .m4v`). Each file is its own request, so one failure
+.tif .tiff .mp4 .mov .webm .m4v .avi .mpg .mpeg`; `.avi`/`.mpg`/`.mpeg` are
+converted to H.264 on first play, which needs `ffmpeg` on the server). Each file is its own request, so one failure
 never affects the others; failed files are never deleted, and the script exits
 non-zero if any upload failed. It prints `saved` / `duplicate` / `FAILED` per file
 and a summary at the end.

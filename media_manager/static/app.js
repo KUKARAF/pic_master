@@ -5801,6 +5801,7 @@
 
   // Video the browser can't decode ("No video with supported format and MIME type
   // found"): ask the server for an H.264 transcode, show progress, then swap it in.
+  // Containers no browser plays (.avi/.mpg, data-needs-transcode) start right away.
   (function () {
     var video = document.getElementById('photo-video');
     if (!video) return;
@@ -5825,7 +5826,7 @@
         }
       }).catch(function () { setTimeout(poll, 3000); });
     }
-    video.addEventListener('error', function () {
+    function startTranscode() {
       if (started || video.src.indexOf('/playable/') !== -1) return;
       started = true;
       note.style.display = '';
@@ -5834,7 +5835,9 @@
         if (!r.ok) return r.json().then(function (d) { throw new Error(d.detail || r.status); });
         poll();
       }).catch(function (e) { note.textContent = 'Cannot play this video: ' + e.message; });
-    });
+    }
+    video.addEventListener('error', startTranscode);
+    if (video.dataset.needsTranscode) startTranscode();
   })();
 
 })();

@@ -56,7 +56,13 @@ from media_manager.database import FACE_NORM_VERSION, Database
 from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
 from media_manager.error_log import ErrorLog
 from media_manager.face_detector import FaceDetector, _norm_angle
-from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS, VIDEO_MIME_TYPES, open_upright_rgb
+from media_manager.formats import (
+    IMAGE_EXTENSIONS,
+    TRANSCODE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    VIDEO_MIME_TYPES,
+    open_upright_rgb,
+)
 from media_manager.gen_service import ComfyUIClient
 from media_manager.ignore import IgnoreRules
 from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
@@ -2644,6 +2650,7 @@ def create_app(data_root: str) -> FastAPI:
         ext = os.path.splitext(file_info['path'])[1].lower()
         file_info['is_image'] = ext in IMAGE_EXTENSIONS
         file_info['is_video'] = ext in VIDEO_EXTENSIONS
+        file_info['needs_transcode'] = ext in TRANSCODE_EXTENSIONS
         frame_count = 1
         if file_info['is_image']:
             abs_path = _live_abs_path(file_id, file_info['path'])

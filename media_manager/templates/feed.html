@@ -204,6 +204,13 @@
     video.src = '/image/' + id; video.poster = '/thumb/' + id;
     video.loop = true; video.playsInline = true; video.muted = !soundOn; video.preload = 'auto';
     video.draggable = false;
+    // Undecodable here (.avi/.mpg, HEVC, ...): use the H.264 copy /photo made, if any.
+    video.addEventListener('error', function () {
+      if (video.src.indexOf('/playable/') !== -1) return;
+      fetch('/api/files/' + id + '/playable').then(function (r) { return r.json(); }).then(function (d) {
+        if (d.state === 'ready' && video.isConnected) { video.src = '/playable/' + id; video.play().catch(function () {}); }
+      }).catch(function () {});
+    }, { once: true });
     item.insertBefore(video, item.firstChild);
     // drop the placeholder poster <img> once the video actually has a frame (no black gap)
     var poster = item.querySelector('.feed-poster');

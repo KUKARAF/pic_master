@@ -18,7 +18,7 @@ import cv2
 
 # recognised extensions (case-insensitive)
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
-VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+VIDEO_EXTS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.m4v', '.mpg', '.mpeg'}
 
 # OSError errnos that mean OUR side failed (fd exhaustion, I/O, permissions, the file
 # vanishing mid-scan, a full disk) — never evidence that the file's bytes are bad.
