@@ -6,9 +6,15 @@
 {% block content %}
 <div class="page-heading">
   <h1>
+    {% if avatar_ref %}
+    <img id="person-avatar" src="/face-crop/{{ avatar_ref }}" alt="{{ name }}"
+         title="{{ 'Profile picture — click to change' if profile_picked else 'Automatic profile picture — click to pick one' }}"
+         style="width:48px;height:48px;border-radius:50%;object-fit:cover;vertical-align:middle;margin-right:8px;cursor:pointer;border:1px solid var(--border,#333);">
+    {% endif %}
     {{ name }}
     <a href="/find-person/{{ name | urlencode }}" class="heart-btn-inline" title="Find more photos of {{ name }} by face">🔍</a>
     <a href="/find-person/{{ name | urlencode }}/body" class="heart-btn-inline" title="Find more photos of {{ name }} by body (clothing/pose/build)">🧍</a>
+    <button type="button" id="person-profile-btn" class="heart-btn-inline" title="Pick profile picture">🖼️</button>
     <button type="button" id="person-edit-btn" class="heart-btn-inline" title="Rename / manage aliases">✏️</button>
     <button type="button" id="estimate-all-age-btn" class="heart-btn-inline" title="Estimate age &amp; gender for every photo of {{ name }}">🎂</button>
     <button type="button" id="person-split-btn" class="heart-btn-inline" title="Split off photos that are actually someone else">✂️</button>
@@ -656,6 +662,66 @@
       box.appendChild(addAliasBtn);
     });
   });
+})();
+
+/* Picture icon (or the avatar itself) — pick which of this person's confirmed
+   faces is their profile picture, used for them everywhere a person crop is shown
+   (/faces, friend lists, identity pickers). "Automatic" drops the pick. */
+(function() {
+  var btn = document.getElementById('person-profile-btn');
+  if (!btn) return;
+  var name = {{ name | tojson }};
+  var url = '/api/person/' + encodeURIComponent(name) + '/profile-face';
+
+  function save(method, ref) {
+    return fetch(url, {
+      method: method,
+      headers: {'Content-Type': 'application/json'},
+      body: ref ? JSON.stringify({ref: ref}) : undefined,
+    }).then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+      .then(function() { closeModal(); location.reload(); })
+      .catch(function(err) { showToast('Failed to set profile picture: ' + err.message); });
+  }
+
+  function open() {
+    openModal('Profile picture — ' + name, function(box) {
+      var status = document.createElement('div');
+      status.className = 'sub';
+      status.textContent = 'Loading faces…';
+      box.appendChild(status);
+      var grid = document.createElement('div');
+      grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;max-height:60vh;overflow-y:auto;margin:8px 0;';
+      box.appendChild(grid);
+      fetch('/api/person/' + encodeURIComponent(name) + '/faces')
+        .then(function(r) { if (!r.ok) throw new Error('Request failed: ' + r.status); return r.json(); })
+        .then(function(data) {
+          var faces = data.faces || [];
+          status.textContent = faces.length ? 'Click a face to use it as the profile picture.' : 'No confirmed faces yet.';
+          faces.slice().reverse().forEach(function(f) {
+            var img = document.createElement('img');
+            img.src = '/face-crop/' + f.ref;
+            img.loading = 'lazy';
+            img.title = f.ref === data.profile_ref ? 'Current profile picture' : 'Use this face';
+            img.style.cssText = 'width:80px;height:80px;border-radius:50%;object-fit:cover;cursor:pointer;' +
+              'border:3px solid ' + (f.ref === data.profile_ref ? 'var(--chip-blue,#8ab4f8)' : 'transparent') + ';';
+            img.addEventListener('click', function() { save('PUT', f.ref); });
+            grid.appendChild(img);
+          });
+          if (data.profile_ref) {
+            var auto = document.createElement('button');
+            auto.type = 'button';
+            auto.textContent = 'Use automatic';
+            auto.addEventListener('click', function() { save('DELETE'); });
+            box.appendChild(auto);
+          }
+        })
+        .catch(function(err) { status.textContent = 'Failed: ' + err.message; });
+    });
+  }
+
+  btn.addEventListener('click', open);
+  var avatar = document.getElementById('person-avatar');
+  if (avatar) avatar.addEventListener('click', open);
 })();
 
 /* Scissors icon — "Split" review: pick the other person a batch of this

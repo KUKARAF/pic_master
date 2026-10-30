@@ -737,6 +737,12 @@ class ManualDB(ThreadLocalDB):
         # display and matching agree.
         if 'rotation' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN rotation INTEGER NOT NULL DEFAULT 0')
+        # When the user picked this face as its person's profile picture (📌 on
+        # /person/{name}); the newest non-rejected one per identity wins over the
+        # automatic "first/newest face" choice everywhere a person's crop is shown.
+        # Lives on the face row so renames and merges carry it along.
+        if 'profile_at' not in existing_face_cols2:
+            cur.execute('ALTER TABLE faces ADD COLUMN profile_at INTEGER')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_checksum ON file_tags (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags (tag_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_checksum ON faces (checksum)')
@@ -3294,6 +3300,39 @@ class ManualDB(ThreadLocalDB):
                 result[source_face_id] = manual_id
         return result
 
+    def set_profile_face(self, identity, face_id):
+        """Make manual face `face_id` the profile picture of `identity`. False if
+        the face doesn't exist, is rejected, or belongs to someone else."""
+        cur = self.conn.cursor()
+        row = cur.execute('SELECT identity, rejected FROM faces WHERE id = ?', (face_id,)).fetchone()
+        if row is None or row[0] != identity or row[1]:
+            return False
+        cur.execute('UPDATE faces SET profile_at = NULL WHERE identity = ? AND profile_at IS NOT NULL', (identity,))
+        cur.execute('UPDATE faces SET profile_at = ? WHERE id = ?', (int(time.time()), face_id))
+        self.conn.commit()
+        return True
+
+    def clear_profile_face(self, identity):
+        """Back to the automatic choice for `identity`'s profile picture."""
+        self.conn.execute('UPDATE faces SET profile_at = NULL WHERE identity = ?', (identity,))
+        self.conn.commit()
+
+    def get_profile_face_ids(self):
+        """{identity: manual face id} for every person with a user-picked profile
+        picture (the most recently picked non-rejected one)."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT identity, id FROM faces '
+                    'WHERE identity IS NOT NULL AND rejected = 0 AND profile_at IS NOT NULL '
+                    'ORDER BY profile_at, id')
+        return {identity: face_id for identity, face_id in cur.fetchall()}
+
+    def get_profile_face_id(self, identity):
+        """The user-picked profile face id for one identity, or None."""
+        row = self.conn.execute('SELECT id FROM faces WHERE identity = ? AND rejected = 0 '
+                                'AND profile_at IS NOT NULL ORDER BY profile_at DESC, id DESC LIMIT 1',
+                                (identity,)).fetchone()
+        return row[0] if row else None
+
     def get_identity_reference_faces(self):
         """{identity: representative manual face id} — one crop per person to show
         beside their name in the review UI's candidate list. A favorited face wins
@@ -3307,6 +3346,9 @@ class ManualDB(ThreadLocalDB):
         result = {}
         for identity, face_id in cur.fetchall():
             if identity not in result:
+                result[identity] = face_id
+        for identity, face_id in self.get_profile_face_ids().items():
+            if identity in result:
                 result[identity] = face_id
         return result
 
@@ -3698,7 +3740,9 @@ class ManualDB(ThreadLocalDB):
         rows = cur.fetchall()
         if not rows:
             return []
-        rep_ids = [row['rep_id'] for row in rows]
+        profile_ids = self.get_profile_face_ids()
+        rep_by_identity = {row['identity']: profile_ids.get(row['identity'], row['rep_id']) for row in rows}
+        rep_ids = list(rep_by_identity.values())
         placeholders = ','.join('?' for _ in rep_ids)
         cur.execute(f'SELECT id, checksum FROM faces WHERE id IN ({placeholders})', rep_ids)
         checksum_by_id = {r['id']: r['checksum'] for r in cur.fetchall()}
@@ -3707,8 +3751,8 @@ class ManualDB(ThreadLocalDB):
                 'identity': row['identity'],
                 'count': row['cnt'],
                 'last_modified': row['last_modified'],
-                'ref': f"manual:{row['rep_id']}",
-                'checksum': checksum_by_id.get(row['rep_id']),
+                'ref': f"manual:{rep_by_identity[row['identity']]}",
+                'checksum': checksum_by_id.get(rep_by_identity[row['identity']]),
             }
             for row in rows
         ]
@@ -3724,7 +3768,9 @@ class ManualDB(ThreadLocalDB):
             WHERE identity IS NOT NULL AND rejected = 0
             GROUP BY identity
         ''')
-        return {identity: face_id for identity, face_id in cur.fetchall()}
+        result = {identity: face_id for identity, face_id in cur.fetchall()}
+        result.update(self.get_profile_face_ids())
+        return result
 
     def get_files_by_face_identity(self, name, limit=100):
         """Returns checksums; resolve to current file_id/path via Database.get_files_by_checksums."""

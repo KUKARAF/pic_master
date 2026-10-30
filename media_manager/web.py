@@ -293,6 +293,10 @@ class FileMetaBody(BaseModel):
     overlay, which only carries file ids and fetches captions in one batch."""
     ids: List[int] = []
 
+class ProfileFaceBody(BaseModel):
+    ref: str  # 'manual:<face id>' — one of the person's own confirmed faces
+
+
 class SwipeExcludeBody(BaseModel):
     """Shared body for every swipe stack's buffer-refill endpoint. Sent as a
     POST body rather than a query-string `exclude` param because the client's
@@ -2998,8 +3002,17 @@ def create_app(data_root: str) -> FastAPI:
             sets = sorted(sets_by_id.values(), key=lambda s: s['name'].lower())
             _attach_set_people([sets])
 
+        # Header avatar: the picked profile picture, else the same newest-confirmed
+        # face the /faces grid falls back to.
+        profile_id = manual.get_profile_face_id(name)
+        own_face_ids = [int(inst['face_ref'].split(':', 1)[1]) for inst in instances
+                        if (inst['face_ref'] or '').startswith('manual:')]
+        avatar_id = profile_id or (max(own_face_ids) if own_face_ids else None)
+
         return templates.TemplateResponse(request, 'person.html', {
             'name': name,
+            'avatar_ref': f'manual:{avatar_id}' if avatar_id else None,
+            'profile_picked': profile_id is not None,
             'message': message,
             'tags': tags,
             'sets': sets,
@@ -3344,7 +3357,24 @@ def create_app(data_root: str) -> FastAPI:
         for face_id, checksum, _emb in manual.get_faces_for_identity(canonical):
             frow = db.get_file_by_checksum(checksum)
             out.append({'ref': f'manual:{face_id}', 'file_id': (frow['id'] if frow else None)})
-        return {'faces': out}
+        profile_id = manual.get_profile_face_id(canonical)
+        return {'faces': out, 'profile_ref': f'manual:{profile_id}' if profile_id else None}
+
+    @app.put('/api/person/{name}/profile-face')
+    def api_set_profile_face(name: str, body: ProfileFaceBody):
+        """Pick which of this person's faces is their profile picture — the crop shown
+        for them on /faces, in friend lists, identity pickers and name suggestions."""
+        canonical = manual.resolve_identity_name(name)
+        kind, raw = _parse_face_ref(body.ref)
+        if kind != 'manual' or not manual.set_profile_face(canonical, int(raw)):
+            raise HTTPException(status_code=400, detail=f'Not one of {canonical}\'s confirmed faces')
+        return {'ok': True, 'profile_ref': body.ref}
+
+    @app.delete('/api/person/{name}/profile-face')
+    def api_clear_profile_face(name: str):
+        """Back to the automatic profile picture."""
+        manual.clear_profile_face(manual.resolve_identity_name(name))
+        return {'ok': True, 'profile_ref': None}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int):
