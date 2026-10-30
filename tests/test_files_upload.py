@@ -76,6 +76,10 @@ def run():
     r = _upload(client, ('../../evil.mp4', b'evil'))
     assert r.json()['saved'][0]['path'].startswith('uploads/') and r.json()['saved'][0]['name'] == 'evil.mp4'
 
+    # A '"' arrives as %22 (browser/curl form encoding) and is stored as '"'.
+    r = _upload(client, ('say %22hi%22.mp4', b'quoted'))
+    assert r.json()['saved'][0]['name'] == 'say "hi".mp4', r.json()
+
     # No half-written temp files left behind; uploads show up in the Files tab.
     assert os.listdir(os.path.join(root, 'uploads', '.incoming')) == []
     page = client.get('/files/uploads/' + cs[:2]).text

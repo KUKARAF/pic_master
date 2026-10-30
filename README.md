@@ -83,6 +83,53 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media worker` | Run the ML-offload worker HTTP service on a beefy machine (see below) |
 | `media worker-connect <url>` | Point this host at a worker (base URL) to offload heavy ML |
 
+## Bulk uploading
+
+A running `media web` server accepts uploads over HTTP, so you can push files from
+any machine without a shell on the library box. Every upload is stored under
+`uploads/<bucket>/` in the library — 256 buckets named after the first two hex
+digits of the file's content hash, so no folder grows huge — and is tracked and
+indexed straight away (EXIF + CLIP run in the background). Content the library
+already has anywhere (same full-file xxh64) is **rejected**, never stored twice.
+
+Upload a whole folder with `upload_folder.sh` from the project root:
+
+```bash
+./upload_folder.sh ~/Pictures/phone-dump                        # recursive, to https://127.0.0.1:8000
+./upload_folder.sh -u https://192.168.1.231:8000 ~/Pictures/dump  # another host (or export MEDIA_URL)
+./upload_folder.sh -d ~/Pictures/dump                            # delete each file once the server saved it
+./upload_folder.sh -d --delete-duplicates ~/Pictures/dump        # …and those the library already had
+./upload_folder.sh --dry-run ~/Pictures/dump                     # just list what would be sent
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-u, --url URL` | Server base URL (default: `$MEDIA_URL`, else `https://127.0.0.1:8000`) |
+| `-d, --delete-uploaded` | Delete a local file only after the server confirmed it saved it (HTTP 200) |
+| `--delete-duplicates` | With `-d`: also delete files the server rejected as already in the library |
+| `-n, --no-recursive` | Only the folder itself, not its subfolders |
+| `--strict-tls` | Verify the server certificate (by default the self-signed cert `media web` generates is accepted) |
+| `--dry-run` | List the files that would be uploaded and exit |
+
+Only the media types the library tracks are sent (`.jpg .jpeg .png .gif .bmp .webp
+.tif .tiff .mp4 .mov .webm .m4v`). Each file is its own request, so one failure
+never affects the others; failed files are never deleted, and the script exits
+non-zero if any upload failed. It prints `saved` / `duplicate` / `FAILED` per file
+and a summary at the end.
+
+Single files work with plain curl (`-k` for the self-signed cert; `--fail` makes
+curl exit non-zero when nothing new was stored):
+
+```bash
+curl -k --fail -F file=@photo.jpg https://127.0.0.1:8000/api/files/upload
+curl -k -F file=@a.jpg -F file=@b.mp4 https://127.0.0.1:8000/api/files/upload
+```
+
+The response is JSON — `saved` (`id`, `name`, `path`), `duplicates` (with the
+`existing_path` already in the library) and `skipped` (non-media files) — with
+status 200 if anything was saved, 409 if everything was a duplicate, and 400 if
+nothing usable was sent. The Files tab's **⬆ Upload** button uses the same endpoint.
+
 ## Optional: offline city names (reverse-geocoding)
 
 Run `media geo fetch-cities` once to download the [GeoNames](https://www.geonames.org/)

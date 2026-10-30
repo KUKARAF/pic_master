@@ -2394,7 +2394,10 @@ def create_app(data_root: str) -> FastAPI:
         os.makedirs(incoming, exist_ok=True)
         saved, duplicates, skipped, to_index = [], [], [], []
         for up in uploads:
-            name = os.path.basename((up.filename or '').replace('\\', '/')).strip()
+            # Browsers and curl send a '"' in a multipart filename as %22 (WHATWG form
+            # encoding) — decode just that, so the stored name matches the original.
+            raw = (up.filename or '').replace('%22', '"')
+            name = os.path.basename(raw.replace('\\', '/')).strip()
             ext = os.path.splitext(name)[1].lower()
             if not name or name.startswith('.') or ext not in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS):
                 skipped.append({'name': up.filename or '', 'reason': 'not an image or video'})
