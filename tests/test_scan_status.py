@@ -112,6 +112,7 @@ def run_classification():
 
     _captures(manual, 'cs-dir/v_done.mp4', 3)
     manual.mark_video_frame_scanned('cs-dir/v_done.mp4')
+    _stage(db, f['v_done.mp4'], 'clip')   # videos need a similarity embedding too
     _captures(manual, 'cs-dir/v_two.mp4', 2)
     _captures(manual, 'cs-dir/v_half.mp4', 4)
 
@@ -150,9 +151,9 @@ def run_classification():
 
     assert by['v_done.mp4']['kind'] == 'video' and by['v_done.mp4']['state'] == 'scanned'
     assert by['v_two.mp4']['state'] == 'tracked'
-    assert by['v_two.mp4']['missing'] == [LABEL['stills'], LABEL['video_faces']]
+    assert by['v_two.mp4']['missing'] == [LABEL['clip'], LABEL['stills'], LABEL['video_faces']]
     assert by['v_half.mp4']['state'] == 'partial'
-    assert by['v_half.mp4']['stages'] == {'stills': True, 'video_faces': False}
+    assert by['v_half.mp4']['stages'] == {'clip': False, 'stills': True, 'video_faces': False}
 
     summ = scan_status.summarize(st)
     assert summ == {'broken': 2, 'scanned': 2, 'partial': 5, 'tracked': 3, 'total': 12}, summ

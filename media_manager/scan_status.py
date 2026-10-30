@@ -43,7 +43,7 @@ from .formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 STAGES = {
     'image': [  # (key, label, required)
         ('exif', 'EXIF', True),
-        ('clip', 'CLIP embedding', True),
+        ('clip', 'Similarity embedding (CLIP)', True),
         ('tags', 'Auto-tags', True),
         ('faces', 'Faces', True),
         ('bodies', 'Bodies', True),
@@ -54,6 +54,9 @@ STAGES = {
         ('tiles', 'Tiles', False),
     ],
     'video': [
+        # One CLIP vector per video (mean of a few sampled frames), in the same
+        # embeddings table as photos — what /similar and set tinder search over.
+        ('clip', 'Similarity embedding (CLIP)', True),
         ('stills', 'Captured stills (≥3)', True),
         ('video_faces', 'Video face scan', True),
     ],
@@ -144,7 +147,7 @@ def _load_subset(db, manual, ids, image_ids, video_ids):
             files[r[0]] = tuple(r[1:])
     sets = {key: set() for key in _TABLE_STAGES}
     for key in _TABLE_STAGES:
-        for chunk in ThreadLocalDB._chunked(image_ids):
+        for chunk in ThreadLocalDB._chunked(ids if key == 'clip' else image_ids):
             sql = _stage_sql(key, with_in=len(chunk))
             sets[key].update(r[0] for r in conn.execute(sql, _algo_params(key) + tuple(chunk)))
     checksums = [files[i][0] for i in video_ids if i in files]
@@ -198,6 +201,7 @@ def _status(fid, kind, row, data):
         stages['phash'] = fid in sets['phash']
         stages['tiles'] = fid in sets['tiles']
     elif kind == 'video':
+        stages['clip'] = fid in sets['clip']
         stages['stills'] = bool(hidden) or data['captures'].get(checksum, 0) >= MIN_STILLS
         stages['video_faces'] = bool(hidden) or checksum in data['vscanned']
     missing = [label for key, label, req in STAGES.get(kind, ()) if req and not stages[key]]

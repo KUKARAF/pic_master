@@ -4469,14 +4469,54 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
+    VIDEO_EMBED_FRAMES = 5
+
+    def _video_clip_embedding(abs_path, indexer):
+        """One CLIP vector for a whole video: the L2-normalised mean of the embeddings
+        of VIDEO_EMBED_FRAMES frames spread across it (10%..90%), so it lands in the
+        same space as photo embeddings. Raises ValueError when no frame decodes."""
+        cap = video_decode.open_capture(abs_path)
+        frames = []
+        try:
+            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            positions = ([int(count * (0.1 + 0.8 * i / (VIDEO_EMBED_FRAMES - 1)))
+                          for i in range(VIDEO_EMBED_FRAMES)] if count > VIDEO_EMBED_FRAMES else [None])
+            for pos in positions:
+                if pos is not None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ok, frame = cap.read()
+                if ok and frame is not None:
+                    frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+        finally:
+            cap.release()
+        if not frames:
+            raise ValueError('no decodable frames')
+        embs = np.asarray(indexer.embed_pil_images(frames), dtype=np.float32)
+        mean = embs.mean(axis=0)
+        norm = float(np.linalg.norm(mean))
+        return mean / norm if norm > 0 else mean
+
     def _process_clip_index(candidates, on_progress, should_stop=_never):
-        """CLIP-embed each (fid, abs_path), 32 per model call — the loop shared by the
-        /bulk index job and the folder ML job. on_progress(done, failed) after each
-        file; should_stop() before each batch and each file's write (the rest of a
-        stopped batch stays un-embedded). Returns (done, failed)."""
+        """CLIP-embed each (fid, abs_path), 32 images per model call, videos one by one
+        (_video_clip_embedding) — the loop shared by the /bulk index job and the folder
+        ML job. on_progress(done, failed) after each file; should_stop() before each
+        batch and each file's write (the rest of a stopped batch stays un-embedded).
+        Returns (done, failed)."""
         indexer = _get_clip_indexer()
         model_id = indexer.model_id()
         done = failed = 0
+        videos = [c for c in candidates if os.path.splitext(c[1])[1].lower() in VIDEO_EXTENSIONS]
+        candidates = [c for c in candidates if os.path.splitext(c[1])[1].lower() not in VIDEO_EXTENSIONS]
+        for fid, fpath in videos:
+            if should_stop():
+                return done, failed
+            try:
+                db.insert_embedding(fid, _video_clip_embedding(fpath, indexer).tobytes(), model_id)
+            except (ValueError, OSError, cv2.error) as exc:
+                errors.log(fpath, f'video embedding: {exc}')
+                failed += 1
+            done += 1
+            on_progress(done, failed)
         for start in range(0, len(candidates), 32):
             if should_stop():
                 break
@@ -4510,7 +4550,7 @@ def create_app(data_root: str) -> FastAPI:
         candidates = _drop_trashed([
             (fid, os.path.join(data_root, rel_path))
             for fid, rel_path in db.get_unindexed_files(limit=None)
-            if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS
+            if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS | VIDEO_EXTENSIONS
         ], include_trashed)
         index_job.update(running=True, done=0, total=len(candidates), error=None)
         if (busy := _folder_ml_holds('clip', index_job)):
@@ -6411,10 +6451,17 @@ def create_app(data_root: str) -> FastAPI:
         if not os.path.isfile(abs_path):
             raise HTTPException(status_code=404, detail='File not found on disk')
         ext = os.path.splitext(abs_path)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
-            raise HTTPException(status_code=400, detail='Only images can be embedded (CLIP is image-only).')
-
         indexer = _get_clip_indexer()
+        if ext in VIDEO_EXTENSIONS:
+            try:
+                emb = _video_clip_embedding(abs_path, indexer)
+            except (ValueError, OSError, cv2.error) as exc:
+                raise HTTPException(status_code=500, detail=f'Embedding failed: {exc}')
+            db.insert_embedding(file_id, emb.tobytes(), indexer.model_id())
+            return {'embedded': True}
+        if ext not in IMAGE_EXTENSIONS:
+            raise HTTPException(status_code=400, detail='Only images and videos can be embedded.')
+
         embeddings, failed = indexer.embed_images([abs_path])
         if len(embeddings) == 0:
             detail = failed[0][1] if failed else 'no embedding produced'

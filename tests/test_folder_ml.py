@@ -139,7 +139,7 @@ def _st(kind, done=(), state='partial'):
 def test_plan_order_and_defaults():
     files = [(1, 'x.png'), (2, 'y.png'), (3, 'v.mp4'), (4, 'bad.png')]
     statuses = {1: _st('image', done={'exif', 'clip'}), 2: _st('image'),
-                3: _st('video', done={'stills'}), 4: _st('image', state='broken')}
+                3: _st('video', done={'stills', 'clip'}), 4: _st('image', state='broken')}
     plan = folder_ml.plan(files, statuses)
     keys = [k for k, _f in plan]
     assert keys == ['exif', 'clip', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',

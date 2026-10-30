@@ -10,14 +10,10 @@
 </div>
 
 {% if no_embedding %}
-  {% if source_is_video %}
-  <div class="alert" style="margin-bottom:20px;">Videos can't be embedded — CLIP similarity is images only.</div>
-  {% else %}
   <div class="alert" style="margin-bottom:20px;">
-    <button type="button" id="embed-now-btn" class="btn-similar" data-file-id="{{ source_id }}">No embeddings for this image — embed {{ source_filename }} now</button>
+    <button type="button" id="embed-now-btn" class="btn-similar" data-file-id="{{ source_id }}">No embedding for this {{ 'video' if source_is_video else 'image' }} — embed {{ source_filename }} now</button>
     <span id="embed-now-status" class="sub" style="display:none;margin-left:10px;"></span>
   </div>
-  {% endif %}
 {% elif message %}
 <div class="alert" style="margin-bottom:20px;">{{ message | safe }}</div>
 {% endif %}
