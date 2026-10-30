@@ -183,11 +183,12 @@ def run():
     assert folders['milan']['counts']['untracked'] == 0, folders['milan']
 
     # An upload lands in the inventory immediately (counted tracked, not missing).
-    r = client.post('/api/files/upload', data={'folder': 'trips/milan'},
+    # (uploads always land in uploads/<bucket>/, whatever folder you're viewing)
+    r = client.post('/api/files/upload',
                     files=[('files', ('up.mp4', b'uploaded', 'application/octet-stream'))])
     assert r.status_code == 200 and r.json()['saved'], r.text
-    folders = _by_name(client.get('/api/fm/list', params={'path': 'trips'}).json()['folders'])
-    assert _tracked_sum(folders['milan']['counts']) == 2 and folders['milan']['counts']['missing'] == 0
+    folders = _by_name(client.get('/api/fm/list', params={'path': ''}).json()['folders'])
+    assert _tracked_sum(folders['uploads']['counts']) == 1 and folders['uploads']['counts']['missing'] == 0
     print('OK  live listing re-syncs inventory rows; uploads are counted at once')
 
     # --- jail on list ---

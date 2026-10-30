@@ -1,10 +1,10 @@
-"""The /files page's ⬆ Upload (POST /api/files/upload).
+"""⬆ Upload (POST /api/files/upload) — the Files tab button and plain curl.
 
-Files land in the chosen folder under their own name (a clash gets ' (1)' — never an
-overwrite), are tracked with the same full-file xxh64 checksum a scan computes, and
-show up in that folder's listing. Folders outside the library or inside .media are
-refused; non-media files are skipped and reported. Videos only, so the background
-indexing never loads CLIP.
+Every upload lands in uploads/<first 2 hex of its xxh64>/ (256 buckets, so no one
+folder grows huge), tracked with the same full-file checksum a scan computes. Content
+already in the library — or repeated within one request — is rejected, never saved.
+Accepts the multipart field as `file` (curl -F file=@x) or `files` (the web UI).
+Videos only, so the background indexing never loads CLIP.
 
 Run: python tests/test_files_upload.py   (or python -m pytest tests/test_files_upload.py)
 """
@@ -17,60 +17,73 @@ from fastapi.testclient import TestClient
 from media_manager.web import create_app
 
 
-def _upload(client, folder, *named_bytes):
-    return client.post('/api/files/upload', data={'folder': folder},
-                       files=[('files', (name, data, 'application/octet-stream'))
+def _upload(client, *named_bytes, field='file'):
+    return client.post('/api/files/upload',
+                       files=[(field, (name, data, 'application/octet-stream'))
                               for name, data in named_bytes])
 
 
 def run():
     root = tempfile.mkdtemp()
     os.makedirs(os.path.join(root, '.media'), exist_ok=True)
-    os.makedirs(os.path.join(root, 'trips', 'rome'))
     app = create_app(root)
     db = app.state.dbs[0]
     client = TestClient(app)
 
-    # Upload into a subfolder: saved on disk, tracked with the scan's checksum.
-    r = _upload(client, 'trips/rome', ('clip.mp4', b'first-video'), ('notes.txt', b'hi'))
+    # curl-style single upload: saved under uploads/<bucket>/, tracked, scan checksum.
+    r = _upload(client, ('clip.mp4', b'first-video'))
+    assert r.status_code == 200, r.text
+    saved = r.json()['saved']
+    cs = xxhash.xxh64(b'first-video').hexdigest()
+    assert saved[0]['path'] == 'uploads/%s/clip.mp4' % cs[:2], saved
+    path = os.path.join(root, saved[0]['path'])
+    assert open(path, 'rb').read() == b'first-video'
+    row = db.get_file_by_path(saved[0]['path'])
+    assert row is not None and row['checksum'] == cs
+
+    # Same content again (any name) -> rejected with 409, nothing new on disk/in db.
+    r = _upload(client, ('renamed.mp4', b'first-video'))
+    assert r.status_code == 409, r.status_code
+    d = r.json()
+    assert d['saved'] == [] and d['duplicates'][0]['existing_path'] == saved[0]['path'], d
+    assert not os.path.exists(os.path.join(os.path.dirname(path), 'renamed.mp4'))
+
+    # Content already tracked from a scan elsewhere in the library -> also rejected.
+    db.upsert_file_path('trips/old.mp4', xxhash.xxh64(b'scanned-video').hexdigest(), size=13)
+    db.conn.commit()
+    assert _upload(client, ('copy.mp4', b'scanned-video')).status_code == 409
+
+    # Batch (web UI field name): new + in-batch repeat + already present + non-media.
+    r = _upload(client, ('a.mp4', b'aaa'), ('a-again.mp4', b'aaa'), ('dup.mp4', b'first-video'),
+                ('notes.txt', b'hi'), field='files')
     assert r.status_code == 200, r.text
     d = r.json()
-    assert [f['name'] for f in d['saved']] == ['clip.mp4'], d
+    assert [f['name'] for f in d['saved']] == ['a.mp4'], d
+    assert sorted(f['name'] for f in d['duplicates']) == ['a-again.mp4', 'dup.mp4'], d
     assert d['skipped'][0]['name'] == 'notes.txt', d
-    path = os.path.join(root, 'trips', 'rome', 'clip.mp4')
-    assert open(path, 'rb').read() == b'first-video'
-    row = db.get_file_by_path('trips/rome/clip.mp4')
-    assert row is not None and row['checksum'] == xxhash.xxh64(b'first-video').hexdigest()
-    assert not any(n.endswith('.upload') for n in os.listdir(os.path.dirname(path)))
 
-    # Same name again: never overwrites, gets ' (1)'; same bytes elsewhere = duplicate.
-    r = _upload(client, 'trips/rome', ('clip.mp4', b'second-video'))
+    # Same name, different content in the same bucket never overwrites.
+    other = b'x' * 7
+    while xxhash.xxh64(other).hexdigest()[:2] != cs[:2]:
+        other += b'x'
+    r = _upload(client, ('clip.mp4', other))
     assert r.json()['saved'][0]['name'] == 'clip (1).mp4', r.json()
     assert open(path, 'rb').read() == b'first-video'
-    r = _upload(client, '', ('copy.mp4', b'first-video'))
-    assert r.json()['saved'][0]['duplicate'] is True, r.json()
-    assert os.path.isfile(os.path.join(root, 'copy.mp4'))
 
-    # The listing for that folder shows the uploads.
-    page = client.get('/files/trips/rome').text
-    for name in ('clip.mp4', 'clip (1).mp4'):
-        fid = db.get_file_by_path('trips/rome/' + name)['id']
-        assert '/photo/%d' % fid in page, name
+    # Nothing usable -> 400; no files at all -> 400. A path-ish name keeps only its basename.
+    assert _upload(client, ('notes.txt', b'hi')).status_code == 400
+    assert client.post('/api/files/upload').status_code in (400, 422)
+    r = _upload(client, ('../../evil.mp4', b'evil'))
+    assert r.json()['saved'][0]['path'].startswith('uploads/') and r.json()['saved'][0]['name'] == 'evil.mp4'
 
-    # Refused targets.
-    assert _upload(client, '../escape', ('x.mp4', b'x')).status_code == 400
-    assert _upload(client, '.media', ('x.mp4', b'x')).status_code == 400
-    assert _upload(client, 'no/such/dir', ('x.mp4', b'x')).status_code == 404
-    assert not os.path.exists(os.path.join(os.path.dirname(root), 'escape'))
+    # No half-written temp files left behind; uploads show up in the Files tab.
+    assert os.listdir(os.path.join(root, 'uploads', '.incoming')) == []
+    page = client.get('/files/uploads/' + cs[:2]).text
+    assert '/photo/%d' % saved[0]['id'] in page
 
-    # A path-ish filename is reduced to its basename (no writing outside the folder).
-    r = _upload(client, 'trips', ('../../evil.mp4', b'evil'))
-    assert r.json()['saved'][0]['name'] == 'evil.mp4', r.json()
-    assert os.path.isfile(os.path.join(root, 'trips', 'evil.mp4'))
-
-    print('OK  upload into folder, checksum, skip non-media')
-    print('OK  name clash -> " (1)", duplicate flag, listing shows uploads')
-    print('OK  refuses ../, .media, missing folder; basename-only filenames')
+    print('OK  curl-style upload -> uploads/<bucket>/, scan checksum')
+    print('OK  duplicates rejected (409): repeat, in-batch, already scanned elsewhere')
+    print('OK  no overwrite, non-media skipped, 400 when nothing usable, no temp leftovers')
     print('ALL ASSERTIONS PASSED')
 
 

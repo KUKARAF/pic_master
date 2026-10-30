@@ -2340,14 +2340,14 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     UPLOAD_CHUNK = 1 << 20
+    # Every upload lands under data_root/uploads/<2 hex>/ — 256 buckets keyed by the
+    # first two hex digits of the content checksum, which spreads files evenly so no
+    # single folder grows huge. Partial uploads stream into uploads/.incoming/ first
+    # (a .part name the scanner ignores) and are only moved into a bucket once the
+    # checksum is known not to be in the library already.
+    UPLOADS_DIR = 'uploads'
+    _upload_lock = threading.Lock()   # dedup check + move + track happen atomically
 
-    def _upload_target_dir(folder):
-        """Absolute dir for a /files upload into `folder` (relative to data_root, '' =
-        root) — the _library_path jail, plus the folder has to exist on disk."""
-        target, rel = _library_path((folder or '').strip('/'))
-        if not os.path.isdir(target):
-            raise HTTPException(status_code=404, detail='Folder not found on disk')
-        return target, rel
     def _unique_upload_name(target_dir, name):
         """`name`, or 'stem (1).ext', 'stem (2).ext', … — an upload never overwrites."""
         stem, ext = os.path.splitext(name)
@@ -2369,22 +2369,37 @@ def create_app(data_root: str) -> FastAPI:
         threading.Thread(target=_run, daemon=True, name='upload-index').start()
 
     @app.post('/api/files/upload')
-    def api_upload_files(folder: str = Form(''), files: List[UploadFile] = File(...)):
-        """The /files page's ⬆ Upload: save each media file into `folder` (never
-        overwriting — a clash gets ' (n)'), track it with the same full-file xxh64
-        checksum a scan computes, then EXIF/CLIP-index it in the background.
-        Non-media files are skipped and reported."""
-        target_dir, rel_folder = _upload_target_dir(folder)
-        saved, skipped, to_index = [], [], []
-        for up in files:
+    def api_upload_files(files: Optional[List[UploadFile]] = File(None),
+                         file: Optional[List[UploadFile]] = File(None)):
+        """Upload media into uploads/<bucket>/ (see UPLOADS_DIR) — from the Files tab's
+        ⬆ Upload, or straight from a shell:
+
+            curl -F file=@photo.jpg  http://host:port/api/files/upload
+            curl -F file=@a.jpg -F file=@b.mp4 http://host:port/api/files/upload
+
+        (`files` works as the field name too.) Each file is hashed with the same
+        full-file xxh64 a scan uses; content ALREADY in the library is rejected (not
+        saved), as is a repeat within the same request. New files are tracked at once
+        and EXIF/CLIP-indexed in the background; non-media files are skipped.
+
+        Response: {"saved": [{id, name, path}], "duplicates": [{name, existing_id,
+        existing_path}], "skipped": [{name, reason}]}. Status 200 when anything was
+        saved; otherwise 409 if every media file was a duplicate, else 400 — so
+        `curl --fail` exits non-zero when nothing new was uploaded."""
+        uploads = (files or []) + (file or [])
+        if not uploads:
+            raise HTTPException(status_code=400, detail="No files — send them as -F file=@path")
+        uploads_root = os.path.join(data_root, UPLOADS_DIR)
+        incoming = os.path.join(uploads_root, '.incoming')
+        os.makedirs(incoming, exist_ok=True)
+        saved, duplicates, skipped, to_index = [], [], [], []
+        for up in uploads:
             name = os.path.basename((up.filename or '').replace('\\', '/')).strip()
             ext = os.path.splitext(name)[1].lower()
             if not name or name.startswith('.') or ext not in (IMAGE_EXTENSIONS | VIDEO_EXTENSIONS):
                 skipped.append({'name': up.filename or '', 'reason': 'not an image or video'})
                 continue
-            final_name = _unique_upload_name(target_dir, name)
-            abs_path = os.path.join(target_dir, final_name)
-            tmp_path = os.path.join(target_dir, f'.{final_name}.{os.getpid()}.upload')
+            tmp_path = os.path.join(incoming, f'{uuid.uuid4().hex}.part')
             hasher, size = xxhash.xxh64(), 0
             try:
                 with open(tmp_path, 'wb') as out:
@@ -2392,25 +2407,47 @@ def create_app(data_root: str) -> FastAPI:
                         hasher.update(chunk)
                         out.write(chunk)
                         size += len(chunk)
-                os.replace(tmp_path, abs_path)
             except OSError as exc:
                 with contextlib.suppress(OSError):
                     os.remove(tmp_path)
                 skipped.append({'name': name, 'reason': f'could not save: {exc.strerror or exc}'})
                 continue
             checksum = hasher.hexdigest()
-            duplicate = db.get_file_by_checksum(checksum) is not None
-            rel_path = f'{rel_folder}/{final_name}' if rel_folder else final_name
-            mtime = os.path.getmtime(abs_path)
-            file_id = db.upsert_file_path(rel_path, checksum, size=size, modified_time=int(mtime))
-            # Into the disk inventory too, so folder rollups count it before the next walk.
-            file_inventory.record_files(db.conn, [(rel_path, size, mtime)])
-            db.conn.commit()
-            saved.append({'id': file_id, 'name': final_name, 'duplicate': duplicate})
+            with _upload_lock:
+                existing = db.get_file_by_checksum(checksum)
+                if existing is not None:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
+                    duplicates.append({'name': name, 'existing_id': existing['id'],
+                                       'existing_path': existing['path']})
+                    continue
+                bucket = checksum[:2]
+                target_dir = os.path.join(uploads_root, bucket)
+                try:
+                    os.makedirs(target_dir, exist_ok=True)
+                    final_name = _unique_upload_name(target_dir, name)
+                    abs_path = os.path.join(target_dir, final_name)
+                    os.replace(tmp_path, abs_path)
+                except OSError as exc:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp_path)
+                    skipped.append({'name': name, 'reason': f'could not save: {exc.strerror or exc}'})
+                    continue
+                rel_path = f'{UPLOADS_DIR}/{bucket}/{final_name}'
+                mtime = os.path.getmtime(abs_path)
+                file_id = db.upsert_file_path(rel_path, checksum, size=size, modified_time=int(mtime))
+                # Into the disk inventory too, so folder rollups count it before the next walk.
+                file_inventory.record_files(db.conn, [(rel_path, size, mtime)])
+                db.conn.commit()
+            saved.append({'id': file_id, 'name': final_name, 'path': rel_path})
             to_index.append((file_id, abs_path, ext in IMAGE_EXTENSIONS))
         if to_index:
             _index_uploads_in_background(to_index)
-        return {'saved': saved, 'skipped': skipped}
+            scan_status.invalidate()
+        body = {'saved': saved, 'duplicates': duplicates, 'skipped': skipped}
+        if saved:
+            return body
+        return JSONResponse(status_code=409 if duplicates else 400, content=body)
 
     # --- Phone-first swipe-down browse feeds (Unloved / Biggest / Random / Favorites) --
     def _feed_page(request, source, title, start_id=None):

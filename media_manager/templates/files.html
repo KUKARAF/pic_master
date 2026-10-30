@@ -260,9 +260,9 @@ function reloadWithFileFilters() {
 document.getElementById('hide-with-face').addEventListener('change', reloadWithFileFilters);
 document.getElementById('hide-with-set').addEventListener('change', reloadWithFileFilters);
 
-// ⬆ Upload here — POST the picked files to /api/files/upload with this folder, show
-// upload progress (XHR: fetch has no upload-progress events), then reload so the new
-// files appear in the listing.
+// ⬆ Upload — POST the picked files to /api/files/upload (they land in uploads/<bucket>/,
+// content already in the library is rejected), showing upload progress (XHR: fetch has
+// no upload-progress events), then a summary with a link to the uploads folder.
 (function () {
   var btn = document.getElementById('upload-btn');
   var input = document.getElementById('upload-input');
@@ -289,20 +289,28 @@ document.getElementById('hide-with-set').addEventListener('change', reloadWithFi
       input.value = '';
       var d = {};
       try { d = JSON.parse(xhr.responseText); } catch (err) { d = {}; }
-      if (xhr.status !== 200) {
+      // 409 (all duplicates) / 400 (nothing usable) still carry the per-file lists.
+      if (!d.saved && !d.duplicates && !d.skipped) {
         status.textContent = 'Upload failed: ' + (d.detail || xhr.status);
         return;
       }
-      var saved = d.saved || [], skipped = d.skipped || [];
-      var dups = saved.filter(function (f) { return f.duplicate; }).length;
-      var msg = 'Uploaded ' + saved.length + ' file' + (saved.length === 1 ? '' : 's');
-      if (dups) msg += ' (' + dups + ' already in the library elsewhere)';
+      var saved = d.saved || [], dups = d.duplicates || [], skipped = d.skipped || [];
+      var msg = 'Uploaded ' + saved.length + ' new file' + (saved.length === 1 ? '' : 's');
+      if (dups.length) {
+        msg += ' · rejected ' + dups.length + ' already in the library: ' +
+          dups.map(function (f) { return f.name + ' (= ' + f.existing_path + ')'; }).join(', ');
+      }
       if (skipped.length) {
         msg += ' · skipped ' + skipped.length + ': ' +
           skipped.map(function (f) { return f.name + ' (' + f.reason + ')'; }).join(', ');
       }
-      status.textContent = msg;
-      if (saved.length) setTimeout(function () { window.location.reload(); }, skipped.length ? 4000 : 1200);
+      status.textContent = msg + ' ';
+      if (saved.length) {
+        var link = document.createElement('a');
+        link.href = '/files/uploads';
+        link.textContent = 'Open uploads →';
+        status.appendChild(link);
+      }
     });
     xhr.addEventListener('error', function () {
       btn.disabled = false;
