@@ -31,3 +31,7 @@ timm
 # both sides serialize msgpack dicts (raw bytes / float32 embeddings round-trip).
 msgpack
 requests
+# SigLIP 2 (embedders.py): open_clip's SigLIP tokenizer is a Hugging Face tokenizer
+# (AutoTokenizer) and needs transformers + sentencepiece at runtime. Neither pins torch.
+transformers
+sentencepiece
