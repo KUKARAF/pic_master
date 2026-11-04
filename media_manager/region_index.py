@@ -1,3 +1,5 @@
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+# (region search)
 """Instance-level region search: DINOv2 window prefilter + RootSIFT/MAGSAC geometric re-rank.
 
 The CLIP tile index answers "what kind of thing is this crop" and so returns generic

@@ -121,11 +121,15 @@ class Database(ThreadLocalDB):
         self._tile_ver = 0
         self._objreg_ver = 0  # bumped on object_region_embeddings writes (same pattern)
         self._place_ver = 0  # bumped on place_embeddings writes (same pattern as above)
+        self._siglip_ver = 0  # bumped on embeddings_siglip writes (SigLIP 2 text+image space)
+        self._dino_ver = 0  # bumped on embeddings_dino writes (DINOv2 image-only space)
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
         self._emb_cache = None
         self._face_cache = None
         self._body_cache = None
+        self._siglip_cache = None
+        self._dino_cache = None
         self.create_tables()
 
     def create_tables(self):
@@ -266,6 +270,21 @@ class Database(ThreadLocalDB):
                 PRIMARY KEY (file_id, frame_index)
             )
         ''')
+        # Extra whole-image embedding spaces alongside CLIP, same shape/semantics as
+        # `embeddings` (PK (file_id, frame_index); frame 0 = primary): SigLIP 2
+        # (text+image) and DINOv2 (image-only). `model` is the embedder id so a model
+        # change is detected and re-embedded (see get_files_needing_siglip/dino).
+        for _t in ('embeddings_siglip', 'embeddings_dino'):
+            cursor.execute(f'''
+                CREATE TABLE IF NOT EXISTS {_t} (
+                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                    frame_index INTEGER NOT NULL DEFAULT 0,
+                    embedding BLOB NOT NULL,
+                    model TEXT NOT NULL,
+                    indexed_at INTEGER NOT NULL,
+                    PRIMARY KEY (file_id, frame_index)
+                )
+            ''')
         # Perceptual hashes: the near-duplicate detector's primary signal (DCT pHash +
         # difference-hash, 8 bytes each, big-endian uint64 BLOBs — INTEGER would overflow
         # SQLite's signed range for hashes with the top bit set). width/height are the
@@ -994,6 +1013,12 @@ class Database(ThreadLocalDB):
             'clip': stat("SELECT COUNT(*) FROM embeddings WHERE frame_index=0",
                          "SELECT length(embedding) FROM embeddings WHERE frame_index=0 "
                          "AND embedding IS NOT NULL LIMIT 1"),
+            'siglip': stat("SELECT COUNT(*) FROM embeddings_siglip WHERE frame_index=0",
+                           "SELECT length(embedding) FROM embeddings_siglip WHERE frame_index=0 "
+                           "AND embedding IS NOT NULL LIMIT 1"),
+            'dino': stat("SELECT COUNT(*) FROM embeddings_dino WHERE frame_index=0",
+                         "SELECT length(embedding) FROM embeddings_dino WHERE frame_index=0 "
+                         "AND embedding IS NOT NULL LIMIT 1"),
             'face': stat("SELECT COUNT(*) FROM faces WHERE embedding != x''",
                          "SELECT length(embedding) FROM faces WHERE embedding != x'' LIMIT 1"),
             'body': stat("SELECT COUNT(*) FROM body_embeddings WHERE bbox != '[]'",
@@ -1013,6 +1038,8 @@ class Database(ThreadLocalDB):
         # (label, cache attribute, index of the matrix within the cached result tuple)
         for label, attr, idx in (('clip', '_emb_cache', 2),
                                   ('face', '_face_cache', 2),
+                                  ('siglip', '_siglip_cache', 2),
+                                  ('dino', '_dino_cache', 2),
                                   ('body', '_body_cache', 3)):
             out[label] = 0
             try:
@@ -1265,6 +1292,142 @@ class Database(ThreadLocalDB):
         cursor.execute('SELECT COUNT(*) FROM embeddings WHERE frame_index = 0')
         row = cursor.fetchone()
         return row[0] if row else 0
+
+    # --- SigLIP 2 / DINOv2 whole-image embedding spaces ------------------------------
+    # Same shape and semantics as the CLIP `embeddings` table (frame_index=0 is the
+    # primary embedding), one set of methods per space. Space-agnostic internals take
+    # the table + version attr; the public per-space wrappers below are what callers use.
+    _SPACE_TABLES = {'siglip': 'embeddings_siglip', 'dino': 'embeddings_dino'}
+
+    def _space_insert(self, space, file_id, embedding_bytes, model, frame_index):
+        table = self._SPACE_TABLES[space]
+        cursor = self.conn.cursor()
+        cursor.execute(f'''
+            INSERT OR REPLACE INTO {table} (file_id, frame_index, embedding, model, indexed_at)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (file_id, frame_index, embedding_bytes, model, int(time.time())))
+        self.conn.commit()
+        setattr(self, f'_{space}_ver', getattr(self, f'_{space}_ver') + 1)
+
+    def _space_get_all(self, space):
+        cursor = self.conn.cursor()
+        cursor.execute(f'''
+            SELECT e.file_id, f.path, e.embedding, f.checksum
+            FROM {self._SPACE_TABLES[space]} e
+            JOIN files_with_path f ON f.id = e.file_id
+            WHERE e.frame_index = 0
+        ''')
+        return cursor.fetchall()
+
+    def _space_matrix(self, space):
+        import numpy as np  # hook-allow: lazy — heavy
+        table = self._SPACE_TABLES[space]
+        cache_attr = f'_{space}_cache'
+        with self._matrix_lock:
+            cache = getattr(self, cache_attr)
+            if cache is not None and cache[0] == getattr(self, f'_{space}_ver'):
+                return cache[1]
+            ver = getattr(self, f'_{space}_ver')
+            cursor = self.conn.cursor()
+            cursor.execute(f'''
+                SELECT e.file_id, f.checksum, e.embedding
+                FROM {table} e
+                JOIN files_with_path f ON f.id = e.file_id
+                WHERE e.frame_index = 0
+            ''')
+            rows = cursor.fetchall()
+            if not rows:
+                result = (np.array([], dtype=np.int64), [], np.empty((0, 0), np.float32))
+                setattr(self, cache_attr, (ver, result))
+                return result
+            matrix, keep = self._stack_embeddings([r[2] for r in rows], f'{space}-matrix')
+            file_ids = np.array([rows[i][0] for i in range(len(rows)) if keep[i]], dtype=np.int64)
+            checksums = [rows[i][1] for i in range(len(rows)) if keep[i]]
+            result = (file_ids, checksums, matrix)
+            setattr(self, cache_attr, (ver, result))
+            return result
+
+    def _space_iter(self, space, chunk):
+        cur = self.conn.cursor()
+        cur.execute(f'SELECT file_id, embedding FROM {self._SPACE_TABLES[space]} '
+                    'WHERE frame_index = 0 AND embedding IS NOT NULL ORDER BY file_id')
+        while True:
+            rows = cur.fetchmany(chunk)
+            if not rows:
+                break
+            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
+
+    def _space_needing(self, space, model, limit):
+        """(id, path) for files with no primary row in the space, or whose row was
+        produced by a different model id than `model` (re-embed on model change)."""
+        sql = f'''
+            SELECT f.id, f.path
+            FROM files_with_path f
+            LEFT JOIN {self._SPACE_TABLES[space]} e ON e.file_id = f.id AND e.frame_index = 0
+            WHERE e.file_id IS NULL OR e.model != ?
+        '''
+        params = [model]
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(limit)
+        return self.conn.cursor().execute(sql, params).fetchall()
+
+    def _space_count(self, space):
+        row = self.conn.cursor().execute(
+            f'SELECT COUNT(*) FROM {self._SPACE_TABLES[space]} WHERE frame_index = 0').fetchone()
+        return row[0] if row else 0
+
+    # SigLIP 2 (text+image)
+    def insert_siglip_embedding(self, file_id, embedding_bytes, model, frame_index=0):
+        """Upsert the SigLIP 2 embedding for a file at a frame (0 = primary)."""
+        self._space_insert('siglip', file_id, embedding_bytes, model, frame_index)
+
+    def get_all_siglip_embeddings(self):
+        """[(file_id, path, embedding_bytes, checksum)] for primary (frame 0) rows."""
+        return self._space_get_all('siglip')
+
+    def get_siglip_embeddings_matrix(self):
+        """Cached, write-invalidated (file_ids int64[N], checksums, float32[N, D]);
+        rebuilt iff self._siglip_ver changed."""
+        return self._space_matrix('siglip')
+
+    def iter_siglip_embeddings(self, chunk=10000):
+        """Stream (file_ids, concatenated float32 blobs) chunks of primary rows."""
+        return self._space_iter('siglip', chunk)
+
+    def get_files_needing_siglip(self, model, limit=None):
+        """(id, path) of files with no primary SigLIP row or one from a different model."""
+        return self._space_needing('siglip', model, limit)
+
+    def count_siglip_indexed(self):
+        """Count of files with a primary (frame_index=0) SigLIP embedding."""
+        return self._space_count('siglip')
+
+    # DINOv2 (image-only)
+    def insert_dino_embedding(self, file_id, embedding_bytes, model, frame_index=0):
+        """Upsert the DINOv2 embedding for a file at a frame (0 = primary)."""
+        self._space_insert('dino', file_id, embedding_bytes, model, frame_index)
+
+    def get_all_dino_embeddings(self):
+        """[(file_id, path, embedding_bytes, checksum)] for primary (frame 0) rows."""
+        return self._space_get_all('dino')
+
+    def get_dino_embeddings_matrix(self):
+        """Cached, write-invalidated (file_ids int64[N], checksums, float32[N, D]);
+        rebuilt iff self._dino_ver changed."""
+        return self._space_matrix('dino')
+
+    def iter_dino_embeddings(self, chunk=10000):
+        """Stream (file_ids, concatenated float32 blobs) chunks of primary rows."""
+        return self._space_iter('dino', chunk)
+
+    def get_files_needing_dino(self, model, limit=None):
+        """(id, path) of files with no primary DINOv2 row or one from a different model."""
+        return self._space_needing('dino', model, limit)
+
+    def count_dino_indexed(self):
+        """Count of files with a primary (frame_index=0) DINOv2 embedding."""
+        return self._space_count('dino')
 
     # --- perceptual hashes (near-duplicate detection, Phase 1) -----------------------
     def insert_phash(self, file_id, phash_bytes, dhash_bytes, width, height, algo,
@@ -2026,7 +2189,8 @@ class Database(ThreadLocalDB):
             cursor.execute('SELECT COUNT(*) FROM file_paths WHERE file_id = ?', (file_id,))
             if cursor.fetchone()[0] > 0:
                 continue  # still tracked at another path (a duplicate) — keep its content row
-            for table in ('embeddings', 'tags', 'detections', 'faces', 'body_embeddings',
+            for table in ('embeddings', 'embeddings_siglip', 'embeddings_dino',
+                          'tags', 'detections', 'faces', 'body_embeddings',
                           'tile_embeddings', 'object_region_embeddings',
                           'place_embeddings', 'place_keypoints',
                           'file_category_matches'):
@@ -2041,6 +2205,8 @@ class Database(ThreadLocalDB):
             self._body_ver += 1
             self._tile_ver += 1
             self._objreg_ver += 1
+            self._siglip_ver += 1
+            self._dino_ver += 1
         return (len(file_path_ids), files_removed)
 
     def delete_file_completely(self, file_id):
@@ -2059,7 +2225,7 @@ class Database(ThreadLocalDB):
         checksum = row[0]
         paths = [r[0] for r in cursor.execute(
             'SELECT path FROM file_paths WHERE file_id = ?', (file_id,)).fetchall()]
-        for table in ('file_paths', 'embeddings', 'phashes', 'dup_group_members', 'tags',
+        for table in ('file_paths', 'embeddings', 'embeddings_siglip', 'embeddings_dino', 'phashes', 'dup_group_members', 'tags',
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
                       'object_region_embeddings',
                       'place_embeddings', 'place_keypoints',
@@ -2074,6 +2240,8 @@ class Database(ThreadLocalDB):
         self._body_ver += 1
         self._tile_ver += 1
         self._objreg_ver += 1
+        self._siglip_ver += 1
+        self._dino_ver += 1
         return (checksum, paths)
 
     def count_detected(self):
@@ -3223,11 +3391,15 @@ class Database(ThreadLocalDB):
         if not skip_faces:
             cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
+        cursor.execute('DELETE FROM embeddings_siglip WHERE file_id = ? AND frame_index = 0', (file_id,))
+        cursor.execute('DELETE FROM embeddings_dino WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         self.conn.commit()
         # Invalidate all cached matrices: this cleared embeddings, body, and
         # (unless skip_faces) faces rows for the file.
         self._emb_ver += 1
+        self._siglip_ver += 1
+        self._dino_ver += 1
         self._body_ver += 1
         if not skip_faces:
             self._face_ver += 1

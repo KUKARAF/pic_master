@@ -1,3 +1,5 @@
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+# (DINOv2 object/region matching)
 """DINOv2 region/crop embedder for INSTANCE-level object retrieval.
 
 Where the CLIP tile index (``tile_index.py``) answers "what *kind* of thing is in
