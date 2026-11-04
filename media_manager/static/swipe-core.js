@@ -147,10 +147,13 @@ window.initSwipeStack = function (config) {
     if (index > 0) el.style.transform = `translateY(${index * PEEK_Y}px) scale(${1 - index * PEEK_SCALE})`;
 
     const { imageUrl, questionHtml, scoreText, metaHtml, originalUrl } = config.renderCard(card);
-    const imgTag = `<img src="${imageUrl}" alt="suggestion">`;
+    // draggable="false": a native link/image drag swallows the mouseup, which
+    // left `dragging` stuck so the NEXT click anywhere (e.g. a set in a modal
+    // on top of the stack) committed a swipe on whatever card was on top.
+    const imgTag = `<img src="${imageUrl}" alt="suggestion" draggable="false">`;
     el.innerHTML = `
       ${originalUrl
-        ? `<a class="swipe-card-img-link" href="${originalUrl}" target="_blank" rel="noopener">${imgTag}</a>`
+        ? `<a class="swipe-card-img-link" href="${originalUrl}" target="_blank" rel="noopener" draggable="false">${imgTag}</a>`
         : imgTag}
       <div class="swipe-card-body">
         <div class="swipe-card-question">${questionHtml}</div>
@@ -349,6 +352,10 @@ window.initSwipeStack = function (config) {
 
     function pointerDown(e) {
       if (!active) return;
+      if (!e.touches && e.button !== 0) return;
+      // Also blocks the browser's own drag/text-selection gesture (see cardEl);
+      // the click that opens the original still fires.
+      if (!e.touches) e.preventDefault();
       const point = e.touches ? e.touches[0] : e;
       dragging = { ref: card.ref, startX: point.clientX, startY: point.clientY, dx: 0, dy: 0, el };
       el.classList.add('dragging');
@@ -356,10 +363,39 @@ window.initSwipeStack = function (config) {
       window.addEventListener('touchmove', pointerMove, { passive: false });
       window.addEventListener('mouseup', pointerUp);
       window.addEventListener('touchend', pointerUp);
+      window.addEventListener('blur', cancelDrag);
+      window.addEventListener('contextmenu', cancelDrag);
+      // Capture phase: this press has already passed window's capture, so only
+      // a LATER press fires it — proof the release was lost, so drop the drag.
+      window.addEventListener('mousedown', cancelDrag, true);
+    }
+
+    function detach() {
+      window.removeEventListener('mousemove', pointerMove);
+      window.removeEventListener('touchmove', pointerMove);
+      window.removeEventListener('mouseup', pointerUp);
+      window.removeEventListener('touchend', pointerUp);
+      window.removeEventListener('blur', cancelDrag);
+      window.removeEventListener('contextmenu', cancelDrag);
+      window.removeEventListener('mousedown', cancelDrag, true);
+    }
+
+    // Snap the card back without deciding anything.
+    function cancelDrag() {
+      detach();
+      dragging = null;
+      el.classList.remove('dragging');
+      el.style.transform = '';
+      resetStamps();
     }
 
     function pointerMove(e) {
       if (!dragging) return;
+      // A drag only exists while the button pressed ON the card is still held.
+      // If the release was lost (released outside the window, alt-tab, …), the
+      // first move with no button down drops the drag, so a later click
+      // elsewhere can never fling the card.
+      if (!e.touches && (e.buttons & 1) === 0) { cancelDrag(); return; }
       e.preventDefault && e.preventDefault();
       const point = e.touches ? e.touches[0] : e;
       dragging.dx = point.clientX - dragging.startX;
@@ -371,13 +407,17 @@ window.initSwipeStack = function (config) {
       stampSkip.style.opacity = String(Math.max(0, Math.min(1, -dragging.dx / DECIDE_THRESHOLD)));
     }
 
-    function pointerUp() {
-      window.removeEventListener('mousemove', pointerMove);
-      window.removeEventListener('touchmove', pointerMove);
-      window.removeEventListener('mouseup', pointerUp);
-      window.removeEventListener('touchend', pointerUp);
-      if (!dragging) return;
-      const { dx, dy } = dragging;
+    function pointerUp(e) {
+      if (!dragging) { detach(); return; }
+      // Only the left button's release ends a drag (a right-click mid-drag
+      // already cancelled it via contextmenu).
+      if (!e.touches && e.type === 'mouseup' && e.button !== 0) return;
+      const { dx, dy, ref } = dragging;
+      // Never decide a card other than the one the drag started on (e.g. the
+      // keyboard already decided it mid-drag), nor while the stack is paused.
+      const top = topCard();
+      if (!active || !top || top.ref !== ref) { cancelDrag(); return; }
+      detach();
       dragging = null;
       // Left is a distinct third action (skip/"not sure"); right is
       // deliberately not bound to anything yet. Dominant axis picks between
