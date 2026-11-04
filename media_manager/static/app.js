@@ -2485,6 +2485,8 @@
       if (e.target === overlay) close();
     });
 
+    var navSearchBtn = document.getElementById('nav-search-btn');
+    if (navSearchBtn) navSearchBtn.addEventListener('click', open);
     if (navInput) {
       navInput.addEventListener('focus', function (e) {
         e.target.blur();
