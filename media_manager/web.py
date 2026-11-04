@@ -7925,7 +7925,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True, honor_negatives=False, background=True,
-                                          info=None):
+                                          model='clip', info=None):
         """Images not yet at this location whose CLIP embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
@@ -7945,20 +7945,32 @@ def create_app(data_root: str) -> FastAPI:
         `background` (a UI toggle, default on): rank by BACKGROUND tiles only (the tile
         index minus tiles covered by person boxes — see background_tiles.py), so the
         place counts and the people in it don't. Falls back to the whole-image ranking
-        when the location's photos have no background tiles yet. `info`, when a dict,
-        receives {'mode': 'background'|'whole'}."""
+        when the location's photos have no background tiles yet.
 
+        `model` ('clip' default | 'siglip' | 'dino'): same selector as
+        _find_similar_files_for_set — members, rejected photos and candidates are all read
+        from that model's space; siglip/dino skip the absolute threshold (top
+        SET_SUGGEST_TOPK pool, stills remapped to their video) and IGNORE `background`
+        (the tile index is CLIP-only). `info`, when a dict, receives {'mode':
+        'background'|'whole', 'model', 'threshold_applied', 'background_applied',
+        'coverage', 'model_missing'}."""
+
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
         excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
         set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
+        if info is not None:
+            info.update(model=model, threshold_applied=(model == 'clip'), background_applied=False)
 
-        if background and member_ids:
+        if background and member_ids and model == 'clip':
             excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
             ranked = _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives)
             if ranked is not None:
                 if info is not None:
                     info['mode'] = 'background'
+                    info['background_applied'] = True
                 placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
                 skip = set(member_ids) | set(exclude_ids or ())
                 want = limit if exclude_ids else offset + limit
@@ -7987,11 +7999,15 @@ def create_app(data_root: str) -> FastAPI:
         if info is not None:
             info['mode'] = 'whole'
 
-        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
+        member_embeddings = _set_member_embeddings(model, member_ids)
+        if info is not None:
+            info.update(coverage={'members_embedded': len(member_embeddings),
+                                  'members_total': len(member_checksums)},
+                        model_missing=(not member_embeddings and bool(member_checksums)))
 
         if honor_negatives and excluded_checksum_set:
             excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
-            excluded_embeddings = [e for _fid, e in db.get_embeddings_for_files(excluded_ids)]
+            excluded_embeddings = _set_member_embeddings(model, excluded_ids)
             centroid = adjusted_centroid(member_embeddings, excluded_embeddings)
         else:
             centroid = mean_normalized_centroid(member_embeddings)
@@ -8003,18 +8019,23 @@ def create_app(data_root: str) -> FastAPI:
         # pressing `s` on one card writes a single set_locations row rather than a
         # file_locations row per member, so this is what stops the rest of that shoot
         # from coming back around the stack one photo at a time.
-        candidates = [
-            row for row in db.get_all_embeddings()
-            if row[3] not in member_checksums and row[3] not in excluded_checksum_set
-            and row[3] not in set_settled_checksums
-        ]
-        if not candidates:
-            return []
-        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
-        passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
-        if avoid_existing and passing:
-            placed_anywhere = manual.get_checksums_with_any_location()
-            passing = [item for item in passing if item[0][2] not in placed_anywhere]
+        placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
+        if model == 'clip':
+            candidates = [
+                row for row in db.get_all_embeddings()
+                if row[3] not in member_checksums and row[3] not in excluded_checksum_set
+                and row[3] not in set_settled_checksums
+            ]
+            if not candidates:
+                return []
+            ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
+            passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+            if avoid_existing and passing:
+                passing = [item for item in passing if item[0][2] not in placed_anywhere]
+        else:
+            passing = _topk_pool_in_space(
+                model, centroid, set(member_checksums) | excluded_checksum_set | set(set_settled_checksums),
+                lambda items: [i for i in items if i[0][2] not in placed_anywhere] if avoid_existing else items)
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -9118,9 +9139,12 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_files_for_location(location_id: int, body: SwipeExcludeBody,
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
-                                        honor_negatives: bool = False, background: bool = True):
+                                        honor_negatives: bool = False, background: bool = True,
+                                        model: str = 'clip'):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
@@ -9128,12 +9152,13 @@ def create_app(data_root: str) -> FastAPI:
         results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
                                                     exclude_ids=exclude_ids, avoid_existing=avoid_existing,
                                                     honor_negatives=honor_negatives, background=background,
-                                                    info=info)
+                                                    model=model, info=info)
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
         # is what swipe-core.js's fetchMoreUrl contract reads. `mode` says whether the
         # background-tile ranking ran or it fell back to whole images.
         return {'results': results, 'cards': results, 'mode': info.get('mode'),
-                'tiled_files': db.count_tiled_files()}
+                'tiled_files': db.count_tiled_files(),
+                **{k: v for k, v in info.items() if k != 'mode'}}
 
     @app.get('/api/locations/{location_id}/background-status')
     def api_location_background_status(location_id: int):

@@ -75,6 +75,15 @@
   Honor negatives (steer ranking away from rejected photos, not just hide them)
 </label>
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
+  Suggest using
+  <select id="location-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
+    <option value="clip">CLIP (ViT-B/32)</option>
+    <option value="siglip">SigLIP 2</option>
+    <option value="dino">DINOv2</option>
+  </select>
+</label>
+<div id="location-model-notice" class="sub" style="display:none;margin-bottom:10px;color:#b45309;"></div>
+<label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Keep searching until
   <input type="range" id="location-buffer-size-slider" min="10" max="200" step="10" value="10">
   <span id="location-buffer-size-value">10</span>
@@ -295,7 +304,49 @@
       '&limit=' + (need || 10) +
       '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
       '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked) +
-      '&background=' + String(!bgToggle || bgToggle.checked);
+      '&background=' + String(!bgToggle || bgToggle.checked) +
+      '&model=' + encodeURIComponent(currentModel);
+  }
+
+  /* Embedding model driving the suggestions ('clip' default | 'siglip' | 'dino'),
+     remembered per browser. siglip/dino ignore the match threshold and the
+     background (CLIP tile index) option server-side, so both controls are disabled. */
+  const MODEL_KEY = 'mm_location_suggest_model';
+  const MODEL_LABELS = { clip: 'CLIP', siglip: 'SigLIP 2', dino: 'DINOv2' };
+  const BG_TIP = 'background matching uses the CLIP tile index; not available for SigLIP/DINOv2';
+  const modelSelect = document.getElementById('location-model-select');
+  const modelNotice = document.getElementById('location-model-notice');
+  function loadModel() {
+    try {
+      const m = localStorage.getItem(MODEL_KEY);
+      if (m && MODEL_LABELS[m]) return m;
+    } catch (e) {}
+    return 'clip';
+  }
+  let currentModel = loadModel();
+  if (modelSelect) modelSelect.value = currentModel;
+  function applyModelToBackgroundToggle() {
+    const bg = document.getElementById('location-background-toggle');
+    if (!bg) return;
+    const off = currentModel !== 'clip';
+    bg.disabled = off;
+    const label = bg.closest('label');
+    if (label) {
+      label.style.opacity = off ? '0.5' : '';
+      label.title = off ? BG_TIP : '';
+    }
+  }
+  applyModelToBackgroundToggle();
+  function showModelNotice(data) {
+    if (!modelNotice) return;
+    const cov = data && data.coverage;
+    if (data && data.model_missing && cov) {
+      modelNotice.textContent = cov.members_embedded + ' of ' + cov.members_total + ' photos here have no ' +
+        MODEL_LABELS[currentModel] + ' embedding yet \u2014 run Index SigLIP 2 + DINOv2 on /bulk';
+      modelNotice.style.display = '';
+    } else {
+      modelNotice.style.display = 'none';
+    }
   }
 
   // Background matching runs on the (optional) Tiles index — say how much of it exists.
@@ -450,14 +501,18 @@
       // unambiguously "no more similar photos", never "not compared yet" —
       // that case can't even get here, the stack isn't built without photos.
       emptyStateHtml: function(stackEl) {
+        const topK = currentModel !== 'clip';
+        const tip = 'Not used for ' + MODEL_LABELS[currentModel] + ': its similarity scale differs from CLIP, so the best 400 candidates are shown instead of applying a threshold.';
         stackEl.innerHTML =
           '<div class="swipe-empty">' +
-            '<p style="margin-bottom:10px;">No more photos similar to this location at threshold ' + currentThreshold.toFixed(2) + '.</p>' +
-            '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;">' +
+            '<p style="margin-bottom:10px;">' + (topK ? 'No more photos similar to this location from ' + MODEL_LABELS[currentModel] + '.'
+              : 'No more photos similar to this location at threshold ' + currentThreshold.toFixed(2)) + (topK ? '' : '.') + '</p>' +
+            '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;"' +
+              (topK ? ' title="' + tip + '"' : '') + '>' +
               '<label for="location-swipe-threshold-slider" style="font-size:0.85em;">Match threshold:</label>' +
-              '<input type="range" id="location-swipe-threshold-slider" min="0.40" max="0.75" step="0.05" value="' + currentThreshold.toFixed(2) + '">' +
+              '<input type="range" id="location-swipe-threshold-slider" min="0.40" max="0.75" step="0.05" value="' + currentThreshold.toFixed(2) + '"' + (topK ? ' disabled' : '') + '>' +
               '<span id="location-swipe-threshold-value" class="sub">' + currentThreshold.toFixed(2) + '</span>' +
-              '<button type="button" id="location-swipe-expand-btn" class="btn-similar" style="font-size:0.85em;">Expand similar image search</button>' +
+              '<button type="button" id="location-swipe-expand-btn" class="btn-similar" style="font-size:0.85em;"' + (topK ? ' disabled' : '') + '>Expand similar image search</button>' +
             '</div>' +
           '</div>';
         const slider = stackEl.querySelector('#location-swipe-threshold-slider');
@@ -488,11 +543,25 @@
       body: JSON.stringify({exclude: []}),
     })
       .then(function(r) { return r.ok ? r.json() : {cards: []}; })
-      .then(function(data) { launchStack(data.cards || []); })
+      .then(function(data) { showModelNotice(data); launchStack(data.cards || []); })
       .catch(function() { launchStack([]); });
   }
 
-  launchStack([]);
+  // Changing the model resets the swipe buffer: refetch from scratch and relaunch
+  // the stack so no card ranked by the previous model lingers.
+  if (modelSelect) {
+    modelSelect.addEventListener('change', function() {
+      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'clip';
+      try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) {}
+      applyModelToBackgroundToggle();
+      if (modelNotice) modelNotice.style.display = 'none';
+      fetchAndLaunch();
+    });
+  }
+
+  // A non-default saved model is fetched up front so the missing-embeddings
+  // notice can show; the CLIP default keeps the original lazy first fetch.
+  if (currentModel !== 'clip') fetchAndLaunch(); else launchStack([]);
 })();
 </script>
 
