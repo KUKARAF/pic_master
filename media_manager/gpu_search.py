@@ -69,7 +69,7 @@ def _resolve_device():
     return None if dev == "cpu" else dev
 
 
-def _resident_tensor(key, version, matrix, device, torch):
+def _resident_tensor(key, version, matrix, device, torch, half=False):
     """Fetch (or (re)build) the resident device tensor for ``key`` at ``version``.
 
     Rebuilds when the cached version differs, replacing the entry so the old
@@ -84,13 +84,16 @@ def _resident_tensor(key, version, matrix, device, torch):
         if cached is not None and cached[0] == version:
             return cached[1]
         tensor = torch.from_numpy(m).to(device)
+        if half:  # fp16-resident: halves VRAM for the big SigLIP/DINO matrices
+            tensor = tensor.half()
         _RESIDENT[key] = (version, tensor)
         d = m.shape[1] if m.ndim > 1 else 0
-        print(f"[gpu_search] resident {key!r} N={m.shape[0]} D={d} on {device}")
+        print(f"[gpu_search] resident {key!r} N={m.shape[0]} D={d} on {device}"
+              f"{' (fp16)' if half else ''}")
         return tensor
 
 
-def matvec(key, version, matrix, query):
+def matvec(key, version, matrix, query, half=False):
     """Score a resident ``[N, D]`` matrix against a ``[D]`` query on the GPU:
     ``matrix @ query -> [N]``, returned as a float32 numpy array.
 
@@ -98,7 +101,12 @@ def matvec(key, version, matrix, query):
     once and reusing it across calls — then uploads only the query and computes
     ``resident @ q``. Returns ``None`` when there's no GPU (caller falls back to
     numpy) or when the matrix is empty (nothing to make resident; the caller's
-    numpy path handles the empty case identically)."""
+    numpy path handles the empty case identically).
+
+    ``half=True`` keeps the resident copy in fp16 (362k x 1152 = ~0.8 GB instead of
+    ~1.7 GB; used for the SigLIP 2 / DINOv2 matrices). The query is cast to fp16 for
+    the matmul and scores come back as float32 (cosine error ~1e-3, irrelevant for
+    ranking). Pick ``half`` consistently per key."""
     device = _resolve_device()
     if device is None:
         return None
@@ -107,9 +115,11 @@ def matvec(key, version, matrix, query):
         return None
     import torch  # hook-allow: lazy — heavy dep (torch), GPU path only
 
-    resident = _resident_tensor(key, version, matrix, device, torch)
+    resident = _resident_tensor(key, version, matrix, device, torch, half=half)
     q = torch.from_numpy(np.ascontiguousarray(query, dtype=np.float32)).to(device)
-    scores = resident @ q
+    if half:
+        q = q.half()
+    scores = (resident @ q).float()
     return scores.detach().to("cpu").numpy().astype(np.float32, copy=False)
 
 

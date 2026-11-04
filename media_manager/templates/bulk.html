@@ -119,6 +119,19 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/siglip-dino/start" data-status="/api/siglip-dino/status" title="One decode pass per photo feeds SigLIP 2 (text and image search) and DINOv2 (visual similarity). Resumable: re-run to continue. Needs a GPU (local or the worker).">🧬 Index SigLIP 2 + DINOv2</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <p class="sub" id="embed-stats" style="margin:2px 2px 8px;">Loading embedding stats…</p>
+    <div class="bulk-action-row" style="align-items:center;flex-wrap:wrap;">
+      <label class="sub">Speed test sample
+        <input type="number" id="speedtest-sample" value="64" min="8" max="2000" step="8" style="width:5em;">
+      </label>
+      <button type="button" id="speedtest-run">⏱ Run speed test</button>
+      <span class="sub">(embeds N random photos through the real path; nothing is saved)</span>
+    </div>
+    <div id="speedtest-result" class="sub" style="margin:2px 2px 10px;"></div>
+    <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start="/api/body-index/start" data-status="/api/body-index/status">🧍 Index bodies</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
@@ -127,6 +140,7 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
+      <!-- DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend. -->
       <button type="button" class="bulk-action-btn" data-start="/api/region-index/start" data-status="/api/region-index/status" title="DINOv2 windows + SIFT features per photo: 🔲 region search finds the same object/region (verified by geometry), not just the same category">🎯 Index region matching</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
@@ -139,6 +153,7 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
+      <!-- DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend. -->
       <button type="button" class="bulk-action-btn" data-start="/api/object-index/start" data-status="/api/object-index/status">📌 Index objects</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
@@ -245,6 +260,59 @@
   if (capCb) capCb.addEventListener('change', sync);
   if (rotCb) rotCb.addEventListener('change', sync);
   sync();
+})();
+/* Embedding stats + speed test (SigLIP 2 + DINOv2). */
+(function () {
+  function dur(sec) {
+    if (sec == null || !isFinite(sec)) return '?';
+    sec = Math.round(sec);
+    if (sec < 90) return sec + 's';
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+    return h > 0 ? (h + 'h ' + m + 'm') : (m + 'm ' + (sec % 60) + 's');
+  }
+  function mb(b) { return (b / 1048576).toFixed(0) + ' MB'; }
+  var statsEl = document.getElementById('embed-stats');
+  function loadStats() {
+    fetch('/api/embed-stats').then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.spaces) { statsEl.textContent = d.detail || 'stats unavailable'; return; }
+      var sp = d.spaces, parts = [];
+      [['clip', 'CLIP'], ['siglip', 'SigLIP 2'], ['dino', 'DINOv2']].forEach(function (k) {
+        var x = sp[k[0]];
+        parts.push(k[1] + ': ' + x.rows.toLocaleString() + ' (' + x.dim + '-d, ' + mb(x.bytes) + ')');
+      });
+      statsEl.textContent = 'Embeddings of ' + d.library_images.toLocaleString() + ' photos — ' + parts.join(' · ');
+    }).catch(function (e) { statsEl.textContent = 'stats failed: ' + e.message; });
+  }
+  loadStats();
+  setInterval(function () { if (document.querySelector('.bulk-action-btn[data-busy]')) loadStats(); }, 15000);
+
+  var runBtn = document.getElementById('speedtest-run');
+  var out = document.getElementById('speedtest-result');
+  var trashCb = document.getElementById('include-trashed');
+  if (!runBtn) return;
+  runBtn.addEventListener('click', function () {
+    var n = parseInt(document.getElementById('speedtest-sample').value, 10) || 64;
+    runBtn.disabled = true;
+    out.textContent = 'Running (warm-up batch, then ' + n + ' photos)…';
+    fetch('/api/embed-speedtest', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sample: n, include_trashed: !!(trashCb && trashCb.checked) })
+    }).then(function (r) { return r.json().then(function (d) { return [r.ok, d]; }); })
+      .then(function (res) {
+        var ok = res[0], d = res[1];
+        if (!ok) { out.textContent = 'Speed test failed: ' + (d.detail || 'error'); return; }
+        var s = '~' + d.images_per_sec + ' img/s on ' + d.sample + ' photos (' + d.device + ')';
+        if (d.gpu_images_per_sec) s += ' · GPU alone ' + d.gpu_images_per_sec + ' img/s';
+        s += ' → ~' + dur(d.est_seconds_total) + ' for the whole library of ' + d.library_total.toLocaleString()
+          + '; ' + dur(d.est_seconds_remaining) + ' remaining (' + d.remaining.toLocaleString() + ' photos)';
+        var b = d.breakdown || {};
+        if (b.gpu_seconds != null) s += ' · wall ' + b.wall_seconds + 's = GPU ' + b.gpu_seconds + 's + decode/transport ~' + b.decode_transport_seconds + 's';
+        if (d.failed) s += ' · ' + d.failed + ' failed';
+        out.textContent = s;
+      })
+      .catch(function (e) { out.textContent = 'Speed test failed: ' + e.message; })
+      .then(function () { runBtn.disabled = false; });
+  });
 })();
 </script>
 {% endblock %}

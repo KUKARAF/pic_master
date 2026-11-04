@@ -55,6 +55,22 @@ class WorkerModels:
         self._face_detector = None
         self._clip_indexer = None
         self._object_detector = None
+        self._siglip = None
+        self._dino = None
+
+    def get_siglip_embedder(self):
+        if self._siglip is None:
+            print("[worker] loading SigLIP2Embedder...", flush=True)
+            from .embedders import SigLIP2Embedder  # hook-allow: lazy — model load
+            self._siglip = SigLIP2Embedder()
+        return self._siglip
+
+    def get_dino_embedder(self):
+        if self._dino is None:
+            print("[worker] loading DINOv2Embedder...", flush=True)
+            from .embedders import DINOv2Embedder  # hook-allow: lazy — model load
+            self._dino = DINOv2Embedder()
+        return self._dino
 
     def get_face_detector(self):
         if self._face_detector is None:
@@ -87,6 +103,10 @@ class WorkerModels:
             ids.append(self._clip_indexer.model_name)
         if self._object_detector is not None:
             ids.append(self._object_detector.model_id())
+        if self._siglip is not None:
+            ids.append(self._siglip.model_id())
+        if self._dino is not None:
+            ids.append(self._dino.model_id())
         return ids
 
 
@@ -226,6 +246,7 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
         return worker_protocol.pack({"error": str(e)})
 
 
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def handle_region(path, data, request_id, link_id, remote_identity, requested_at):
     """Instance-level region search (region_index.py), DINOv2 on the worker's compute device.
       req {image, box}  -> {vecs: float32 bytes (S, DIM), n: S, algo}                  (query)
@@ -412,6 +433,88 @@ def handle_embed_text(path, data, request_id, link_id, remote_identity, requeste
         print(f"[worker] handled {worker_protocol.PATH_EMBED_TEXT} ({text!r}) -> ERROR {e}",
               flush=True)
         return worker_protocol.pack({"embedding": None, "error": str(e)})
+
+
+def _embed_shared(embedders_, sources):
+    """Indirection so the torch-importing embedders module loads lazily (and tests can fake it)."""
+    from .embedders import embed_shared  # hook-allow: lazy — pulls torch
+    return embed_shared(embedders_, sources)
+
+
+def handle_embed_both_batch(path, data, request_id, link_id, remote_identity, requested_at):
+    """N images -> SigLIP2 + DINOv2 vectors in ONE decode pass. Per-item failures (bad image,
+    unsupported extension) are reported in that item's ``error`` and never fail the batch."""
+    tmps = []
+    try:
+        req = worker_protocol.unpack(data)
+        items = req["items"]
+        results = [{"name": it.get("name"), "siglip": None, "dino": None, "error": None}
+                   for it in items]
+        idx_of = {}  # temp path -> result index
+        for i, it in enumerate(items):
+            try:
+                tmp = _write_temp(it["image"], it.get("name"))
+            except Exception as e:  # hook-allow: broad — per-item isolation
+                results[i]["error"] = f"write failed: {e}"
+                continue
+            tmps.append(tmp)
+            idx_of[tmp] = i
+        t0 = time.time()
+        with models.lock:
+            sig = models.get_siglip_embedder()
+            dino = models.get_dino_embedder()
+            order = list(idx_of)
+            (sig_e, dino_e), failed = _embed_shared([sig, dino], order)
+        gpu_s = time.time() - t0
+        failed_paths = {}
+        for label, msg in failed:
+            failed_paths[label] = msg
+        row = 0  # embed_shared drops failed rows; surviving rows keep input order
+        for tmp in order:
+            i = idx_of[tmp]
+            if tmp in failed_paths:
+                results[i]["error"] = failed_paths[tmp]
+                continue
+            results[i]["siglip"] = sig_e[row].astype(np.float32).tobytes()
+            results[i]["dino"] = dino_e[row].astype(np.float32).tobytes()
+            row += 1
+        print(f"[worker] handled {worker_protocol.PATH_EMBED_BOTH_BATCH} ({len(items)} items) -> "
+              f"{row} ok, {len(items) - row} failed, {gpu_s:.2f}s", flush=True)
+        return worker_protocol.pack({
+            "results": results, "siglip_model": sig.model_id(), "dino_model": dino.model_id(),
+            "gpu_seconds": gpu_s, "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
+            "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_EMBED_BOTH_BATCH} -> ERROR {e}",
+              flush=True)
+        return worker_protocol.pack({
+            "results": [], "siglip_model": None, "dino_model": None, "gpu_seconds": 0.0,
+            "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": str(e)})
+    finally:
+        for t in tmps:
+            _cleanup(t)
+
+
+def handle_embed_siglip_text(path, data, request_id, link_id, remote_identity, requested_at):
+    text = None
+    try:
+        req = worker_protocol.unpack(data)
+        text = req["text"]
+        with models.lock:
+            sig = models.get_siglip_embedder()
+            v = sig.embed_text(text)
+        return worker_protocol.pack({
+            "embedding": np.asarray(v, dtype=np.float32).reshape(-1).tobytes(),
+            "siglip_model": sig.model_id(),
+            "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_EMBED_SIGLIP_TEXT} ({text!r}) -> ERROR {e}",
+              flush=True)
+        return worker_protocol.pack({
+            "embedding": None, "siglip_model": None,
+            "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": str(e)})
 
 
 def handle_detect_objects(path, data, request_id, link_id, remote_identity, requested_at):
@@ -986,6 +1089,8 @@ HANDLERS = {
     worker_protocol.PATH_NORMALIZE_FACES: handle_normalize_faces,
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
     worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
+    worker_protocol.PATH_EMBED_BOTH_BATCH: handle_embed_both_batch,
+    worker_protocol.PATH_EMBED_SIGLIP_TEXT: handle_embed_siglip_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,
     worker_protocol.PATH_ESTIMATE_AGE: handle_estimate_age,
     worker_protocol.PATH_TRAIN_CREATE: handle_train_create,

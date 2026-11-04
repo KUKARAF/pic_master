@@ -110,6 +110,11 @@ _HERE = Path(__file__).parent
 # into a string; FastAPI/Pydantic resolve those forward refs against the module's
 # globals when building the OpenAPI schema, and classes defined inside create_app()
 # aren't visible there — the route silently stops accepting the JSON body.
+class EmbedSpeedtestBody(BaseModel):
+    sample: int = 64
+    include_trashed: bool = False
+
+
 class TagBody(BaseModel):
     tag: str
     polarity: str = 'positive'
@@ -563,6 +568,76 @@ def _get_clip_indexer():
     return _clip_indexer_local
 
 
+_siglip_embedder_local = None
+_dino_embedder_local = None
+_siglip_embedder_remote = None
+_dino_embedder_remote = None
+
+
+def _get_siglip_embedder():
+    """SigLIP 2 (text<->image) embedder: the worker's when one is configured, else the
+    local GPU-only SigLIP2Embedder. A local machine without a usable accelerator makes
+    the constructor raise RuntimeError, which propagates (500 / job error) -- never
+    swallowed, never a silent CPU fallback."""
+    global _siglip_embedder_local, _siglip_embedder_remote
+    if _worker_client is not None and _worker_client.is_configured():
+        if _siglip_embedder_remote is None:
+            _siglip_embedder_remote = worker_client.RemoteSigLIPEmbedder(_worker_client)
+        return _siglip_embedder_remote
+    if _siglip_embedder_local is None:
+        from media_manager.embedders import SigLIP2Embedder  # hook-allow: lazy -- pulls in torch/open_clip
+        _siglip_embedder_local = SigLIP2Embedder()
+    return _siglip_embedder_local
+
+
+def _get_dino_embedder():
+    """DINOv2 (image<->image) embedder; same remote/local rules as _get_siglip_embedder."""
+    global _dino_embedder_local, _dino_embedder_remote
+    if _worker_client is not None and _worker_client.is_configured():
+        if _dino_embedder_remote is None:
+            _dino_embedder_remote = worker_client.RemoteDINOEmbedder(_worker_client)
+        return _dino_embedder_remote
+    if _dino_embedder_local is None:
+        from media_manager.embedders import DINOv2Embedder  # hook-allow: lazy -- pulls in torch
+        _dino_embedder_local = DINOv2Embedder()
+    return _dino_embedder_local
+
+
+def _local_embed_shared(embedders, paths):
+    """Local one-decode-pass SigLIP+DINO (embedders.embed_shared). Isolated so tests can fake it."""
+    from media_manager.embedders import embed_shared  # hook-allow: lazy -- pulls in torch
+    return embed_shared(embedders, paths)
+
+
+def _embed_pair_chunk(sig, dino, paths):
+    """Embed `paths` with BOTH models in one decode pass -- the single code path used by the
+    bulk job AND the speed test. Returns (pairs, errors, gpu_seconds, models):
+    pairs[i] = (siglip_vec, dino_vec) or None, errors[i] = message or None (aligned with
+    `paths`), gpu_seconds = worker-reported inference time (None locally), models =
+    (siglip_model_id, dino_model_id) when the worker reported them else None. A transport /
+    no-GPU failure raises (WorkerError / RuntimeError); only per-image failures are isolated."""
+    paths = list(paths)
+    if _worker_client is not None and _worker_client.is_configured():
+        res = worker_client.embed_both(_worker_client, paths, batch_size=sig.batch_size,
+                                       workers=sig.workers)
+        pairs = [(res.siglip[i], res.dino[i]) if res.siglip[i] is not None and res.dino[i] is not None
+                 else None for i in range(len(paths))]
+        models = (res.siglip_model, res.dino_model) if res.siglip_model else None
+        return pairs, list(res.errors), res.gpu_seconds, models
+    (sig_mat, dino_mat), failed = _local_embed_shared([sig, dino], paths)
+    failed_msgs = dict(failed)
+    pairs, errs, k = [], [], 0
+    for p in paths:
+        if p in failed_msgs:
+            pairs.append(None)
+            errs.append(failed_msgs[p])
+        else:
+            pairs.append((sig_mat[k], dino_mat[k]))
+            errs.append(None)
+            k += 1
+    return pairs, errs, None, None
+
+
 _age_estimator = None
 _age_estimator_remote = None
 
@@ -597,6 +672,7 @@ _object_encoder = None
 _object_matcher = None
 
 
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def _get_object_encoder(data_root):
     """Local DINOv2 region/crop encoder for object-exemplar search (object_encoder.py).
     B70-local (runs where the GPU is), not offloaded. Lazy singleton."""
@@ -606,6 +682,7 @@ def _get_object_encoder(data_root):
     return _object_encoder
 
 
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def _get_object_matcher():
     """Local local-feature geometric verifier for same-object confirmation
     (object_matcher.py). B70-local. Lazy singleton."""
@@ -3515,6 +3592,7 @@ def create_app(data_root: str) -> FastAPI:
 
     # Instance-level region search (region_index.py): DINOv2 windows + RootSIFT/MAGSAC.
     # Same offload shape as find-by-pattern — worker first, local fallback.
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _region_index_payload(image_bytes, name):
         """(windows int8, sift pts f16, sift desc u8) for an image, or None if undecodable."""
         wc = _worker_client
@@ -3526,6 +3604,7 @@ def create_app(data_root: str) -> FastAPI:
         pil = region_index.load_pil(image_bytes)
         return None if pil is None else region_index.describe_image(pil)
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _region_query_vectors(image_bytes, pil, box, name='<query>'):
         """float32 (3, DIM) DINO query vectors for the drawn box — worker first, local fallback."""
         wc = _worker_client
@@ -3565,6 +3644,7 @@ def create_app(data_root: str) -> FastAPI:
             on_progress(done, failed)
         return done, failed
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/region-index/start')
     def api_region_index_start(include_trashed: bool = False):
         """Build the instance-level region index: 35 int8 DINOv2 window descriptors + ~300
@@ -3590,6 +3670,7 @@ def create_app(data_root: str) -> FastAPI:
         _spawn_job(_run)
         return {'started': True, 'total': region_index_job['total']}
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.get('/api/region-index/status')
     def api_region_index_status():
         return {
@@ -3600,6 +3681,7 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(_region_pending_files()),
         }
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/files/{file_id}/region-search')
     def api_region_search(file_id: int, body: RegionSearchBody, limit: int = 50):
         """'Search by region'. With the region matching index built (bulk -> Index region
@@ -4590,6 +4672,279 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(db.get_unindexed_files()),
             'device': _ml_device_label(),
         }
+
+    # ------------------------------------------------------------------
+    # SigLIP 2 + DINOv2 embedding pipeline: bulk job, speed test, search.
+    # One decode pass feeds both models (embed_shared locally, embed_both on the worker).
+    # ------------------------------------------------------------------
+    pair_job = {'running': False, 'done': 0, 'total': 0, 'failed': 0, 'error': None,
+                'img_per_sec': 0.0, 'eta_seconds': None}
+    PAIR_CHUNK = 192  # images per write-back chunk: flat memory + frequent resumable commits
+
+    def _pair_model_ids():
+        """(siglip_id, dino_id) for the CURRENT config without loading local models
+        (remote: the worker's cached/probed ids; local: the env-configured static ids)."""
+        if _worker_client is not None and _worker_client.is_configured():
+            return _get_siglip_embedder().model_id(), _get_dino_embedder().model_id()
+        from media_manager.embedders import SigLIP2Embedder, DINOv2Embedder  # hook-allow: lazy -- torch
+        return SigLIP2Embedder.model_id(), DINOv2Embedder.model_id()
+
+    def _pair_candidates(sig_id, dino_id, include_trashed):
+        """[(file_id, rel_path, need_siglip, need_dino)] for IMAGES lacking either embedding
+        under the current model ids (union), trashed dropped unless include_trashed. Captured
+        video stills are hidden images and ARE embedded (like CLIP) so a video can be found
+        via its frames; search collapses them to the video. Videos themselves are not embedded."""
+        need = {}
+        for fid, rel in db.get_files_needing_siglip(sig_id):
+            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS:
+                need[fid] = [rel, True, False]
+        for fid, rel in db.get_files_needing_dino(dino_id):
+            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS:
+                if fid in need:
+                    need[fid][2] = True
+                else:
+                    need[fid] = [rel, False, True]
+        rows = [(fid, v[0], v[1], v[2]) for fid, v in sorted(need.items())]
+        return _drop_trashed(rows, include_trashed)
+
+    def _library_image_rows(include_trashed):
+        cur = db.conn.cursor()
+        cur.execute('SELECT id, path FROM files_with_path')
+        rows = [(fid, rel) for fid, rel in cur.fetchall()
+                if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS]
+        return _drop_trashed(rows, include_trashed)
+
+    @app.post('/api/siglip-dino/start')
+    def api_siglip_dino_start(include_trashed: bool = False):
+        """Bulk-embed every image missing a SigLIP 2 or DINOv2 embedding (for the current
+        model ids) in ONE decode pass per image. Resumable: re-running just continues with
+        what's still missing. Per-file failures are logged to the error log and skipped."""
+        if pair_job['running']:
+            return {'started': False, 'message': 'SigLIP 2 + DINOv2 indexing already running.'}
+        # Constructed here (not in the thread) so a no-GPU RuntimeError / worker problem is
+        # an immediate, readable 500 instead of a job that silently never starts.
+        sig, dino = _get_siglip_embedder(), _get_dino_embedder()
+        sig_id, dino_id = sig.model_id(), dino.model_id()
+        candidates = _pair_candidates(sig_id, dino_id, include_trashed)
+        pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
+                        img_per_sec=0.0, eta_seconds=None)
+
+        def _run():
+            try:
+                t0 = time.time()
+                done = failed = 0
+                for start in range(0, len(candidates), PAIR_CHUNK):
+                    chunk = candidates[start:start + PAIR_CHUNK]
+                    live = []
+                    for fid, rel, need_s, need_d in chunk:
+                        abs_path = _live_abs_path(fid, rel)
+                        if abs_path is None:
+                            errors.log(rel, 'siglip+dino: file not on disk')
+                            failed += 1
+                        else:
+                            live.append((fid, abs_path, need_s, need_d))
+                    if live:
+                        pairs, errs, _gpu, models = _embed_pair_chunk(sig, dino, [x[1] for x in live])
+                        w_sig, w_dino = (models or (None, None))
+                        for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
+                            if pair is None:
+                                errors.log(abs_path, f'siglip+dino: {err or "no embedding returned"}')
+                                failed += 1
+                                continue
+                            try:
+                                if need_s:
+                                    db.insert_siglip_embedding(
+                                        fid, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id)
+                                if need_d:
+                                    db.insert_dino_embedding(
+                                        fid, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id)
+                            except Exception as exc:  # hook-allow: broad -- per-item; one bad row must not sink the job
+                                errors.log(abs_path, f'siglip+dino: store failed: {exc}')
+                                failed += 1
+                    done += len(chunk)
+                    elapsed = max(time.time() - t0, 1e-9)
+                    rate = done / elapsed
+                    pair_job.update(done=done, failed=failed, img_per_sec=round(rate, 2),
+                                    eta_seconds=round((len(candidates) - done) / rate, 1) if rate > 0 else None)
+            except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
+                traceback.print_exc()
+                pair_job['error'] = f'{exc.__class__.__name__}: {exc}'
+            finally:
+                pair_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': pair_job['total']}
+
+    @app.get('/api/siglip-dino/status')
+    def api_siglip_dino_status():
+        out = {k: pair_job[k] for k in ('running', 'done', 'total', 'failed', 'error',
+                                         'img_per_sec', 'eta_seconds')}
+        out['device'] = _ml_device_label()
+        out['pending'] = None
+        if not pair_job['running']:
+            try:  # best-effort: a missing GPU / unreachable worker must not break the poll
+                sig_id, dino_id = _pair_model_ids()
+                out['pending'] = len(_pair_candidates(sig_id, dino_id, True))
+            except Exception as exc:  # hook-allow: broad -- status probe is advisory
+                out['pending_error'] = f'{exc.__class__.__name__}: {exc}'
+        return out
+
+    @app.get('/api/embed-stats')
+    def api_embed_stats():
+        """Row counts / dims / matrix bytes for the CLIP, SigLIP 2 and DINOv2 spaces (+ how much
+        of each is currently resident in RAM), for the /bulk page."""
+        emb = db.embedding_stats()
+        return {
+            'spaces': {k: emb[k] for k in ('clip', 'siglip', 'dino')},
+            'loaded_bytes': db.loaded_matrix_bytes(),
+            'library_images': len(_library_image_rows(False)),
+        }
+
+    @app.post('/api/embed-speedtest')
+    def api_embed_speedtest(body: Optional[EmbedSpeedtestBody] = None):
+        """Throughput probe through the SAME path as the real job (remote upload+decode+infer, or
+        local decode+infer). Random indexable library images; one warm-up batch (excluded from
+        timing); NO database writes. Returns images/sec, GPU-only images/sec (worker only),
+        and total/remaining time estimates for the library."""
+        body = body or EmbedSpeedtestBody()
+        if pair_job['running']:
+            raise HTTPException(status_code=409, detail='Indexing job is running; speed test would be skewed.')
+        n = max(1, min(int(body.sample), 2000))
+        sig, dino = _get_siglip_embedder(), _get_dino_embedder()
+        sig_id, dino_id = sig.model_id(), dino.model_id()
+        rows = _library_image_rows(body.include_trashed)
+        if not rows:
+            raise HTTPException(status_code=404, detail='No indexable images in the library.')
+        order = random.sample(rows, len(rows)) if len(rows) <= 5000 else random.sample(rows, 5000)
+        live = []
+        for fid, rel in order:
+            ap = _live_abs_path(fid, rel)
+            if ap is not None:
+                live.append(ap)
+            if len(live) >= n + 16:
+                break
+        if not live:
+            raise HTTPException(status_code=404, detail='None of the sampled images exist on disk.')
+        warm_n = min(16, len(live))
+        warm = live[:warm_n]
+        # Prefer images the warm-up didn't touch; a tiny library reuses warm ones to fill the sample.
+        sample = (live[warm_n:] + live)[:min(n, len(live))]
+        _embed_pair_chunk(sig, dino, warm)  # warm-up: model/CUDA-graph/connection setup, untimed
+        t0 = time.perf_counter()
+        pairs, _errs, gpu_s, models = _embed_pair_chunk(sig, dino, sample)
+        wall = max(time.perf_counter() - t0, 1e-9)
+        ok = sum(1 for p in pairs if p is not None)
+        if ok == 0:
+            raise HTTPException(status_code=502, detail=f'All {len(sample)} sample images failed to embed: {_errs[:2]}')
+        ips = ok / wall
+        gpu_ips = (ok / gpu_s) if gpu_s else None
+        total = len(rows)
+        remaining = len(_pair_candidates(sig_id, dino_id, body.include_trashed))
+        return {
+            'sample': len(sample), 'ok': ok, 'failed': len(sample) - ok,
+            'warmup': len(warm),
+            'images_per_sec': round(ips, 2),
+            'gpu_images_per_sec': round(gpu_ips, 2) if gpu_ips else None,
+            'library_total': total, 'remaining': remaining,
+            'est_seconds_total': round(total / ips, 1),
+            'est_seconds_remaining': round(remaining / ips, 1),
+            'device': _ml_device_label(),
+            'models': {'siglip': (models[0] if models else None) or sig_id,
+                       'dino': (models[1] if models else None) or dino_id},
+            'breakdown': {
+                'wall_seconds': round(wall, 3),
+                'gpu_seconds': round(gpu_s, 3) if gpu_s is not None else None,
+                # With pipelined batches summed gpu_seconds can exceed wall -> clamp at 0.
+                'decode_transport_seconds': round(max(wall - gpu_s, 0.0), 3) if gpu_s is not None else None,
+            },
+        }
+
+    # ---- search over the SigLIP 2 / DINOv2 spaces ----------------------------------
+
+    def _score_space(space, query):
+        """(file_ids, checksums, scores) for a query vector against a space's resident matrix
+        (fp16-resident in VRAM via gpu_search when a GPU is present, numpy BLAS otherwise)."""
+        from media_manager import gpu_search  # hook-allow: lazy -- numpy/torch GPU path
+        ver = getattr(db, f'_{space}_ver')  # read BEFORE the matrix: a stale tag only costs a re-upload
+        file_ids, checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
+        if matrix.shape[0] == 0:
+            return file_ids, checksums, np.empty(0, dtype=np.float32)
+        q = np.asarray(query, dtype=np.float32)
+        if q.shape[0] != matrix.shape[1]:
+            raise HTTPException(status_code=409, detail=(
+                f'Query dim {q.shape[0]} != indexed {space} dim {matrix.shape[1]}: the model changed; '
+                f're-run "Index SigLIP 2 + DINOv2".'))
+        scores = gpu_search.matvec(space, ver, matrix, q, half=True)
+        if scores is None:
+            scores = matrix.dot(q)
+        return file_ids, checksums, scores
+
+    def _rank_space_results(file_ids, checksums, scores, limit, exclude_ids=()):
+        """Top-`limit` [{'file_id','score'}] best-first. Hidden files are dropped, EXCEPT captured
+        video stills, which are remapped to their SOURCE video (frame and video are one item;
+        a still never surfaces on its own). One entry per file/video (best score wins);
+        trashed files are skipped."""
+        n = int(scores.shape[0])
+        if n == 0:
+            return []
+        still_parents = manual.get_all_frame_capture_parents()
+        trashed = _trashed_file_ids()
+        exclude = set(exclude_ids)
+        k = min(n, max(1, limit) * 4 + 16)
+        while True:
+            results, seen = [], set(exclude)
+            for i in top_k_indices(scores, k):
+                cs = checksums[i]
+                fid = int(file_ids[i])
+                if cs in still_parents:
+                    vrow = db.get_file_by_checksum(still_parents[cs])
+                    if vrow is None:
+                        continue
+                    fid = int(vrow['id'])
+                else:
+                    row = db.get_file_by_id(fid)
+                    if row is None or row['hidden']:
+                        continue
+                if fid in seen or fid in trashed:
+                    continue
+                seen.add(fid)
+                results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
+                if len(results) >= limit:
+                    return results
+            if k >= n:
+                return results
+            k = min(n, k * 4)
+
+    @app.get('/api/search/siglip-text')
+    def api_search_siglip_text(q: str, limit: int = 50):
+        """Text -> image search in the SigLIP 2 space. Same result shape as /api/files/{id}/similar."""
+        q = q.strip()
+        if not q:
+            raise HTTPException(status_code=400, detail='Empty query.')
+        query = np.asarray(_get_siglip_embedder().embed_text(q), dtype=np.float32)
+        file_ids, checksums, scores = _score_space('siglip', query)
+        return {'results': _rank_space_results(file_ids, checksums, scores, limit)}
+
+    def _similar_in_space(space, file_id, limit):
+        _file_or_404(file_id)
+        file_ids, checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
+        hits = np.flatnonzero(file_ids == file_id) if matrix.shape[0] else []
+        if len(hits) == 0:
+            return {'results': [], 'no_embedding': True,
+                    'message': f'This photo has no {space} embedding yet.'}
+        query = matrix[int(hits[0])]
+        file_ids, checksums, scores = _score_space(space, query)
+        return {'results': _rank_space_results(file_ids, checksums, scores, limit, exclude_ids=(file_id,))}
+
+    @app.get('/api/files/{file_id}/similar-dino')
+    def api_similar_dino(file_id: int, limit: int = 50):
+        """Image -> image similarity in the DINOv2 space (visual/instance similarity)."""
+        return _similar_in_space('dino', file_id, limit)
+
+    @app.get('/api/files/{file_id}/similar-siglip')
+    def api_similar_siglip(file_id: int, limit: int = 50):
+        """Image -> image similarity in the SigLIP 2 space (semantic similarity)."""
+        return _similar_in_space('siglip', file_id, limit)
 
     def _unphashed_images():
         """(fid, rel_path) for IMAGES only — the phasher ignores videos (their frames
@@ -6015,6 +6370,7 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/object-index/start')
     def api_object_index_start(include_trashed: bool = False):
         """Build the DINOv2 region index (object_region_embeddings) — the candidate pool
@@ -6060,6 +6416,7 @@ def create_app(data_root: str) -> FastAPI:
         _spawn_job(_run)
         return {'started': True, 'total': object_index_job['total']}
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.get('/api/object-index/status')
     def api_object_index_status():
         return {
@@ -8782,6 +9139,7 @@ def create_app(data_root: str) -> FastAPI:
                 out.setdefault(name, []).append(np.asarray(v, dtype=np.float32))
         return out
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _object_search(location_id, names, exclude_ids, limit):
         """The cascade: embed the selected marked objects (positives) + the location's
         negatives, scan the DINOv2 region index, and rank/ localize candidates. Returns
@@ -8885,6 +9243,7 @@ def create_app(data_root: str) -> FastAPI:
             ]
         return cards, False
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/locations/{location_id}/object-search')
     def api_object_search(location_id: int, body: Optional[ObjectSearchBody] = None,
                           names: List[str] = Query(default=[]), limit: int = 12):
@@ -8902,6 +9261,7 @@ def create_app(data_root: str) -> FastAPI:
         cards, needs = _object_search(location_id, sel, exclude_ids, max(1, min(limit, 48)))
         return {'results': cards, 'cards': cards, 'needs_object_index': needs}
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/locations/{location_id}/object-search/reject')
     def api_object_search_reject(location_id: int, body: ObjectRejectBody):
         """A rejected result's localized region(s) become location-specific NEGATIVES

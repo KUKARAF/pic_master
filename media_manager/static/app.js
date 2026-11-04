@@ -2485,6 +2485,8 @@
       if (e.target === overlay) close();
     });
 
+    var navSearchBtn = document.getElementById('nav-search-btn');
+    if (navSearchBtn) navSearchBtn.addEventListener('click', open);
     if (navInput) {
       navInput.addEventListener('focus', function (e) {
         e.target.blur();
@@ -4021,6 +4023,7 @@
   const searchRegionState = wireBoxDraw(searchRegionBtn, '✏️', '🔲', function (bbox) {
     openMatchesAsQueue({
       el: searchRegionBtn,
+      // DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
       url: '/api/files/' + fileId + '/region-search',
       fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
       label: 'Region matches',

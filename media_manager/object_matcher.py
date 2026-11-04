@@ -1,3 +1,5 @@
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+# (object search geometric verification)
 """
 object_matcher.py -- local-feature geometric verification for "same physical object?"
 

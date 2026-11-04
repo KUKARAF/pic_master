@@ -25,6 +25,13 @@ PATH_EMBED_BBOX = "embed_bbox"
 PATH_NORMALIZE_FACES = "normalize_faces"
 PATH_EMBED_IMAGE = "embed_image"
 PATH_EMBED_TEXT = "embed_text"
+# SigLIP 2 + DINOv2 embedding pipeline (embedders.py). Batched: one request carries N
+# images, decoded ONCE on the worker and fed to both models (embedders.embed_shared).
+PATH_EMBED_BOTH_BATCH = "embed_both_batch"
+PATH_EMBED_SIGLIP_TEXT = "embed_siglip_text"
+# Bumped when the embed_both_batch / embed_siglip_text wire shape changes. Replies carry it as
+# "proto" so a client can tell a stale (un-redeployed) worker from a real failure.
+EMBED_PROTOCOL_VERSION = 1
 PATH_DETECT_OBJECTS = "detect_objects"
 PATH_ESTIMATE_AGE = "estimate_age"
 # Per-tag model TRAINING (job/poll pattern) + fine-tuned inference. Unlike the
@@ -60,6 +67,8 @@ ALL_PATHS = [
     PATH_NORMALIZE_FACES,
     PATH_EMBED_IMAGE,
     PATH_EMBED_TEXT,
+    PATH_EMBED_BOTH_BATCH,
+    PATH_EMBED_SIGLIP_TEXT,
     PATH_DETECT_OBJECTS,
     PATH_ESTIMATE_AGE,
     PATH_TRAIN_CREATE,
@@ -118,6 +127,20 @@ ALL_PATHS = [
 #   PATH_EMBED_TEXT
 #     req:  {"text": <str>}
 #     resp: {"embedding": <bytes: float32 (D,)>, "error": <None|str>}
+#
+#   PATH_EMBED_BOTH_BATCH
+#     req:  {"items": [{"name": <str>, "image": <bytes: encoded image>}, ...]}
+#     resp: {"results": [{"name": <str>, "siglip": <bytes float32 (D1,)>|None,
+#                         "dino": <bytes float32 (D2,)>|None, "error": <None|str>}, ...],
+#                         # SAME length/order as req items; a bad image sets only its own error
+#            "siglip_model": <str>, "dino_model": <str>,
+#            "gpu_seconds": <float: worker time in decode+inference for this batch>,
+#            "proto": EMBED_PROTOCOL_VERSION, "error": <None|str: whole-batch failure>}
+#
+#   PATH_EMBED_SIGLIP_TEXT
+#     req:  {"text": <str>}
+#     resp: {"embedding": <bytes float32 (D1,)>|None, "siglip_model": <str>,
+#            "proto": EMBED_PROTOCOL_VERSION, "error": <None|str>}
 #
 #   PATH_DETECT_OBJECTS
 #     req:  {"name": <str>, "image": <bytes>, "vocab": [<str>, ...]|None}

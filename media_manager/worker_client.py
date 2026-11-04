@@ -20,11 +20,13 @@ Per this project's "no silent failures" rule, every fallback logs a warning
 explaining *why* it fell back; nothing is swallowed quietly.
 """
 import io
+import contextlib
 import os
 import sys
 import time
 import threading
 import collections
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import cv2
@@ -146,7 +148,7 @@ class WorkerClient:
     # -- Request dispatch ---------------------------------------------------
 
     def request(self, path: str, req_dict: dict, timeout: float = 120,
-                retries: int = _MAX_RETRIES) -> dict:
+                retries: int = _MAX_RETRIES, concurrent: bool = False) -> dict:
         """Send a request to the worker and return the unpacked response dict.
 
         Retries up to ``retries`` times, dropping the (possibly dead) link between
@@ -165,7 +167,7 @@ class WorkerClient:
         last_exc = None
         for attempt in range(retries + 1):
             try:
-                return self._request_once(path, req_dict, timeout)
+                return self._request_once(path, req_dict, timeout, concurrent)
             except (WorkerUnavailable, WorkerError) as exc:
                 last_exc = exc
                 if attempt < retries:
@@ -174,12 +176,16 @@ class WorkerClient:
                     time.sleep(_RETRY_BACKOFF * (attempt + 1))
         raise last_exc
 
-    def _request_once(self, path: str, req_dict: dict, timeout: float) -> dict:
+    def _request_once(self, path: str, req_dict: dict, timeout: float,
+                      concurrent: bool = False) -> dict:
         base = worker_config.normalize_url(self.address())
         url = f"{base}/{path}"
         # One request at a time (matches the old single-link semantics and keeps
         # the worker's single-process model lock from being fought over).
-        with self._lock:
+        # concurrent=True (embed_both pipelining) skips the one-at-a-time lock; the worker
+        # still serializes inference with its own models.lock, so this only overlaps
+        # upload/decode of the next batch with GPU work on the current one.
+        with (contextlib.nullcontext() if concurrent else self._lock):
             try:
                 resp = self._session.post(
                     url,
@@ -360,6 +366,7 @@ class WorkerClient:
         _check_algo(resp, algo)
         return np.frombuffer(resp["windows"], np.int8).reshape(resp["n"], dim).copy()
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def region_query(self, image_bytes: bytes, box, algo: str, name: str = "<query>"):
         """DINOv2 query vectors float32 (3, DIM) for one drawn region (instance-level region
         search). `box` is [x1,y1,x2,y2] in EXIF-upright image px. Raises WorkerError on
@@ -370,6 +377,7 @@ class WorkerClient:
         _check_algo(resp, algo)
         return np.frombuffer(resp["vecs"], np.float32).reshape(resp["n"], -1).copy()
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def region_index(self, image_bytes: bytes, algo: str, dim: int, name: str = "<image>"):
         """Region-index payload for one image: (windows int8 (n, dim), sift pts float16 (k, 2),
         sift desc uint8 (k, 128)). Same failure contract as region_query."""
@@ -630,6 +638,213 @@ class RemoteCLIPIndexer:
     def model_id(*args, **kwargs):
         from .indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
         return CLIPIndexer.model_id(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# SigLIP 2 + DINOv2 embedding offload (embedders.py on the worker).
+# ---------------------------------------------------------------------------
+
+_EMBED_BATCH_TIMEOUT = 600
+
+
+def _check_embed_proto(resp: dict, what: str) -> None:
+    """Raise a clear WorkerError for a worker that predates / mismatches the embed protocol."""
+    if resp.get("proto") != worker_protocol.EMBED_PROTOCOL_VERSION:
+        raise WorkerError(
+            f"{what}: worker embed protocol {resp.get('proto')!r} != expected "
+            f"{worker_protocol.EMBED_PROTOCOL_VERSION} -- worker needs redeploy")
+
+
+def _embed_request(client, path: str, req: dict, what: str, concurrent: bool = False) -> dict:
+    try:
+        resp = client.request(path, req, timeout=_EMBED_BATCH_TIMEOUT, concurrent=concurrent)
+    except WorkerError as exc:
+        if "no handler" in str(exc):  # HTTP 404 from an old worker
+            raise WorkerError(f"{what}: worker needs redeploy (does not know {path!r})") from exc
+        raise
+    _check_embed_proto(resp, what)
+    return resp
+
+
+def _item_to_named_bytes(item, i: int):
+    """str path | (name, bytes) | PIL image -> (name, encoded bytes)."""
+    if isinstance(item, str):
+        with open(item, "rb") as f:
+            return os.path.basename(item), f.read()
+    if isinstance(item, (tuple, list)) and len(item) == 2:
+        return str(item[0]), bytes(item[1])
+    buf = io.BytesIO()  # PIL image (lossless so the worker sees the same pixels)
+    item.save(buf, format="PNG")
+    return f"<pil:{i}>.png", buf.getvalue()
+
+
+class BothResult:
+    """Result of :func:`embed_both`; every list is aligned with the input items."""
+
+    def __init__(self, n: int):
+        self.siglip = [None] * n   # np.float32 (D1,) or None
+        self.dino = [None] * n     # np.float32 (D2,) or None
+        self.errors = [None] * n   # str or None
+        self.siglip_model = None
+        self.dino_model = None
+        self.gpu_seconds = 0.0     # summed worker decode+inference time over all batches
+        self.wall_seconds = 0.0    # client wall clock (wall - gpu ~ transport/overhead)
+        self.n_batches = 0
+
+
+def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=None) -> BothResult:
+    """SigLIP 2 + DINOv2 vectors for ``items`` via the worker, ``workers`` batches in flight.
+
+    ``items``: str paths, (name, bytes) tuples, or PIL images. Per-item failures give
+    ``None`` + an error string; a transport/worker-level failure raises WorkerError (a stale
+    worker says "worker needs redeploy"). ``on_batch(done_items, total)`` is called as
+    batches complete (from the calling thread).
+    """
+    items = list(items)
+    n = len(items)
+    out = BothResult(n)
+    t0 = time.time()
+    bs = max(1, int(batch_size))
+    starts = list(range(0, n, bs))
+
+    def run_batch(start):
+        chunk = items[start:start + bs]
+        payload, errs = [], {}
+        for j, it in enumerate(chunk):
+            try:
+                name, data = _item_to_named_bytes(it, start + j)
+            except (OSError, ValueError) as exc:  # unreadable file: isolate to this item
+                errs[j] = f"read failed: {exc}"
+                continue
+            payload.append((j, {"name": name, "image": data}))
+        results = []
+        gpu = 0.0
+        models = (None, None)
+        if payload:
+            client.record("embed_both", f"{len(payload)} items")
+            resp = _embed_request(client, worker_protocol.PATH_EMBED_BOTH_BATCH,
+                                  {"items": [p for _, p in payload]}, "embed_both",
+                                  concurrent=True)
+            if resp.get("error"):
+                raise WorkerError(resp["error"])
+            results = resp.get("results") or []
+            if len(results) != len(payload):
+                raise WorkerError(f"embed_both: worker returned {len(results)} results "
+                                  f"for {len(payload)} items")
+            gpu = float(resp.get("gpu_seconds") or 0.0)
+            models = (resp.get("siglip_model"), resp.get("dino_model"))
+        return start, payload, results, errs, gpu, models
+
+    def merge(res):
+        start, payload, results, errs, gpu, models = res
+        for j, msg in errs.items():
+            out.errors[start + j] = msg
+        for (j, _), r in zip(payload, results):
+            k = start + j
+            if r.get("error") or r.get("siglip") is None or r.get("dino") is None:
+                out.errors[k] = r.get("error") or "no embedding returned"
+                continue
+            out.siglip[k] = np.frombuffer(r["siglip"], dtype=np.float32).copy()
+            out.dino[k] = np.frombuffer(r["dino"], dtype=np.float32).copy()
+        out.gpu_seconds += gpu
+        out.n_batches += 1
+        if models[0]:
+            out.siglip_model, out.dino_model = models
+
+    done = 0
+    if starts:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            futs = [pool.submit(run_batch, s) for s in starts]  # all submitted; pool bounds in-flight
+            try:
+                for f in futs:  # consume in order -> deterministic progress
+                    merge(f.result())
+                    done = min(n, done + bs)
+                    if on_batch:
+                        on_batch(done, n)
+            except BaseException:
+                for f in futs:
+                    f.cancel()
+                raise
+    out.wall_seconds = time.time() - t0
+    return out
+
+
+class _RemoteSharedEmbedder:
+    """Common bits of the SigLIP/DINO proxies: both ride on one embed_both batch."""
+    _which = None  # "siglip" | "dino"
+
+    def __init__(self, client: WorkerClient, batch_size: int = 16, workers: int = 3):
+        self.client = client
+        self.batch_size = batch_size
+        self.workers = workers
+        self._model_id = None
+
+    def _run(self, items):
+        res = embed_both(self.client, items, self.batch_size, self.workers)
+        self.siglip_model, self.dino_model = res.siglip_model, res.dino_model
+        if res.siglip_model:
+            self._model_id = getattr(res, self._which + "_model")
+        return res
+
+    def embed_images(self, paths):
+        paths = list(paths)
+        res = self._run(paths)
+        vecs = getattr(res, self._which)
+        ok = [v for v in vecs if v is not None]
+        failed = [(p, e) for p, e, v in zip(paths, res.errors, vecs) if v is None]
+        emb = np.stack(ok).astype(np.float32) if ok else np.empty((0,), dtype=np.float32)
+        return emb, failed
+
+    def embed_pil_images(self, images):
+        images = list(images)
+        if not images:
+            return np.empty((0,), dtype=np.float32)
+        res = self._run(images)
+        bad = [(i, e) for i, (e, v) in enumerate(zip(res.errors, getattr(res, self._which)))
+               if v is None]
+        if bad:
+            raise WorkerError(f"embed_pil_images failed for {bad[:3]}")
+        return np.stack(getattr(res, self._which)).astype(np.float32)
+
+    def model_id(self) -> str:
+        """Model id the WORKER reports (so DB rows record what actually ran). Cached; the
+        first call on a fresh proxy costs one text probe (siglip) or tiny embed (dino)."""
+        if self._model_id is None:
+            self._probe_model_id()
+        return self._model_id
+
+    def _probe_model_id(self):
+        raise NotImplementedError
+
+
+class RemoteSigLIPEmbedder(_RemoteSharedEmbedder):
+    """Drop-in for :class:`embedders.SigLIP2Embedder` backed by the worker."""
+    _which = "siglip"
+
+    def embed_text(self, text):
+        self.client.record("embed_siglip_text", text[:40])
+        resp = _embed_request(self.client, worker_protocol.PATH_EMBED_SIGLIP_TEXT,
+                              {"text": text}, "embed_siglip_text")
+        if resp.get("error") or resp.get("embedding") is None:
+            raise WorkerError(resp.get("error") or "no embedding returned")
+        if resp.get("siglip_model"):
+            self._model_id = resp["siglip_model"]
+        return np.frombuffer(resp["embedding"], dtype=np.float32).copy()
+
+    def _probe_model_id(self):
+        self.embed_text("a")
+
+
+class RemoteDINOEmbedder(_RemoteSharedEmbedder):
+    """Drop-in for :class:`embedders.DINOv2Embedder` backed by the worker."""
+    _which = "dino"
+
+    def _probe_model_id(self):
+        # No text path for DINO; a 1x1 image through embed_both reports both model ids.
+        from PIL import Image  # hook-allow: lazy — only for the probe
+        res = self._run([Image.new("RGB", (32, 32))])
+        if self._model_id is None:
+            raise WorkerError(f"dino model id probe failed: {res.errors[:1]}")
 
 
 class RemoteAgeEstimator:
