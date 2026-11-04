@@ -603,16 +603,45 @@ def _get_dino_embedder():
     return _dino_embedder_local
 
 
-def _local_embed_shared(embedders, paths):
-    """Local one-decode-pass SigLIP+DINO (embedders.embed_shared). Isolated so tests can fake it."""
+def _local_embed_shared(embedders, paths, stats=None):
+    """Local one-decode-pass SigLIP+DINO (embedders.embed_shared). Isolated so tests can fake it.
+    `stats` (dict) is filled with decode/gpu/lock-wait seconds by the real implementation."""
     from media_manager.embedders import embed_shared  # hook-allow: lazy -- pulls in torch
-    return embed_shared(embedders, paths)
+    return embed_shared(embedders, paths, stats=stats)
 
 
 # Set by create_app (like _worker_client); lets _embed_pair_chunk hand the data root to the worker
 # client for shared-disk mode. _last_transport records the mode of the most recent chunk.
 _embed_data_root = None
-_last_transport = {'mode': None}
+_last_transport = {'mode': None, 'timing': None}
+
+
+def _speedtest_breakdown(wall, transport_mode, gpu_s, timing):
+    """Speed-test breakdown. gpu_seconds is time inside forward passes under the (single) GPU
+    lock, so gpu_busy = gpu_seconds / wall is a true fraction (<= 1). decode_seconds is summed
+    over decode THREADS (it overlaps itself and the GPU), so it is reported as an average thread
+    count (decode_threads_avg = decode_seconds / wall), not as a share of wall."""
+    out = {'wall_seconds': round(wall, 3), 'transport_mode': transport_mode,
+           'gpu_seconds': round(gpu_s, 3) if gpu_s is not None else None,
+           'decode_transport_seconds': round(max(wall - gpu_s, 0.0), 3) if gpu_s is not None else None,
+           'gpu_busy_pct': None, 'decode_seconds': None, 'decode_threads_avg': None,
+           'lock_wait_seconds': None, 'verdict': None}
+    if gpu_s is None or not timing:
+        return out
+    gpu_busy = min(gpu_s / wall, 1.0)
+    dec = timing.get('decode_seconds') or 0.0
+    out.update(gpu_busy_pct=round(100 * gpu_busy, 1), decode_seconds=round(dec, 3),
+               decode_threads_avg=round(dec / wall, 2),
+               lock_wait_seconds=round(timing.get('lock_wait_seconds') or 0.0, 3))
+    if gpu_busy >= 0.8:
+        out['verdict'] = f'GPU-bound (GPU busy {gpu_busy * 100:.0f}% of wall)'
+    elif dec > gpu_s:
+        out['verdict'] = (f'decode-bound (GPU busy only {gpu_busy * 100:.0f}%; '
+                          f'~{dec / wall:.1f} decode threads busy on average)')
+    else:
+        out['verdict'] = (f'neither decode nor GPU saturated (GPU busy {gpu_busy * 100:.0f}%, '
+                          f'~{dec / wall:.1f} decode threads): look at disk IO / transport / request ramp-up')
+    return out
 
 
 def _embed_pair_chunk(sig, dino, paths):
@@ -627,12 +656,17 @@ def _embed_pair_chunk(sig, dino, paths):
         res = worker_client.embed_both(_worker_client, paths, batch_size=sig.batch_size,
                                        workers=sig.workers, data_root=_embed_data_root)
         _last_transport['mode'] = res.mode
+        _last_transport['timing'] = {
+            'decode_seconds': res.decode_seconds, 'gpu_seconds': res.gpu_seconds,
+            'lock_wait_seconds': res.lock_wait_seconds, 'workers': res.workers}
         pairs = [(res.siglip[i], res.dino[i]) if res.siglip[i] is not None and res.dino[i] is not None
                  else None for i in range(len(paths))]
         models = (res.siglip_model, res.dino_model) if res.siglip_model else None
         return pairs, list(res.errors), res.gpu_seconds, models
     _last_transport['mode'] = 'local'
-    (sig_mat, dino_mat), failed = _local_embed_shared([sig, dino], paths)
+    stats = {}
+    (sig_mat, dino_mat), failed = _local_embed_shared([sig, dino], paths, stats)
+    _last_transport['timing'] = dict(stats, workers=1) if stats else None
     failed_msgs = dict(failed)
     pairs, errs, k = [], [], 0
     for p in paths:
@@ -643,7 +677,7 @@ def _embed_pair_chunk(sig, dino, paths):
             pairs.append((sig_mat[k], dino_mat[k]))
             errs.append(None)
             k += 1
-    return pairs, errs, None, None
+    return pairs, errs, (stats.get('gpu_seconds') if stats else None), None
 
 
 _age_estimator = None
@@ -4687,8 +4721,12 @@ def create_app(data_root: str) -> FastAPI:
     # One decode pass feeds both models (embed_shared locally, embed_both on the worker).
     # ------------------------------------------------------------------
     pair_job = {'running': False, 'done': 0, 'total': 0, 'failed': 0, 'error': None,
-                'img_per_sec': 0.0, 'eta_seconds': None, 'transport_mode': None}
-    PAIR_CHUNK = 192  # images per write-back chunk: flat memory + frequent resumable commits
+                'img_per_sec': 0.0, 'eta_seconds': None, 'transport_mode': None,
+                'gpu_busy_pct': None, 'db_write_pct': None, 'decode_threads_avg': None}
+    # Images per embed+write-back chunk. Big enough that the worker pipeline (several requests
+    # in flight) stays full; the DB write-back of chunk N overlaps the embedding of chunk N+1
+    # on a writer thread, and each chunk is ONE commit (still resumable per chunk).
+    PAIR_CHUNK = max(1, int(os.environ.get('MEDIA_EMBED_CHUNK', 768)))
 
     def _pair_model_ids():
         """(siglip_id, dino_id) for the CURRENT config without loading local models
@@ -4736,56 +4774,132 @@ def create_app(data_root: str) -> FastAPI:
         sig_id, dino_id = sig.model_id(), dino.model_id()
         candidates = _pair_candidates(sig_id, dino_id, include_trashed)
         pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
-                        img_per_sec=0.0, eta_seconds=None, transport_mode=None)
+                        img_per_sec=0.0, eta_seconds=None, transport_mode=None,
+                        gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)
 
         def _run():
-            try:
-                t0 = time.time()
-                t_prev = t0
-                ema_rate = None  # smoothed recent img/s (excludes the model-load start-up cost)
-                done = failed = 0
-                for start in range(0, len(candidates), PAIR_CHUNK):
-                    chunk = candidates[start:start + PAIR_CHUNK]
-                    live = []
-                    for fid, rel, need_s, need_d in chunk:
-                        abs_path = _live_abs_path(fid, rel)
-                        if abs_path is None:
-                            errors.log(rel, 'siglip+dino: file not on disk')
+            import queue as _queue
+            from concurrent.futures import ThreadPoolExecutor
+            t0 = time.time()
+            st = {'done': 0, 'failed': 0, 'db_s': 0.0, 'gpu_s': 0.0, 'decode_s': 0.0,
+                  't_prev': t0, 'ema': None}
+            lock = threading.Lock()
+            wq = _queue.Queue(maxsize=2)  # bounded: embedding can run at most 2 chunks ahead of the DB
+            werr = []
+
+            def _resolve(chunk):
+                """Resolve on-disk paths for a chunk (runs one chunk ahead of the embedder)."""
+                live, missing = [], []
+                for fid, rel, need_s, need_d in chunk:
+                    abs_path = _live_abs_path(fid, rel)
+                    if abs_path is None:
+                        missing.append(rel)
+                    else:
+                        live.append((fid, abs_path, need_s, need_d))
+                return live, missing
+
+            def _store(item):
+                """DB write-back of one chunk: ONE transaction/commit; on failure fall back to
+                per-row so a single bad row only costs itself."""
+                live, pairs, errs, missing, models, n_chunk, timing = item
+                w_sig, w_dino = (models or (None, None))
+                failed = 0
+                for rel in missing:
+                    errors.log(rel, 'siglip+dino: file not on disk')
+                    failed += 1
+                srows, drows, ok = [], [], []
+                for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
+                    if pair is None:
+                        errors.log(abs_path, f'siglip+dino: {err or "no embedding returned"}')
+                        failed += 1
+                        continue
+                    if need_s:
+                        srows.append((fid, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id))
+                    if need_d:
+                        drows.append((fid, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id))
+                    ok.append(abs_path)
+                t_db = time.perf_counter()
+                try:
+                    db.insert_pair_embeddings_batch(srows, drows)
+                except Exception as exc:  # hook-allow: broad -- batch rolled back; isolate per row
+                    traceback.print_exc()
+                    for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
+                        if pair is None:
+                            continue
+                        try:
+                            db.insert_pair_embeddings_batch(
+                                [r for r in srows if r[0] == fid], [r for r in drows if r[0] == fid])
+                        except Exception as exc2:  # hook-allow: broad -- per-item; one bad row must not sink the job
+                            errors.log(abs_path, f'siglip+dino: store failed: {exc2}')
                             failed += 1
-                        else:
-                            live.append((fid, abs_path, need_s, need_d))
+                db_s = time.perf_counter() - t_db
+                now = time.time()
+                with lock:
+                    st['failed'] += failed
+                    st['done'] += n_chunk
+                    st['db_s'] += db_s
+                    if timing:
+                        st['gpu_s'] += timing.get('gpu_seconds') or 0.0
+                        st['decode_s'] += timing.get('decode_seconds') or 0.0
+                    chunk_rate = n_chunk / max(now - st['t_prev'], 1e-9)
+                    st['t_prev'] = now
+                    # ETA from the recent speed, not the average since start: the average
+                    # includes model load/warm-up and overestimates the time left early on.
+                    st['ema'] = chunk_rate if st['ema'] is None else 0.8 * st['ema'] + 0.2 * chunk_rate
+                    wall = max(now - t0, 1e-9)
+                    ema = st['ema']
+                    pair_job.update(
+                        done=st['done'], failed=st['failed'], img_per_sec=round(ema, 2),
+                        eta_seconds=round((len(candidates) - st['done']) / ema, 1) if ema > 0 else None,
+                        db_write_pct=round(100 * min(st['db_s'] / wall, 1.0), 1),
+                        gpu_busy_pct=round(100 * min(st['gpu_s'] / wall, 1.0), 1) if st['gpu_s'] else None,
+                        decode_threads_avg=round(st['decode_s'] / wall, 2) if st['decode_s'] else None)
+
+            def _writer():
+                try:
+                    while True:
+                        item = wq.get()
+                        if item is None:
+                            return
+                        if werr:
+                            continue  # writer already failed: drain so the producer never blocks
+                        try:
+                            _store(item)
+                        except Exception as exc:  # hook-allow: broad -- surfaced via the job error
+                            traceback.print_exc()
+                            werr.append(exc)
+                finally:
+                    db.close()  # this thread's per-thread sqlite connections
+                    errors.close()
+
+            writer = threading.Thread(target=_writer, name='pair-writer', daemon=True)
+            writer.start()
+            resolver = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pair-resolve')
+            try:
+                chunks = [candidates[i:i + PAIR_CHUNK] for i in range(0, len(candidates), PAIR_CHUNK)]
+                nxt = resolver.submit(_resolve, chunks[0]) if chunks else None
+                for idx, chunk in enumerate(chunks):
+                    live, missing = nxt.result()
+                    nxt = resolver.submit(_resolve, chunks[idx + 1]) if idx + 1 < len(chunks) else None
+                    if werr:
+                        raise werr[0]
+                    pairs, errs, models, timing = [], [], None, None
                     if live:
                         pairs, errs, _gpu, models = _embed_pair_chunk(sig, dino, [x[1] for x in live])
                         pair_job['transport_mode'] = _last_transport['mode']
-                        w_sig, w_dino = (models or (None, None))
-                        for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
-                            if pair is None:
-                                errors.log(abs_path, f'siglip+dino: {err or "no embedding returned"}')
-                                failed += 1
-                                continue
-                            try:
-                                if need_s:
-                                    db.insert_siglip_embedding(
-                                        fid, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id)
-                                if need_d:
-                                    db.insert_dino_embedding(
-                                        fid, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id)
-                            except Exception as exc:  # hook-allow: broad -- per-item; one bad row must not sink the job
-                                errors.log(abs_path, f'siglip+dino: store failed: {exc}')
-                                failed += 1
-                    done += len(chunk)
-                    now = time.time()
-                    chunk_rate = len(chunk) / max(now - t_prev, 1e-9)
-                    t_prev = now
-                    # ETA from the recent speed, not the average since start: the average
-                    # includes model load/warm-up and overestimates the time left early on.
-                    ema_rate = chunk_rate if ema_rate is None else 0.8 * ema_rate + 0.2 * chunk_rate
-                    pair_job.update(done=done, failed=failed, img_per_sec=round(ema_rate, 2),
-                                    eta_seconds=round((len(candidates) - done) / ema_rate, 1) if ema_rate > 0 else None)
+                        timing = _last_transport.get('timing')
+                    wq.put((live, pairs, errs, missing, models, len(chunk), timing))
             except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
                 traceback.print_exc()
                 pair_job['error'] = f'{exc.__class__.__name__}: {exc}'
             finally:
+                # Chunks already embedded still get written (resumability); then join the writer.
+                wq.put(None)
+                writer.join()
+                resolver.submit(db.close).result()
+                resolver.shutdown()
+                if werr and not pair_job['error']:
+                    pair_job['error'] = f'{werr[0].__class__.__name__}: {werr[0]}'
                 pair_job['running'] = False
 
         _spawn_job(_run)
@@ -4794,7 +4908,8 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/siglip-dino/status')
     def api_siglip_dino_status():
         out = {k: pair_job[k] for k in ('running', 'done', 'total', 'failed', 'error',
-                                         'img_per_sec', 'eta_seconds', 'transport_mode')}
+                                         'img_per_sec', 'eta_seconds', 'transport_mode',
+                                         'gpu_busy_pct', 'db_write_pct', 'decode_threads_avg')}
         out['device'] = _ml_device_label()
         out['pending'] = None
         if not pair_job['running']:
@@ -4849,6 +4964,7 @@ def create_app(data_root: str) -> FastAPI:
         t0 = time.perf_counter()
         pairs, _errs, gpu_s, models = _embed_pair_chunk(sig, dino, sample)
         transport_mode = _last_transport['mode']
+        timing = _last_transport.get('timing')
         wall = max(time.perf_counter() - t0, 1e-9)
         ok = sum(1 for p in pairs if p is not None)
         if ok == 0:
@@ -4869,13 +4985,7 @@ def create_app(data_root: str) -> FastAPI:
             'transport_mode': transport_mode,
             'models': {'siglip': (models[0] if models else None) or sig_id,
                        'dino': (models[1] if models else None) or dino_id},
-            'breakdown': {
-                'wall_seconds': round(wall, 3),
-                'transport_mode': transport_mode,
-                'gpu_seconds': round(gpu_s, 3) if gpu_s is not None else None,
-                # With pipelined batches summed gpu_seconds can exceed wall -> clamp at 0.
-                'decode_transport_seconds': round(max(wall - gpu_s, 0.0), 3) if gpu_s is not None else None,
-            },
+            'breakdown': _speedtest_breakdown(wall, transport_mode, gpu_s, timing),
         }
 
     # ---- search over the SigLIP 2 / DINOv2 spaces ----------------------------------

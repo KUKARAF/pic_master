@@ -72,7 +72,7 @@ def test_rejected_files_never_read(root, tmp_path, monkeypatch):
     secret.write_bytes(b"\x09s")
     seen = []
     monkeypatch.setattr(worker_server, "_embed_shared",
-                        lambda e, src: (seen.extend(src), fake_embed_shared(e, src))[1])
+                        lambda e, src, stats=None: (seen.extend(src), fake_embed_shared(e, src))[1])
     _paths(root, ["../secret.jpg", str(secret), "sub/1.jpg"])
     assert seen == [os.path.realpath(root / "sub" / "1.jpg")]
 

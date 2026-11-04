@@ -95,6 +95,9 @@
       if (d.device) s += ' · ' + d.device;
       if (countKey && d[countKey] != null) s += ' · ' + d[countKey] + ' ' + (countLabel || 'matched');
       if (rate && rate > 0) s += ' · ~' + Math.round(rate * 60) + '/min';
+      // Pipeline diagnostics some jobs report (SigLIP+DINO index): where the time goes.
+      if (d.gpu_busy_pct != null) s += ' · GPU busy ' + Math.round(d.gpu_busy_pct) + '%';
+      if (d.db_write_pct != null) s += ' · DB write ' + Math.round(d.db_write_pct) + '%';
       // ETA: prefer a server-provided estimate (e.g. the imdb index load),
       // else derive from the smoothed rate. Only shown when finite and work remains.
       var eta = d.eta_seconds != null ? d.eta_seconds

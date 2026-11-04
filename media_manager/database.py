@@ -1357,6 +1357,41 @@ class Database(ThreadLocalDB):
         self.conn.commit()
         setattr(self, f'_{space}_ver', getattr(self, f'_{space}_ver') + 1)
 
+    def insert_pair_embeddings_batch(self, siglip_rows=(), dino_rows=(), frame_index=0):
+        """Upsert many SigLIP / DINO rows in ONE transaction with ONE commit (the per-row
+        commit of insert_*_embedding is an fsync'd WAL commit each -- hundreds per second
+        during a bulk index). Rows are (file_id, embedding_bytes, model). All-or-nothing: on
+        error the transaction is rolled back and re-raised (callers may retry per row).
+        Version counters are bumped once per space, after the commit."""
+        siglip_rows, dino_rows = list(siglip_rows), list(dino_rows)
+        if not siglip_rows and not dino_rows:
+            return
+        now = int(time.time())
+        cursor = self.conn.cursor()
+        try:
+            for space, rows in (('siglip', siglip_rows), ('dino', dino_rows)):
+                if rows:
+                    cursor.executemany(f'''
+                        INSERT OR REPLACE INTO {self._SPACE_TABLES[space]}
+                            (file_id, frame_index, embedding, model, indexed_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', [(fid, frame_index, emb, model, now) for fid, emb, model in rows])
+            self.conn.commit()
+        except Exception:  # hook-allow: broad -- roll back the whole batch, then re-raise
+            self.conn.rollback()
+            raise
+        for space, rows in (('siglip', siglip_rows), ('dino', dino_rows)):
+            if rows:
+                setattr(self, f'_{space}_ver', getattr(self, f'_{space}_ver') + 1)
+
+    def insert_siglip_embeddings_batch(self, rows, frame_index=0):
+        """rows: (file_id, embedding_bytes, model); one transaction, one commit."""
+        self.insert_pair_embeddings_batch(siglip_rows=rows, frame_index=frame_index)
+
+    def insert_dino_embeddings_batch(self, rows, frame_index=0):
+        """rows: (file_id, embedding_bytes, model); one transaction, one commit."""
+        self.insert_pair_embeddings_batch(dino_rows=rows, frame_index=frame_index)
+
     def _space_get_all(self, space):
         cursor = self.conn.cursor()
         cursor.execute(f'''

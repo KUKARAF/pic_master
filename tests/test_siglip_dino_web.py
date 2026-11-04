@@ -40,7 +40,7 @@ def env(tmp_path, monkeypatch):
     os.makedirs(tmp_path / '.media')
     calls = {'chunks': [], 'bad': set(), 'raise_after': None}
 
-    def fake_shared(embs, paths):
+    def fake_shared(embs, paths, stats=None):
         calls['chunks'].append(list(paths))
         if calls['raise_after'] is not None and len(calls['chunks']) > calls['raise_after']:
             raise RuntimeError('boom: no GPU')
@@ -234,3 +234,61 @@ def test_embed_stats(env):
     app, c, db, *_ = env
     d = c.get('/api/embed-stats').json()
     assert set(d['spaces']) == {'clip', 'siglip', 'dino'} and d['library_images'] == 10
+
+
+# ---- writer thread / chunk overlap ------------------------------------------------
+
+@pytest.fixture
+def small_chunk(monkeypatch):
+    """Must be requested BEFORE `env` so create_app reads MEDIA_EMBED_CHUNK=3."""
+    monkeypatch.setenv('MEDIA_EMBED_CHUNK', '3')
+
+
+def test_chunked_writer_order_and_status(small_chunk, env):
+    app, c, db, errors, manual, ids, calls, _ = env
+    c.post('/api/siglip-dino/start')
+    st = _wait(c)
+    assert st['error'] is None and st['done'] == 10 and st['failed'] == 0
+    assert [len(ch) for ch in calls['chunks']] == [3, 3, 3, 1]  # chunks embedded in order
+    flat = [os.path.basename(p) for ch in calls['chunks'] for p in ch]
+    assert flat == [f'img{i}.jpg' for i in range(10)]
+    assert db.count_siglip_indexed() == 10 and db.count_dino_indexed() == 10
+    assert st['db_write_pct'] is not None  # instrumentation present in the status
+
+
+def test_chunked_resume_after_midway_error(small_chunk, env):
+    app, c, db, errors, manual, ids, calls, _ = env
+    calls['raise_after'] = 1  # 1st chunk ok, 2nd raises
+    c.post('/api/siglip-dino/start')
+    st = _wait(c)
+    assert 'boom: no GPU' in st['error']
+    assert db.count_siglip_indexed() == 3 and st['done'] == 3  # the finished chunk was committed
+    calls['raise_after'] = None
+    assert c.post('/api/siglip-dino/start').json()['total'] == 7
+    assert _wait(c)['error'] is None and db.count_siglip_indexed() == 10
+
+
+def test_writer_error_surfaces_and_joins(small_chunk, env, monkeypatch):
+    app, c, db, errors, manual, ids, calls, tmp = env
+    os.remove(tmp / 'img1.jpg')
+    monkeypatch.setattr(errors, 'log', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('errlog down')))
+    c.post('/api/siglip-dino/start')
+    st = _wait(c)
+    assert st['running'] is False and 'errlog down' in (st['error'] or '')
+
+
+def test_batch_failure_falls_back_per_row(small_chunk, env, monkeypatch):
+    app, c, db, errors, manual, ids, calls, _ = env
+    real = db.insert_pair_embeddings_batch
+    n = {'calls': 0}
+
+    def flaky(s, d, *a, **k):
+        n['calls'] += 1
+        if len(s) > 1:
+            raise RuntimeError('batch boom')
+        return real(s, d, *a, **k)
+
+    monkeypatch.setattr(db, 'insert_pair_embeddings_batch', flaky)
+    c.post('/api/siglip-dino/start')
+    st = _wait(c)
+    assert st['error'] is None and st['failed'] == 0 and db.count_siglip_indexed() == 10

@@ -306,7 +306,11 @@
         s += ' → ~' + dur(d.est_seconds_total) + ' for the whole library of ' + d.library_total.toLocaleString()
           + '; ' + dur(d.est_seconds_remaining) + ' remaining (' + d.remaining.toLocaleString() + ' photos)';
         var b = d.breakdown || {};
-        if (b.gpu_seconds != null) s += ' · wall ' + b.wall_seconds + 's = GPU ' + b.gpu_seconds + 's + decode/transport ~' + b.decode_transport_seconds + 's';
+        if (b.gpu_seconds != null) {
+          s += ' · wall ' + b.wall_seconds + 's, GPU busy ' + (b.gpu_busy_pct != null ? b.gpu_busy_pct + '%' : '?') + ' (' + b.gpu_seconds + 's in forward passes)';
+          if (b.decode_threads_avg != null) s += ', ~' + b.decode_threads_avg + ' decode threads busy on average';
+          if (b.verdict) s += ' → ' + b.verdict;
+        }
         if (d.transport_mode === 'paths') s += ' · reading from shared disk';
         else if (d.transport_mode === 'mixed') s += ' · shared disk + uploading some images';
         else if (d.transport_mode === 'upload') s += ' · uploading images';

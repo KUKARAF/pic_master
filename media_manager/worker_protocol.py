@@ -139,7 +139,11 @@ ALL_PATHS = [
 #                         "dino": <bytes float32 (D2,)>|None, "error": <None|str>}, ...],
 #                         # SAME length/order as req items; a bad image sets only its own error
 #            "siglip_model": <str>, "dino_model": <str>,
-#            "gpu_seconds": <float: worker time in decode+inference for this batch>,
+#            "gpu_seconds": <float: time inside forward passes + host sync, under the GPU lock>,
+#            "decode_seconds": <float: decode+preprocess time summed over decode threads>,
+#            "lock_wait_seconds": <float: time blocked waiting for the GPU lock>,
+#            "wall_seconds": <float: worker wall time for this request>,
+#            (the three new fields are optional/additive; absent from older workers)
 #            "proto": EMBED_PROTOCOL_VERSION, "error": <None|str: whole-batch failure>}
 #
 #   PATH_EMBED_SIGLIP_TEXT

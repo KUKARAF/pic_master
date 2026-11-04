@@ -687,15 +687,20 @@ class BothResult:
         self.errors = [None] * n   # str or None
         self.siglip_model = None
         self.dino_model = None
-        self.gpu_seconds = 0.0     # summed worker decode+inference time over all batches
-        self.wall_seconds = 0.0    # client wall clock (wall - gpu ~ transport/overhead)
+        self.gpu_seconds = 0.0     # summed worker time inside forward passes (GPU lock held)
+        self.decode_seconds = 0.0  # summed worker decode+preprocess thread time
+        self.lock_wait_seconds = 0.0  # summed worker time blocked on the GPU lock
+        self.worker_wall_seconds = 0.0  # summed worker per-request wall (overlaps across requests)
+        self.workers = 1           # requests kept in flight (for busy-fraction maths)
+        self.wall_seconds = 0.0    # client wall clock
         self.n_batches = 0
         # 'paths' = worker read the files from the shared disk (no bytes sent), 'upload' = bytes
         # were sent, 'mixed' = some of each (items outside data_root fall back to upload).
         self.mode = "upload"
 
 
-PATHS_BATCH_SIZE = 64          # path-mode batches carry no bytes, so they can be much larger
+PATHS_BATCH_SIZE = int(os.environ.get("MEDIA_EMBED_PATHS_BATCH", 128))  # no bytes sent -> larger requests
+PATHS_WORKERS = int(os.environ.get("MEDIA_EMBED_PATHS_WORKERS", 4))      # requests in flight, path mode
 _PROBE_TTL_NEGATIVE = 300.0    # re-probe a "not visible" answer after this many seconds
 
 
@@ -765,12 +770,14 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
         rels = [_rel_under_root(it, root_real) for it in items]
         if any(r is not None for r in rels):
             bs = max(bs, PATHS_BATCH_SIZE)
+            workers = max(int(workers), PATHS_WORKERS)  # upload mode keeps the caller's count
     n_paths = sum(1 for r in rels if r is not None)
     out.mode = "paths" if n_paths == n and n else ("mixed" if n_paths else "upload")
     if n:
         print(f"[worker-client] embed_both: {n} items, mode={out.mode} "
               f"({n_paths} via shared disk), batch_size={bs}", flush=True)
     starts = list(range(0, n, bs))
+    out.workers = max(1, min(int(workers), len(starts) or 1))
 
     def upload_part(idxs, errs):
         payload = []
@@ -819,6 +826,7 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
             if ks:
                 parts.append((ks, resp))
         gpu, models, merged = 0.0, (None, None), []
+        tm = [0.0, 0.0, 0.0]  # decode, lock wait, worker wall
         for ks, resp in parts:
             if resp.get("error"):
                 raise WorkerError(resp["error"])
@@ -827,12 +835,15 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
                 raise WorkerError(f"embed_both: worker returned {len(results)} results "
                                   f"for {len(ks)} items")
             gpu += float(resp.get("gpu_seconds") or 0.0)
+            tm[0] += float(resp.get("decode_seconds") or 0.0)
+            tm[1] += float(resp.get("lock_wait_seconds") or 0.0)
+            tm[2] += float(resp.get("wall_seconds") or 0.0)
             models = (resp.get("siglip_model"), resp.get("dino_model"))
             merged.extend(zip(ks, results))
-        return merged, errs, gpu, models
+        return merged, errs, gpu, models, tm
 
     def merge(res):
-        merged, errs, gpu, models = res
+        merged, errs, gpu, models, tm = res
         for k, msg in errs.items():
             out.errors[k] = msg
         for k, r in merged:
@@ -842,6 +853,9 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
             out.siglip[k] = np.frombuffer(r["siglip"], dtype=np.float32).copy()
             out.dino[k] = np.frombuffer(r["dino"], dtype=np.float32).copy()
         out.gpu_seconds += gpu
+        out.decode_seconds += tm[0]
+        out.lock_wait_seconds += tm[1]
+        out.worker_wall_seconds += tm[2]
         out.n_batches += 1
         if models[0]:
             out.siglip_model, out.dino_model = models

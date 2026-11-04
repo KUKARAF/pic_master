@@ -31,8 +31,14 @@ from __future__ import annotations
 import functools
 import os
 import sys
+import threading
 
 _VALID = ("cuda", "xpu", "mps", "cpu")
+
+# Serializes actual accelerator forward passes in one process (torch-free so worker_server can
+# import it without pulling torch). Decode/preprocess and model LOADING deliberately do not
+# hold it, so one request's image decoding overlaps another request's GPU work.
+GPU_LOCK = threading.Lock()
 
 
 def _override() -> str:

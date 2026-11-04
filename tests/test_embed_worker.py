@@ -19,7 +19,7 @@ class FakeEmb:
         return v
 
 
-def fake_embed_shared(embs, sources):
+def fake_embed_shared(embs, sources, stats=None):
     ok, failed = [], []
     for s in sources:
         if open(s, "rb").read().startswith(b"BAD"):

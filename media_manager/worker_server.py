@@ -42,6 +42,38 @@ from . import yolo_tag_classifier as yt
 DEFAULT_CONF_THRESHOLD = 0.15
 
 
+class _InferenceLock:
+    """``models.lock``: exclusive model-load lock PLUS the process-wide GPU lock.
+
+    Every non-embedding handler (CLIP, faces, YOLO, MiVOLO, ...) keeps using
+    ``with models.lock:`` and so still excludes every other model call, embedding forwards
+    included. The SigLIP+DINO bulk-embed path instead takes only ``models.load_lock`` (lazy
+    model construction) and then ``compute.GPU_LOCK`` around each forward pass, so one
+    request's decode overlaps another's GPU work. Lock order is always load_lock -> GPU_LOCK
+    (the embed path never holds GPU_LOCK while asking for load_lock), so there is no cycle."""
+
+    def __init__(self, load_lock, gpu_lock):
+        self.load_lock, self.gpu_lock = load_lock, gpu_lock
+
+    def acquire(self, *a, **k):
+        if not self.load_lock.acquire(*a, **k):
+            return False
+        self.gpu_lock.acquire()
+        return True
+
+    def release(self):
+        self.gpu_lock.release()
+        self.load_lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+
 class WorkerModels:
     """Lazy, cached singletons for the three heavy model classes.
 
@@ -51,7 +83,8 @@ class WorkerModels:
     """
 
     def __init__(self):
-        self.lock = threading.Lock()
+        self.load_lock = threading.Lock()
+        self.lock = _InferenceLock(self.load_lock, compute.GPU_LOCK)
         self._face_detector = None
         self._clip_indexer = None
         self._object_detector = None
@@ -435,26 +468,35 @@ def handle_embed_text(path, data, request_id, link_id, remote_identity, requeste
         return worker_protocol.pack({"embedding": None, "error": str(e)})
 
 
-def _embed_shared(embedders_, sources):
+def _embed_shared(embedders_, sources, stats=None):
     """Indirection so the torch-importing embedders module loads lazily (and tests can fake it)."""
     from .embedders import embed_shared  # hook-allow: lazy — pulls torch
-    return embed_shared(embedders_, sources)
+    return embed_shared(embedders_, sources, stats=stats)
 
 
 def _embed_items_reply(path_name, results, idx_of):
     """Run SigLIP+DINO over the files in ``idx_of`` (file path -> [result indices]) and fill
-    ``results`` in place; returns the packed reply shared by embed_both_batch / _paths."""
+    ``results`` in place; returns the packed reply shared by embed_both_batch / _paths.
+
+    Only model LOADING holds the load lock; the forward passes take compute.GPU_LOCK inside
+    embed_shared, so concurrent requests overlap decode with each other's GPU work."""
     t0 = time.time()
-    with models.lock:
-        sig = models.get_siglip_embedder()
-        dino = models.get_dino_embedder()
-        order = list(idx_of)
-        if order:
-            (sig_e, dino_e), failed = _embed_shared([sig, dino], order)
-        else:
-            sig_e = dino_e = None
-            failed = []
-    gpu_s = time.time() - t0
+    stats = {"decode_seconds": 0.0, "gpu_seconds": 0.0, "lock_wait_seconds": 0.0}
+    if models._siglip is None or models._dino is None:
+        # First use: construct (incl. the smoke forward on the device) under the FULL lock so no
+        # other forward runs during a load. Steady state skips the lock entirely.
+        with models.lock:
+            models.get_siglip_embedder()
+            models.get_dino_embedder()
+    sig, dino = models.get_siglip_embedder(), models.get_dino_embedder()
+    order = list(idx_of)
+    if order:
+        (sig_e, dino_e), failed = _embed_shared([sig, dino], order, stats)
+    else:
+        sig_e = dino_e = None
+        failed = []
+    wall_s = time.time() - t0
+    gpu_s = float(stats.get("gpu_seconds", 0.0))
     failed_paths = {}
     for label, msg in failed:
         failed_paths[label] = msg
@@ -473,10 +515,15 @@ def _embed_items_reply(path_name, results, idx_of):
             n_ok += 1
         row += 1
     print(f"[worker] handled {path_name} ({len(results)} items) -> "
-          f"{n_ok} ok, {len(results) - n_ok} failed, {gpu_s:.2f}s", flush=True)
+          f"{n_ok} ok, {len(results) - n_ok} failed, wall {wall_s:.2f}s "
+          f"(decode {stats.get('decode_seconds', 0.0):.2f}s summed, gpu {gpu_s:.2f}s, "
+          f"lock wait {stats.get('lock_wait_seconds', 0.0):.2f}s)", flush=True)
     return worker_protocol.pack({
         "results": results, "siglip_model": sig.model_id(), "dino_model": dino.model_id(),
-        "gpu_seconds": gpu_s, "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
+        "gpu_seconds": gpu_s, "wall_seconds": wall_s,
+        "decode_seconds": float(stats.get("decode_seconds", 0.0)),
+        "lock_wait_seconds": float(stats.get("lock_wait_seconds", 0.0)),
+        "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
         "error": None})
 
 
@@ -588,9 +635,11 @@ def handle_embed_siglip_text(path, data, request_id, link_id, remote_identity, r
     try:
         req = worker_protocol.unpack(data)
         text = req["text"]
-        with models.lock:
-            sig = models.get_siglip_embedder()
-            v = sig.embed_text(text)
+        if models._siglip is None:
+            with models.lock:  # first use: load under the full lock
+                models.get_siglip_embedder()
+        sig = models.get_siglip_embedder()
+        v = sig.embed_text(text)  # takes compute.GPU_LOCK itself
         return worker_protocol.pack({
             "embedding": np.asarray(v, dtype=np.float32).reshape(-1).tobytes(),
             "siglip_model": sig.model_id(),

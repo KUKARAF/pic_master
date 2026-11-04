@@ -33,6 +33,8 @@ Input is squashed to 224x224 (no center crop, so nothing at the borders is lost)
 from __future__ import annotations
 
 import os
+import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,6 +43,7 @@ import torch
 from PIL import Image, ImageOps
 
 from . import compute
+from .compute import GPU_LOCK
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
 
 SIGLIP_DEFAULT_MODEL = 'ViT-SO400M-14-SigLIP2'
@@ -60,8 +63,24 @@ _IMAGENET_MEAN = (0.485, 0.456, 0.406)
 _IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
-def _decode_rgb(src) -> Image.Image:
-    """Open path (or take a PIL image), EXIF-orient, frame 0 only, RGB."""
+# JPEG DCT-domain downscale ("draft mode"): libjpeg decodes at 1/2, 1/4 or 1/8 size for a
+# fraction of the cost. The draft target is DRAFT_MARGIN x the largest model input, so the
+# later (properly antialiased) resize in each model's preprocess still has >= 2x the pixels to
+# work with. NOTE: this changes embeddings very slightly vs a full-resolution decode (cosine
+# similarity >0.99 in practice); set MEDIA_EMBED_DRAFT=0 to disable and match full decode.
+DRAFT_MARGIN = 2
+
+
+def _draft_enabled() -> bool:
+    return os.environ.get('MEDIA_EMBED_DRAFT', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _decode_rgb(src, draft_size: int | None = None) -> Image.Image:
+    """Open path (or take a PIL image), EXIF-orient, frame 0 only, RGB.
+
+    ``draft_size`` (pixels): for JPEG files, ask libjpeg for a reduced-size decode whose
+    shorter side is still >= this (see DRAFT_MARGIN note above). Applied before
+    exif_transpose, which only needs the EXIF tag, so orientation is unaffected."""
     if isinstance(src, Image.Image):
         img = src
     else:
@@ -70,8 +89,16 @@ def _decode_rgb(src) -> Image.Image:
             img.seek(0)  # animated gif/webp/apng: first frame only
         except EOFError:
             pass
+        if draft_size and img.format == 'JPEG' and _draft_enabled():
+            img.draft(None, (draft_size, draft_size))
     img = ImageOps.exif_transpose(img)
     return img.convert('RGB')
+
+
+def _draft_target(embedders) -> int:
+    """Draft decode target: DRAFT_MARGIN x the largest input side among the embedders."""
+    sizes = [int(getattr(e, 'input_size', 0) or DINO_INPUT) for e in embedders]
+    return DRAFT_MARGIN * max(sizes)
 
 
 def _autocast_ctx(device: str):
@@ -82,12 +109,18 @@ def _autocast_ctx(device: str):
     return torch.autocast(device_type=device, dtype=dtype)
 
 
-def embed_shared(embedders, sources, labels=None):
+def embed_shared(embedders, sources, labels=None, stats=None, gpu_lock=None):
     """Decode each image ONCE and feed every embedder (e.g. SigLIP2 + DINOv2 in one pass).
 
     Returns ([emb_per_embedder (N_ok, D_i)], failed). Rows are aligned across embedders
     (an image failing to decode is dropped from all). Decode + each model's preprocessing
     run in a thread pool a few batches ahead of the GPU.
+
+    Forward passes run under ``gpu_lock`` (default: the process-wide compute.GPU_LOCK) and
+    ONLY those: decode never holds it, so concurrent callers overlap one's decode with
+    another's GPU work. If ``stats`` (a dict) is given it accumulates ``decode_seconds``
+    (summed over decode threads), ``gpu_seconds`` (inside the lock: forward + host sync) and
+    ``lock_wait_seconds`` (time blocked acquiring the lock).
     """
     embedders = list(embedders)
     bs = min(e.batch_size for e in embedders)
@@ -96,17 +129,34 @@ def embed_shared(embedders, sources, labels=None):
     window = bs * 3
     pending = deque()
     tens = [[] for _ in embedders]
+    lock = GPU_LOCK if gpu_lock is None else gpu_lock
+    draft = _draft_target(embedders)
+    st = stats if stats is not None else {}
+    for k in ('decode_seconds', 'gpu_seconds', 'lock_wait_seconds'):
+        st.setdefault(k, 0.0)
+    st_lock = threading.Lock()
 
     def job(src):
-        img = _decode_rgb(src)
-        return [e._prep(img) for e in embedders]
+        t = time.perf_counter()
+        try:
+            img = _decode_rgb(src, draft)
+            return [e._prep(img) for e in embedders]
+        finally:
+            with st_lock:
+                st['decode_seconds'] += time.perf_counter() - t
 
     def flush():
         if tens[0]:
-            for i, e in enumerate(embedders):
-                outs[i].append(e._run(tens[i]))
-            for t in tens:
-                t.clear()
+            t = time.perf_counter()
+            with lock:
+                t_in = time.perf_counter()
+                for i, e in enumerate(embedders):
+                    outs[i].append(e._run(tens[i]))
+                t_out = time.perf_counter()
+            st['lock_wait_seconds'] += t_in - t
+            st['gpu_seconds'] += t_out - t_in
+            for t_ in tens:
+                t_.clear()
 
     def drain_one():
         label, fut = pending.popleft()
@@ -208,6 +258,8 @@ class SigLIP2Embedder(_BaseEmbedder):
         self.model = self._to_device(model)
         self.preprocess = preprocess
         self.tokenizer = open_clip.get_tokenizer(self.model_name)
+        size = getattr(model.visual, 'image_size', DINO_INPUT)
+        self.input_size = int(max(size) if isinstance(size, (tuple, list)) else size)
         self.dim = int(getattr(model, 'text_projection', None).shape[-1]) if getattr(model, 'text_projection', None) is not None \
             else SIGLIP_DIM.get(self.model_name, 0)
         print(f"[siglip2] {self.model_name}/{self.pretrained} device={self.device} bs={self.batch_size}", flush=True)
@@ -227,14 +279,14 @@ class SigLIP2Embedder(_BaseEmbedder):
     def embed_text(self, text):
         """L2-normalized float32 (D,) vector in the image embedding space."""
         tokens = self.tokenizer([text]).to(self.device)
-        with torch.no_grad(), _autocast_ctx(self.device):
+        with GPU_LOCK, torch.no_grad(), _autocast_ctx(self.device):
             feats = self.model.encode_text(tokens).float()
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats.cpu().numpy().astype(np.float32)[0]
 
     def embed_texts(self, texts):
         tokens = self.tokenizer(list(texts)).to(self.device)
-        with torch.no_grad(), _autocast_ctx(self.device):
+        with GPU_LOCK, torch.no_grad(), _autocast_ctx(self.device):
             feats = self.model.encode_text(tokens).float()
         feats = feats / feats.norm(dim=-1, keepdim=True)
         return feats.cpu().numpy().astype(np.float32)
@@ -251,6 +303,7 @@ class DINOv2Embedder(_BaseEmbedder):
         if self.variant not in DINO_VARIANTS:
             raise ValueError(f"MEDIA_DINO_MODEL={self.variant!r} not in {tuple(DINO_VARIANTS)}")
         self.hub_name, self.dim = DINO_VARIANTS[self.variant]
+        self.input_size = DINO_INPUT
         self._init_common(batch_size, num_workers, _allow_cpu)
         local = os.path.join(torch.hub.get_dir(), 'facebookresearch_dinov2_main')
         if os.path.isdir(local):  # reuse the cache, skip the GitHub round-trip
