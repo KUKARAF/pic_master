@@ -4773,6 +4773,8 @@ def create_app(data_root: str) -> FastAPI:
         sig, dino = _get_siglip_embedder(), _get_dino_embedder()
         sig_id, dino_id = sig.model_id(), dino.model_id()
         candidates = _pair_candidates(sig_id, dino_id, include_trashed)
+        if not candidates:  # nothing missing: don't spawn a thread (a back-to-back start would race it)
+            return {'started': False, 'total': 0, 'message': 'Nothing to index — all photos already have SigLIP 2 + DINOv2 embeddings.'}
         pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
                         img_per_sec=0.0, eta_seconds=None, transport_mode=None,
                         gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)

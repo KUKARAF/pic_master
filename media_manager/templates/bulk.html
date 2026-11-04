@@ -276,7 +276,7 @@
     fetch('/api/embed-stats').then(function (r) { return r.json(); }).then(function (d) {
       if (!d.spaces) { statsEl.textContent = d.detail || 'stats unavailable'; return; }
       var sp = d.spaces, parts = [];
-      [['clip', 'CLIP'], ['siglip', 'SigLIP 2'], ['dino', 'DINOv2']].forEach(function (k) {
+      [['clip', 'CLIP (legacy, not re-run by this job)'], ['siglip', 'SigLIP 2'], ['dino', 'DINOv2']].forEach(function (k) {
         var x = sp[k[0]];
         parts.push(k[1] + ': ' + x.rows.toLocaleString() + ' (' + x.dim + '-d, ' + mb(x.bytes) + ')');
       });
