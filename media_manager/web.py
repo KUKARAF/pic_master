@@ -4741,6 +4741,8 @@ def create_app(data_root: str) -> FastAPI:
         def _run():
             try:
                 t0 = time.time()
+                t_prev = t0
+                ema_rate = None  # smoothed recent img/s (excludes the model-load start-up cost)
                 done = failed = 0
                 for start in range(0, len(candidates), PAIR_CHUNK):
                     chunk = candidates[start:start + PAIR_CHUNK]
@@ -4772,10 +4774,14 @@ def create_app(data_root: str) -> FastAPI:
                                 errors.log(abs_path, f'siglip+dino: store failed: {exc}')
                                 failed += 1
                     done += len(chunk)
-                    elapsed = max(time.time() - t0, 1e-9)
-                    rate = done / elapsed
-                    pair_job.update(done=done, failed=failed, img_per_sec=round(rate, 2),
-                                    eta_seconds=round((len(candidates) - done) / rate, 1) if rate > 0 else None)
+                    now = time.time()
+                    chunk_rate = len(chunk) / max(now - t_prev, 1e-9)
+                    t_prev = now
+                    # ETA from the recent speed, not the average since start: the average
+                    # includes model load/warm-up and overestimates the time left early on.
+                    ema_rate = chunk_rate if ema_rate is None else 0.8 * ema_rate + 0.2 * chunk_rate
+                    pair_job.update(done=done, failed=failed, img_per_sec=round(ema_rate, 2),
+                                    eta_seconds=round((len(candidates) - done) / ema_rate, 1) if ema_rate > 0 else None)
             except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
                 traceback.print_exc()
                 pair_job['error'] = f'{exc.__class__.__name__}: {exc}'
@@ -7673,8 +7679,65 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
+    SET_SUGGEST_MODELS = ('clip', 'siglip', 'dino')
+    SET_SUGGEST_TOPK = 400   # siglip/dino: size of the "passing" pool (no absolute threshold)
+
+    def _set_member_embeddings(model, file_ids):
+        """[float32 embedding bytes] of the given files in `model`'s space; files with no
+        embedding in that space are skipped. 'clip' is the original embeddings-table read."""
+        if model == 'clip':
+            return [e for _fid, e in db.get_embeddings_for_files(file_ids)]
+        if not file_ids:
+            return []
+        ids, _checksums, matrix = getattr(db, f'get_{model}_embeddings_matrix')()
+        if matrix.shape[0] == 0:
+            return []
+        idx = np.flatnonzero(np.isin(ids, np.asarray(list(file_ids), dtype=np.int64)))
+        return [np.ascontiguousarray(matrix[i], dtype=np.float32).tobytes() for i in idx]
+
+    def _topk_pool_in_space(space, centroid, skip_checksums, apply_filters, k=SET_SUGGEST_TOPK):
+        """[((file_id, path, checksum), score)] best-first, at most `k`, for siglip/dino:
+        score the whole resident matrix (gpu_search fp16 when a GPU is present), then walk
+        the ranking in blocks applying the hard exclusions (`skip_checksums` = members +
+        rejected), the frame rule and `apply_filters` until `k` survive. Hidden files are
+        dropped EXCEPT captured stills, which are remapped to their source video (a still
+        never surfaces on its own); trashed files are kept (the card marks them, as CLIP's
+        candidate list does)."""
+        file_ids, checksums, scores = _score_space(space, centroid)
+        if scores.shape[0] == 0:
+            return []
+        order = top_k_indices(scores, None)
+        still_parents = manual.get_all_frame_capture_parents()
+        seen_ids, pool = set(), []
+        for start in range(0, len(order), 1000):
+            block = []
+            for i in order[start:start + 1000]:
+                cs, fid = checksums[i], int(file_ids[i])
+                if cs in still_parents:
+                    vrow = db.get_file_by_checksum(still_parents[cs])
+                    if vrow is None:
+                        continue
+                    fid, cs = int(vrow['id']), vrow['checksum']
+                    path = vrow['path']
+                else:
+                    if cs in skip_checksums:
+                        continue
+                    row = db.get_file_by_id(fid)
+                    if row is None or row['hidden']:
+                        continue
+                    path = row['path']
+                if fid in seen_ids or cs in skip_checksums:
+                    continue
+                seen_ids.add(fid)
+                block.append(((fid, path, cs), float(scores[i])))
+            pool.extend(apply_filters(block))
+            if len(pool) >= k:
+                break
+        return pool[:k]
+
     def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
-                                     honor_negatives=False, exclude_non_matching_faces=False):
+                                     honor_negatives=False, exclude_non_matching_faces=False,
+                                     model='clip', info=None):
         """Images not yet in the set whose CLIP embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
@@ -7711,50 +7774,82 @@ def create_app(data_root: str) -> FastAPI:
         named face on one of the set's own photos). A candidate with no
         recognized face at all is never dropped by this — there's nothing to
         judge a mismatch against. If the set has no confirmed people yet
-        either, this is a no-op (same reason)."""
+        either, this is a no-op (same reason).
 
+        `model` ('clip' default | 'siglip' | 'dino'): which embedding space drives
+        the ranking — members, rejected photos (for honor_negatives) and candidates
+        are all read from THAT space. 'clip' is the original behavior, untouched.
+        For siglip/dino the absolute `threshold` is NOT applied (cosine scales differ
+        per model; SET_SUGGEST_THRESHOLD is tuned for CLIP-B/32): the best
+        SET_SUGGEST_TOPK candidates after every exclusion are the "passing" pool, and
+        captured video stills are remapped to their source video (frame and video are
+        one item). `info`, when a dict, receives {'model', 'coverage': {members_embedded,
+        members_total}, 'model_missing', 'threshold_applied'}."""
+
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
-        member_embeddings = [e for _fid, e in db.get_embeddings_for_files(member_ids)]
+        member_embeddings = _set_member_embeddings(model, member_ids)
+        if info is not None:
+            info.update(model=model, threshold_applied=(model == 'clip'),
+                        coverage={'members_embedded': len(member_embeddings),
+                                  'members_total': len(member_checksums)},
+                        model_missing=(not member_embeddings and bool(member_checksums)))
 
         member_checksum_set = set(member_checksums)
         excluded_checksum_set = manual.get_excluded_checksums_for_set(set_id)
 
         if honor_negatives and excluded_checksum_set:
             excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
-            excluded_embeddings = [e for _fid, e in db.get_embeddings_for_files(excluded_ids)]
+            excluded_embeddings = _set_member_embeddings(model, excluded_ids)
             centroid = adjusted_centroid(member_embeddings, excluded_embeddings)
         else:
             centroid = mean_normalized_centroid(member_embeddings)
         if centroid is None:
             return []
 
-        candidates = [
-            row for row in db.get_all_embeddings()
-            if row[3] not in member_checksum_set and row[3] not in excluded_checksum_set
-        ]
-        if not candidates:
-            return []
-        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
-        passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
-        if exclude_non_matching_faces and passing:
+        # passing = [((file_id, path, checksum), score)] best first. The two
+        # per-candidate filters below are shared by every model.
+        face_ok = None
+        if exclude_non_matching_faces:
             set_people = set(manual.get_people_present_in_set(set_id, member_checksums).keys())
             if set_people:
-                cand_checksums = [item[0][2] for item in passing]
-                # A candidate's recognized people come from BOTH named faces AND
-                # faceless whole-photo assignments — mirror get_people_present_in_set,
-                # which counts both on the set side. Using faces alone here let a photo
-                # whose only non-member person was assigned without a face slip through.
-                identities_map = manual.get_identities_for_checksums(cand_checksums)
-                assigned_map = manual.get_photo_assignments_for_checksums(cand_checksums)
-                passing = [
-                    item for item in passing
-                    if not ((set(identities_map.get(item[0][2], []))
-                             | set(assigned_map.get(item[0][2], []))) - set_people)
-                ]
-        if avoid_existing and passing:
-            member_checksums_anywhere = manual.get_all_set_member_checksums()
-            passing = [item for item in passing if item[0][2] not in member_checksums_anywhere]
+                def face_ok(items):
+                    cand_checksums = [item[0][2] for item in items]
+                    # A candidate's recognized people come from BOTH named faces AND
+                    # faceless whole-photo assignments — mirror get_people_present_in_set,
+                    # which counts both on the set side. Using faces alone here let a photo
+                    # whose only non-member person was assigned without a face slip through.
+                    identities_map = manual.get_identities_for_checksums(cand_checksums)
+                    assigned_map = manual.get_photo_assignments_for_checksums(cand_checksums)
+                    return [
+                        item for item in items
+                        if not ((set(identities_map.get(item[0][2], []))
+                                 | set(assigned_map.get(item[0][2], []))) - set_people)
+                    ]
+        member_checksums_anywhere = manual.get_all_set_member_checksums() if avoid_existing else None
+
+        def apply_filters(items):
+            if face_ok is not None and items:
+                items = face_ok(items)
+            if avoid_existing and items:
+                items = [item for item in items if item[0][2] not in member_checksums_anywhere]
+            return items
+
+        if model == 'clip':
+            candidates = [
+                row for row in db.get_all_embeddings()
+                if row[3] not in member_checksum_set and row[3] not in excluded_checksum_set
+            ]
+            if not candidates:
+                return []
+            ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
+            passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
+            passing = apply_filters(passing)
+        else:
+            passing = _topk_pool_in_space(model, centroid, member_checksum_set | excluded_checksum_set,
+                                          apply_filters)
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -8422,19 +8517,24 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
-                                   honor_negatives: bool = False, exclude_non_matching_faces: bool = False):
+                                   honor_negatives: bool = False, exclude_non_matching_faces: bool = False,
+                                   model: str = 'clip'):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
+        info = {}
         results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids,
                                                 avoid_existing=avoid_existing, honor_negatives=honor_negatives,
-                                                exclude_non_matching_faces=exclude_non_matching_faces)
+                                                exclude_non_matching_faces=exclude_non_matching_faces,
+                                                model=model, info=info)
         # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
         # response contract expects; 'results' stays for the pre-existing grid
         # (offset-based load-more + threshold-expand) callers, unchanged.
-        return {'results': results, 'cards': results}
+        return {'results': results, 'cards': results, **info}
 
     @app.get('/api/sets')
     def api_list_sets(favorite: bool = False, light: bool = False):

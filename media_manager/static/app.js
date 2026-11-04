@@ -75,10 +75,12 @@
      the body-index build poll. On page load each row also checks its status once,
      so a job started elsewhere keeps updating and idle rows show "N pending". */
   (function () {
-    // Renders `<90s => Ns`, else `Xm Ys`.
+    // Renders `<90s => Ns`, `<90min => Xm Ys`, else `Xh Ym`.
     function humanDur(sec) {
       var e = Math.round(sec);
-      return e < 90 ? e + 's' : Math.floor(e / 60) + 'm ' + (e % 60) + 's';
+      if (e < 90) return e + 's';
+      if (e < 5400) return Math.floor(e / 60) + 'm ' + (e % 60) + 's';
+      return Math.floor(e / 3600) + 'h ' + (Math.floor(e / 60) % 60) + 'm';
     }
     // `rate` (items/sec, from the client-side EMA) is passed only while running.
     // countLabel names what the job's own counter counts — "matched" for the
