@@ -2001,6 +2001,13 @@
     var suggestionsEl = document.getElementById('palette-suggestions');
     var gridEl = document.getElementById('palette-grid');
     var viewAllEl = document.getElementById('palette-viewall');
+    var modeBtn = document.getElementById('palette-mode-btn');
+    var semanticNote = document.getElementById('palette-semantic-note');
+    var TAG_PLACEHOLDER = input.placeholder;
+    var SEMANTIC_PLACEHOLDER = 'describe the image, e.g. "sunset over the sea" · Tab = back to tag search';
+    var semanticMode = false;
+    try { semanticMode = localStorage.getItem('paletteMode') === 'semantic'; } catch (e) {}
+    var lastSemanticQuery = '';
 
     var chips = [];       // [{type, value}] — applied facet filters
     var sortSpec = null;  // {field, dir} parsed from a "field:asc|desc" token, or null
@@ -2044,10 +2051,32 @@
       return i === -1 ? '' : v.slice(0, i);
     }
 
+    function applyMode() {
+      if (modeBtn) {
+        modeBtn.textContent = semanticMode ? '\u2728 semantic' : 'Aa tags';
+        modeBtn.classList.toggle('is-semantic', semanticMode);
+        modeBtn.setAttribute('aria-pressed', semanticMode ? 'true' : 'false');
+      }
+      input.placeholder = semanticMode ? SEMANTIC_PLACEHOLDER : TAG_PLACEHOLDER;
+      if (semanticNote) semanticNote.style.display = semanticMode ? '' : 'none';
+      suggestionsEl.style.display = semanticMode ? 'none' : '';
+      chipsEl.style.display = semanticMode ? 'none' : '';
+      var loc = document.getElementById('palette-hasloc-btn');
+      if (loc) loc.style.display = semanticMode ? 'none' : '';
+    }
+    function setMode(on) {
+      semanticMode = !!on;
+      try { localStorage.setItem('paletteMode', semanticMode ? 'semantic' : 'tags'); } catch (e) {}
+      applyMode();
+      if (!semanticMode) updateSuggestions();
+      updateGrid();
+    }
+
     function open() {
       overlay.style.display = 'flex';
       input.value = '';
       input.focus();
+      applyMode();
       updateSuggestions();
       updateGrid();
     }
@@ -2213,11 +2242,14 @@
 
     // A photo tile that, when clicked, opens the FULL result set as the photo
     // viewer's watch queue starting at this photo (not just the previewed tiles).
-    function photoTile(m) {
+    function photoTile(m, semantic) {
       var tile = makeTile('/photo/' + m.id, '/thumb/' + m.id, m.filename, m.title || m.filename);
       tile.dataset.fileId = m.id;
       var link = tile.querySelector('.card-img-link');
-      if (link) link.addEventListener('click', function (e) { e.preventDefault(); openResultsAsQueue(m.id); });
+      if (link) link.addEventListener('click', function (e) {
+        e.preventDefault();
+        if (semantic) openSemanticAsQueue(m.id); else openResultsAsQueue(m.id);
+      });
       return tile;
     }
 
@@ -2278,7 +2310,24 @@
     // Open the full result set (chips + free text, in the current sort order) as
     // the photo viewer's watch queue, starting at `startId` (or the first result).
     // Replaces the old "view all on /search" — results are browsed as a queue.
+    function openSemanticAsQueue(startId) {
+      var q = input.value.trim();
+      if (!q) return;
+      fetch('/api/search/siglip-text?limit=200&q=' + encodeURIComponent(q))
+        .then(function (r) { if (!r.ok) throw new Error('semantic search ' + r.status); return r.json(); })
+        .then(function (data) {
+          var ids = (data.results || []).map(function (x) { return x.file_id; });
+          if (!ids.length) { showToast('No results to open.'); return; }
+          var cursor = startId != null ? ids.indexOf(startId) : 0;
+          if (cursor < 0) { ids.unshift(startId); cursor = 0; }
+          sessionStorage.setItem('photoQueue', JSON.stringify({ ids: ids, cursor: cursor, label: 'Semantic: ' + q }));
+          window.openPhoto(ids[cursor]);
+        })
+        .catch(function (err) { showToast('Failed to open results: ' + err.message); });
+    }
+
     function openResultsAsQueue(startId) {
+      if (semanticMode) { openSemanticAsQueue(startId); return; }
       var q = fragmentText().trim();
       fetch('/api/search-ids', {
         method: 'POST',
@@ -2355,7 +2404,72 @@
       renderSuggestions();
     }
 
+    function showGridMessage(text) {
+      gridEl.innerHTML = '';
+      var el = document.createElement('div');
+      el.className = 'palette-empty';
+      el.textContent = text;
+      gridEl.appendChild(el);
+    }
+
+    // Semantic (SigLIP 2 text -> image) search: same grid look, same requestSeq guard.
+    function updateSemanticGrid() {
+      var seq = ++requestSeq;
+      var q = input.value.trim();
+      lastSemanticQuery = q;
+      viewAllEl.style.display = 'none';
+      if (!q) {
+        countEl.textContent = '';
+        showGridMessage('Type a description to search by meaning\u2026');
+        return;
+      }
+      fetch('/api/search/siglip-text?limit=60&q=' + encodeURIComponent(q))
+        .then(function (r) {
+          return r.json().catch(function () { return {}; }).then(function (d) {
+            if (!r.ok) throw new Error(d && d.detail ? (typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail)) : ('HTTP ' + r.status));
+            return d;
+          });
+        })
+        .then(function (data) {
+          if (seq !== requestSeq) return;
+          if (data.no_embedding) {
+            countEl.textContent = '';
+            showGridMessage(data.message || 'No SigLIP 2 embeddings yet \u2014 run "Index SigLIP 2 + DINOv2" on /bulk.');
+            return;
+          }
+          var cards = data.cards || [];
+          gridEl.innerHTML = '';
+          if (!cards.length) {
+            countEl.textContent = '0 RESULTS';
+            showGridMessage('\u2014 no results for this query \u2014');
+            return;
+          }
+          var sec = section('SEMANTIC', cards.length);
+          cards.forEach(function (m) {
+            var tile = photoTile(m, true);
+            if (m.score != null) {
+              var badge = document.createElement('span');
+              badge.className = 'score-badge';
+              badge.textContent = Number(m.score).toFixed(3);
+              tile.appendChild(badge);
+            }
+            sec.tiles.appendChild(tile);
+          });
+          gridEl.appendChild(sec.wrap);
+          countEl.textContent = cards.length + ' RESULTS';
+          viewAllEl.style.display = '';
+          viewAllEl.textContent = 'Browse results \u2192';
+        })
+        .catch(function (err) {
+          if (seq !== requestSeq) return;
+          console.error('semantic palette query failed:', err);
+          countEl.textContent = '';
+          showGridMessage('Semantic search failed: ' + (err && err.message ? err.message : err));
+        });
+    }
+
     function updateGrid() {
+      if (semanticMode) { updateSemanticGrid(); return; }
       var seq = ++requestSeq;
       var q = fragmentText().trim();
       fetch('/api/search-palette', {
@@ -2411,6 +2525,11 @@
 
     var gridDebounceTimer = null;
     input.addEventListener('input', function () {
+      if (semanticMode) {
+        clearTimeout(gridDebounceTimer);
+        gridDebounceTimer = setTimeout(updateGrid, 250);
+        return;
+      }
       // A "field:asc|desc" token anywhere in the box is pulled out into the sort
       // chip and disappears from the input.
       var parsed = parseSortToken(input.value);
@@ -2426,8 +2545,17 @@
     if (viewAllEl) {
       viewAllEl.addEventListener('click', function (e) {
         e.preventDefault();
+        if (semanticMode) {
+          var sq = input.value.trim();
+          if (sq) window.location.href = '/semantic?q=' + encodeURIComponent(sq);
+          return;
+        }
         openResultsAsQueue(null);
       });
+    }
+
+    if (modeBtn) {
+      modeBtn.addEventListener('click', function () { setMode(!semanticMode); input.focus(); });
     }
 
     // "📍 Has location" toggles a `location:any` chip — the sentinel the backend
@@ -2453,6 +2581,22 @@
     });
 
     input.addEventListener('keydown', function (e) {
+      if (e.key === 'Tab') {
+        e.preventDefault();   // keep focus in the box; Tab toggles tags <-> semantic
+        setMode(!semanticMode);
+        return;
+      }
+      if (semanticMode) {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          clearTimeout(gridDebounceTimer);
+          if (input.value.trim()) window.location.href = '/semantic?q=' + encodeURIComponent(input.value.trim());
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          close();
+        }
+        return;
+      }
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         highlighted = Math.min(highlighted + 1, Math.max(0, suggestions.length - 1));

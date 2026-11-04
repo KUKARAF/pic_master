@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% import "_macros.html" as macros %}
+
+{% block title %}{% if q %}Semantic: {{ q }}{% else %}Semantic search{% endif %} — media{% endblock %}
+
+{% block content %}
+<div class="page-heading">
+  <h1>Semantic search</h1>
+  <span class="sub">Describe what you are looking for; results are ranked by image/text embedding similarity.</span>
+</div>
+
+<form method="get" action="/semantic" id="semantic-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:16px;">
+  <input type="text" name="q" id="semantic-q" value="{{ q }}" placeholder="e.g. sunset over the sea, a dog on a couch" autocomplete="off" style="flex:1;min-width:240px;" autofocus>
+  <select name="model" id="semantic-model" title="Text search model">
+    {% for key, label in models %}
+    <option value="{{ key }}" {{ 'selected' if key == model }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <button type="submit" class="btn-similar">Search</button>
+</form>
+
+{% if message %}
+<div class="alert" id="semantic-message" style="margin-bottom:20px;">{{ message }}</div>
+{% endif %}
+
+{% if files %}
+<div class="grid" data-queue-source="Semantic: {{ q }}">
+  {% for f in files %}
+  {{ macros.card(f, star_href='/similar/' ~ f.id, star_title='Find similar images') }}
+  {% endfor %}
+</div>
+<div class="semantic-paging" style="display:flex;gap:12px;justify-content:center;margin:20px 0;">
+  {% if page > 1 %}<a class="btn-similar" href="/semantic?q={{ q | urlencode }}&model={{ model }}&page={{ page - 1 }}">← Previous</a>{% endif %}
+  <span class="sub">Page {{ page }}</span>
+  {% if has_more %}<a class="btn-similar" href="/semantic?q={{ q | urlencode }}&model={{ model }}&page={{ page + 1 }}">Load more →</a>{% endif %}
+</div>
+{% elif q and not message %}
+<div class="empty-state"><div class="icon">🖼️</div><p>No matching images.</p></div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
+  wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
+});
+</script>
+{% endblock %}

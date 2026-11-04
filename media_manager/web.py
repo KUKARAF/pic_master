@@ -9,6 +9,7 @@ import ctypes.util
 import errno
 import gc
 import hashlib
+import html
 import io
 import json
 import math
@@ -3545,8 +3546,10 @@ def create_app(data_root: str) -> FastAPI:
         return {'ok': True, 'profile_ref': None}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
-    def similar_page(request: Request, file_id: int):
+    def similar_page(request: Request, file_id: int, model: str = 'clip'):
         row = _file_or_404(file_id)
+        if model not in ('clip', 'siglip', 'dino'):
+            model = 'clip'
         filename = os.path.basename(row['path'])
         files = []
         message = ''
@@ -3554,8 +3557,16 @@ def create_app(data_root: str) -> FastAPI:
         source_is_video = os.path.splitext(row['path'])[1].lower() in VIDEO_EXTENSIONS
         all_tags = manual.list_all_tags()
 
-        emb_bytes = db.get_embedding(file_id)
-        if emb_bytes is None:
+        emb_bytes = db.get_embedding(file_id) if model == 'clip' else None
+        if model != 'clip':
+            try:
+                d = _similar_in_space(model, file_id, 20)
+                files, message = d['cards'], d.get('message', '') if d.get('no_embedding') else ''
+            except HTTPException as exc:
+                message = html.escape(str(exc.detail))  # template renders message |safe
+            except Exception as exc:  # hook-allow: broad -- report any search failure to the UI
+                message = html.escape(f'Similarity search error: {exc}')
+        elif emb_bytes is None:
             # The template shows an "embed now" button instead of a message here.
             no_embedding = True
         else:
@@ -3600,6 +3611,7 @@ def create_app(data_root: str) -> FastAPI:
             'files': files,
             'message': message,
             'no_embedding': no_embedding,
+            'model': model,
             'source_is_video': source_is_video,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
@@ -5046,26 +5058,67 @@ def create_app(data_root: str) -> FastAPI:
                 return results
             k = min(n, k * 4)
 
-    @app.get('/api/search/siglip-text')
-    def api_search_siglip_text(q: str, limit: int = 50):
-        """Text -> image search in the SigLIP 2 space. Same result shape as /api/files/{id}/similar."""
-        q = q.strip()
+    NO_EMB_HINT = 'Run "Index SigLIP 2 + DINOv2" on /bulk first.'
+
+    def _cards_for_results(results):
+        """Enriched grid cards (the same dicts the palette/gallery/macros use, plus 'score')
+        for [{'file_id','score'}] results, in order. Additive: callers keep 'results'."""
+        rows, scoremap = [], {}
+        for r in results:
+            fr = db.get_file_by_id(r['file_id'])
+            if fr is None:
+                continue
+            rows.append((fr['id'], fr['path'], True, fr['checksum']))
+            scoremap[fr['id']] = r['score']
+        return _enrich_rows(rows, scores=scoremap)
+
+    # Text-search models selectable on /semantic. Add more here: key -> (label, embed(q) -> vec, space).
+    TEXT_MODELS = {
+        'siglip2': ('SigLIP 2', lambda q: _get_siglip_embedder().embed_text(q), 'siglip'),
+    }
+
+    def _text_search(model, q, limit, offset):
+        """Shared by the JSON endpoint and the /semantic page. Returns the response dict
+        ('results' = this page only, plus 'cards', 'has_more', 'offset'); raises HTTPException."""
+        q = (q or '').strip()
         if not q:
             raise HTTPException(status_code=400, detail='Empty query.')
-        query = np.asarray(_get_siglip_embedder().embed_text(q), dtype=np.float32)
-        file_ids, checksums, scores = _score_space('siglip', query)
-        return {'results': _rank_space_results(file_ids, checksums, scores, limit)}
+        if model not in TEXT_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown text model {model!r}.')
+        limit, offset = max(1, min(int(limit), 500)), max(0, int(offset))
+        _label, embed, space = TEXT_MODELS[model]
+        try:
+            query = np.asarray(embed(q), dtype=np.float32)
+        except HTTPException:
+            raise
+        except Exception as exc:  # hook-allow: broad -- worker down / no GPU / model load: surface the message
+            raise HTTPException(status_code=502, detail=f'Could not embed the query: {exc}')
+        file_ids, checksums, scores = _score_space(space, query)
+        if scores.shape[0] == 0:
+            return {'results': [], 'cards': [], 'offset': offset, 'has_more': False,
+                    'no_embedding': True, 'message': f'No {space} embeddings exist yet. {NO_EMB_HINT}'}
+        ranked = _rank_space_results(file_ids, checksums, scores, offset + limit + 1)
+        page = ranked[offset:offset + limit]
+        return {'results': page, 'cards': _cards_for_results(page), 'offset': offset,
+                'has_more': len(ranked) > offset + limit}
+
+    @app.get('/api/search/siglip-text')
+    def api_search_siglip_text(q: str, limit: int = 50, offset: int = 0):
+        """Text -> image search in the SigLIP 2 space. Same result shape as /api/files/{id}/similar
+        (+ additive 'cards', 'offset', 'has_more'; 'no_embedding'/'message' when nothing is indexed)."""
+        return _text_search('siglip2', q, limit, offset)
 
     def _similar_in_space(space, file_id, limit):
         _file_or_404(file_id)
         file_ids, checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
         hits = np.flatnonzero(file_ids == file_id) if matrix.shape[0] else []
         if len(hits) == 0:
-            return {'results': [], 'no_embedding': True,
-                    'message': f'This photo has no {space} embedding yet.'}
+            return {'results': [], 'cards': [], 'no_embedding': True,
+                    'message': f'This photo has no {space} embedding yet. {NO_EMB_HINT}'}
         query = matrix[int(hits[0])]
         file_ids, checksums, scores = _score_space(space, query)
-        return {'results': _rank_space_results(file_ids, checksums, scores, limit, exclude_ids=(file_id,))}
+        results = _rank_space_results(file_ids, checksums, scores, limit, exclude_ids=(file_id,))
+        return {'results': results, 'cards': _cards_for_results(results)}
 
     @app.get('/api/files/{file_id}/similar-dino')
     def api_similar_dino(file_id: int, limit: int = 50):
@@ -5076,6 +5129,29 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_siglip(file_id: int, limit: int = 50):
         """Image -> image similarity in the SigLIP 2 space (semantic similarity)."""
         return _similar_in_space('siglip', file_id, limit)
+
+    @app.get('/semantic', response_class=HTMLResponse)
+    def semantic_page(request: Request, q: str = '', model: str = 'siglip2', page: int = 1):
+        """Full results page for text -> image semantic search (palette 'Browse results')."""
+        page = max(1, page)
+        per_page = 60
+        q = q.strip()
+        files, message, no_embedding, has_more = [], '', False, False
+        if model not in TEXT_MODELS:
+            model = 'siglip2'
+        if q:
+            try:
+                d = _text_search(model, q, per_page, (page - 1) * per_page)
+                files, has_more = d['cards'], d['has_more']
+                no_embedding, message = bool(d.get('no_embedding')), d.get('message', '')
+            except HTTPException as exc:
+                message = str(exc.detail)
+        return templates.TemplateResponse(request, 'semantic.html', {
+            'q': q, 'model': model, 'page': page, 'files': files, 'message': message,
+            'no_embedding': no_embedding, 'has_more': has_more,
+            'models': [(k, v[0]) for k, v in TEXT_MODELS.items()],
+            'all_categories': _all_categories_for_nav(),
+        })
 
     def _unphashed_images():
         """(fid, rel_path) for IMAGES only — the phasher ignores videos (their frames

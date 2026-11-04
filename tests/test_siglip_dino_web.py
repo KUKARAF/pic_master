@@ -292,3 +292,82 @@ def test_batch_failure_falls_back_per_row(small_chunk, env, monkeypatch):
     c.post('/api/siglip-dino/start')
     st = _wait(c)
     assert st['error'] is None and st['failed'] == 0 and db.count_siglip_indexed() == 10
+
+
+def _seed_siglip(db, ids, n=5):
+    q = _unit(7, 6)
+    for i in range(n):
+        _put(db, ids[f'img{i}.jpg'], 'siglip', q * (1 - 0.1 * i) + _unit(20 + i, 6) * 0.1 * i)
+    for i in range(n):
+        _put(db, ids[f'img{i}.jpg'], 'dino', _unit(30 + i, 4))
+
+
+def test_text_search_paging_and_cards(env):
+    app, c, db, errors, manual, ids, calls, _ = env
+    _seed_siglip(db, ids)
+    full = c.get('/api/search/siglip-text?q=cat&limit=10').json()
+    assert len(full['results']) == 5 and full['has_more'] is False
+    assert [x['id'] for x in full['cards']] == [r['file_id'] for r in full['results']]
+    assert all('score' in x and 'filename' in x and 'is_video' in x for x in full['cards'])
+    p1 = c.get('/api/search/siglip-text?q=cat&limit=2&offset=0').json()
+    p2 = c.get('/api/search/siglip-text?q=cat&limit=2&offset=2').json()
+    p3 = c.get('/api/search/siglip-text?q=cat&limit=2&offset=4').json()
+    assert p1['has_more'] and p2['has_more'] and not p3['has_more']
+    got = [r['file_id'] for p in (p1, p2, p3) for r in p['results']]
+    assert got == [r['file_id'] for r in full['results']]
+
+
+def test_text_search_errors_and_no_embedding(env, monkeypatch):
+    app, c, db, errors, manual, ids, calls, _ = env
+    r = c.get('/api/search/siglip-text?q=cat').json()  # nothing indexed
+    assert r['no_embedding'] is True and r['results'] == [] and '/bulk' in r['message']
+    assert c.get('/api/search/siglip-text?q=%20').status_code == 400
+
+    class Boom(FakeEmb):
+        def embed_text(self, text):
+            raise RuntimeError('worker needs redeploy')
+    monkeypatch.setattr(web, '_get_siglip_embedder', lambda: Boom('siglip'))
+    r = c.get('/api/search/siglip-text?q=cat')
+    assert r.status_code == 502 and 'worker needs redeploy' in r.json()['detail']
+
+
+def test_semantic_page(env, monkeypatch):
+    app, c, db, errors, manual, ids, calls, _ = env
+    r = c.get('/semantic')
+    assert r.status_code == 200 and 'id="semantic-q"' in r.text and 'SigLIP 2' in r.text
+    r = c.get('/semantic?q=cat')                       # no embeddings yet
+    assert r.status_code == 200 and '/bulk' in r.text
+    _seed_siglip(db, ids)
+    r = c.get('/semantic?q=cat')
+    assert r.status_code == 200 and 'score-badge' in r.text and f'/similar/{ids["img0.jpg"]}' in r.text
+    assert 'value="cat"' in r.text
+
+    class Boom(FakeEmb):
+        def embed_text(self, text):
+            raise RuntimeError('no GPU here')
+    monkeypatch.setattr(web, '_get_siglip_embedder', lambda: Boom('siglip'))
+    r = c.get('/semantic?q=cat')
+    assert r.status_code == 200 and 'no GPU here' in r.text
+
+
+def test_similar_page_model_param(env):
+    app, c, db, errors, manual, ids, calls, _ = env
+    _seed_siglip(db, ids)
+    a = ids['img0.jpg']
+    for m in ('siglip', 'dino'):
+        r = c.get(f'/similar/{a}?model={m}')
+        assert r.status_code == 200 and 'score-badge' in r.text
+        assert f'data-model="{m}"' in r.text and 'aria-current' in r.text
+    r = c.get(f'/similar/{ids["img8.jpg"]}?model=dino')   # no dino embedding
+    assert r.status_code == 200 and '/bulk' in r.text and 'id="embed-now-btn"' not in r.text
+    r = c.get(f'/similar/{a}?model=bogus')               # falls back to CLIP (default)
+    assert r.status_code == 200 and 'data-model="clip"' in r.text
+    r = c.get(f'/similar/{a}')
+    assert r.status_code == 200 and 'id="embed-now-btn"' in r.text   # CLIP: no embedding -> embed-now
+
+
+def test_similar_api_cards_additive(env):
+    app, c, db, errors, manual, ids, calls, _ = env
+    _seed_siglip(db, ids)
+    r = c.get(f'/api/files/{ids["img0.jpg"]}/similar-dino').json()
+    assert [x['id'] for x in r['cards']] == [x['file_id'] for x in r['results']]

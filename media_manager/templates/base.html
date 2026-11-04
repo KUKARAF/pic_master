@@ -68,11 +68,14 @@
       <span class="palette-caret">&gt;</span>
       <input type="text" id="palette-input" class="palette-in" autocomplete="off"
              placeholder="search tags &amp; filenames · sort e.g. age:asc, date:desc · click filters at left">
+      <button type="button" id="palette-mode-btn" class="palette-mode-btn" title="Switch between tag search and semantic (SigLIP 2) search — Tab"
+              aria-pressed="false">Aa tags</button>
       <span class="palette-count" id="palette-count"></span>
     </div>
     <div class="palette-body">
       <div class="palette-left">
         <div class="palette-applied" id="palette-applied"></div>
+        <div class="palette-semantic-note" id="palette-semantic-note" style="display:none;">Semantic mode: describe the image in words. Chips, filters and sorting only apply to tag search.</div>
         <div class="palette-suggestions" id="palette-suggestions"></div>
       </div>
       <div class="palette-grid" id="palette-grid"></div>
@@ -81,7 +84,7 @@
       <a href="#" id="palette-viewall" class="sub" style="display:none;">Browse results →</a>
       <button type="button" id="palette-hasloc-btn" class="sub" style="background:none;border:none;cursor:pointer;padding:0;"
               title="Filter to photos that have location metadata">📍 Has location</button>
-      <span class="sub palette-hint">↑↓ select · Enter apply filter / open results · Esc close</span>
+      <span class="sub palette-hint">Tab switch tags/semantic · ↑↓ select · Enter apply filter / open results · Esc close</span>
     </div>
   </div>
 </div>

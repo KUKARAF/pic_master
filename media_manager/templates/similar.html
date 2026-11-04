@@ -9,6 +9,13 @@
   <a href="/photo/{{ source_id }}" class="sub">← Back to photo</a>
 </div>
 
+<div class="similar-model-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+  <span class="sub">Model:</span>
+  {% for key, label, hint in [('clip', 'CLIP', 'Whole-image CLIP (default)'), ('siglip', 'SigLIP 2', 'Semantic similarity'), ('dino', 'DINOv2', 'Visual / instance similarity')] %}
+  <a href="/similar/{{ source_id }}?model={{ key }}" class="btn-similar similar-model-btn{{ ' is-active' if model == key }}" data-model="{{ key }}" title="{{ hint }}"{% if model == key %} aria-current="true" style="outline:2px solid var(--accent);"{% endif %}>{{ label }}</a>
+  {% endfor %}
+</div>
+
 {% if no_embedding %}
   <div class="alert" style="margin-bottom:20px;">
     <button type="button" id="embed-now-btn" class="btn-similar" data-file-id="{{ source_id }}">No embedding for this {{ 'video' if source_is_video else 'image' }} — embed {{ source_filename }} now</button>
@@ -35,6 +42,23 @@
 
 {% block scripts %}
 <script>
+(function () {
+  // Remember the chosen model; a bare /similar/{id} URL (e.g. the star links) re-opens in it.
+  var current = {{ model | tojson }};
+  var hasParam = /[?&]model=/.test(location.search);
+  var saved = null;
+  try { saved = localStorage.getItem('similarModel'); } catch (e) {}
+  if (!hasParam && saved && saved !== current && /^(clip|siglip|dino)$/.test(saved)) {
+    location.replace(location.pathname + '?model=' + saved);
+    return;
+  }
+  document.querySelectorAll('.similar-model-btn').forEach(function (a) {
+    a.addEventListener('click', function () {
+      try { localStorage.setItem('similarModel', a.dataset.model); } catch (e) {}
+    });
+  });
+  if (hasParam) { try { localStorage.setItem('similarModel', current); } catch (e) {} }
+})();
 document.querySelectorAll('.file-heart-btn').forEach(function (btn) {
   wireHeartButton(btn, '/api/files/' + btn.dataset.fileId + '/favorite');
 });
