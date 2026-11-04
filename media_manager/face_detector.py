@@ -8,6 +8,24 @@ import numpy as np
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
 from . import compute
 
+# OpenCV refuses WebP files over 64 MiB by default (animated WebPs from uploads
+# easily exceed it). Raise the cap before cv2 loads; setdefault so an explicit
+# env override still wins.
+os.environ.setdefault('OPENCV_IMGCODECS_WEBP_MAX_FILE_SIZE', str(1 << 30))
+
+
+def _read_bgr(path):
+    """cv2.imread with a Pillow fallback (frame 0 only, like every other
+    pipeline here) for files OpenCV's codecs reject (oversized/odd WebP etc.)."""
+    import cv2  # hook-allow: lazy — heavy dep (cv2)
+    img = cv2.imread(path)
+    if img is not None:
+        return img
+    from PIL import Image
+    with Image.open(path) as pil:
+        rgb = pil.convert('RGB')
+    return cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+
 # --- Angle convention: the single source of truth for the whole app -----------
 # Every face dict carries 'angle' = the in-plane roll of the face AS IT SITS IN
 # THE SOURCE IMAGE, measured CLOCKWISE from upright, folded into (-180, 180].
@@ -234,9 +252,7 @@ class FaceDetector:
                 results.append((path, [], 'unsupported extension'))
                 continue
             try:
-                img = cv2.imread(path)
-                if img is None:
-                    raise ValueError('cv2.imread returned None')
+                img = _read_bgr(path)
                 faces = []
                 for face in self.app.get(img):
                     if face.det_score < self.det_thresh:
