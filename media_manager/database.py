@@ -41,6 +41,11 @@ class ThreadLocalDB:
         # Persistent for the db file, so one-time here on the creating thread.
         self.conn.execute('PRAGMA journal_mode=WAL')
 
+    def _connection_pragmas(self):
+        """Extra per-connection PRAGMAs; none by default (ManualDB keeps SQLite's safe
+        defaults — it holds the irreplaceable human decisions)."""
+        return ()
+
     @property
     def conn(self):
         conn = getattr(self._local, 'conn', None)
@@ -53,6 +58,8 @@ class ThreadLocalDB:
             conn = sqlite3.connect(self.db_path, check_same_thread=False)
             conn.row_factory = sqlite3.Row
             conn.execute('PRAGMA busy_timeout=5000')
+            for pragma in self._connection_pragmas():
+                conn.execute(pragma)
             self._local.conn = conn
             with self._conns_lock:
                 self._conns[threading.current_thread()] = conn
@@ -105,6 +112,23 @@ class ThreadLocalDB:
 
 
 class Database(ThreadLocalDB):
+    def _connection_pragmas(self):
+        """media.db is derived, rebuildable data (embeddings, detections, indexes), so it
+        trades the per-commit fsync for speed: with WAL, synchronous=NORMAL cannot corrupt
+        the file — a power loss can only drop the last few committed transactions, which
+        the resumable jobs simply redo. Overridable via env (MEDIA_DB_SYNCHRONOUS=FULL to
+        restore SQLite's default; MEDIA_DB_CACHE_MB per connection; MEDIA_DB_MMAP_MB shared
+        by the OS page cache, not per-connection memory)."""
+        sync = os.environ.get('MEDIA_DB_SYNCHRONOUS', 'NORMAL').upper()
+        if sync not in ('OFF', 'NORMAL', 'FULL', 'EXTRA'):
+            raise ValueError(f"MEDIA_DB_SYNCHRONOUS={sync!r} not in OFF|NORMAL|FULL|EXTRA")
+        cache_mb = int(os.environ.get('MEDIA_DB_CACHE_MB', '128'))
+        mmap_mb = int(os.environ.get('MEDIA_DB_MMAP_MB', '4096'))
+        return (f'PRAGMA synchronous={sync}',
+                f'PRAGMA cache_size=-{cache_mb * 1024}',
+                'PRAGMA temp_store=MEMORY',
+                f'PRAGMA mmap_size={mmap_mb * 1024 * 1024}')
+
     def __init__(self, db_path="media.db"):
         super().__init__(db_path)
         # --- Cached embedding matrices (write-invalidated) -----------------
