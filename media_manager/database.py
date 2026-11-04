@@ -682,6 +682,11 @@ class Database(ThreadLocalDB):
         # Indexes for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_path ON file_paths (path)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_file ON file_paths (file_id)')
+        # Covering index for files_with_path's per-file "most recently seen path" subquery
+        # (WHERE file_id=? ORDER BY last_seen_at DESC LIMIT 1): answered from the index alone,
+        # no table lookups or sort. Cheap (one pass over file_paths) and idempotent, so it is
+        # created automatically on startup like every other index here.
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_file_seen ON file_paths (file_id, last_seen_at DESC, path)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_checksum ON files (checksum)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_taken_at ON files (taken_at)')
         # Backs the gallery's default sort ('added' = first_seen DESC, the homepage's
