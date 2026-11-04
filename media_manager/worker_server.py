@@ -441,6 +441,116 @@ def _embed_shared(embedders_, sources):
     return embed_shared(embedders_, sources)
 
 
+def _embed_items_reply(path_name, results, idx_of):
+    """Run SigLIP+DINO over the files in ``idx_of`` (file path -> [result indices]) and fill
+    ``results`` in place; returns the packed reply shared by embed_both_batch / _paths."""
+    t0 = time.time()
+    with models.lock:
+        sig = models.get_siglip_embedder()
+        dino = models.get_dino_embedder()
+        order = list(idx_of)
+        if order:
+            (sig_e, dino_e), failed = _embed_shared([sig, dino], order)
+        else:
+            sig_e = dino_e = None
+            failed = []
+    gpu_s = time.time() - t0
+    failed_paths = {}
+    for label, msg in failed:
+        failed_paths[label] = msg
+    row = 0  # embed_shared drops failed rows; surviving rows keep input order
+    n_ok = 0
+    for fpath in order:
+        idxs = idx_of[fpath]
+        if fpath in failed_paths:
+            for i in idxs:
+                results[i]["error"] = failed_paths[fpath]
+            continue
+        sv = sig_e[row].astype(np.float32).tobytes()
+        dv = dino_e[row].astype(np.float32).tobytes()
+        for i in idxs:
+            results[i]["siglip"], results[i]["dino"] = sv, dv
+            n_ok += 1
+        row += 1
+    print(f"[worker] handled {path_name} ({len(results)} items) -> "
+          f"{n_ok} ok, {len(results) - n_ok} failed, {gpu_s:.2f}s", flush=True)
+    return worker_protocol.pack({
+        "results": results, "siglip_model": sig.model_id(), "dino_model": dino.model_id(),
+        "gpu_seconds": gpu_s, "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
+        "error": None})
+
+
+def _data_root_problem(data_root):
+    """None if ``data_root`` is an acceptable shared root, else a reason string. A root is
+    accepted only if it is an absolute path with an existing ``.media`` directory (the marker
+    of a media repo, like .git) -- so a client can't point the worker at an arbitrary tree."""
+    if not isinstance(data_root, str) or not data_root or "\0" in data_root:
+        return "data_root missing or invalid"
+    if not os.path.isabs(data_root):
+        return "data_root is not an absolute path"
+    if not os.path.isdir(data_root):
+        return "data_root does not exist on the worker"
+    if not os.path.isdir(os.path.join(data_root, ".media")):
+        return "data_root has no .media directory on the worker"
+    return None
+
+
+def resolve_under_root(root_real, rel):
+    """Realpath of ``<root_real>/<rel>`` if it is a regular file strictly inside ``root_real``
+    (symlinks resolved), else raise ValueError. Rejects absolute / traversal / NUL paths and
+    symlinks that escape the root. ``root_real`` must already be os.path.realpath()'d."""
+    if not isinstance(rel, str) or not rel or "\0" in rel:
+        raise ValueError("invalid path")
+    if os.path.isabs(rel) or rel.startswith(("/", "\\")):
+        raise ValueError("absolute path rejected")
+    real = os.path.realpath(os.path.join(root_real, rel))
+    if os.path.commonpath([root_real, real]) != root_real or real == root_real:
+        raise ValueError("path outside data_root")
+    if not os.path.isfile(real):
+        raise ValueError("not a file")
+    return real
+
+
+def handle_probe_data_root(path, data, request_id, link_id, remote_identity, requested_at):
+    try:
+        req = worker_protocol.unpack(data)
+        reason = _data_root_problem(req.get("data_root"))
+        return worker_protocol.pack({
+            "visible": reason is None, "reason": reason or "ok",
+            "proto": worker_protocol.EMBED_PROTOCOL_VERSION})
+    except Exception as e:  # hook-allow: broad — report error to caller
+        return worker_protocol.pack({
+            "visible": False, "reason": str(e), "proto": worker_protocol.EMBED_PROTOCOL_VERSION})
+
+
+def handle_embed_both_paths(path, data, request_id, link_id, remote_identity, requested_at):
+    """Shared-disk variant of embed_both_batch: the worker reads ``<data_root>/<rel>`` itself.
+    Whole request refused unless data_root has a .media dir; each file must realpath-resolve
+    inside realpath(data_root) or that item gets an error (and is never opened)."""
+    try:
+        req = worker_protocol.unpack(data)
+        data_root = req.get("data_root")
+        problem = _data_root_problem(data_root)
+        if problem:
+            raise ValueError(problem)
+        root_real = os.path.realpath(data_root)
+        rels = req["paths"]
+        results = [{"name": r, "siglip": None, "dino": None, "error": None} for r in rels]
+        idx_of = {}  # real file path -> result indices
+        for i, rel in enumerate(rels):
+            try:
+                idx_of.setdefault(resolve_under_root(root_real, rel), []).append(i)
+            except (ValueError, OSError) as e:
+                results[i]["error"] = f"rejected: {e}"
+        return _embed_items_reply(worker_protocol.PATH_EMBED_BOTH_PATHS, results, idx_of)
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_EMBED_BOTH_PATHS} -> ERROR {e}", flush=True)
+        return worker_protocol.pack({
+            "results": [], "siglip_model": None, "dino_model": None, "gpu_seconds": 0.0,
+            "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": str(e)})
+
+
 def handle_embed_both_batch(path, data, request_id, link_id, remote_identity, requested_at):
     """N images -> SigLIP2 + DINOv2 vectors in ONE decode pass. Per-item failures (bad image,
     unsupported extension) are reported in that item's ``error`` and never fail the batch."""
@@ -459,31 +569,8 @@ def handle_embed_both_batch(path, data, request_id, link_id, remote_identity, re
                 continue
             tmps.append(tmp)
             idx_of[tmp] = i
-        t0 = time.time()
-        with models.lock:
-            sig = models.get_siglip_embedder()
-            dino = models.get_dino_embedder()
-            order = list(idx_of)
-            (sig_e, dino_e), failed = _embed_shared([sig, dino], order)
-        gpu_s = time.time() - t0
-        failed_paths = {}
-        for label, msg in failed:
-            failed_paths[label] = msg
-        row = 0  # embed_shared drops failed rows; surviving rows keep input order
-        for tmp in order:
-            i = idx_of[tmp]
-            if tmp in failed_paths:
-                results[i]["error"] = failed_paths[tmp]
-                continue
-            results[i]["siglip"] = sig_e[row].astype(np.float32).tobytes()
-            results[i]["dino"] = dino_e[row].astype(np.float32).tobytes()
-            row += 1
-        print(f"[worker] handled {worker_protocol.PATH_EMBED_BOTH_BATCH} ({len(items)} items) -> "
-              f"{row} ok, {len(items) - row} failed, {gpu_s:.2f}s", flush=True)
-        return worker_protocol.pack({
-            "results": results, "siglip_model": sig.model_id(), "dino_model": dino.model_id(),
-            "gpu_seconds": gpu_s, "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
-            "error": None})
+        return _embed_items_reply(worker_protocol.PATH_EMBED_BOTH_BATCH, results,
+                                  {p: [i] for p, i in idx_of.items()})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BOTH_BATCH} -> ERROR {e}",
@@ -1090,6 +1177,8 @@ HANDLERS = {
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
     worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
     worker_protocol.PATH_EMBED_BOTH_BATCH: handle_embed_both_batch,
+    worker_protocol.PATH_EMBED_BOTH_PATHS: handle_embed_both_paths,
+    worker_protocol.PATH_PROBE_DATA_ROOT: handle_probe_data_root,
     worker_protocol.PATH_EMBED_SIGLIP_TEXT: handle_embed_siglip_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,
     worker_protocol.PATH_ESTIMATE_AGE: handle_estimate_age,

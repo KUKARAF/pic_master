@@ -554,6 +554,12 @@ def _local_embed_shared(embedders, paths):
     return embed_shared(embedders, paths)
 
 
+# Set by create_app (like _worker_client); lets _embed_pair_chunk hand the data root to the worker
+# client for shared-disk mode. _last_transport records the mode of the most recent chunk.
+_embed_data_root = None
+_last_transport = {'mode': None}
+
+
 def _embed_pair_chunk(sig, dino, paths):
     """Embed `paths` with BOTH models in one decode pass -- the single code path used by the
     bulk job AND the speed test. Returns (pairs, errors, gpu_seconds, models):
@@ -564,11 +570,13 @@ def _embed_pair_chunk(sig, dino, paths):
     paths = list(paths)
     if _worker_client is not None and _worker_client.is_configured():
         res = worker_client.embed_both(_worker_client, paths, batch_size=sig.batch_size,
-                                       workers=sig.workers)
+                                       workers=sig.workers, data_root=_embed_data_root)
+        _last_transport['mode'] = res.mode
         pairs = [(res.siglip[i], res.dino[i]) if res.siglip[i] is not None and res.dino[i] is not None
                  else None for i in range(len(paths))]
         models = (res.siglip_model, res.dino_model) if res.siglip_model else None
         return pairs, list(res.errors), res.gpu_seconds, models
+    _last_transport['mode'] = 'local'
     (sig_mat, dino_mat), failed = _local_embed_shared([sig, dino], paths)
     failed_msgs = dict(failed)
     pairs, errs, k = [], [], 0
@@ -830,8 +838,9 @@ def create_app(data_root: str) -> FastAPI:
     # can offload to a remote worker when one is configured + reachable. Cheap: no
     # RNS init and no network until is_available() is first called (and that pays
     # nothing when no worker is configured).
-    global _worker_client
+    global _worker_client, _embed_data_root
     _worker_client = worker_client.get_client(data_root)
+    _embed_data_root = data_root
 
     # Return freed heap back to the OS periodically (see _start_malloc_trimmer):
     # the big transient embedding matrices otherwise ratchet RSS upward.
@@ -4062,7 +4071,7 @@ def create_app(data_root: str) -> FastAPI:
     # One decode pass feeds both models (embed_shared locally, embed_both on the worker).
     # ------------------------------------------------------------------
     pair_job = {'running': False, 'done': 0, 'total': 0, 'failed': 0, 'error': None,
-                'img_per_sec': 0.0, 'eta_seconds': None}
+                'img_per_sec': 0.0, 'eta_seconds': None, 'transport_mode': None}
     PAIR_CHUNK = 192  # images per write-back chunk: flat memory + frequent resumable commits
 
     def _pair_model_ids():
@@ -4111,7 +4120,7 @@ def create_app(data_root: str) -> FastAPI:
         sig_id, dino_id = sig.model_id(), dino.model_id()
         candidates = _pair_candidates(sig_id, dino_id, include_trashed)
         pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
-                        img_per_sec=0.0, eta_seconds=None)
+                        img_per_sec=0.0, eta_seconds=None, transport_mode=None)
 
         def _run():
             try:
@@ -4129,6 +4138,7 @@ def create_app(data_root: str) -> FastAPI:
                             live.append((fid, abs_path, need_s, need_d))
                     if live:
                         pairs, errs, _gpu, models = _embed_pair_chunk(sig, dino, [x[1] for x in live])
+                        pair_job['transport_mode'] = _last_transport['mode']
                         w_sig, w_dino = (models or (None, None))
                         for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
                             if pair is None:
@@ -4162,7 +4172,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/siglip-dino/status')
     def api_siglip_dino_status():
         out = {k: pair_job[k] for k in ('running', 'done', 'total', 'failed', 'error',
-                                         'img_per_sec', 'eta_seconds')}
+                                         'img_per_sec', 'eta_seconds', 'transport_mode')}
         out['device'] = _ml_device_label()
         out['pending'] = None
         if not pair_job['running']:
@@ -4216,6 +4226,7 @@ def create_app(data_root: str) -> FastAPI:
         _embed_pair_chunk(sig, dino, warm)  # warm-up: model/CUDA-graph/connection setup, untimed
         t0 = time.perf_counter()
         pairs, _errs, gpu_s, models = _embed_pair_chunk(sig, dino, sample)
+        transport_mode = _last_transport['mode']
         wall = max(time.perf_counter() - t0, 1e-9)
         ok = sum(1 for p in pairs if p is not None)
         if ok == 0:
@@ -4233,10 +4244,12 @@ def create_app(data_root: str) -> FastAPI:
             'est_seconds_total': round(total / ips, 1),
             'est_seconds_remaining': round(remaining / ips, 1),
             'device': _ml_device_label(),
+            'transport_mode': transport_mode,
             'models': {'siglip': (models[0] if models else None) or sig_id,
                        'dino': (models[1] if models else None) or dino_id},
             'breakdown': {
                 'wall_seconds': round(wall, 3),
+                'transport_mode': transport_mode,
                 'gpu_seconds': round(gpu_s, 3) if gpu_s is not None else None,
                 # With pipelined batches summed gpu_seconds can exceed wall -> clamp at 0.
                 'decode_transport_seconds': round(max(wall - gpu_s, 0.0), 3) if gpu_s is not None else None,

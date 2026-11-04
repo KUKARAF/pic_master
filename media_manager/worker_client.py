@@ -674,57 +674,152 @@ class BothResult:
         self.gpu_seconds = 0.0     # summed worker decode+inference time over all batches
         self.wall_seconds = 0.0    # client wall clock (wall - gpu ~ transport/overhead)
         self.n_batches = 0
+        # 'paths' = worker read the files from the shared disk (no bytes sent), 'upload' = bytes
+        # were sent, 'mixed' = some of each (items outside data_root fall back to upload).
+        self.mode = "upload"
 
 
-def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=None) -> BothResult:
+PATHS_BATCH_SIZE = 64          # path-mode batches carry no bytes, so they can be much larger
+_PROBE_TTL_NEGATIVE = 300.0    # re-probe a "not visible" answer after this many seconds
+
+
+def _worker_sees_data_root(client, data_root) -> bool:
+    """One-time (cached per client+root) probe: can the worker read ``data_root`` itself?
+    A positive answer is cached for the process; a negative one (incl. an old worker with no
+    probe handler) for a few minutes; transport errors are not cached (-> upload this time)."""
+    cache = client.__dict__.setdefault("_data_root_probe", {})
+    hit = cache.get(data_root)
+    if hit is not None and (hit[0] or time.time() < hit[1]):
+        return hit[0]
+    try:
+        resp = client.request(worker_protocol.PATH_PROBE_DATA_ROOT, {"data_root": data_root},
+                              timeout=15, retries=0)
+    except WorkerError as exc:
+        visible, reason = False, str(exc)
+        if "no handler" not in reason:
+            return False  # timeout / transient: don't cache
+    except WorkerUnavailable:
+        return False
+    else:
+        visible, reason = bool(resp.get("visible")), resp.get("reason")
+    cache[data_root] = (visible, time.time() + _PROBE_TTL_NEGATIVE)
+    print(f"[worker-client] data_root {data_root!r} visible to worker: {visible} ({reason})",
+          flush=True)
+    return visible
+
+
+def _rel_under_root(item, root_real):
+    """Relative '/'-path of file ``item`` inside ``root_real`` (symlinks resolved), or None if
+    it is not a plain path string or resolves outside the root (-> upload that item)."""
+    if not isinstance(item, str):
+        return None
+    real = os.path.realpath(item)
+    try:
+        if os.path.commonpath([root_real, real]) != root_real or real == root_real:
+            return None
+    except ValueError:
+        return None
+    return os.path.relpath(real, root_real).replace(os.sep, "/")
+
+
+def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=None,
+               data_root=None) -> BothResult:
     """SigLIP 2 + DINOv2 vectors for ``items`` via the worker, ``workers`` batches in flight.
 
     ``items``: str paths, (name, bytes) tuples, or PIL images. Per-item failures give
     ``None`` + an error string; a transport/worker-level failure raises WorkerError (a stale
     worker says "worker needs redeploy"). ``on_batch(done_items, total)`` is called as
     batches complete (from the calling thread).
+
+    Shared-disk mode: when ``data_root`` is given and the worker's (cached) probe says it can see
+    it, str items inside ``data_root`` are sent as relative paths (no bytes) with batches of at
+    least PATHS_BATCH_SIZE. Everything else (and an old worker) uses the upload path.
+    ``BothResult.mode`` reports what was used.
     """
     items = list(items)
     n = len(items)
     out = BothResult(n)
     t0 = time.time()
     bs = max(1, int(batch_size))
+
+    rels = [None] * n  # rel path per item when it goes via shared disk
+    if data_root and n and any(isinstance(it, str) for it in items) \
+            and _worker_sees_data_root(client, data_root):
+        root_real = os.path.realpath(data_root)
+        rels = [_rel_under_root(it, root_real) for it in items]
+        if any(r is not None for r in rels):
+            bs = max(bs, PATHS_BATCH_SIZE)
+    n_paths = sum(1 for r in rels if r is not None)
+    out.mode = "paths" if n_paths == n and n else ("mixed" if n_paths else "upload")
+    if n:
+        print(f"[worker-client] embed_both: {n} items, mode={out.mode} "
+              f"({n_paths} via shared disk), batch_size={bs}", flush=True)
     starts = list(range(0, n, bs))
 
-    def run_batch(start):
-        chunk = items[start:start + bs]
-        payload, errs = [], {}
-        for j, it in enumerate(chunk):
+    def upload_part(idxs, errs):
+        payload = []
+        for k in idxs:
             try:
-                name, data = _item_to_named_bytes(it, start + j)
+                name, data = _item_to_named_bytes(items[k], k)
             except (OSError, ValueError) as exc:  # unreadable file: isolate to this item
-                errs[j] = f"read failed: {exc}"
+                errs[k] = f"read failed: {exc}"
                 continue
-            payload.append((j, {"name": name, "image": data}))
-        results = []
-        gpu = 0.0
-        models = (None, None)
-        if payload:
-            client.record("embed_both", f"{len(payload)} items")
-            resp = _embed_request(client, worker_protocol.PATH_EMBED_BOTH_BATCH,
-                                  {"items": [p for _, p in payload]}, "embed_both",
-                                  concurrent=True)
+            payload.append((k, {"name": name, "image": data}))
+        if not payload:
+            return [], []
+        client.record("embed_both", f"{len(payload)} items")
+        resp = _embed_request(client, worker_protocol.PATH_EMBED_BOTH_BATCH,
+                              {"items": [p for _, p in payload]}, "embed_both", concurrent=True)
+        return [k for k, _ in payload], resp
+
+    def paths_part(idxs):
+        client.record("embed_both", f"{len(idxs)} paths")
+        try:
+            resp = _embed_request(client, worker_protocol.PATH_EMBED_BOTH_PATHS,
+                                  {"data_root": data_root, "paths": [rels[k] for k in idxs]},
+                                  "embed_both", concurrent=True)
+        except WorkerError as exc:
+            if "needs redeploy" not in str(exc):
+                raise
+            # Old worker without the path mode: remember, and upload these items instead.
+            client.__dict__.setdefault("_data_root_probe", {})[data_root] = (
+                False, time.time() + _PROBE_TTL_NEGATIVE)
+            return None
+        return idxs, resp
+
+    def run_batch(start):
+        idxs = list(range(start, min(n, start + bs)))
+        errs, parts = {}, []  # parts: (item indices, reply)
+        p_idx = [k for k in idxs if rels[k] is not None]
+        u_idx = [k for k in idxs if rels[k] is None]
+        if p_idx:
+            got = paths_part(p_idx)
+            if got is None:
+                u_idx = idxs
+            else:
+                parts.append(got)
+        if u_idx:
+            ks, resp = upload_part(u_idx, errs)
+            if ks:
+                parts.append((ks, resp))
+        gpu, models, merged = 0.0, (None, None), []
+        for ks, resp in parts:
             if resp.get("error"):
                 raise WorkerError(resp["error"])
             results = resp.get("results") or []
-            if len(results) != len(payload):
+            if len(results) != len(ks):
                 raise WorkerError(f"embed_both: worker returned {len(results)} results "
-                                  f"for {len(payload)} items")
-            gpu = float(resp.get("gpu_seconds") or 0.0)
+                                  f"for {len(ks)} items")
+            gpu += float(resp.get("gpu_seconds") or 0.0)
             models = (resp.get("siglip_model"), resp.get("dino_model"))
-        return start, payload, results, errs, gpu, models
+            merged.extend(zip(ks, results))
+        return merged, errs, gpu, models
 
     def merge(res):
-        start, payload, results, errs, gpu, models = res
-        for j, msg in errs.items():
-            out.errors[start + j] = msg
-        for (j, _), r in zip(payload, results):
-            k = start + j
+        merged, errs, gpu, models = res
+        for k, msg in errs.items():
+            out.errors[k] = msg
+        for k, r in merged:
             if r.get("error") or r.get("siglip") is None or r.get("dino") is None:
                 out.errors[k] = r.get("error") or "no embedding returned"
                 continue
