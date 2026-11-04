@@ -29,6 +29,11 @@ PATH_EMBED_TEXT = "embed_text"
 # images, decoded ONCE on the worker and fed to both models (embedders.embed_shared).
 PATH_EMBED_BOTH_BATCH = "embed_both_batch"
 PATH_EMBED_SIGLIP_TEXT = "embed_siglip_text"
+# Shared-disk mode (web server and worker on the same machine): instead of uploading bytes the
+# client sends {data_root, paths:[rel...]} and the worker reads <data_root>/<rel> itself.
+# probe_data_root ({data_root} -> {visible, reason}) is the cheap check that it can.
+PATH_EMBED_BOTH_PATHS = "embed_both_paths"
+PATH_PROBE_DATA_ROOT = "probe_data_root"
 # Bumped when the embed_both_batch / embed_siglip_text wire shape changes. Replies carry it as
 # "proto" so a client can tell a stale (un-redeployed) worker from a real failure.
 EMBED_PROTOCOL_VERSION = 1

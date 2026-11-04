@@ -307,6 +307,9 @@
           + '; ' + dur(d.est_seconds_remaining) + ' remaining (' + d.remaining.toLocaleString() + ' photos)';
         var b = d.breakdown || {};
         if (b.gpu_seconds != null) s += ' · wall ' + b.wall_seconds + 's = GPU ' + b.gpu_seconds + 's + decode/transport ~' + b.decode_transport_seconds + 's';
+        if (d.transport_mode === 'paths') s += ' · reading from shared disk';
+        else if (d.transport_mode === 'mixed') s += ' · shared disk + uploading some images';
+        else if (d.transport_mode === 'upload') s += ' · uploading images';
         if (d.failed) s += ' · ' + d.failed + ' failed';
         out.textContent = s;
       })
