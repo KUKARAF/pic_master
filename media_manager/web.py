@@ -8916,7 +8916,7 @@ def create_app(data_root: str) -> FastAPI:
         return pool[:k]
 
     def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
-                                     honor_negatives=False, exclude_non_matching_faces=False,
+                                     honor_negatives=True, exclude_non_matching_faces=True,
                                      model='siglip', info=None):
         """Images not yet in the set whose embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
@@ -8939,7 +8939,7 @@ def create_app(data_root: str) -> FastAPI:
         ranked pool before slicing to `limit`, so it pulls in fresh unsorted
         candidates rather than padding the buffer with already-in-a-set photos.
 
-        `honor_negatives` (default False — a UI toggle, off by default):
+        `honor_negatives` (default True — a UI toggle, on by default):
         rejected photos (file_set_exclusions) are always hard-excluded from the
         candidate pool regardless of this flag — what it controls is whether
         they *also* pull the ranking centroid away from their own embeddings
@@ -8947,7 +8947,7 @@ def create_app(data_root: str) -> FastAPI:
         so photos that merely resemble something already rejected rank lower
         too, not just literal re-suggestions of the same rejected photo.
 
-        `exclude_non_matching_faces` (default False — a UI toggle, off by
+        `exclude_non_matching_faces` (default True — a UI toggle, on by
         default): drops any threshold-passing candidate that has a recognized
         face belonging to someone who isn't already confirmed in this set (see
         get_people_present_in_set — manually assigned people plus anyone with a
@@ -9162,7 +9162,7 @@ def create_app(data_root: str) -> FastAPI:
         return [window[i] for i in order] + passing[len(window):]
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
-                                          avoid_existing=True, honor_negatives=False, background=True,
+                                          avoid_existing=True, honor_negatives=True, background=True,
                                           model='place', info=None, mask=True, mask_wait=None):
         """Images not yet at this location whose embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
@@ -9834,7 +9834,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/sets/{set_id}/similar-files')
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
-                                   honor_negatives: bool = False, exclude_non_matching_faces: bool = False,
+                                   honor_negatives: bool = True, exclude_non_matching_faces: bool = True,
                                    model: str = 'siglip'):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
@@ -10453,7 +10453,7 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_files_for_location(location_id: int, body: SwipeExcludeBody,
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
-                                        honor_negatives: bool = False, background: bool = True,
+                                        honor_negatives: bool = True, background: bool = True,
                                         model: str = 'place', mask: bool = True,
                                         mask_wait: Optional[float] = None):
         if manual.get_location(location_id) is None:

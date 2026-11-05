@@ -112,7 +112,7 @@ def test_unknown_model_400(env):
 @pytest.mark.parametrize('model', ['siglip', 'dino'])
 def test_model_routing_and_no_threshold(env, model):
     _app, _db, _m, ids, loc, client = env
-    data = _get(client, loc, model)
+    data = _get(client, loc, model, honor_negatives='false')   # pure-similarity order
     order = _order(data, ids)
     assert data['model'] == model and data['threshold_applied'] is False
     assert data['background_applied'] is False and data['model_missing'] is False
@@ -131,21 +131,22 @@ def test_toggles(env, model):
     assert 'placed' in _order(_get(client, loc, model, avoid_existing='false'), ids)
     # settled (set linked to the location) stays hidden even without avoid_existing
     assert 'settled' not in _order(_get(client, loc, model, avoid_existing='false'), ids)
-    base = _order(_get(client, loc, model), ids)
+    base = _order(_get(client, loc, model, honor_negatives='false'), ids)
     neg = _order(_get(client, loc, model, honor_negatives='true'), ids)
     assert base.index('x') < base.index('y')
     assert neg.index('y') < neg.index('x')
+    assert _order(_get(client, loc, model), ids) == neg      # default (omitted) == on
     assert 'rej' not in base and 'rej' not in neg
     r = client.post(f'/api/locations/{loc}/similar-files?limit=2&offset=1&model={model}', json={'exclude': []})
-    assert _order(r.json(), ids) == base[1:3]
+    assert _order(r.json(), ids) == neg[1:3]
     r = client.post(f'/api/locations/{loc}/similar-files?limit=2&model={model}',
-                    json={'exclude': [str(ids[base[0]][0])]})
-    assert _order(r.json(), ids) == base[1:3]
+                    json={'exclude': [str(ids[neg[0]][0])]})
+    assert _order(r.json(), ids) == neg[1:3]
 
 
 def test_negatives_change_clip_too(env):
     _app, _db, _m, ids, loc, client = env
-    assert 'x' in _order(_get(client, loc, 'clip', background='false'), ids)
+    assert 'x' in _order(_get(client, loc, 'clip', background='false', honor_negatives='false'), ids)
     neg = _order(_get(client, loc, 'clip', background='false', honor_negatives='true'), ids)
     assert 'x' not in neg and 'y' in neg
 

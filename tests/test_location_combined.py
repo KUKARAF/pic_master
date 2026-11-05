@@ -104,7 +104,7 @@ def test_default_combined_ranking(env):
 
 def test_negatives_and_pagination(env):
     _app, _db, _m, ids, loc, client, _mp = env
-    base_d = _post(client, loc)
+    base_d = _post(client, loc, honor_negatives='false')
     neg_d = _post(client, loc, honor_negatives='true')
     base, neg = _names(base_d, ids), _names(neg_d, ids)
     assert 'rej' not in base and 'rej' not in neg
@@ -113,11 +113,12 @@ def test_negatives_and_pagination(env):
     score = lambda d, n: next(c['score'] for c in d['cards'] if c['id'] == ids[n][0])
     assert score(neg_d, 'xneg') < score(base_d, 'xneg') - 0.1
     assert neg.index('xneg') >= base.index('xneg')
+    assert _names(_post(client, loc), ids) == neg      # default (omitted) == on
     r = client.post(f'/api/locations/{loc}/similar-files?limit=2&offset=1', json={'exclude': []})
-    assert _names(r.json(), ids) == base[1:3]
+    assert _names(r.json(), ids) == neg[1:3]
     r = client.post(f'/api/locations/{loc}/similar-files?limit=2',
-                    json={'exclude': [str(ids[base[0]][0])]})
-    assert _names(r.json(), ids) == base[1:3]
+                    json={'exclude': [str(ids[neg[0]][0])]})
+    assert _names(r.json(), ids) == neg[1:3]
 
 
 def test_one_space_missing_falls_back(env):

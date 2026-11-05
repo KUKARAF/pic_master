@@ -109,7 +109,7 @@ def test_unknown_model_400(env):
 @pytest.mark.parametrize('model', ['siglip', 'dino'])
 def test_model_routing_and_no_threshold(env, model):
     _app, _db, _m, ids, sid, client = env
-    data = _get(client, sid, model)
+    data = _get(client, sid, model, honor_negatives='false')   # pure-similarity order
     order = _order(data, ids)
     assert data['model'] == model and data['threshold_applied'] is False
     assert data['model_missing'] is False
@@ -129,21 +129,23 @@ def test_toggles(env, model):
     assert 'inset' not in _order(_get(client, sid, model), ids)
     assert 'inset' in _order(_get(client, sid, model, avoid_existing='false'), ids)
     # honor_negatives: rejected photo's own space pulls x (leans to rej) below y
-    base = _order(_get(client, sid, model), ids)
+    base = _order(_get(client, sid, model, honor_negatives='false'), ids)
     neg = _order(_get(client, sid, model, honor_negatives='true'), ids)
     assert base.index('x') < base.index('y')
     assert neg.index('y') < neg.index('x')
+    # default (field omitted) == on
+    assert _order(_get(client, sid, model), ids) == neg
     # offset paging + exclude_ids
     r = client.post(f'/api/sets/{sid}/similar-files?limit=2&offset=1&model={model}', json={'exclude': []})
-    assert _order(r.json(), ids) == base[1:3]
+    assert _order(r.json(), ids) == neg[1:3]
     r = client.post(f'/api/sets/{sid}/similar-files?limit=2&model={model}',
-                    json={'exclude': [str(ids[base[0]][0])]})
-    assert _order(r.json(), ids) == base[1:3]
+                    json={'exclude': [str(ids[neg[0]][0])]})
+    assert _order(r.json(), ids) == neg[1:3]
 
 
 def test_negatives_change_clip_too(env):
     _app, _db, _m, ids, sid, client = env
-    assert 'x' in _order(_get(client, sid, 'clip'), ids)
+    assert 'x' in _order(_get(client, sid, 'clip', honor_negatives='false'), ids)
     neg = _order(_get(client, sid, 'clip', honor_negatives='true'), ids)
     assert 'x' not in neg and 'y' in neg   # x falls under the CLIP threshold once steered away
 
@@ -154,9 +156,13 @@ def test_faces_filter_shared(env):
     manual.assign_identity_to_photo(ids['m1'][1], 'Alice')
     manual.assign_identity_to_photo(ids['x'][1], 'Bob')
     for model in ('clip', 'siglip', 'dino'):
-        off = _order(_get(client, sid, model), ids)
-        on = _order(_get(client, sid, model, exclude_non_matching_faces='true'), ids)
+        off = _order(_get(client, sid, model, exclude_non_matching_faces='false',
+                          honor_negatives='false'), ids)
+        on = _order(_get(client, sid, model, exclude_non_matching_faces='true',
+                         honor_negatives='false'), ids)
         assert 'x' in off and 'x' not in on and 'y' in on
+        # omitted field == on
+        assert _order(_get(client, sid, model, honor_negatives='false'), ids) == on
 
 
 @pytest.mark.parametrize('model', ['siglip', 'dino'])
