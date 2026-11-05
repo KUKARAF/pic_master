@@ -173,6 +173,9 @@ class CleanupDecideBody(BaseModel):
     ref: str
     action: str  # 'keep' | 'remove'
     include_approved: bool = False
+    group: bool = False   # also apply to the other uncertain frames of the same video
+    keep: float = person_cleanup.DEFAULT_KEEP
+    remove: float = person_cleanup.DEFAULT_REMOVE
 
 
 class ConfirmAboveThresholdBody(BaseModel):
@@ -983,7 +986,7 @@ def _make_body_crop(src_path: str, bbox_json: str, dst_path: str, height: int = 
 
 
 def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 200,
-                    rotation: int = 0, angle: float = 0.0) -> bool:
+                    rotation: int = 0, angle: float = 0.0, frame_index=None) -> bool:
     """Crop a face from src_path using bbox JSON, save JPEG to dst_path. Two separate
     in-plane corrections, both meaning "show this face upright": `rotation` is
     quarter-turns clockwise (0..3) that a user picked by hand, `angle` is the free
@@ -996,7 +999,11 @@ def _make_face_crop(src_path: str, bbox_json: str, dst_path: str, size: int = 20
         if not bbox or len(bbox) < 4:
             return False
         x1, y1, x2, y2 = [int(v) for v in bbox]
-        with PILImage.open(src_path) as img:
+        # A face found on frame N of an animated file has its box in THAT frame's pixels.
+        frame_img = frames.extract_frame(src_path, frame_index) if frame_index else None
+        if frame_index and frame_img is None:
+            return False
+        with (contextlib.nullcontext(frame_img) if frame_img is not None else PILImage.open(src_path)) as img:
             img = img.convert('RGB')
             w, h = img.size
             x1, y1 = max(0, x1), max(0, y1)
@@ -3626,10 +3633,43 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     def _cleanup_rows(name):
-        """The person's face rows minus captured video stills (those belong to the
-        video's Frames pod and never surface outside it)."""
-        stills = set(manual.get_all_frame_capture_parents())
-        return [r for r in manual.get_identity_face_rows(name) if r['checksum'] not in stills]
+        """Every face row of the person, INCLUDING faces captured from video frames
+        (captured stills and per-frame faces of animated files). They are scored, banded
+        and removable like any face; the UI labels them via _cleanup_frame_info and links
+        to the video, never to the hidden still."""
+        return list(manual.get_identity_face_rows(name))
+
+    def _fmt_ms(ms):
+        s_ = int(ms or 0) // 1000
+        return '%02d:%02d' % (s_ // 60, s_ % 60) if s_ < 3600 else '%d:%02d:%02d' % (s_ // 3600, s_ // 60 % 60, s_ % 60)
+
+    def _cleanup_frame_info(rows):
+        """{manual face id: info} for faces that come from a video frame; absent for
+        ordinary photo faces. kind 'still' = a captured still (own file row, linked to
+        its video via frame_captures); kind 'frame' = a face found on frame N of the
+        file itself (faces.frame_index). `group` is the source video/file checksum:
+        every frame face of one video shares it. `link_checksum` is what the UI links
+        to (the video, never the still)."""
+        times = {c: t for c, t in manual.conn.execute('SELECT child_checksum, time_ms FROM frame_captures')}
+        parents = manual.get_all_frame_capture_parents()
+        out = {}
+        for r in rows:
+            cs = r['checksum']
+            if cs in parents:
+                grp, ms = parents[cs], times.get(cs, 0)
+                out[int(r['id'])] = {'kind': 'still', 'group': grp, 'time_ms': ms,
+                                     'label': 'video frame ' + _fmt_ms(ms)}
+            elif r['frame_index']:
+                out[int(r['id'])] = {'kind': 'frame', 'group': cs, 'time_ms': None,
+                                     'frame_index': int(r['frame_index']),
+                                     'label': 'frame %d' % int(r['frame_index'])}
+        vids = {}
+        for info in out.values():
+            if info['group'] not in vids:
+                vr = db.get_file_by_checksum(info['group'])
+                vids[info['group']] = (vr['id'], os.path.basename(vr['path'])) if vr else (None, None)
+            info['video_file_id'], info['video_name'] = vids[info['group']]
+        return out
 
     ANCHOR_MAX = 20   # best-N hand-set faces (by quality) used as the anchor set
 
@@ -3658,6 +3698,7 @@ def create_app(data_root: str) -> FastAPI:
         rows = _cleanup_rows(name)
         tier = {int(r['id']): person_cleanup.face_trust(r) for r in rows}
         quality = _cleanup_quality(rows)
+        frame_info = _cleanup_frame_info(rows)
         source, pool = 'none', []
         for t, label in ((3, 'manual'), (2, 'approved')):
             pool = [r for r in rows if tier[int(r['id'])] == t
@@ -3717,6 +3758,8 @@ def create_app(data_root: str) -> FastAPI:
                 'nearest_anchor_ref': f'manual:{anchor_used[int(sims.argmax())]}',
                 'source_face_id': r['source_face_id'], 'checksum': r['checksum'],
                 'approved': elig == 'approved',
+                'frame': frame_info.get(fid),
+                'link_checksum': frame_info[fid]['group'] if fid in frame_info else r['checksum'],
                 # approved faces are only ever reviewed one by one: never in the bulk REMOVE band
                 'band': 'uncertain' if (elig == 'approved') else band,
             })
@@ -3725,10 +3768,16 @@ def create_app(data_root: str) -> FastAPI:
     def _cleanup_file_ids(cands):
         out = {}
         for c in cands:
-            if c['checksum'] not in out:
-                row = db.get_file_by_checksum(c['checksum'])
-                out[c['checksum']] = row['id'] if row else None
+            cs = c['link_checksum']   # a captured still links to its VIDEO
+            if cs not in out:
+                row = db.get_file_by_checksum(cs)
+                out[cs] = row['id'] if row else None
         return out
+
+    def _frame_json(info):
+        if not info:
+            return None
+        return {k: info.get(k) for k in ('kind', 'label', 'time_ms', 'frame_index', 'video_file_id', 'video_name', 'group')}
 
     @app.get('/api/people/{name}/cleanup/faces')
     def api_cleanup_faces(name: str, limit: int = 60, offset: int = 0):
@@ -3739,6 +3788,7 @@ def create_app(data_root: str) -> FastAPI:
         name = manual.resolve_identity_name(name)
         rows = _cleanup_rows(name)
         quality = _cleanup_quality(rows)
+        frame_info = _cleanup_frame_info(rows)
         picked = set(manual.get_cleanup_anchor_ids(name))
         items = []
         for r in rows:
@@ -3747,7 +3797,9 @@ def create_app(data_root: str) -> FastAPI:
             items.append({'face_id': fid, 'ref': f'manual:{fid}', 'quality': round(quality[fid], 3),
                           'width': round(r['x2'] - r['x1']), 'trust': t,
                           'is_anchor': t >= 3, 'picked': fid in picked, 'locked': t >= 3 and fid not in picked,
-                          'checksum': r['checksum'], 'kind': person_cleanup.eligibility(r)})
+                          'checksum': frame_info[fid]['group'] if fid in frame_info else r['checksum'],
+                          'frame': _frame_json(frame_info.get(fid)),
+                          'kind': person_cleanup.eligibility(r)})
         items.sort(key=lambda i: (-i['quality'], i['face_id']))
         page = items[offset:offset + max(1, min(limit, 500))]
         for it in page:
@@ -3790,6 +3842,15 @@ def create_app(data_root: str) -> FastAPI:
         approved = [c for c in cands if c['approved']]
         sample = sorted(bands['remove'], key=lambda c: c['score'])[:max(0, min(limit, 500))]
         fids = _cleanup_file_ids(sample)
+        # REMOVE-band frame faces grouped by source video (many consecutive frames of one
+        # video give dozens of near-identical faces).
+        groups = {}
+        for c in bands['remove']:
+            if c['frame']:
+                g = groups.setdefault(c['frame']['group'], {'video_file_id': c['frame']['video_file_id'],
+                                                           'video_name': c['frame']['video_name'], 'count': 0})
+                g['count'] += 1
+        remove_groups = sorted(groups.values(), key=lambda g: -g['count'])[:100]
         last = manual.get_last_cleanup_batch(name)
         last_info = None
         if last is not None:
@@ -3806,10 +3867,13 @@ def create_app(data_root: str) -> FastAPI:
                        'keep': len(bands['keep']), 'uncertain': len(bands['uncertain']),
                        'remove': len(bands['remove']), 'protected': a['protected'],
                        'approved_skipped': a['approved_skipped'], 'approved_far': len(approved),
-                       'missing_embedding': a['missing_embedding']},
+                       'missing_embedding': a['missing_embedding'],
+                       'frame_faces': sum(1 for c in cands if c['frame'] and not c['approved']),
+                       'frame_remove': sum(g['count'] for g in groups.values())},
+            'remove_groups': remove_groups,
             'histogram': person_cleanup.histogram([c['score'] for c in cands if not c['approved']]),
-            'remove_sample': [{'ref': c['ref'], 'file_id': fids.get(c['checksum']), 'score': round(c['score'], 3)}
-                              for c in sample],
+            'remove_sample': [{'ref': c['ref'], 'file_id': fids.get(c['link_checksum']), 'score': round(c['score'], 3),
+                               'frame': _frame_json(c['frame'])} for c in sample],
             'last_batch': last_info,
         }
 
@@ -3865,9 +3929,15 @@ def create_app(data_root: str) -> FastAPI:
         cands = sorted((c for c in pool if c['ref'] not in exclude),
                        key=lambda c: abs(c['score'] - mid))[:max(1, min(count, 100))]
         fids = _cleanup_file_ids(cands)
-        cards = [{'ref': c['ref'], 'file_id': fids[c['checksum']], 'score': round(c['score'], 3),
-                  'anchor_ref': c['nearest_anchor_ref'], 'face_id': c['face_id'], 'approved': c['approved']}
-                 for c in cands if fids.get(c['checksum']) is not None]
+        group_n = {}
+        for c in pool:
+            if c['frame']:
+                group_n[c['frame']['group']] = group_n.get(c['frame']['group'], 0) + 1
+        cards = [{'ref': c['ref'], 'file_id': fids[c['link_checksum']], 'score': round(c['score'], 3),
+                  'anchor_ref': c['nearest_anchor_ref'], 'face_id': c['face_id'], 'approved': c['approved'],
+                  'frame': _frame_json(c['frame']),
+                  'group_count': group_n.get(c['frame']['group'], 0) if c['frame'] else 0}
+                 for c in cands if fids.get(c['link_checksum']) is not None]
         return {'cards': _attach_file_meta(cards), 'remaining': len(pool)}
 
     @app.post('/api/people/{name}/cleanup/decide')
@@ -3881,13 +3951,25 @@ def create_app(data_root: str) -> FastAPI:
         kind, raw = _parse_face_ref(body.ref)
         if kind != 'manual':
             raise HTTPException(status_code=400, detail='manual:<id> ref required')
+        ids = [raw]
+        if body.group:
+            # Explicit "apply to all N frames from this video": every OTHER currently
+            # uncertain candidate of the same source video. Recomputed server-side;
+            # eligibility is re-checked per face in manual_db, so hand-set faces can
+            # never ride along.
+            a = _cleanup_analysis(name, body.keep, body.remove, body.include_approved)
+            me = next((c for c in a['candidates'] if c['face_id'] == raw), None)
+            if me is not None and me['frame']:
+                ids += [c['face_id'] for c in a['candidates']
+                        if c['band'] == 'uncertain' and c['frame'] and c['face_id'] != raw
+                        and c['frame']['group'] == me['frame']['group']]
         if body.action == 'remove':
-            res = manual.cleanup_remove_faces(name, [raw], include_approved=body.include_approved, kind='swipe_remove')
+            res = manual.cleanup_remove_faces(name, ids, include_approved=body.include_approved, kind='swipe_remove')
             if res['removed']:
-                db.mark_faces_handled([res['removed'][0]['source_face_id']], 0)
-            return {'ok': bool(res['removed']), 'skipped': res['skipped']}
-        res = manual.cleanup_keep_faces(name, [raw], include_approved=body.include_approved)
-        return {'ok': bool(res['kept']), 'skipped': res['skipped']}
+                db.mark_faces_handled([r['source_face_id'] for r in res['removed']], 0)
+            return {'ok': bool(res['removed']), 'skipped': res['skipped'], 'applied': len(res['removed'])}
+        res = manual.cleanup_keep_faces(name, ids, include_approved=body.include_approved)
+        return {'ok': bool(res['kept']), 'skipped': res['skipped'], 'applied': len(res['kept'])}
 
     @app.delete('/api/people/{name}/cleanup/decide/{face_id}')
     def api_cleanup_undo_decide(name: str, face_id: int):
@@ -11244,10 +11326,13 @@ def create_app(data_root: str) -> FastAPI:
         # and an auto face the re-normalization backfill re-angled each render fresh
         # bytes instead of serving the stale crop, and an auto crop stays immutable per
         # (id, angle). Tenths of a degree is finer than anything visible in a 200px crop.
+        fidx = _face_ref_frame_index(face_id)
         crop_path = os.path.join(
-            thumbs_dir, 'face_%s_%d_r%d_a%d.jpg' % (kind, raw_id, rotation, round(angle * 10)))
+            thumbs_dir, 'face_%s_%d_r%d_a%d%s.jpg' % (kind, raw_id, rotation, round(angle * 10),
+                                                      '_f%d' % fidx if fidx else ''))
         if not os.path.isfile(crop_path):
-            if not _make_face_crop(src_path, bbox_json, crop_path, rotation=rotation, angle=angle):
+            if not _make_face_crop(src_path, bbox_json, crop_path, rotation=rotation, angle=angle,
+                                   frame_index=fidx):
                 return Response(content=_gray_placeholder(), media_type='image/jpeg')
         # A manual face keeps no-cache anyway: its bbox itself can be redrawn under the
         # same (id, rotation) key, which the filename can't express. An auto face's box
@@ -11502,6 +11587,15 @@ def create_app(data_root: str) -> FastAPI:
         if file_row is None:
             return None
         return file_row, row['bbox'], row['embedding'], 0, float(row['angle'] or 0.0)
+
+    def _face_ref_frame_index(face_ref):
+        """The animated-file frame a face was found on (None / 0 = the primary frame)."""
+        kind, raw_id = _parse_face_ref(face_ref)
+        if kind == 'manual':
+            row = manual.get_face(raw_id)
+            return row['frame_index'] if row is not None else None
+        r = db.conn.execute('SELECT frame_index FROM faces WHERE id = ?', (raw_id,)).fetchone()
+        return r['frame_index'] if r is not None else None
 
     def _rotated_face_embedding(face_ref, rotate):
         """Re-embed a face from its source image with the region rotated by `rotate`

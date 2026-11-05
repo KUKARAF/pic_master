@@ -42,6 +42,7 @@
 
   <div class="section-title" style="margin:12px 0 6px;">Preview: would be removed <span class="sub">(nothing changes until you confirm)</span></div>
   <div id="cl-remove-grid" class="cl-grid"></div>
+  <p id="cl-remove-groups" class="sub" style="display:none;margin:6px 0 0;"></p>
   <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:12px 0 20px;">
     <button type="button" id="cl-apply" class="btn-similar" disabled>Remove 0 far faces</button>
     <button type="button" id="cl-undo" class="btn-similar" style="display:none;">Undo last cleanup</button>
@@ -50,6 +51,9 @@
 
   <div class="section-title" style="margin:14px 0 6px;">3 · Decide the uncertain ones <span class="sub" id="cl-unc-count"></span></div>
   <button type="button" id="cl-start-swipe" class="btn-similar">Review uncertain faces</button>
+  <label class="sub" style="display:block;margin:6px 0;">
+    <input type="checkbox" id="cl-group"> For faces from a video: apply my decision to <strong>all</strong> the uncertain
+    frames of that video at once (off = each frame is decided on its own)</label>
   <div class="swipe-page" id="cl-swipe" style="display:none;">
     <div class="swipe-stack-wrap" id="cl-swipe-stack"></div>
     <div class="swipe-controls">
@@ -75,6 +79,8 @@
     background:rgba(0,0,0,.7); color:#fff; }
   .cl-badge.t3 { background:#2e7d32; } .cl-badge.t2 { background:#1565c0; } .cl-badge.t1 { background:#6d6d6d; }
   .cl-face.locked { cursor:default; }
+  .cl-vid { position:absolute; right:3px; top:3px; font-size:10px; line-height:1; padding:2px 4px; border-radius:6px;
+    background:#6a1b9a; color:#fff; }
   .cl-sliders { display:flex; flex-wrap:wrap; gap:18px; align-items:center; margin-bottom:6px; }
   .cl-sliders label { display:flex; flex-direction:column; gap:2px; min-width:200px; }
   .cl-hist { display:flex; align-items:flex-end; gap:1px; height:90px; max-width:640px; margin:8px 0 2px; }
@@ -100,6 +106,7 @@
 
   const TRUST_TITLES = {{ trust_titles | tojson }};
   const TRUST_LABELS = {{ trust_labels | tojson }};
+  function vidBadge(fr) { return fr ? '<span class="cl-vid" title="From ' + escapeHtml(fr.video_name || 'a video') + '">' + escapeHtml(fr.label) + '</span>' : ''; }
   function badge(t) { return '<span class="cl-badge t' + t + '" title="' + TRUST_TITLES[t] + '">' + TRUST_LABELS[t] + '</span>'; }
 
   function json(r) { if (!r.ok) return r.json().then(function (e) { throw new Error(e.detail || r.status); }); return r.json(); }
@@ -115,7 +122,7 @@
       div.className = 'cl-face' + (anchors.has(f.ref) ? ' selected' : '');
       div.title = 'quality ' + f.quality + ' · ' + TRUST_TITLES[f.trust];
       if (f.locked) div.classList.add('locked');
-      div.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.quality.toFixed(2) + '</span>' + badge(f.trust);
+      div.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.quality.toFixed(2) + '</span>' + badge(f.trust) + vidBadge(f.frame);
       div.addEventListener('click', function () {
         if (f.locked) { if (window.showToast) showToast('Set by hand: always an anchor'); return; }
         if (f._prev === undefined) f._prev = f.trust;
@@ -195,9 +202,16 @@
       p.remove_sample.forEach(function (f) {
         const a = document.createElement('a');
         a.className = 'cl-face'; a.href = f.file_id ? '/photo/' + f.file_id : '#'; a.target = '_blank';
-        a.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.score.toFixed(2) + '</span>';
+        a.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.score.toFixed(2) + '</span>' + vidBadge(f.frame);
         grid.appendChild(a);
       });
+      const gp = $('cl-remove-groups');
+      if (p.remove_groups && p.remove_groups.length) {
+        gp.style.display = 'block';
+        gp.innerHTML = 'Of these, <strong>' + c.frame_remove + '</strong> are frames from videos: ' + p.remove_groups.map(function (g) {
+          return (g.video_file_id ? '<a href="/photo/' + g.video_file_id + '" target="_blank">' + escapeHtml(g.video_name || 'video') + '</a>' : 'video') + ' (' + g.count + ')';
+        }).join(', ');
+      } else { gp.style.display = 'none'; }
       if (c.remove > p.remove_sample.length) {
         const more = document.createElement('span');
         more.className = 'sub'; more.textContent = '+ ' + (c.remove - p.remove_sample.length) + ' more (lowest scores shown)';
@@ -261,6 +275,10 @@
     }).catch(function (e) { $('cl-status').textContent = 'Undo failed: ' + e.message; });
   });
 
+  function decideBody(card, action) {
+    return { ref: card.ref, action: action, include_approved: $('cl-approved').checked,
+      group: !!(card.frame && $('cl-group').checked), keep: Number($('cl-keep').value), remove: Number($('cl-remove').value) };
+  }
   function swipeParams() { return params(); }
   $('cl-start-swipe').addEventListener('click', function () {
     $('cl-swipe').style.display = 'block';
@@ -276,7 +294,10 @@
       renderCard: function (card) {
         return {
           imageUrl: cropUrl(card.ref),
-          questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>? ' +
+          questionHtml: (card.frame ? '<div class="sub" style="margin-bottom:4px;">' + vidBadge(card.frame).replace('class="cl-vid"', 'class="cl-vid" style="position:static;"') +
+            ' from <a href="/photo/' + card.file_id + '" target="_blank">' + escapeHtml(card.frame.video_name || 'video') + '</a>' +
+            (card.group_count > 1 ? ' · ' + card.group_count + ' uncertain frames from this video' : '') + '</div>' : '') +
+          'Is this <strong>' + escapeHtml(personName) + '</strong>? ' +
             '<img src="' + cropUrl(card.anchor_ref) + '" alt="anchor" style="height:56px;vertical-align:middle;border-radius:6px;margin-left:8px;" draggable="false">',
           scoreText: (card.approved ? 'previously approved · ' : '') + 'similarity to anchor ' + card.score.toFixed(2),
           metaHtml: window.swipeCardMeta ? swipeCardMeta(card) : '',
@@ -284,10 +305,10 @@
         };
       },
       onConfirm: function (card) {
-        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'keep', include_approved: $('cl-approved').checked } };
+        return { url: base + '/decide', method: 'POST', body: decideBody(card, 'keep') };
       },
       onReject: function (card) {
-        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'remove', include_approved: $('cl-approved').checked } };
+        return { url: base + '/decide', method: 'POST', body: decideBody(card, 'remove') };
       },
       onUndo: function (card) {
         return { url: base + '/decide/' + card.face_id, method: 'DELETE' };
