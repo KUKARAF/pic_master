@@ -125,13 +125,13 @@ def main():
     rm_cmd.add_argument('path', help='Tracked file or directory path (relative to repo root) to untrack')
 
     # media commit [path] [--with-full-ml] - scan, optionally followed by the full
-    # ML pipeline (metadata, YOLO index, CLIP embed, face detect) in one go
+    # ML pipeline (metadata, YOLO index, SigLIP 2/DINOv2 embed, face detect) in one go
     commit = sub.add_parser('commit', help='Scan a directory, optionally running the full ML pipeline too')
     commit.add_argument('path', nargs='?', default='.', help='Directory to process (default: .)')
     commit.add_argument('-r', '--recursive', action='store_true', default=True,
                          help='Scan recursively')
     commit.add_argument('--with-full-ml', action='store_true',
-                         help='Also run metadata, YOLO indexing, CLIP embedding, and face detection')
+                         help='Also run metadata, YOLO indexing, SigLIP 2 + DINOv2 embedding, and face detection')
     commit.add_argument('--reindex', action='store_true',
                          help='Force reprocessing (clear detections/faces/embedding) for already-tracked files found in this scan')
 
@@ -187,8 +187,8 @@ def main():
     search_cmd.add_argument('--limit', type=int, default=20,
                             help='Number of results to return (default: 20)')
 
-    # media embed [path] - build CLIP embeddings for "find similar"
-    embed_cmd = sub.add_parser('embed', help='Build CLIP embeddings for visual similarity search')
+    # media embed [path] - build SigLIP 2 + DINOv2 embeddings for "find similar" / semantic search
+    embed_cmd = sub.add_parser('embed', help='Build SigLIP 2 + DINOv2 embeddings for similarity / semantic search (GPU only)')
     embed_cmd.add_argument('path', nargs='?', default='.',
                            help='Directory to embed (relative to repo root, default: .)')
     embed_cmd.add_argument('--batch-size', type=int, default=32,
@@ -333,9 +333,11 @@ def main():
     category_files.add_argument('name', help='Category name')
     category_files.add_argument('--limit', type=int, default=200, help='Number of files to list')
 
-    category_match = category_sub.add_parser('match', help='Run CLIP-similarity auto-matching against category examples')
+    category_match = category_sub.add_parser('match', help='Run embedding-centroid auto-matching against category examples (default: SigLIP 2)')
     category_match.add_argument('path', nargs='?', default='.', help='Path to scope matching to (default: whole repo)')
     category_match.add_argument('--dry-run', action='store_true', help='Report matches without writing to the DB')
+    category_match.add_argument('--model', choices=('siglip', 'dino', 'clip'), default='siglip',
+                                help="Embedding space (default siglip; 'clip' is legacy and uses the CLIP-tuned category temperature)")
 
     # media age-setup - build the isolated MiVOLO venv (machine-level, not per-repo)
     age_setup = sub.add_parser(
@@ -891,7 +893,12 @@ def main():
                     print(file_row['path'])
 
         elif args.category_cmd == 'match':
-            matched, skipped, considered = m.match_categories(args.path, dry_run=args.dry_run)
+            matched, skipped, considered = m.match_categories(args.path, dry_run=args.dry_run, model=args.model)
+            legacy = sum(n for mid, n in m.db.count_category_matches_by_model().items()
+                         if mid == 'clip-centroid-v1')
+            if legacy and args.model != 'clip':
+                print(f"Note: {legacy} legacy CLIP auto-match row(s) remain (flagged legacy); "
+                      "files re-scanned in the new space had theirs replaced.")
             verb = "Would match" if args.dry_run else "Matched"
             print(f"{verb} {matched} file(s); skipped {skipped} with a manual override; considered {considered} total.")
         m.close()

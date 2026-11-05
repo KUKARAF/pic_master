@@ -100,3 +100,33 @@ def rank_by_similarity(centroid, candidates, embedding_index=2, k=None,
     idx, scores = rank_matrix(centroid, matrix, k=k,
                               gpu_key=gpu_key, gpu_version=gpu_version)
     return [(candidates[i], float(scores[j])) for j, i in enumerate(idx)]
+
+
+def fuse_zscores(parts):
+    """Rank-fusion of several embedding spaces by weighted mean of z-scored cosines.
+
+    parts: [(file_ids int64[n], checksums[n], scores float32[n], weight)], one per space
+    (spaces may cover different files). Each space's scores are z-scored over its own
+    whole matrix, so models with differently-shaped cosine distributions (DINOv2 vs
+    SigLIP 2) are commensurable; a file embedded in only some spaces is scored by the
+    weight-renormalised mean of the ones it has. Returns (file_ids, checksums, rank,
+    display) over the union of files: `rank` is the fused z (order by this), `display` the
+    same weighted mean of the RAW cosines (a 0..1-ish number a card can show)."""
+    parts = [p for p in parts if p[2].shape[0] > 0]
+    if not parts:
+        return (np.empty(0, np.int64), [], np.empty(0, np.float32), np.empty(0, np.float32))
+    all_ids = np.concatenate([np.asarray(p[0], dtype=np.int64) for p in parts])
+    union, first = np.unique(all_ids, return_index=True)
+    all_cs = [c for p in parts for c in p[1]]
+    checksums = [all_cs[i] for i in first]
+    num = np.zeros(len(union), np.float64)
+    raw = np.zeros(len(union), np.float64)
+    den = np.zeros(len(union), np.float64)
+    for ids, _cs, sc, w in parts:
+        sc = np.asarray(sc, dtype=np.float64)
+        z = (sc - sc.mean()) / max(float(sc.std()), 1e-6)
+        pos = np.searchsorted(union, np.asarray(ids, dtype=np.int64))
+        np.add.at(num, pos, w * z)
+        np.add.at(raw, pos, w * sc)
+        np.add.at(den, pos, w)
+    return union, checksums, (num / den).astype(np.float32), (raw / den).astype(np.float32)

@@ -6,7 +6,9 @@ get_un*_files + the web.py wrappers around them), so a file the file manager sho
 missing stage X is exactly a file the /bulk page counts as pending for X:
 
   exif        files.metadata_checked_at IS NOT NULL         (get_files_without_metadata)
-  clip        embeddings row with frame_index = 0            (get_unindexed_files)
+  embed       embeddings_siglip AND embeddings_dino rows    (web _pair_candidates)
+              with frame_index = 0 (images AND videos: a video's vector is the mean
+              of a few sampled frames; model-id changes are the bulk job's concern)
   tags        detections row with frame_index IS NULL; the  (get_undetected_files)
               '__indexed__' sentinel counts
   faces       files.noface = 1, or a faces row with         (get_unface_indexed_files)
@@ -43,7 +45,7 @@ from .formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 STAGES = {
     'image': [  # (key, label, required)
         ('exif', 'EXIF', True),
-        ('clip', 'Similarity embedding (CLIP)', True),
+        ('embed', 'Similarity embedding (SigLIP 2 + DINOv2)', True),
         ('tags', 'Auto-tags', True),
         ('faces', 'Faces', True),
         ('bodies', 'Bodies', True),
@@ -54,9 +56,9 @@ STAGES = {
         ('tiles', 'Tiles (location / region matching)', False),
     ],
     'video': [
-        # One CLIP vector per video (mean of a few sampled frames), in the same
-        # embeddings table as photos — what /similar and set tinder search over.
-        ('clip', 'Similarity embedding (CLIP)', True),
+        # One SigLIP 2 + one DINOv2 vector per video (mean of a few sampled frames), in the
+        # same embedding tables as photos — what /similar and set tinder search over.
+        ('embed', 'Similarity embedding (SigLIP 2 + DINOv2)', True),
         ('stills', 'Captured stills (≥3)', True),
         ('video_faces', 'Video face scan', True),
     ],
@@ -74,7 +76,9 @@ MIN_STILLS = 3
 # (table, extra WHERE condition) — the done-set for each table-backed stage. The
 # conditions are the LEFT JOIN conditions of the matching get_un*_files query.
 _TABLE_STAGES = {
-    'clip': ('embeddings', 'frame_index = 0'),
+    # 'embed' needs BOTH spaces: two done-sets, intersected in _status.
+    'embed_siglip': ('embeddings_siglip', 'frame_index = 0'),
+    'embed_dino': ('embeddings_dino', 'frame_index = 0'),
     'tags': ('detections', 'frame_index IS NULL'),
     'faces': ('faces', 'frame_index IS NULL'),
     'bodies': ('body_embeddings', 'frame_index IS NULL'),
@@ -147,7 +151,7 @@ def _load_subset(db, manual, ids, image_ids, video_ids):
             files[r[0]] = tuple(r[1:])
     sets = {key: set() for key in _TABLE_STAGES}
     for key in _TABLE_STAGES:
-        for chunk in ThreadLocalDB._chunked(ids if key == 'clip' else image_ids):
+        for chunk in ThreadLocalDB._chunked(ids if key.startswith('embed_') else image_ids):
             sql = _stage_sql(key, with_in=len(chunk))
             sets[key].update(r[0] for r in conn.execute(sql, _algo_params(key) + tuple(chunk)))
     checksums = [files[i][0] for i in video_ids if i in files]
@@ -191,7 +195,7 @@ def _status(fid, kind, row, data):
     stages = {}
     if kind == 'image':
         stages['exif'] = meta_at is not None
-        stages['clip'] = fid in sets['clip']
+        stages['embed'] = fid in sets['embed_siglip'] and fid in sets['embed_dino']
         stages['tags'] = fid in sets['tags']
         stages['faces'] = bool(noface) or fid in sets['faces']
         stages['bodies'] = fid in sets['bodies']
@@ -201,7 +205,7 @@ def _status(fid, kind, row, data):
         stages['phash'] = fid in sets['phash']
         stages['tiles'] = fid in sets['tiles']
     elif kind == 'video':
-        stages['clip'] = fid in sets['clip']
+        stages['embed'] = fid in sets['embed_siglip'] and fid in sets['embed_dino']
         stages['stills'] = bool(hidden) or data['captures'].get(checksum, 0) >= MIN_STILLS
         stages['video_faces'] = bool(hidden) or checksum in data['vscanned']
     missing = [label for key, label, req in STAGES.get(kind, ()) if req and not stages[key]]

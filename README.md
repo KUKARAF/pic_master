@@ -56,7 +56,7 @@ All device selection funnels through `media_manager/compute.py`.
 cd /path/to/your/media
 media init                       # create the .media/ repo (index db lives here)
 media add .                      # scan + hash files
-media commit . --with-full-ml    # scan + EXIF + object index + CLIP embed + faces
+media commit . --with-full-ml    # scan + EXIF + object index + SigLIP 2/DINOv2 embed + faces
 media web                        # browse at http://127.0.0.1:8000/
 ```
 
@@ -72,7 +72,7 @@ media web                        # browse at http://127.0.0.1:8000/
 | `media find_broken [path]` | Find corrupted images/videos |
 | `media index [path]` | Detect objects with YOLO-World |
 | `media search <query>` | Search by detected object class |
-| `media embed [path]` | Build CLIP embeddings for similarity search |
+| `media embed [path]` | Build SigLIP 2 + DINOv2 embeddings for similarity / semantic search (GPU only) |
 | `media faces [path]` | Detect and embed faces (InsightFace) |
 | `media bodies [path]` | Crop + embed person boxes for find-by-body search |
 | `media who <image>` | Find which known people appear in an image |
@@ -89,7 +89,7 @@ A running `media web` server accepts uploads over HTTP, so you can push files fr
 any machine without a shell on the library box. Every upload is stored under
 `uploads/<bucket>/` in the library — 256 buckets named after the first two hex
 digits of the file's content hash, so no folder grows huge — and is tracked and
-indexed straight away (EXIF + CLIP run in the background). Content the library
+indexed straight away (EXIF + SigLIP 2/DINOv2 embeddings run in the background). Content the library
 already has anywhere (same full-file xxh64) is **rejected**, never stored twice.
 
 Upload a whole folder with `upload_folder.sh` from the project root:
@@ -218,7 +218,7 @@ note near the top of this README.
 **2. Start the worker, bound so the host can reach it:**
 
 ```bash
-media worker --host 0.0.0.0 --port 4243     # add --preload to load models at startup
+media worker --host 0.0.0.0 --port 4243     # add --preload to load models at startup (faces, SigLIP 2, DINOv2, YOLO-World; legacy CLIP stays lazy)
 ```
 
 It prints its URL and serves until Ctrl-C. Leave it running (tmux/screen, a

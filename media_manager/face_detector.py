@@ -2,6 +2,7 @@
 import os
 import math
 import sys
+import threading
 import traceback
 import numpy as np
 
@@ -25,6 +26,45 @@ def _read_bgr(path):
     with Image.open(path) as pil:
         rgb = pil.convert('RGB')
     return cv2.cvtColor(np.asarray(rgb), cv2.COLOR_RGB2BGR)
+
+# Longest image side (px) fed to detection. Bigger photos are shrunk first (JPEGs via the
+# decoder's cheap DCT-domain 1/2 scaling when they are at least twice the cap), and the
+# resulting boxes are mapped back to ORIGINAL-image coordinates. SCRFD letterboxes to
+# 640x640 anyway, and PCN's smallest face is ~28px, so a generous cap costs nothing
+# measurable on faces worth indexing while saving a lot of decode + PCN time on
+# 20-50 MP photos. 0 disables (full-resolution, the old behaviour).
+FACE_MAX_SIDE = int(os.environ.get('MEDIA_FACE_MAX_SIDE', 3200))
+
+
+def _read_bgr_capped(path, max_side=None):
+    """(bgr image, scale): `scale` >= 1.0 is original_long_side / returned_long_side, so
+    multiply returned-image coordinates by it to get original coordinates. 1.0 when the
+    image was not shrunk."""
+    import cv2  # hook-allow: lazy — heavy dep (cv2)
+    cap = FACE_MAX_SIDE if max_side is None else max_side
+    if not cap or cap <= 0:
+        return _read_bgr(path), 1.0
+    orig_long = 0
+    try:
+        from PIL import Image
+        with Image.open(path) as pil:
+            orig_long = max(pil.size)
+    except Exception:  # hook-allow: broad — header probe only; fall back to a full read
+        orig_long = 0
+    img = None
+    if orig_long >= 2 * cap and path.lower().endswith(('.jpg', '.jpeg')):
+        img = cv2.imread(path, cv2.IMREAD_REDUCED_COLOR_2)
+    if img is None:
+        img = _read_bgr(path)
+    long_now = max(img.shape[:2])
+    orig_long = orig_long or long_now
+    if long_now > cap:
+        k = cap / float(long_now)
+        img = cv2.resize(img, (max(1, round(img.shape[1] * k)), max(1, round(img.shape[0] * k))),
+                         interpolation=cv2.INTER_AREA)
+        long_now = max(img.shape[:2])
+    return img, (orig_long / float(long_now) if long_now and orig_long > long_now else 1.0)
+
 
 # --- Angle convention: the single source of truth for the whole app -----------
 # Every face dict carries 'angle' = the in-plane roll of the face AS IT SITS IN
@@ -187,6 +227,15 @@ class PCNUnavailable(RuntimeError):
 
 
 class FaceDetector:
+    # Class-level so instances built without __init__ (tests) still work.
+    _pcn_lock = threading.RLock()
+    _pcn_errors = 0
+    # Per-thread GPU lock: the worker's concurrent face path sets it (via detect_image)
+    # so only the InsightFace/GPU calls serialize, while decode and the CPU PCN cascade
+    # of different images overlap. Unset everywhere else (callers that already hold the
+    # GPU lock through models.lock).
+    _tl = threading.local()
+
     def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=None):
         from insightface.app import FaceAnalysis  # hook-allow: lazy — heavy optional dep (insightface)
         self.det_thresh = det_thresh
@@ -216,16 +265,59 @@ class FaceDetector:
         degraded pipeline can't masquerade as a healthy one; normalize_faces, which
         cannot do its job without PCN, refuses to run (see pcn_available)."""
         if self._pcn is None and not self._pcn_failed:
-            try:
-                from media_manager.pcn import PCNDetector  # hook-allow: lazy — optional PCN; load failure disables it
-                self._pcn = PCNDetector()
-            except Exception as exc:  # hook-allow: broad — optional PCN, any load failure falls back to InsightFace-only
-                self._pcn_failed = True
-                print(f"[faces] PCN rotation detector failed to load — rotated faces will NOT "
-                      f"be corrected/recovered: {type(exc).__name__}: {exc}",
-                      file=sys.stderr, flush=True)
-                traceback.print_exc()
+            with self._pcn_lock:
+                if self._pcn is None and not self._pcn_failed:
+                    try:
+                        from media_manager.pcn import PCNDetector  # hook-allow: lazy — optional PCN; load failure disables it
+                        self._pcn = PCNDetector()
+                        print(f"[faces] PCN rotation detector on "
+                              f"{'GPU' if self._pcn.on_gpu else 'CPU'}", flush=True)
+                    except Exception as exc:  # hook-allow: broad — optional PCN, any load failure falls back to InsightFace-only
+                        self._pcn_failed = True
+                        print(f"[faces] PCN rotation detector failed to load — rotated faces will NOT "
+                              f"be corrected/recovered: {type(exc).__name__}: {exc}",
+                              file=sys.stderr, flush=True)
+                        traceback.print_exc()
         return self._pcn
+
+    def _pcn_gpu_fatal(self, exc) -> bool:
+        """PCN raised a GPU-fatal error (e.g. CL_OUT_OF_RESOURCES). It is an OPTIONAL
+        pass, so it must not take the job down: if it was on the GPU, rebuild it on the
+        CPU and carry on (returns True: retry); otherwise disable it for the rest of the
+        process (returns False). Logged once, loudly."""
+        with self._pcn_lock:
+            cur = self._pcn
+            if cur is not None and getattr(cur, 'on_gpu', False):
+                try:
+                    from media_manager.pcn import PCNDetector  # hook-allow: lazy — optional PCN
+                    self._pcn = PCNDetector(device='cpu')
+                    print(f"[faces] PCN hit a GPU-fatal error ({str(exc).splitlines()[0][:160] if str(exc) else exc!r}) "
+                          f"— PCN switched to CPU for the rest of this process", file=sys.stderr, flush=True)
+                    return True
+                except Exception:  # hook-allow: broad — fall through to disabling PCN
+                    pass
+            if not self._pcn_failed:
+                print(f"[faces] PCN hit a GPU-fatal error ({str(exc).splitlines()[0][:160] if str(exc) else exc!r}) "
+                      f"— PCN rotation correction DISABLED for the rest of this process; "
+                      f"InsightFace-only detection continues", file=sys.stderr, flush=True)
+            self._pcn, self._pcn_failed = None, True
+            return False
+
+    def _pcn_detect(self, pcn, img):
+        """pcn.detect(img), under the per-thread GPU lock only if PCN is on the GPU."""
+        lock = getattr(self._tl, 'gpu_lock', None)
+        if lock is not None and getattr(pcn, 'on_gpu', False):
+            with lock:
+                return pcn.detect(img)
+        return pcn.detect(img)
+
+    def _app_get(self, img):
+        """InsightFace app.get(img), serialized on the per-thread GPU lock when one is set."""
+        lock = getattr(self._tl, 'gpu_lock', None)
+        if lock is None:
+            return self.app.get(img)
+        with lock:
+            return self.app.get(img)
 
     def pcn_available(self) -> bool:
         """True when the PCN rotation detector is loaded (loading it on first call).
@@ -234,7 +326,7 @@ class FaceDetector:
         as normalized."""
         return self._get_pcn() is not None
 
-    def detect_faces(self, paths: list) -> list:
+    def detect_faces(self, paths: list, gpu_lock=None) -> list:
         """Run detection + embedding on a list of image paths.
 
         Returns list of (path, faces, error):
@@ -244,7 +336,6 @@ class FaceDetector:
                   0.0 when the face needed no rotation correction
           error = None on success, str on failure
         """
-        import cv2  # hook-allow: lazy — heavy dep (cv2)
         results = []
         for path in paths:
             ext = os.path.splitext(path)[1].lower()
@@ -252,25 +343,41 @@ class FaceDetector:
                 results.append((path, [], 'unsupported extension'))
                 continue
             try:
-                img = _read_bgr(path)
-                faces = []
-                for face in self.app.get(img):
-                    if face.det_score < self.det_thresh:
-                        continue
-                    faces.append({
-                        'bbox': [float(v) for v in face.bbox],
-                        # normed_embedding, not embedding — InsightFace's raw .embedding
-                        # is NOT unit length, so a plain dot product isn't cosine
-                        # similarity (scores can exceed 1, thresholds become meaningless).
-                        'embedding': face.normed_embedding.astype(np.float32),
-                        'det_score': float(face.det_score),
-                        'angle': 0.0,
-                    })
-                self._normalize_in_place(img, faces)
-                results.append((path, faces, None))
+                img, scale = _read_bgr_capped(path)
+                results.append((path, self.detect_image(img, scale, gpu_lock), None))
             except Exception as exc:  # hook-allow: broad — per-image resilience, error reported in result
                 results.append((path, [], str(exc)))
         return results
+
+    def detect_image(self, img, scale=1.0, gpu_lock=None) -> list:
+        """Faces for one decoded BGR image (the body of :meth:`detect_faces`). `scale`
+        (>= 1) maps `img` coordinates back to the original photo's (see
+        _read_bgr_capped); boxes are returned in ORIGINAL coordinates. When `gpu_lock` is
+        given, only the GPU-bound InsightFace calls hold it (decode and the CPU PCN
+        cascade run unlocked, so concurrent images overlap)."""
+        prev = getattr(self._tl, 'gpu_lock', None)
+        self._tl.gpu_lock = gpu_lock
+        try:
+            faces = []
+            for face in self._app_get(img):
+                if face.det_score < self.det_thresh:
+                    continue
+                faces.append({
+                    'bbox': [float(v) for v in face.bbox],
+                    # normed_embedding, not embedding — InsightFace's raw .embedding
+                    # is NOT unit length, so a plain dot product isn't cosine
+                    # similarity (scores can exceed 1, thresholds become meaningless).
+                    'embedding': face.normed_embedding.astype(np.float32),
+                    'det_score': float(face.det_score),
+                    'angle': 0.0,
+                })
+            self._normalize_in_place(img, faces)
+            if scale and scale != 1.0:
+                for f in faces:
+                    f['bbox'] = [float(v) * scale for v in f['bbox']]
+            return faces
+        finally:
+            self._tl.gpu_lock = prev
 
     def normalize_faces(self, img, faces):
         """Given a full-size BGR image and existing face dicts (bbox/embedding/
@@ -350,7 +457,16 @@ class FaceDetector:
             # One floor per arm, so the corroborated correction arm isn't held to
             # the high bar the uncorroborated recovery arm needs.
             floor = min(PCN_MIN_CONF, PCN_CORRECT_MIN_CONF) if recover else PCN_CORRECT_MIN_CONF
-            candidates = [c for c in pcn.detect(img) if c['conf'] >= floor]
+            try:
+                found = self._pcn_detect(pcn, img)
+            except Exception as exc:  # hook-allow: broad — classify below, re-raise anything else
+                if not compute.is_gpu_fatal(exc):
+                    raise
+                if not self._pcn_gpu_fatal(exc):
+                    return claimed
+                pcn = self._get_pcn()
+                found = self._pcn_detect(pcn, img) if pcn is not None else []
+            candidates = [c for c in found if c['conf'] >= floor]
             # Highest-confidence first so the per-image cap keeps the best faces.
             candidates.sort(key=lambda c: c['conf'], reverse=True)
             for cand in candidates:
@@ -383,10 +499,13 @@ class FaceDetector:
                 claimed.add(len(faces) - 1)
             return claimed
         except Exception as exc:  # hook-allow: broad — PCN pass is best-effort by design, but never silent
+            self._pcn_errors += 1
+            first = (str(exc).splitlines() or [''])[0][:200]
             print(f"[faces] PCN correct/recover pass failed — keeping InsightFace-only "
-                  f"results for this image: {type(exc).__name__}: {exc}",
+                  f"results for this image: {type(exc).__name__}: {first}",
                   file=sys.stderr, flush=True)
-            traceback.print_exc()
+            if self._pcn_errors == 1:  # full traceback once; per-image tracebacks are just spam
+                traceback.print_exc()
             return claimed
 
     def _correct_face(self, pcn, img, cand, angle, faces, hit, claimed):
@@ -435,7 +554,7 @@ class FaceDetector:
         crop = pcn.upright_crop(img, win, PCN_WARP_SIZE)
         if crop is None or crop.size == 0:
             return None
-        face = self._centered_face(self.app.get(crop), crop.shape)
+        face = self._centered_face(self._app_get(crop), crop.shape)
         if face is None:
             return None
         return {
@@ -478,11 +597,11 @@ class FaceDetector:
                 crop, _x, _y = _padded_crop(img, face['bbox'], ROTATION_TTA_PAD)
                 if crop.size == 0:
                     continue
-                upright = self._centered_face(self.app.get(crop), crop.shape)
+                upright = self._centered_face(self._app_get(crop), crop.shape)
                 reads = [] if upright is None else [(0, upright)]
                 for k, code in turns:
                     rot = cv2.rotate(crop, code)
-                    got = self._centered_face(self.app.get(rot), rot.shape)
+                    got = self._centered_face(self._app_get(rot), rot.shape)
                     if got is not None:
                         reads.append((k, got))
                 if not reads:
@@ -548,7 +667,7 @@ class FaceDetector:
         """
         crop, cx1, cy1 = _padded_crop(img, bbox, pad_ratio)
 
-        raw_faces = self.app.get(crop) if crop.size else None
+        raw_faces = self._app_get(crop) if crop.size else None
         face = max(raw_faces, key=lambda f: f.det_score) if raw_faces else None
         if face is not None:
             fx1, fy1, fx2, fy2 = [float(v) for v in face.bbox]
@@ -597,7 +716,7 @@ class FaceDetector:
             # edges, not black: the detectors respond to them far better.
             b = max(1, int(max(crop.shape[:2]) * PCN_CROP_BORDER))
             padded = cv2.copyMakeBorder(crop, b, b, b, b, cv2.BORDER_REPLICATE)
-            cands = [c for c in pcn.detect(padded) if c['conf'] >= PCN_CORRECT_MIN_CONF]
+            cands = [c for c in self._pcn_detect(pcn, padded) if c['conf'] >= PCN_CORRECT_MIN_CONF]
             if not cands:
                 return None
             cand = max(cands, key=lambda c: c['conf'])

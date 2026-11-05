@@ -163,7 +163,11 @@
         .then(function (r) { return r.json(); })
         .then(function (d) {
           if (d.running) { btn.dataset.busy = '1'; btn.disabled = true; poll(); }
-          else if (d.pending) { statusEl.textContent = d.pending + ' pending'; }
+          else if (d.pending) {
+            statusEl.textContent = d.pending + ' pending'
+              + (d.stale ? ' (' + d.stale + ' from an older model/projection: needs reindex)' : '');
+          }
+          else if (d.projection_ready === false) { statusEl.textContent = 'projection not fitted yet (bench/bench_pattern_dino.py --fit)'; }
         })
         .catch(function () { /* status is best-effort on load */ });
     });
@@ -4188,11 +4192,21 @@
      fabric) rather than the same *thing*. Needs the pattern index built
      (/bulk → Index patterns; re-run after an algorithm update). */
   const searchPatternBtn = document.querySelector('.find-by-pattern-btn');
+  // Method selector (texture = ResNet18 default | DINOv2-L cells | fused); remembered per browser.
+  const patternAlgoSel = document.querySelector('.pattern-algo-select');
+  if (patternAlgoSel) {
+    try { patternAlgoSel.value = localStorage.getItem('patternAlgo') || 'resnet'; } catch (e) {}
+    if (!patternAlgoSel.value) patternAlgoSel.value = 'resnet';
+    patternAlgoSel.addEventListener('change', function () {
+      try { localStorage.setItem('patternAlgo', patternAlgoSel.value); } catch (e) {}
+    });
+  }
   const searchPatternState = wireBoxDraw(searchPatternBtn, '✏️', '🧩', function (bbox) {
     openMatchesAsQueue({
       el: searchPatternBtn,
       url: '/api/files/' + fileId + '/pattern-search',
-      fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
+      fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                   body: JSON.stringify({ bbox: bbox, algo: patternAlgoSel ? patternAlgoSel.value : 'resnet' }) },
       label: 'Pattern matches',
       extractIds: function (data) { return (data.results || []).map(function (r) { return r.file_id; }); },
       onEmpty: function () { if (window.showToast) showToast('No pattern matches — is the pattern index built? (/bulk)'); },

@@ -104,3 +104,19 @@ negatives, which CLIP's category-level semantics already solve (H@1 0.98); the s
 cut-out-pasted-on-clutter cases are the discriminating ones (H@1 0.20, hard negatives
 beat positives in 60% of cases). Full per-case results: `results/baseline_*.json`.
 
+
+## DINOv2-L dense cells vs ResNet pattern windows (`bench_pattern_dino.py`)
+
+Standalone script (GPU machine only; `DINOv2Embedder` is GPU-only) with the harness's corpus, cases and
+metrics. It builds + caches the raw DINOv2-L/14-reg pooled cells (448 px forward, 2x2-token cells) and the
+production ResNet windows, then reports mAP/H@1/R@10/HN>pos (all/real/synthetic) for: query mode
+{mask, crop, both} x rotations x crop scales x PCA dim, an un-projected oracle, the ResNet production path,
+and z-score fusions of both. Reference mAP (all): production ResNet .731, float prototype .757, DINOv2-S dense
+prototype (e2) .425.
+
+```
+.venv/bin/python -I bench/bench_pattern_dino.py --json bench/results/pattern_dino.json
+.venv/bin/python -I bench/bench_pattern_dino.py --fit --dim 128 --write-proj   # ship the winning projection
+```
+`--write-proj` writes `media_manager/data/pattern_dino_proj.npz` (required by the web job and the worker; the
+algo tag includes its hash, so a refit marks the DINO pattern index stale).

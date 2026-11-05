@@ -19,7 +19,8 @@
             title="Rename this tag everywhere" style="font-size:0.9em;">✏️</button>
     <button type="button" class="tag-delete-btn heart-btn-inline" data-label="{{ t.label }}"
             title="Delete this tag everywhere" style="font-size:0.9em;">🗑️</button>
-    {{ macros.classifier_button(t.clip_btn) }}
+    {{ macros.classifier_button(t.siglip_btn) }}
+    {{ macros.classifier_button(t.dino_btn) }}
     {{ macros.classifier_button(t.yolo_btn) }}
   </li>
   {% endfor %}

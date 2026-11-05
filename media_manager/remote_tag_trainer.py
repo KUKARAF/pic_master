@@ -16,8 +16,11 @@ downscales the images (YOLO trains at imgsz=640; boxes are stored normalized, so
 this is label-invariant and cuts RNS transfer ~10-50x), ships them to the worker
 in batches, then polls the worker job and mirrors its progress into
 metadata.json / train.log. YOLO checkpoints stay on the worker (served by
-tag_detect); the small CLIP weights.npz artifact is pulled back so score_all can
-run locally.
+tag_detect); the small weights.npz artifact of an embedding-space classifier
+(kind siglip_model | dino_model | legacy clip_model) is pulled back so score_all can
+run locally; the host validates its dimension against the uploaded embeddings and
+re-stamps it with the space/model id, so a worker that trained in the wrong space
+can never leave a silently-wrong artifact behind.
 
 Fail-loud: if the worker is unreachable there is NO local fallback (that would
 reintroduce the OOM the offload exists to prevent) — the job is recorded failed
@@ -31,14 +34,16 @@ import sys
 import time
 
 from media_manager.clip_tag_classifier import (
-    classifier_dir, slugify, write_status, MIN_EXAMPLES_PER_CLASS)
+    SPACES, all_embeddings_for_space, classifier_dir, current_embedding_model, save_weights, slugify, write_status,
+    MIN_EXAMPLES_PER_CLASS)
 from media_manager.yolo_tag_classifier import MIN_BOXES
 from media_manager.database import Database
 from media_manager.manual_db import ManualDB
 
 _MAX_LONG_SIDE = 640          # ultralytics trains at imgsz=640; no point shipping bigger
 _YOLO_UPLOAD_BATCH = 16       # images per train_add — keeps each RNS request modest
-_CLIP_UPLOAD_BATCH = 64
+_CLIP_UPLOAD_BATCH = 64   # (embedding-classifier batches; name kept)
+_KIND_TO_SPACE = {v['dir_kind']: k for k, v in SPACES.items()}
 _POLL_INTERVAL = 3.0
 _MAX_POLL_ERRORS = 5          # consecutive status-poll failures before giving up
 
@@ -95,7 +100,7 @@ def train_for_tag(data_root, tag_label, kind):
         if kind == 'yolo_model':
             _drive_yolo(data_root, tag_label, out_dir, pid, started_at)
         else:
-            _drive_clip(data_root, tag_label, out_dir, pid, started_at)
+            _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind)
     except Exception as exc:  # hook-allow: broad — top-level boundary records failure then re-raises
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
@@ -178,7 +183,7 @@ def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
                      done_extra={'n_boxes': len(rows), 'n_images': n_images})
 
 
-def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
+def _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind='siglip_model'):
     from PIL import Image as PILImage  # hook-allow: lazy — PIL only needed for this path
 
     client = _client(data_root)
@@ -190,30 +195,33 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
     manual = ManualDB(os.path.join(media_dir, 'manual.db'))
 
     slug = slugify(tag_label)
-    job_id = client.train_create('clip_model', tag_label, slug, epochs=None)
+    space = _KIND_TO_SPACE[kind]
+    job_id = client.train_create(kind, tag_label, slug, epochs=None)
     _active.update(client=client, job_id=job_id)
     _log(out_dir, f'created remote job {job_id}; uploading examples')
 
-    # Whole-image examples ship as their already-stored ~2 KB CLIP embeddings —
+    # Whole-image examples ship as their already-stored embeddings in this space —
     # no image files, no model needed on either side for these.
     polarities = manual.get_whole_image_tag_polarities(tag_label)
-    embedding_by_checksum = {row[3]: row[2] for row in db.get_all_embeddings()}
+    embedding_by_checksum = {row[3]: row[2] for row in all_embeddings_for_space(db, space)}
     batch, n_pos, n_neg = [], 0, 0
+    expected_dim = None
     for checksum, polarity in polarities.items():
         emb = embedding_by_checksum.get(checksum)
         if emb is None:
             continue
         label = 1 if polarity == 'positive' else 0
+        expected_dim = expected_dim or len(emb) // 4  # float32 bytes -> dim
         batch.append({'label': label, 'embedding': emb})
         n_pos += label
         n_neg += (1 - label)
         if len(batch) >= _CLIP_UPLOAD_BATCH:
-            client.train_add(job_id, 'clip_model', batch)
+            client.train_add(job_id, kind, batch)
             batch = []
 
     # Region examples must be cropped from the original (the crop's OWN embedding
     # is more precise than the whole-image one). Crop + downscale on the host and
-    # ship the small JPEG; the worker embeds it with its CLIP model.
+    # ship the small JPEG; the worker embeds it with its model for this space.
     region_rows = manual.get_all_spatial_tags_for_label(tag_label)
     n_region, n_region_skipped = 0, 0
     if region_rows:
@@ -238,10 +246,10 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
             n_neg += (1 - label)
             n_region += 1
             if len(batch) >= _CLIP_UPLOAD_BATCH:
-                client.train_add(job_id, 'clip_model', batch)
+                client.train_add(job_id, kind, batch)
                 batch = []
     if batch:
-        client.train_add(job_id, 'clip_model', batch)
+        client.train_add(job_id, kind, batch)
 
     if n_pos < MIN_EXAMPLES_PER_CLASS or n_neg < MIN_EXAMPLES_PER_CLASS:
         client.train_cancel(job_id)
@@ -252,8 +260,9 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at):
 
     _log(out_dir, f'uploaded {n_pos} pos / {n_neg} neg (regions: {n_region}, skipped {n_region_skipped}); starting training')
     client.train_run(job_id)
-    _poll_until_done(client, job_id, out_dir, pid, started_at, kind='clip_model',
-                     done_extra={'n_region_examples': n_region, 'n_region_skipped': n_region_skipped})
+    _poll_until_done(client, job_id, out_dir, pid, started_at, kind=kind,
+                     done_extra={'n_region_examples': n_region, 'n_region_skipped': n_region_skipped,
+                                 'expected_dim': expected_dim})
 
 
 def _poll_until_done(client, job_id, out_dir, pid, started_at, kind, done_extra):
@@ -288,16 +297,25 @@ def _poll_until_done(client, job_id, out_dir, pid, started_at, kind, done_extra)
 
 
 def _finalize_done(client, job_id, out_dir, kind, metrics, done_extra):
-    if kind == 'clip_model':
+    if kind != 'yolo_model':
         # Pull the small weights.npz back so score_all runs locally on the host.
         art = client.train_status(job_id, want_artifact=True)
         blob = art.get('artifact')
         if not blob:
-            raise RuntimeError('worker reported CLIP training done but returned no weights artifact')
-        with open(os.path.join(out_dir, 'weights.npz'), 'wb') as f:
-            f.write(blob)
+            raise RuntimeError(f'worker reported {kind} training done but returned no weights artifact')
+        import numpy as np  # hook-allow: lazy — numpy only needed to validate/re-stamp the artifact
+        space = _KIND_TO_SPACE[kind]
+        data = np.load(io.BytesIO(blob))
+        w, b = data['w'].astype(np.float32), float(data['b'])
+        expected_dim = done_extra.get('expected_dim')
+        if expected_dim and w.shape[0] != expected_dim:
+            raise RuntimeError(
+                f'worker trained a {w.shape[0]}-d classifier but the uploaded {space} embeddings are '
+                f'{expected_dim}-d (an out-of-date worker ignoring the embedding space?) — redeploy the worker.')
+        save_weights(os.path.join(out_dir, 'weights.npz'), w, b, space)
         write_status(
-            out_dir, status='done', trained_at=int(time.time()),
+            out_dir, status='done', trained_at=int(time.time()), space=space,
+            embedding_model=current_embedding_model(space), dim=int(w.shape[0]),
             n_positive=metrics.get('n_positive'), n_negative=metrics.get('n_negative'),
             cv_accuracy=metrics.get('cv_accuracy'),
             n_region_examples=done_extra.get('n_region_examples', 0),
@@ -331,7 +349,7 @@ def main():
     parser = argparse.ArgumentParser(description='Drive per-tag training on the remote worker.')
     parser.add_argument('--data-root', required=True)
     parser.add_argument('--tag', required=True)
-    parser.add_argument('--kind', required=True, choices=['clip_model', 'yolo_model'])
+    parser.add_argument('--kind', required=True, choices=sorted(_KIND_TO_SPACE) + ['yolo_model'])
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, _sigterm)

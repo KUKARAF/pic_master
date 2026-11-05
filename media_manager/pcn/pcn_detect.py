@@ -161,20 +161,22 @@ def stage1(img, imgPad, net, thres):
         img_resized = preprocess_img(img_resized)
         cls_prob, rotate, bbox = _run(net, set_input(img_resized))
         w = netSize * curScale
-        for i in range(cls_prob.shape[2]):
-            for j in range(cls_prob.shape[3]):
-                if cls_prob[0, 1, i, j] > thres:
-                    sn = bbox[0, 0, i, j]
-                    xn = bbox[0, 1, i, j]
-                    yn = bbox[0, 2, i, j]
-                    rx = int(j * curScale * stride_ - 0.5 * sn * w + sn * xn * w + 0.5 * w) + col
-                    ry = int(i * curScale * stride_ - 0.5 * sn * w + sn * yn * w + 0.5 * w) + row
-                    rw = int(w * sn)
-                    if legal(rx, ry, imgPad) and legal(rx + rw - 1, ry + rw - 1, imgPad):
-                        if rotate[0, 1, i, j] > 0.5:
-                            winlist.append(Window2(rx, ry, rw, rw, 0, curScale, float(cls_prob[0, 1, i, j])))
-                        else:
-                            winlist.append(Window2(rx, ry, rw, rw, 180, curScale, float(cls_prob[0, 1, i, j])))
+        # np.argwhere yields the (i, j) hits in row-major order -- the exact order the
+        # old nested python loops visited them -- without a python-level pass over
+        # every cell of a (potentially huge) score map.
+        for i, j in np.argwhere(cls_prob[0, 1] > thres):
+            i, j = int(i), int(j)
+            sn = bbox[0, 0, i, j]
+            xn = bbox[0, 1, i, j]
+            yn = bbox[0, 2, i, j]
+            rx = int(j * curScale * stride_ - 0.5 * sn * w + sn * xn * w + 0.5 * w) + col
+            ry = int(i * curScale * stride_ - 0.5 * sn * w + sn * yn * w + 0.5 * w) + row
+            rw = int(w * sn)
+            if legal(rx, ry, imgPad) and legal(rx + rw - 1, ry + rw - 1, imgPad):
+                if rotate[0, 1, i, j] > 0.5:
+                    winlist.append(Window2(rx, ry, rw, rw, 0, curScale, float(cls_prob[0, 1, i, j])))
+                else:
+                    winlist.append(Window2(rx, ry, rw, rw, 180, curScale, float(cls_prob[0, 1, i, j])))
         img_resized = resize_img(img_resized, scale_)
         curScale = img.shape[0] / img_resized.shape[0]
     return winlist
@@ -335,21 +337,46 @@ def crop_face(img, face, crop_size=200):
     return ret, pointlist
 
 
+def pcn_device() -> str:
+    """'cpu' (default) or 'gpu', from MEDIA_PCN_DEVICE. PCN is a 3-net cascade whose
+    stage 1 feeds an image pyramid of MANY distinct input shapes per photo and whose
+    stages 2/3 use a different batch size per photo. OpenVINO's GPU plugin compiles
+    and allocates kernels per distinct shape, which on Intel Arc ends in
+    `[GPU] clFinish, error code: -5 CL_OUT_OF_RESOURCES` and a poisoned GPU context
+    for every later call (InsightFace included). The nets are tiny (~2 MB), so the
+    CPU is the right home for them; 'gpu' ('auto' too) is kept as an opt-in."""
+    v = os.environ.get('MEDIA_PCN_DEVICE', 'cpu').strip().lower()
+    return 'gpu' if v in ('gpu', 'auto', 'xpu', 'cuda') else 'cpu'
+
+
+def pcn_providers(device=None):
+    """onnxruntime provider list for the PCN nets (see :func:`pcn_device`)."""
+    if (device or pcn_device()).lower() in ('gpu', 'auto', 'xpu', 'cuda'):
+        return compute.onnx_providers()
+    return ['CPUExecutionProvider']
+
+
+def pcn_threads() -> int:
+    """intra-op threads per PCN session (MEDIA_PCN_THREADS). Small: several images are
+    detected concurrently on the worker and the nets are tiny."""
+    try:
+        return max(1, int(os.environ['MEDIA_PCN_THREADS']))
+    except (KeyError, ValueError):
+        return max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
 class PCNDetector:
     """Lazy-loading rotation-invariant face detector. detect() returns
     [{'bbox':[x1,y1,x2,y2], 'angle':degrees, 'conf':float, 'points':[(x,y)x4]}]."""
 
-    def __init__(self, model_dir=None):
+    def __init__(self, model_dir=None, device=None):
         import onnxruntime as ort  # hook-allow: lazy — heavy dep (onnxruntime)
         d = model_dir or os.path.dirname(os.path.abspath(__file__))
         so = ort.SessionOptions()
-        so.intra_op_num_threads = max(1, (os.cpu_count() or 2) - 1)
-        # Route through the central provider pick so PCN rides the same accelerator
-        # as InsightFace (OpenVINO GPU on Intel Arc, CUDA on NVIDIA) rather than the
-        # old hardcoded CPU-only list. Tiny cascade nets, so the win is small — this
-        # is mostly for consistency; the intra_op thread tuning above is harmless
-        # (simply ignored) when a GPU provider binds.
-        providers = compute.onnx_providers()
+        so.intra_op_num_threads = pcn_threads()
+        providers = pcn_providers(device)
+        self.on_gpu = any((p[0] if isinstance(p, tuple) else p) != 'CPUExecutionProvider'
+                          for p in providers)
         self.nets = [
             ort.InferenceSession(os.path.join(d, f'pcn{i}.onnx'),
                                  sess_options=so, providers=providers)

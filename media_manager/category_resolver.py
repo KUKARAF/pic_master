@@ -11,6 +11,44 @@ best one. Lives in its own module, not web.py and not media.py, since both
 the CLI (media.py's MediaManager.match_categories, to skip files already
 excluded) and web.py need this, and media.py must not import web.py."""
 
+# Model id stored in file_category_matches.model per embedding space. The CLIP id is
+# LEGACY: its scores were thresholded with CLIP-calibrated per-category temperatures and
+# are not comparable with SigLIP/DINO cosines. Legacy rows are never deleted by the
+# migration; they are flagged (see 'legacy' below) and replaced file-by-file when
+# `media category match` is rerun in a current space.
+CATEGORY_MATCH_MODEL_IDS = {
+    'siglip': 'siglip-centroid-v1',
+    'dino': 'dino-centroid-v1',
+    'clip': 'clip-centroid-v1',
+}
+LEGACY_CATEGORY_MATCH_MODELS = frozenset({'clip-centroid-v1'})
+
+
+def is_legacy_category_match(model):
+    return model in LEGACY_CATEGORY_MATCH_MODELS
+
+
+def calibrate_category_threshold(member_scores, all_scores, member_pct=10.0, sigma=None):
+    """Per-category cosine threshold valid in any embedding space, derived from the
+    category's own data instead of an absolute (CLIP-tuned) number.
+    member_scores: cosines of the category's examples to its centroid.
+    all_scores:    cosines of the whole candidate pool to the centroid.
+    The threshold is the larger of (a) the `member_pct` percentile of member scores
+    (so ~90% of known members would clear it) and (b) a background floor
+    mean + sigma*std of the pool (so a loose category cannot match everything; sigma
+    is 2 with >=5 examples, 3 with fewer, where the member percentile is unreliable),
+    capped at the members' median so a category stays satisfiable."""
+    import numpy as np  # hook-allow: lazy -- heavy
+    all_scores = np.asarray(all_scores, dtype=np.float32)
+    member_scores = np.asarray(member_scores, dtype=np.float32)
+    if sigma is None:
+        sigma = 2.0 if member_scores.size >= 5 else 3.0
+    floor = float(all_scores.mean() + sigma * all_scores.std()) if all_scores.size else float('inf')
+    if member_scores.size == 0:
+        return floor
+    thr = max(float(np.percentile(member_scores, member_pct)), floor)
+    return min(thr, float(np.median(member_scores)))
+
 
 def resolve_categories_for_file(manual, db, file_id, checksum):
     """Single-file resolution for the photo page.
@@ -21,14 +59,15 @@ def resolve_categories_for_file(manual, db, file_id, checksum):
     result = [{'id': c['id'], 'name': c['name'], 'source': 'manual', 'score': None} for c in manual_categories]
     seen_names = {c['name'] for c in result}
     excluded_category_ids = manual.get_category_exclusions_for_checksums([checksum]).get(checksum, set())
-    for category_name, score, _model in db.get_file_category_matches(file_id):
+    for category_name, score, model in db.get_file_category_matches(file_id):
         if category_name in seen_names:
             continue  # already has this one manually — don't list it twice
         cat_row = manual.find_category(category_name)
         cat_id = cat_row['id'] if cat_row else None
         if cat_id is not None and cat_id in excluded_category_ids:
             continue  # explicitly rejected for this specific category
-        result.append({'id': cat_id, 'name': category_name, 'source': 'auto', 'score': score})
+        result.append({'id': cat_id, 'name': category_name, 'source': 'auto', 'score': score,
+                       'legacy': is_legacy_category_match(model)})
     return result
 
 
@@ -58,12 +97,13 @@ def resolve_categories_for_checksums(manual, db, file_checksum_pairs):
         existing = result.setdefault(checksum, [])
         seen_names = {c['name'] for c in existing}
         excluded_ids = exclusions_map.get(checksum, set())
-        for category_name, score, _model in matches:
+        for category_name, score, model in matches:
             if category_name in seen_names:
                 continue
             if name_to_id.get(category_name) in excluded_ids:
                 continue
-            existing.append({'name': category_name, 'source': 'auto', 'score': score})
+            existing.append({'name': category_name, 'source': 'auto', 'score': score,
+                             'legacy': is_legacy_category_match(model)})
 
     return {checksum: cats for checksum, cats in result.items() if cats}
 

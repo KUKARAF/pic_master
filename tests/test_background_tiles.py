@@ -67,7 +67,7 @@ def check_api():
     loc = manual.create_location('Café A')
     manual.add_file_location('cs-m.jpg', loc)
 
-    url = '/api/locations/%d/similar-files?threshold=0&avoid_existing=false' % loc
+    url = '/api/locations/%d/similar-files?threshold=0&avoid_existing=false&model=clip' % loc
     whole = client.post(url + '&background=false', json={'exclude': []}).json()
     assert whole['mode'] == 'whole' and [c['id'] for c in whole['cards']][0] == same_person, whole
     bg = client.post(url, json={'exclude': []}).json()
@@ -85,7 +85,7 @@ def check_api():
     lonely = add('z.jpg', A, None)
     loc2 = manual.create_location('Elsewhere')
     manual.add_file_location('cs-z.jpg', loc2)
-    r = client.post('/api/locations/%d/similar-files?threshold=0&avoid_existing=false' % loc2,
+    r = client.post('/api/locations/%d/similar-files?threshold=0&avoid_existing=false&model=clip' % loc2,
                     json={'exclude': []}).json()
     assert r['mode'] == 'whole' and r['cards'][0]['id'] == same_place, r
     assert lonely not in [c['id'] for c in r['cards']]

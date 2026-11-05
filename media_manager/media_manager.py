@@ -300,97 +300,153 @@ class MediaManager:
 
         return indexed_count, failed_count
 
-    def embed_files(self, path='.', batch_size=32, model_name='ViT-B-32', pretrained='openai'):
+    def embed_files(self, path='.', batch_size=32, model_name=None, pretrained=None):
         """
-        Run CLIP on unembedded image files under path, store embeddings in DB.
-        Powers the "find similar" visual-similarity feature (separate from YOLO-World
-        object-class search). Returns (indexed_count, failed_count).
+        Run SigLIP 2 + DINOv2 (one decode pass per image) on image files under path that lack
+        either embedding; store them in embeddings_siglip / embeddings_dino. Powers the "find
+        similar" and semantic-search features. GPU-only: with no worker configured and no local
+        accelerator this raises (no silent CPU fallback). `model_name`/`pretrained` are legacy
+        CLIP arguments, accepted and ignored. Videos are embedded by the web bulk job / upload
+        hook (frame sampling lives there). Returns (indexed_count, failed_count).
         """
-        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS  # hook-allow: lazy — torch/open_clip
+        import numpy as np  # hook-allow: lazy — heavy
+        from .formats import IMAGE_EXTENSIONS  # hook-allow: lazy
 
         client = self._worker()
         if client.is_configured():
             from . import worker_client  # hook-allow: lazy — pulls cv2/requests
-            # The worker runs the default CLIPIndexer (ViT-B-32/openai) and ignores a
-            # requested model_name/pretrained. Warn and record the worker's actual
-            # model_id so embeddings aren't stored under a model tag they don't match.
-            if model_name != 'ViT-B-32' or pretrained != 'openai':
-                print(f"[media] WARNING: remote worker runs CLIP ViT-B-32/openai; "
-                      f"requested model_name={model_name} pretrained={pretrained} ignored")
-            print("[media] offloading CLIP embedding to remote worker")
-            indexer = worker_client.RemoteCLIPIndexer(client)
-            model_id = CLIPIndexer.model_id()
-        else:
-            indexer = CLIPIndexer(model_name=model_name, pretrained=pretrained)
-            model_id = CLIPIndexer.model_id(model_name, pretrained)
+            print("[media] offloading SigLIP 2 + DINOv2 embedding to remote worker")
+            sig = worker_client.RemoteSigLIPEmbedder(client)
+            dino = worker_client.RemoteDINOEmbedder(client)
 
-        unindexed = self.db.get_unindexed_files(limit=None)
+            def embed(paths):
+                res = worker_client.embed_both(client, paths, batch_size=sig.batch_size,
+                                               workers=sig.workers, data_root=self.data_root)
+                pairs = [(res.siglip[i], res.dino[i]) if res.siglip[i] is not None and res.dino[i] is not None
+                         else None for i in range(len(paths))]
+                return pairs, list(res.errors), (res.siglip_model, res.dino_model)
+        else:
+            from .embedders import DINOv2Embedder, SigLIP2Embedder, embed_shared  # hook-allow: lazy — torch
+            sig, dino = SigLIP2Embedder(batch_size=batch_size), DINOv2Embedder(batch_size=batch_size)
+
+            def embed(paths):
+                (sig_mat, dino_mat), failed = embed_shared([sig, dino], paths)
+                failed_msgs = dict(failed)
+                pairs, errs, k = [], [], 0
+                for p in paths:
+                    if p in failed_msgs:
+                        pairs.append(None)
+                        errs.append(failed_msgs[p])
+                    else:
+                        pairs.append((sig_mat[k], dino_mat[k]))
+                        errs.append(None)
+                        k += 1
+                return pairs, errs, (None, None)
+        sig_id, dino_id = sig.model_id(), dino.model_id()
+
+        need = {}
+        for fid, rel in self.db.get_files_needing_siglip(sig_id):
+            need[fid] = [rel, True, False]
+        for fid, rel in self.db.get_files_needing_dino(dino_id):
+            if fid in need:
+                need[fid][2] = True
+            else:
+                need[fid] = [rel, False, True]
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
         candidates = []
-        for file_id, rel_path in unindexed:
-            ext = os.path.splitext(rel_path)[1].lower()
-            if ext not in SUPPORTED_EXTENSIONS:
+        for file_id, (rel_path, need_s, need_d) in sorted(need.items()):
+            if os.path.splitext(rel_path)[1].lower() not in IMAGE_EXTENSIONS:
                 continue
             abs_file = os.path.join(self.data_root, rel_path)
             if not abs_file.startswith(abs_path):
                 continue
-            candidates.append((file_id, abs_file))
+            candidates.append((file_id, abs_file, need_s, need_d))
 
         total = len(candidates)
         indexed_count = 0
         failed_count = 0
+        step = max(1, int(batch_size)) * 8
 
-        for batch_start in range(0, total, batch_size):
-            batch = candidates[batch_start:batch_start + batch_size]
-            batch_ids = [fid for fid, _ in batch]
-            batch_paths = [fpath for _, fpath in batch]
-
-            embeddings, failed = indexer.embed_images(batch_paths)
-            failed_messages = dict(failed)
-            emb_iter = iter(embeddings)
-            for file_id, fpath in zip(batch_ids, batch_paths):
-                if fpath in failed_messages:
+        for batch_start in range(0, total, step):
+            batch = candidates[batch_start:batch_start + step]
+            pairs, errs, (w_sig, w_dino) = embed([c[1] for c in batch])
+            srows, drows = [], []
+            for (file_id, fpath, need_s, need_d), pair, err in zip(batch, pairs, errs):
+                if pair is None:
                     failed_count += 1
-                    self.errors.log(fpath, failed_messages[fpath])
-                else:
-                    self.db.insert_embedding(file_id, next(emb_iter).tobytes(), model_id)
-                    indexed_count += 1
+                    self.errors.log(fpath, err or 'no embedding returned')
+                    continue
+                if need_s:
+                    srows.append((file_id, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id))
+                if need_d:
+                    drows.append((file_id, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id))
+                indexed_count += 1
+            self.db.insert_pair_embeddings_batch(srows, drows)
 
             if total > 0:
-                done = min(batch_start + batch_size, total)
+                done = min(batch_start + step, total)
                 print(f"Embedded {min(indexed_count + failed_count, done)}/{total}...")
 
         return indexed_count, failed_count
 
-    def match_categories(self, path='.', dry_run=False):
+    def match_categories(self, path='.', dry_run=False, model='siglip'):
         """
         Categories are multi-valued: for every embedded file under `path`, score
         it independently against every category's centroid (mean of that
         category's manually-assigned example files' embeddings) and record an
-        auto-match for *every* category whose own temperature threshold is
-        cleared — not just the single best one. A category a file is already
-        manually assigned to, or has been explicitly rejected for (see
-        category_resolver.py), is skipped for that category specifically; the
-        same file can still gain auto-matches for other categories it has no
-        manual decision on. Existing auto-matches for a file are cleared and
-        rebuilt each run so a category that no longer clears threshold doesn't
-        leave a stale match behind.
+        auto-match for *every* category whose threshold is cleared — not just the
+        single best one. A category a file is already manually assigned to, or has
+        been explicitly rejected for (see category_resolver.py), is skipped for that
+        category specifically. Existing auto-matches for a scanned file are cleared and
+        rebuilt each run so a category that no longer clears threshold doesn't leave a
+        stale match behind (this also supersedes that file's legacy CLIP rows; files
+        with no embedding in `model`'s space keep theirs, flagged legacy).
+
+        `model` ('siglip' default | 'dino' | legacy 'clip') picks the embedding space for
+        examples, Rocchio negatives and candidates; the model id is stored in each match.
+        siglip/dino use a per-category threshold calibrated from the category's own
+        member-to-centroid cosines (category_resolver.calibrate_category_threshold);
+        only legacy 'clip' uses the category's CLIP-tuned `temperature`. Captured video
+        stills (frame and video are one item) and hidden files are never auto-matched.
         Returns (matched_count, skipped_count, considered_count) — matched is a
         count of (file, category) matches, not files; skipped is files that
         matched zero categories this run.
         """
         import numpy as np  # hook-allow: lazy — heavy
         from .similarity import mean_normalized_centroid, adjusted_centroid  # hook-allow: lazy — numpy
+        from .category_resolver import CATEGORY_MATCH_MODEL_IDS, calibrate_category_threshold  # hook-allow: lazy
+
+        if model not in CATEGORY_MATCH_MODEL_IDS:
+            raise ValueError(f"Unknown model {model!r}; expected one of {sorted(CATEGORY_MATCH_MODEL_IDS)}")
+        model_id = CATEGORY_MATCH_MODEL_IDS[model]
 
         categories = self.manual.list_categories()
         if not categories:
             return 0, 0, 0
 
+        def embeddings_for(checksums):
+            ids = [r['id'] for r in self.db.get_files_by_checksums(list(checksums))]
+            if model == 'clip':
+                return [e for _fid, e in self.db.get_embeddings_for_files(ids)]
+            return [e for _fid, e in self.db.get_space_embeddings_for_files(model, ids)]
+
         # AI-generated media never trains a category or gets auto-matched (no
         # synthetic feedback loops) — excluded from examples and candidates below.
         ai_all = self.db.get_all_ai_generated_checksums()
 
-        category_centroids = []  # [(name, temperature, centroid_vector)]
+        # Candidate pool in the chosen space: parallel (file_ids, checksums, matrix).
+        if model == 'clip':
+            rows = self.db.get_all_embeddings()  # (file_id, path, embedding, checksum)
+            cand_ids = np.array([r[0] for r in rows], dtype=np.int64)
+            cand_checksums = [r[3] for r in rows]
+            cand_matrix = (np.stack([np.frombuffer(r[2], dtype=np.float32) for r in rows])
+                           if rows else np.empty((0, 0), np.float32))
+        else:
+            cand_ids, cand_checksums, cand_matrix = getattr(self.db, f'get_{model}_embeddings_matrix')()
+        if len(cand_ids) == 0:
+            return 0, 0, 0
+
+        category_centroids = []  # [(name, threshold, centroid_vector)]
         category_examples = {}
         category_rejections = {}
         for cat in categories:
@@ -399,34 +455,48 @@ class MediaManager:
             category_examples[cat['name']] = set(example_checksums)
             rejected = self.manual.get_excluded_checksums_for_category(cat['id'])
             category_rejections[cat['name']] = rejected
-            example_ids = [r['id'] for r in self.db.get_files_by_checksums(example_checksums)]
-            example_embeddings = [e for _fid, e in self.db.get_embeddings_for_files(example_ids)]
+            example_embeddings = embeddings_for(example_checksums)
             # Excluded (down-swiped) items steer the centroid away from their look
             # (Rocchio), so auto-match surfaces fewer like them — not just a skip.
             if rejected:
-                rej_ids = [r['id'] for r in self.db.get_files_by_checksums(list(rejected))]
-                rej_embeddings = [e for _fid, e in self.db.get_embeddings_for_files(rej_ids)]
-                centroid = adjusted_centroid(example_embeddings, rej_embeddings)
+                centroid = adjusted_centroid(example_embeddings, embeddings_for(rejected))
             else:
                 centroid = mean_normalized_centroid(example_embeddings)
-            if centroid is not None:
-                category_centroids.append((cat['name'], cat['temperature'], centroid))
+            if centroid is None or centroid.shape[0] != cand_matrix.shape[1]:
+                continue
+            if model == 'clip':
+                threshold = cat['temperature']
+            else:
+                ex = np.stack([np.frombuffer(e, dtype=np.float32) for e in example_embeddings])
+                # Background stats exclude the category's own examples (they'd inflate the floor).
+                ex_set = set(example_checksums)
+                bg = np.fromiter((c not in ex_set for c in cand_checksums), dtype=bool, count=len(cand_checksums))
+                threshold = calibrate_category_threshold(ex.dot(centroid), cand_matrix[bg].dot(centroid))
+            category_centroids.append((cat['name'], threshold, centroid))
         if not category_centroids:
             return 0, 0, 0
 
+        # Frame/video: a captured still is the same item as its video — never auto-match it
+        # on its own (it would surface outside the video's Frames pod).
+        still_parents = self.manual.get_all_frame_capture_parents()
+
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
-        candidates = [
-            (file_id, emb, checksum)
-            for file_id, rel_path, emb, checksum in self.db.get_all_embeddings()
-            if os.path.join(self.data_root, rel_path).startswith(abs_path)
-        ]
+        scoped = path not in ('.', '', None)
+        paths = {}
+        if scoped:
+            paths = {r[0]: r[1] for r in (self.db.get_all_embeddings() if model == 'clip'
+                                          else getattr(self.db, f'get_all_{model}_embeddings')())}
 
         considered = matched = skipped = 0
-        for file_id, emb, checksum in candidates:
-            if checksum in ai_all:   # never auto-classify AI-generated media
+        for i in range(len(cand_ids)):
+            checksum = cand_checksums[i]
+            file_id = int(cand_ids[i])
+            if checksum in ai_all or checksum in still_parents:
+                continue
+            if scoped and not os.path.join(self.data_root, paths.get(file_id, '')).startswith(abs_path):
                 continue
             considered += 1
-            vec = np.frombuffer(emb, dtype=np.float32)
+            vec = cand_matrix[i]
             file_matches = []
             for name, threshold, centroid in category_centroids:
                 if checksum in category_examples.get(name, ()) or checksum in category_rejections.get(name, ()):
@@ -435,13 +505,16 @@ class MediaManager:
                 if score >= threshold:
                     file_matches.append((name, score))
             if file_matches:
+                row = self.db.get_file_by_id(file_id)
+                if row is not None and row['hidden']:
+                    continue
                 matched += len(file_matches)
             else:
                 skipped += 1
             if not dry_run:
                 self.db.clear_file_category_match(file_id)
                 for name, score in file_matches:
-                    self.db.set_file_category_match(file_id, name, score, model='clip-centroid-v1')
+                    self.db.set_file_category_match(file_id, name, score, model=model_id)
 
         return matched, skipped, considered
 

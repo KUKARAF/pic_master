@@ -4,13 +4,13 @@
 
 {% block content %}
 <div class="page-heading">
-  <h1>Find more "{{ label }}" — {{ 'CLIP' if model == 'clip' else 'YOLO' }} model</h1>
+  <h1>Find more "{{ label }}" — {{ {'clip': 'CLIP (legacy)', 'siglip': 'SigLIP 2', 'dino': 'DINOv2'}.get(model, 'YOLO') }} model</h1>
   <a href="/search?tag={{ label | urlencode }}" class="sub">← Back to tag "{{ label }}"</a>
 </div>
 
 {% if not ready %}
 <div class="alert" style="margin-bottom:20px;">
-  No trained {{ 'CLIP' if model == 'clip' else 'YOLO' }} model for "{{ label }}" yet — train it from the
+  No trained {{ {'clip': 'CLIP (legacy)', 'siglip': 'SigLIP 2', 'dino': 'DINOv2'}.get(model, 'YOLO') }} model for "{{ label }}" yet — train it from the
   <a href="/search?tag={{ label | urlencode }}">tag page</a> first.
 </div>
 {% else %}

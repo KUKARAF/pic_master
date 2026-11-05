@@ -37,6 +37,16 @@ PATH_PROBE_DATA_ROOT = "probe_data_root"
 # Bumped when the embed_both_batch / embed_siglip_text wire shape changes. Replies carry it as
 # "proto" so a client can tell a stale (un-redeployed) worker from a real failure.
 EMBED_PROTOCOL_VERSION = 1
+# Shared-disk face detection (same data_root contract as embed_both_paths): the worker reads
+# <data_root>/<rel> itself and returns one result per path, in request order.
+#   req:  {"data_root": <str>, "paths": [<rel '/'-path>, ...]}
+#   resp: {"results": [{"name": <rel>, "faces": [<same face dicts as PATH_DETECT_FACES>],
+#                       "error": <None|str>}],
+#          "proto": FACE_PROTOCOL_VERSION, "gpu_seconds": <float>, "wall_seconds": <float>,
+#          "error": <None|str: whole-request failure>}
+# An old worker answers HTTP 404 (no handler) -> the client falls back to PATH_DETECT_FACES.
+PATH_DETECT_FACES_PATHS = "detect_faces_paths"
+FACE_PROTOCOL_VERSION = 1
 PATH_DETECT_OBJECTS = "detect_objects"
 PATH_ESTIMATE_AGE = "estimate_age"
 # Per-tag model TRAINING (job/poll pattern) + fine-tuned inference. Unlike the
@@ -62,10 +72,25 @@ PATH_PATTERN = "pattern_descriptor"
 # Instance-level region search (region_index.py): DINOv2 windows + RootSIFT for indexing,
 # DINOv2 query vectors for searching.
 PATH_REGION = "region_descriptor"
+# Find-by-pattern, DINOv2-L dense-cell algorithm (pattern_dino.py). Batched index op (upload or
+# shared-disk paths, same data_root contract as embed_both_paths) + a query op. A worker that
+# predates it answers HTTP 404 ("no handler"), a stale one a different "proto"/"algo": the client
+# turns both into a "worker needs redeploy" WorkerError (no silent fallback).
+#   req  {"op": "index", "items": [{"name", "image": bytes}]}           (upload)
+#        {"op": "index", "data_root": <str>, "paths": [<rel '/'-path>]} (shared disk)
+#   resp {"results": [{"name", "cells": int8 bytes (n, dim), "n", "error"}], "algo", "dim",
+#         "gpu_seconds", "decode_seconds", "lock_wait_seconds", "wall_seconds",
+#         "proto": PATTERN_DINO_PROTOCOL_VERSION, "error"}
+#   req  {"op": "query", "image": bytes, "box": [x1,y1,x2,y2], "mode": "mask|crop|both", "rots": [0..3]}
+#   resp {"queries": float32 bytes (S, dim), "n": S, "algo", "dim", "proto", "error"}
+#   req  {"op": "info"} -> {"ready": bool, "algo", "dim", "proto", "error"}
+PATH_PATTERN_DINO = "pattern_dino"
+PATTERN_DINO_PROTOCOL_VERSION = 1
 
 ALL_PATHS = [
     PATH_PING,
     PATH_PATTERN,
+    PATH_PATTERN_DINO,
     PATH_REGION,
     PATH_DETECT_FACES,
     PATH_EMBED_BBOX,
@@ -171,11 +196,15 @@ ALL_PATHS = [
 # The host driver (remote_tag_trainer.py) creates a job, uploads the training
 # data in batches (small requests, so RNS never has to ship one huge payload),
 # starts it, then polls status until a terminal state. YOLO checkpoints stay on
-# the worker (served by PATH_TAG_DETECT); the CLIP artifact (a ~2 KB weights.npz)
-# rides back in the final status response.
+# the worker (served by PATH_TAG_DETECT); the embedding-classifier artifact (a small
+# weights.npz) rides back in the final status response. The embedding space is part of
+# the kind: "siglip_model" (SigLIP 2, default), "dino_model", or legacy "clip_model"
+# (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not
+# extend). A worker that predates a kind rejects it in train_create ("unknown training
+# kind"), so a stale worker can never train in the wrong space.
 #
 #   PATH_TRAIN_CREATE
-#     req:  {"kind": "yolo_model"|"clip_model", "tag": <str>, "slug": <str>,
+#     req:  {"kind": "yolo_model"|"siglip_model"|"dino_model"|"clip_model", "tag": <str>, "slug": <str>,
 #            "epochs": <int|None>}
 #     resp: {"job_id": <str>, "error": <None|str>}
 #
@@ -183,8 +212,8 @@ ALL_PATHS = [
 #     req:  {"job_id": <str>, "kind": <str>, "batch": [ <item>, ... ]}
 #           yolo item:  {"name": <str>, "image": <bytes: <=640px JPEG>,
 #                        "boxes": [[cx, cy, w, h] normalized floats, ...]}
-#           clip item:  {"label": 0|1,
-#                        "embedding": <bytes: float32 (D,)>}   # whole-image
+#           embedding item (all *_model kinds except yolo):  {"label": 0|1,
+#                        "embedding": <bytes: float32 (D,), in the kind's space>}   # whole-image
 #                        | {"image": <bytes: cropped+downscaled JPEG>}  # region
 #     resp: {"received": <int>, "error": <None|str>}
 #
@@ -197,7 +226,7 @@ ALL_PATHS = [
 #     resp: {"status": "created"|"running"|"done"|"failed"|"cancelled",
 #            "current_epoch": <int>, "total_epochs": <int>,
 #            "metrics": {<str>: <num|None>, ...}, "log_tail": <str>,
-#            "artifact": <bytes|None>,   # clip weights.npz, only if want_artifact & done
+#            "artifact": <bytes|None>,   # weights.npz (embedding kinds), only if want_artifact & done
 #            "error": <None|str>}
 #
 #   PATH_TRAIN_CANCEL

@@ -114,9 +114,9 @@
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Suggest using
   <select id="set-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
-    <option value="clip">CLIP (ViT-B/32)</option>
     <option value="siglip">SigLIP 2</option>
     <option value="dino">DINOv2</option>
+    {% if clip_legacy_available %}<option value="clip">CLIP (ViT-B/32, legacy)</option>{% endif %}
   </select>
 </label>
 <div id="set-model-notice" class="sub" style="display:none;margin-bottom:10px;color:#b45309;"></div>
@@ -735,8 +735,8 @@
   // the live one, not whichever existed when the page first loaded.
   let stackHandle = null;
 
-  /* Embedding model driving the suggestions ('clip' default | 'siglip' | 'dino'),
-     remembered per browser. siglip/dino ignore the match threshold server-side
+  /* Embedding model driving the suggestions ('siglip' default | 'dino' | legacy 'clip',
+     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold server-side
      (their cosine scale differs), so the threshold slider is disabled for them. */
   const MODEL_KEY = 'mm_set_suggest_model';
   const MODEL_LABELS = { clip: 'CLIP', siglip: 'SigLIP 2', dino: 'DINOv2' };
@@ -745,9 +745,9 @@
   function loadModel() {
     try {
       const m = localStorage.getItem(MODEL_KEY);
-      if (m && MODEL_LABELS[m]) return m;
+      if (m && MODEL_LABELS[m] && (m !== 'clip' || (modelSelect && modelSelect.querySelector('option[value=clip]')))) return m;
     } catch (e) {}
-    return 'clip';
+    return 'siglip';
   }
   let currentModel = loadModel();
   if (modelSelect) modelSelect.value = currentModel;
@@ -864,7 +864,7 @@
   // the stack so no card ranked by the previous model lingers.
   if (modelSelect) {
     modelSelect.addEventListener('change', function() {
-      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'clip';
+      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'siglip';
       try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) {}
       if (modelNotice) modelNotice.style.display = 'none';
       fetchAndLaunch();
@@ -1169,7 +1169,7 @@
 
   if (swipePage) {
     // A non-default saved model is fetched up front so the missing-embeddings
-    // notice can show; the CLIP default keeps the original lazy first fetch.
+    // notice can show; the legacy CLIP model keeps the original lazy first fetch.
     if (currentModel !== 'clip') fetchAndLaunch(); else launchStack([]);
   }
 })();

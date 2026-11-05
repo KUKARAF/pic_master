@@ -77,9 +77,10 @@
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Suggest using
   <select id="location-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
-    <option value="clip">CLIP (ViT-B/32)</option>
-    <option value="siglip">SigLIP 2</option>
-    <option value="dino">DINOv2</option>
+    <option value="combined">DINOv2 + SigLIP 2 (same place, recommended)</option>
+    <option value="siglip">SigLIP 2 (scene)</option>
+    <option value="dino">DINOv2 (layout)</option>
+    {% if clip_legacy_available %}<option value="clip">CLIP (ViT-B/32, legacy)</option>{% endif %}
   </select>
 </label>
 <div id="location-model-notice" class="sub" style="display:none;margin-bottom:10px;color:#b45309;"></div>
@@ -114,6 +115,90 @@
   visual similarity to it.
 </div>
 {% endif %}
+
+{# ============ Describe the place (SigLIP 2 text -> image) ============ #}
+<div class="section-title" style="margin-top:36px;margin-bottom:12px;">Find by description</div>
+<div id="loc-text-search">
+  <p class="sub" style="margin-bottom:8px;">
+    Describe what this place looks like (e.g. <em>white tiled bathroom with a round mirror</em>) and
+    SigLIP 2 finds photos in the library that match. Photos already here, rejected here, or in a set
+    linked here are left out.
+  </p>
+  <form id="loc-text-form" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;">
+    <input type="text" id="loc-text-q" placeholder="beach at sunset" autocomplete="off" style="flex:1;min-width:240px;">
+    <label class="sub" style="display:flex;align-items:center;gap:6px;">
+      <input type="checkbox" id="loc-text-avoid" checked> Skip photos that already have a location
+    </label>
+    <button type="submit" class="btn-similar">Search</button>
+  </form>
+  <div id="loc-text-msg" class="sub" style="margin-bottom:8px;"></div>
+  <div id="loc-text-grid" style="display:flex;flex-wrap:wrap;gap:10px;"></div>
+  <button type="button" id="loc-text-more" class="btn-similar" style="display:none;margin-top:10px;">Load more</button>
+</div>
+<script>
+(function () {
+  const locId = {{ location.id }};
+  const form = document.getElementById('loc-text-form');
+  if (!form) return;
+  const qEl = document.getElementById('loc-text-q');
+  const avoid = document.getElementById('loc-text-avoid');
+  const msg = document.getElementById('loc-text-msg');
+  const grid = document.getElementById('loc-text-grid');
+  const more = document.getElementById('loc-text-more');
+  const PAGE = 24;
+  let query = '', offset = 0;
+
+  function addCard(c) {
+    const box = document.createElement('div');
+    box.style.cssText = 'width:150px;text-align:center;';
+    const a = document.createElement('a');
+    a.href = '/photo/' + c.id;
+    const img = document.createElement('img');
+    img.src = '/thumb/' + c.id;
+    img.loading = 'lazy';
+    img.style.cssText = 'width:150px;height:150px;object-fit:cover;border-radius:6px;';
+    a.appendChild(img);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn-similar';
+    btn.style.cssText = 'margin-top:4px;font-size:0.85em;';
+    btn.textContent = 'Add here' + (c.score != null ? ' \u00b7 ' + Number(c.score).toFixed(2) : '');
+    btn.addEventListener('click', function () {
+      btn.disabled = true;
+      fetch('/api/files/' + c.id + '/locations', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({location_id: locId})
+      }).then(function (r) {
+        btn.textContent = r.ok ? 'Added' : 'Failed';
+        if (!r.ok) btn.disabled = false;
+      }).catch(function () { btn.textContent = 'Failed'; btn.disabled = false; });
+    });
+    box.appendChild(a);
+    box.appendChild(btn);
+    grid.appendChild(box);
+  }
+
+  function run(reset) {
+    if (reset) { offset = 0; grid.innerHTML = ''; query = qEl.value.trim(); }
+    if (!query) return;
+    msg.textContent = 'Searching\u2026';
+    more.style.display = 'none';
+    fetch('/api/locations/' + locId + '/text-search?q=' + encodeURIComponent(query) +
+          '&limit=' + PAGE + '&offset=' + offset + '&avoid_existing=' + String(avoid.checked))
+      .then(function (r) { return r.json().then(function (d) { return {ok: r.ok, d: d}; }); })
+      .then(function (x) {
+        if (!x.ok) { msg.textContent = (x.d && x.d.detail) || 'Search failed.'; return; }
+        (x.d.cards || []).forEach(addCard);
+        offset += (x.d.cards || []).length;
+        msg.textContent = x.d.message || (grid.children.length ? '' : 'No matching photos.');
+        more.style.display = x.d.has_more ? '' : 'none';
+      })
+      .catch(function () { msg.textContent = 'Search failed.'; });
+  }
+  form.addEventListener('submit', function (e) { e.preventDefault(); run(true); });
+  more.addEventListener('click', function () { run(false); });
+})();
+</script>
 
 {# ============ Find objects across the library ============
    A self-contained feature, independent of the "Suggested photos" swipe above:
@@ -308,20 +393,20 @@
       '&model=' + encodeURIComponent(currentModel);
   }
 
-  /* Embedding model driving the suggestions ('clip' default | 'siglip' | 'dino'),
-     remembered per browser. siglip/dino ignore the match threshold and the
+  /* Embedding model driving the suggestions ('combined' = DINOv2 + SigLIP 2 default | 'siglip' | 'dino' | legacy 'clip',
+     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold and the
      background (CLIP tile index) option server-side, so both controls are disabled. */
   const MODEL_KEY = 'mm_location_suggest_model';
-  const MODEL_LABELS = { clip: 'CLIP', siglip: 'SigLIP 2', dino: 'DINOv2' };
+  const MODEL_LABELS = { clip: 'CLIP', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
   const BG_TIP = 'background matching uses the CLIP tile index; not available for SigLIP/DINOv2';
   const modelSelect = document.getElementById('location-model-select');
   const modelNotice = document.getElementById('location-model-notice');
   function loadModel() {
     try {
       const m = localStorage.getItem(MODEL_KEY);
-      if (m && MODEL_LABELS[m]) return m;
+      if (m && MODEL_LABELS[m] && (m !== 'clip' || (modelSelect && modelSelect.querySelector('option[value=clip]')))) return m;
     } catch (e) {}
-    return 'clip';
+    return 'combined';
   }
   let currentModel = loadModel();
   if (modelSelect) modelSelect.value = currentModel;
@@ -551,7 +636,7 @@
   // the stack so no card ranked by the previous model lingers.
   if (modelSelect) {
     modelSelect.addEventListener('change', function() {
-      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'clip';
+      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'combined';
       try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) {}
       applyModelToBackgroundToggle();
       if (modelNotice) modelNotice.style.display = 'none';
@@ -560,7 +645,7 @@
   }
 
   // A non-default saved model is fetched up front so the missing-embeddings
-  // notice can show; the CLIP default keeps the original lazy first fetch.
+  // notice can show; the legacy CLIP model keeps the original lazy first fetch.
   if (currentModel !== 'clip') fetchAndLaunch(); else launchStack([]);
 })();
 </script>

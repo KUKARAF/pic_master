@@ -37,8 +37,9 @@ def _stage(db, fid, key, algo=None):
     """Write the row(s) the job for `key` writes when it finds NOTHING (the sentinel form)."""
     if key == 'exif':
         db.update_file_metadata(fid)
-    elif key == 'clip':
-        db.insert_embedding(fid, b'\0' * 8, 'm')
+    elif key == 'embed':
+        db.insert_siglip_embedding(fid, b'\0' * 8, 'm')
+        db.insert_dino_embedding(fid, b'\0' * 8, 'm')
     elif key == 'tags':
         db.insert_detections(fid, [], 'm')                       # '__indexed__' sentinel
     elif key == 'faces':
@@ -98,11 +99,12 @@ def run_classification():
 
     _stage(db, f['stale.jpg'], 'region', algo='old-region-algo')
     _stage(db, f['stale.jpg'], 'pattern', algo='old-pattern-algo')
-    _stage(db, f['stale.jpg'], 'clip')
+    _stage(db, f['stale.jpg'], 'embed')
 
     # Frame-specific rows only: the primary-frame jobs still consider these pending.
     fo = f['frameonly.jpg']
-    db.insert_embedding(fo, b'\0' * 8, 'm', frame_index=5)
+    db.insert_siglip_embedding(fo, b'\0' * 8, 'm', frame_index=5)
+    db.insert_dino_embedding(fo, b'\0' * 8, 'm', frame_index=5)
     db.insert_detections(fo, [], 'm', frame_index=3)
     db.add_manual_face(fo, [1, 2, 3, 4], b'', 0.9, frame_index=2)
 
@@ -112,7 +114,7 @@ def run_classification():
 
     _captures(manual, 'cs-dir/v_done.mp4', 3)
     manual.mark_video_frame_scanned('cs-dir/v_done.mp4')
-    _stage(db, f['v_done.mp4'], 'clip')   # videos need a similarity embedding too
+    _stage(db, f['v_done.mp4'], 'embed')   # videos need the similarity embeddings too
     _captures(manual, 'cs-dir/v_two.mp4', 2)
     _captures(manual, 'cs-dir/v_half.mp4', 4)
 
@@ -130,10 +132,10 @@ def run_classification():
 
     nf = by['noface.jpg']
     assert nf['stages']['faces'] and nf['stages']['exif'] and nf['state'] == 'partial', nf
-    assert LABEL['faces'] not in nf['missing'] and LABEL['clip'] in nf['missing']
+    assert LABEL['faces'] not in nf['missing'] and LABEL['embed'] in nf['missing']
 
     stale = by['stale.jpg']['stages']
-    assert stale['region'] is False and stale['pattern'] is False and stale['clip'] is True
+    assert stale['region'] is False and stale['pattern'] is False and stale['embed'] is True
 
     fos = by['frameonly.jpg']
     assert not any(fos['stages'].values()) and fos['state'] == 'tracked', fos
@@ -151,9 +153,9 @@ def run_classification():
 
     assert by['v_done.mp4']['kind'] == 'video' and by['v_done.mp4']['state'] == 'scanned'
     assert by['v_two.mp4']['state'] == 'tracked'
-    assert by['v_two.mp4']['missing'] == [LABEL['clip'], LABEL['stills'], LABEL['video_faces']]
+    assert by['v_two.mp4']['missing'] == [LABEL['embed'], LABEL['stills'], LABEL['video_faces']]
     assert by['v_half.mp4']['state'] == 'partial'
-    assert by['v_half.mp4']['stages'] == {'clip': False, 'stills': True, 'video_faces': False}
+    assert by['v_half.mp4']['stages'] == {'embed': False, 'stills': True, 'video_faces': False}
 
     summ = scan_status.summarize(st)
     assert summ == {'broken': 2, 'scanned': 2, 'partial': 5, 'tracked': 3, 'total': 12}, summ
@@ -165,11 +167,15 @@ def run_classification():
     # Cache: the large path serves a snapshot until invalidate().
     scan_status.invalidate()
     bare = [(f['bare.jpg'], 'dir/bare.jpg')]
-    assert not scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['clip']
-    _stage(db, f['bare.jpg'], 'clip')
-    assert not scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['clip']
+    assert not scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['embed']
+    db.insert_siglip_embedding(f['bare.jpg'], b'\0' * 8, 'm')   # one space only: still missing
     scan_status.invalidate()
-    assert scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['clip']
+    for thr in (0, None):
+        assert not scan_status.status_for_files(db, manual, bare, large_threshold=thr)[f['bare.jpg']]['stages']['embed']
+    _stage(db, f['bare.jpg'], 'embed')
+    assert not scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['embed']
+    scan_status.invalidate()
+    assert scan_status.status_for_files(db, manual, bare, large_threshold=0)[f['bare.jpg']]['stages']['embed']
     scan_status.invalidate()
     print('OK  classification / sentinels / noface / algo / broken / video / summarize / cache')
 
@@ -209,7 +215,7 @@ def run_consistency():
     def images(rows):
         return {r[0] for r in rows if os.path.splitext(r[1])[1].lower() in IMAGE_EXTENSIONS}
 
-    assert missing('clip') == images(db.get_unindexed_files())
+    assert missing('embed') == images(db.get_files_needing_siglip('m')) | images(db.get_files_needing_dino('m'))
     assert missing('exif') == images(db.get_files_without_metadata())
     assert missing('tags') == images(db.get_undetected_files())
     assert missing('faces') == images(db.get_unface_indexed_files())

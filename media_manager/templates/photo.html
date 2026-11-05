@@ -270,7 +270,7 @@
         {% for c in file.categories %}
         <span class="tag-removable" data-category-id="{{ c.id or '' }}" style="margin-bottom:4px;display:inline-flex;">
           <a href="/search?category={{ c.name | urlencode }}">{{ c.name }}</a>
-          {% if c.source == 'auto' %}<span style="opacity:.7;">(auto)</span>{% endif %}
+          {% if c.source == 'auto' %}<span style="opacity:.7;"{% if c.legacy %} title="Matched with the retired CLIP model; rerun 'media category match' to refresh"{% endif %}>(auto{% if c.legacy %}, legacy{% endif %})</span>{% endif %}
           {% if c.source == 'manual' %}<button class="rm category-remove-btn" type="button" title="Remove this category">×</button>{% endif %}
         </span>
         {% endfor %}
@@ -545,7 +545,7 @@
               aria-label="Find by body">🧍</button>
       <span class="split-div"></span>
       <button type="button" class="split-seg find-by-distance-btn" data-file-id="{{ file.id }}"
-              title="Find similar images — visually closest photos (CLIP distance)"
+              title="Find similar images — visually closest photos (SigLIP 2 distance)"
               aria-label="Find similar images">📏</button>
       {% if file.is_image %}
       <span class="split-div"></span>
@@ -555,6 +555,13 @@
       <button type="button" class="split-seg find-by-pattern-btn" data-file-id="{{ file.id }}"
               title="Search a pattern — drag a box around a texture/pattern (e.g. a wallpaper) to find the same surface elsewhere, matched at the pixel scale you drew (needs /bulk → Index patterns)"
               aria-label="Search a pattern">🧩</button>
+      <select class="split-seg pattern-algo-select" aria-label="Pattern search method"
+              title="Pattern method: texture = ResNet18 texture statistics (default, pure surfaces/swatches); DINOv2 = semantic patch features (prints, objects; needs /bulk → Index patterns (DINOv2-L)); fused = both"
+              style="width:auto;max-width:4.6em;padding:0 2px;font-size:.72em;background:transparent;color:inherit;border:0;">
+        <option value="resnet">texture</option>
+        <option value="dino">DINOv2</option>
+        <option value="fused">fused</option>
+      </select>
       {% endif %}
     </div>
   </div>

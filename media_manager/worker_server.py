@@ -279,6 +279,90 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
         return worker_protocol.pack({"error": str(e)})
 
 
+def _pattern_dino_meta(pdino):
+    return {"algo": pdino.algo_tag(), "dim": pdino.dim(),
+            "proto": worker_protocol.PATTERN_DINO_PROTOCOL_VERSION}
+
+
+def handle_pattern_dino(path, data, request_id, link_id, remote_identity, requested_at):
+    """Find-by-pattern, DINOv2-L dense cells (pattern_dino.py). Ops (see worker_protocol):
+    info / query / index (upload items, or shared-disk paths under a validated data_root).
+    Shares the worker's ONE DINOv2Embedder with the embedding pipeline (no second copy in VRAM);
+    like embed_both only model LOADING takes models.lock — forwards take compute.GPU_LOCK
+    themselves, so decode of one request overlaps another's GPU work."""
+    from media_manager import pattern_dino as pdino  # hook-allow: lazy — pulls numpy only
+    op = None
+    try:
+        req = worker_protocol.unpack(data)
+        op = req.get("op")
+        meta = _pattern_dino_meta(pdino)
+        if op == "info":
+            return worker_protocol.pack({**meta, "ready": pdino.projection_ready(), "error": None})
+        if not pdino.projection_ready():
+            raise RuntimeError("pattern_dino projection missing on the worker "
+                               "(media_manager/data/pattern_dino_proj.npz): fit it with "
+                               "bench/bench_pattern_dino.py --fit and redeploy")
+        if models._dino is None:
+            with models.lock:  # first use: construct (incl. smoke forward) under the full lock
+                models.get_dino_embedder()
+        dino = models.get_dino_embedder()
+        t0 = time.time()
+        if op == "query":
+            from media_manager import pattern_deep  # hook-allow: lazy — decode helper
+            rgb = pattern_deep.load_rgb(req["image"])
+            if rgb is None:
+                return worker_protocol.pack({**meta, "queries": b"", "n": 0, "error": "could not decode image"})
+            q = pdino.describe_query(dino, rgb, req["box"], mode=req.get("mode") or "both",
+                                     rots=tuple(req.get("rots") or (0,)))
+            print(f"[worker] handled {worker_protocol.PATH_PATTERN_DINO} query -> "
+                  f"{0 if q is None else len(q)} vectors in {time.time() - t0:.2f}s", flush=True)
+            return worker_protocol.pack({**meta, "queries": q.tobytes() if q is not None else b"",
+                                         "n": 0 if q is None else int(q.shape[0]), "error": None})
+        if op != "index":
+            raise ValueError(f"unknown op {op!r}")
+        if "paths" in req:
+            data_root = req.get("data_root")
+            problem = _data_root_problem(data_root)
+            if problem:
+                raise ValueError(problem)
+            root_real = os.path.realpath(data_root)
+            names = list(req["paths"])
+            results = [{"name": r, "cells": b"", "n": 0, "error": None} for r in names]
+            sources = []
+            for i, rel in enumerate(names):
+                try:
+                    sources.append((i, resolve_under_root(root_real, rel)))
+                except (ValueError, OSError) as e:
+                    results[i]["error"] = f"rejected: {e}"
+        else:
+            items = req["items"]
+            results = [{"name": it.get("name"), "cells": b"", "n": 0, "error": None} for it in items]
+            sources = [(i, it["image"]) for i, it in enumerate(items)]
+        stats = {"decode_seconds": 0.0, "gpu_seconds": 0.0, "lock_wait_seconds": 0.0}
+        if sources:
+            cells, errs = pdino.describe_files(dino, [s for _, s in sources], stats=stats)
+            for (i, _), c, err in zip(sources, cells, errs):
+                if c is None:
+                    results[i]["error"] = err or "no cells returned"
+                else:
+                    results[i]["cells"], results[i]["n"] = c.tobytes(), int(c.shape[0])
+        wall = time.time() - t0
+        print(f"[worker] handled {worker_protocol.PATH_PATTERN_DINO} index ({len(results)} items) -> "
+              f"{sum(1 for r in results if r['error'] is None)} ok, wall {wall:.2f}s "
+              f"(decode {stats['decode_seconds']:.2f}s summed, gpu {stats['gpu_seconds']:.2f}s, "
+              f"lock wait {stats['lock_wait_seconds']:.2f}s)", flush=True)
+        return worker_protocol.pack({**meta, "results": results, "gpu_seconds": stats["gpu_seconds"],
+                                     "decode_seconds": stats["decode_seconds"],
+                                     "lock_wait_seconds": stats["lock_wait_seconds"],
+                                     "wall_seconds": wall, "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_PATTERN_DINO} ({op}) -> ERROR {e}", flush=True)
+        return worker_protocol.pack({"results": [], "queries": b"", "n": 0, "algo": None, "dim": None,
+                                     "proto": worker_protocol.PATTERN_DINO_PROTOCOL_VERSION,
+                                     "error": str(e)})
+
+
 # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def handle_region(path, data, request_id, link_id, remote_identity, requested_at):
     """Instance-level region search (region_index.py), DINOv2 on the worker's compute device.
@@ -309,6 +393,75 @@ def handle_region(path, data, request_id, link_id, remote_identity, requested_at
         return worker_protocol.pack({"error": str(e)})
 
 
+def _face_detector_ready():
+    """The FaceDetector, constructed (first use only) under the FULL lock so no other forward
+    runs during a model load; steady state skips the lock entirely."""
+    if models._face_detector is None:
+        with models.lock:
+            models.get_face_detector()
+    return models._face_detector
+
+
+def _detect_faces_concurrent(file_paths):
+    """FaceDetector.detect_faces over local files WITHOUT holding models.lock for the whole
+    call: image decode, JPEG down-scaling and the CPU PCN cascade of concurrent requests
+    overlap, and only the GPU-bound InsightFace calls serialize on compute.GPU_LOCK (taken
+    inside the detector, per call). Lock order stays load_lock -> GPU_LOCK (the detector
+    never asks for load_lock while holding GPU_LOCK), so there is no cycle, and every other
+    handler's `with models.lock` still excludes these forwards."""
+    return _face_detector_ready().detect_faces(file_paths, gpu_lock=compute.GPU_LOCK)
+
+
+def _pack_faces(faces):
+    return [{
+        "bbox": [float(v) for v in face["bbox"]],
+        "embedding": face["embedding"].astype(np.float32).tobytes(),
+        "det_score": float(face["det_score"]),
+        "angle": float(face.get("angle", 0.0)),
+    } for face in faces]
+
+
+def handle_detect_faces_paths(path, data, request_id, link_id, remote_identity, requested_at):
+    """Shared-disk variant of detect_faces for N files: the worker reads <data_root>/<rel>
+    itself (same data_root/.media check and realpath containment as embed_both_paths; a
+    rejected item gets its own error and is never opened). Replies one result per requested
+    path, in request order."""
+    t0 = time.time()
+    try:
+        req = worker_protocol.unpack(data)
+        data_root = req.get("data_root")
+        problem = _data_root_problem(data_root)
+        if problem:
+            raise ValueError(problem)
+        root_real = os.path.realpath(data_root)
+        rels = list(req["paths"])
+        results = [{"name": r, "faces": [], "error": None} for r in rels]
+        todo = []  # (result index, real path)
+        for i, rel in enumerate(rels):
+            try:
+                todo.append((i, resolve_under_root(root_real, rel)))
+            except (ValueError, OSError) as e:
+                results[i]["error"] = f"rejected: {e}"
+        if todo:
+            got = _detect_faces_concurrent([rp for _, rp in todo])
+            for (i, _rp), (_p, faces, error) in zip(todo, got):
+                results[i]["faces"] = _pack_faces(faces) if error is None else []
+                results[i]["error"] = error
+        n_faces = sum(len(r["faces"]) for r in results)
+        n_err = sum(1 for r in results if r["error"])
+        wall = time.time() - t0
+        print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES_PATHS} ({len(rels)} items) -> "
+              f"{n_faces} faces, {n_err} errors, wall {wall:.2f}s", flush=True)
+        return worker_protocol.pack({
+            "results": results, "wall_seconds": wall,
+            "proto": worker_protocol.FACE_PROTOCOL_VERSION, "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        traceback.print_exc()
+        print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES_PATHS} -> ERROR {e}", flush=True)
+        return worker_protocol.pack({
+            "results": [], "proto": worker_protocol.FACE_PROTOCOL_VERSION, "error": str(e)})
+
+
 def handle_detect_faces(path, data, request_id, link_id, remote_identity, requested_at):
     name = None
     tmp = None
@@ -316,17 +469,8 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
         req = worker_protocol.unpack(data)
         name = req.get("name")
         tmp = _write_temp(req["image"], name)
-        with models.lock:
-            res = models.get_face_detector().detect_faces([tmp])
-        _, faces, error = res[0]
-        out_faces = []
-        for face in faces:
-            out_faces.append({
-                "bbox": [float(v) for v in face["bbox"]],
-                "embedding": face["embedding"].astype(np.float32).tobytes(),
-                "det_score": float(face["det_score"]),
-                "angle": float(face.get("angle", 0.0)),
-            })
+        _, faces, error = _detect_faces_concurrent([tmp])[0]
+        out_faces = _pack_faces(faces)
         summary = f"{len(out_faces)} faces" if error is None else f"err={error}"
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> {summary}",
               flush=True)
@@ -755,7 +899,8 @@ class TrainingJob:
         # YOLO staging: [(staging_image_path, [[cx,cy,w,h] normalized, ...]), ...]
         self.yolo_examples = []
         self._yolo_counter = 0
-        # CLIP: whole-image [(emb_bytes, label)] and region [(crop_jpeg, label)]
+        # embedding classifier (siglip|dino|legacy clip): whole-image [(emb_bytes, label)]
+        # and region [(crop_jpeg, label)]
         self.clip_whole = []
         self.clip_regions = []
 
@@ -871,8 +1016,22 @@ def _run_yolo_job(job):
         shutil.rmtree(os.path.join(job.scratch_dir, 'staging'), ignore_errors=True)
 
 
+_EMBED_KIND_TO_SPACE = {'siglip_model': 'siglip', 'dino_model': 'dino', 'clip_model': 'clip'}
+
+
+def _worker_embedder_for_space(space):
+    """The worker's image embedder for a tag-classifier space. Caller holds models.lock."""
+    if space == 'siglip':
+        return models.get_siglip_embedder()
+    if space == 'dino':
+        return models.get_dino_embedder()
+    return models.get_clip_indexer()  # DEPRECATION PLANNED: legacy CLIP; superseded by SigLIP 2 + DINOv2, do not extend.
+
+
 def _run_clip_job(job):
+    """Embedding-space tag classifier (kind siglip_model | dino_model | legacy clip_model)."""
     try:
+        space = _EMBED_KIND_TO_SPACE[job.kind]
         xs, ys = [], []
         for emb_bytes, label in job.clip_whole:
             xs.append(np.frombuffer(emb_bytes, dtype=np.float32))
@@ -883,9 +1042,9 @@ def _run_clip_job(job):
             for crop_bytes, label in job.clip_regions:
                 crops.append(PILImage.open(io.BytesIO(crop_bytes)).convert('RGB'))
                 labels.append(label)
-            job.log(f'embedding {len(crops)} region crops on the worker CLIP model')
+            job.log(f'embedding {len(crops)} region crops on the worker {space} model')
             with models.lock:
-                embs = models.get_clip_indexer().embed_pil_images(crops)
+                embs = _worker_embedder_for_space(space).embed_pil_images(crops)
             for e, l in zip(embs, labels):
                 xs.append(e.astype(np.float32))
                 ys.append(l)
@@ -904,13 +1063,16 @@ def _run_clip_job(job):
 
         X = np.stack(xs).astype(np.float32)
         y = np.array(ys, dtype=np.float32)
-        job.log(f'fitting CLIP logistic on {n_pos} pos / {n_neg} neg')
+        dims = {x.shape[0] for x in xs}
+        if len(dims) != 1:
+            raise ValueError(f'mixed embedding dims {sorted(dims)} in {space} examples — re-embed, then retrain')
+        job.log(f'fitting {space} logistic on {n_pos} pos / {n_neg} neg')
         w, b, cv = ct.fit_from_examples(X, y)
 
-        out_dir = os.path.join(TAG_MODELS_DIR, job.slug, 'clip_model')
+        out_dir = os.path.join(TAG_MODELS_DIR, job.slug, job.kind)
         os.makedirs(out_dir, exist_ok=True)
         weights_path = os.path.join(out_dir, 'weights.npz')
-        np.savez(weights_path, w=w, b=np.float32(b), embedding_model='ViT-B-32/openai')
+        ct.save_weights(weights_path, w, b, space)
         with open(weights_path, 'rb') as f:
             job.artifact_bytes = f.read()
         job.metrics = {'cv_accuracy': round(cv, 4), 'n_positive': n_pos, 'n_negative': n_neg}
@@ -963,7 +1125,7 @@ def handle_train_create(path, data, request_id, link_id, remote_identity, reques
     try:
         req = worker_protocol.unpack(data)
         kind = req['kind']
-        if kind not in ('yolo_model', 'clip_model'):
+        if kind != 'yolo_model' and kind not in _EMBED_KIND_TO_SPACE:
             raise ValueError(f'unknown training kind {kind!r}')
         tag = req.get('tag', '')
         slug = req['slug']
@@ -1219,8 +1381,10 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
     worker_protocol.PATH_PATTERN: handle_pattern,
+    worker_protocol.PATH_PATTERN_DINO: handle_pattern_dino,
     worker_protocol.PATH_REGION: handle_region,
     worker_protocol.PATH_DETECT_FACES: handle_detect_faces,
+    worker_protocol.PATH_DETECT_FACES_PATHS: handle_detect_faces_paths,
     worker_protocol.PATH_EMBED_BBOX: handle_embed_bbox,
     worker_protocol.PATH_NORMALIZE_FACES: handle_normalize_faces,
     worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
@@ -1293,8 +1457,12 @@ def run(host="127.0.0.1", port=4243, preload=False):
         # (A blocking preload that crashed on one model is exactly what made the
         # old worker die before it could serve anything.)
         def _preload():
+            # SigLIP 2 + DINOv2 are the similarity/search embedders (every embed request goes
+            # through them), so they load alongside the faces; legacy CLIP (body/tile/tag
+            # classifier paths) stays lazy: its first request loads it on demand.
             for name, getter in (("FaceDetector", models.get_face_detector),
-                                  ("CLIPIndexer", models.get_clip_indexer),
+                                  ("SigLIP2Embedder", models.get_siglip_embedder),
+                                  ("DINOv2Embedder", models.get_dino_embedder),
                                   ("YOLOWorldDetector", models.get_object_detector)):
                 try:
                     print(f"[worker] preloading {name}...", flush=True)

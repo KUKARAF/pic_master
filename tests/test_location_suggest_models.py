@@ -88,17 +88,18 @@ def _order(data, ids):
     return [rev[c['id']] for c in data['cards']]
 
 
-def test_default_is_clip_and_unchanged(env):
+def test_default_is_combined_and_clip_still_selectable(env):
     _app, _db, _m, ids, loc, client = env
-    default = _get(client, loc, background='false')
+    default = _get(client, loc)
+    comb = _get(client, loc, 'combined')
+    assert _order(default, ids) == _order(comb, ids)
+    assert default['model'] == 'combined' and default['threshold_applied'] is False
+    assert default['background_applied'] is False and default['cards'] == default['results']
     clip = _get(client, loc, 'clip', background='false')
-    assert _order(default, ids) == _order(clip, ids)
-    order = _order(default, ids)
-    assert 'clip_only' in order and 'far' not in order            # threshold applied
+    order = _order(clip, ids)
+    assert 'clip_only' in order and 'far' not in order            # legacy: threshold applied
     assert not {'rej', 'm1', 'settled', 'placed'} & set(order)
-    assert default['model'] == 'clip' and default['threshold_applied'] is True
-    assert default['mode'] == 'whole' and default['background_applied'] is False
-    assert default['cards'] == default['results']
+    assert clip['model'] == 'clip' and clip['threshold_applied'] is True and clip['mode'] == 'whole'
 
 
 def test_unknown_model_400(env):

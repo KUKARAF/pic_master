@@ -29,7 +29,7 @@ from . import compute, scan_status
 # Execution order: images first (embedding/detection before the indexes that reuse
 # them — bodies reuse tags' person boxes), videos last with the face scan after the
 # stills. Every scan_status stage appears exactly once.
-STAGE_ORDER = ('exif', 'clip', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
+STAGE_ORDER = ('exif', 'embed', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
                'phash', 'tiles', 'stills', 'video_faces')
 
 # key -> (label, required, kind), from scan_status.STAGES.

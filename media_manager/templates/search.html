@@ -14,9 +14,11 @@
   <h1>Tag: {{ tag }}</h1>
   <span class="sub">{{ files | length }} file(s)</span>
   <div style="display:flex;gap:8px;margin-top:6px;">
-    {{ macros.classifier_button(clip_btn) }}
+    {{ macros.classifier_button(siglip_btn) }}
+    {{ macros.classifier_button(dino_btn) }}
     {{ macros.classifier_button(yolo_btn) }}
   </div>
+  {% if legacy_clip_note %}<div class="sub" style="font-size:0.8em;margin-top:4px;">{{ legacy_clip_note }}</div>{% endif %}
   {% else %}
   <h1>Search</h1>
   {% endif %}
@@ -61,8 +63,10 @@
       <button type="button" class="btn-similar" id="tag-review-default-btn">▶ Start review</button>
       <button type="button" class="btn-similar" id="tag-review-yolo-btn"
               {% if not (yolo_status and yolo_status.status == 'done') %}disabled title="Train a YOLO model for this tag first"{% endif %}>▶ Review with YOLO</button>
-      <button type="button" class="btn-similar" id="tag-review-clip-btn"
-              {% if not (clip_status and clip_status.status == 'done') %}disabled title="Train a CLIP model for this tag first"{% endif %}>▶ Review with CLIP</button>
+      <button type="button" class="btn-similar" id="tag-review-siglip-btn"
+              {% if not (siglip_status and siglip_status.status == 'done') %}disabled title="{{ 'Retrain the SigLIP 2 model for this tag (embedding model changed)' if siglip_status and siglip_status.status == 'needs_retrain' else 'Train a SigLIP 2 model for this tag first' }}"{% endif %}>▶ Review with SigLIP 2</button>
+      <button type="button" class="btn-similar" id="tag-review-dino-btn"
+              {% if not (dino_status and dino_status.status == 'done') %}disabled title="{{ 'Retrain the DINOv2 model for this tag (embedding model changed)' if dino_status and dino_status.status == 'needs_retrain' else 'Train a DINOv2 model for this tag first' }}"{% endif %}>▶ Review with DINOv2</button>
     </div>
     <div class="swipe-stack-wrap" id="tag-swipe-stack" style="display:none;"></div>
   </div>
@@ -239,7 +243,7 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
 })();
 
 /* Three explicit review modes instead of one auto-started stream — "Start
-   review" (default centroid ranking), "Review with YOLO"/"Review with CLIP"
+   review" (default centroid ranking), "Review with YOLO"/"Review with SigLIP 2"/"Review with DINOv2"
    (a trained per-tag model's own ranking, see _next_tag_suggestions_by_model
    in web.py). All three write plain tag confirmations through the exact same
    endpoints regardless of which one surfaced the candidate — a trained model
@@ -280,10 +284,10 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
           originalUrl: '/photo/' + card.file_id,
         };
       },
-      // When the suggestion carries a bbox (YOLO detection, or a CLIP highlight tile —
+      // When the suggestion carries a bbox (YOLO detection, or a legacy-CLIP highlight tile —
       // both normalized 0..1), persist the TAG WITH THAT BOX so the swipe builds real
       // spatial training data: confirm = positive region, reject = region hard-negative.
-      // No box (centroid stream, or CLIP without a tile index) → whole-image tag.
+      // No box (centroid stream, SigLIP/DINOv2 — no tile index in those spaces) → whole-image tag.
       onConfirm: function(card) {
         if (card.bbox && card.bbox.length === 4) {
           return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',
@@ -320,17 +324,20 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
 
   const defaultBtn = document.getElementById('tag-review-default-btn');
   const yoloBtn = document.getElementById('tag-review-yolo-btn');
-  const clipBtn = document.getElementById('tag-review-clip-btn');
+  const siglipBtn = document.getElementById('tag-review-siglip-btn');
+  const dinoBtn = document.getElementById('tag-review-dino-btn');
   if (defaultBtn) defaultBtn.addEventListener('click', function() { startReview('default'); });
   if (yoloBtn) yoloBtn.addEventListener('click', function() { startReview('yolo'); });
-  if (clipBtn) clipBtn.addEventListener('click', function() { startReview('clip'); });
+  if (siglipBtn) siglipBtn.addEventListener('click', function() { startReview('siglip'); });
+  if (dinoBtn) dinoBtn.addEventListener('click', function() { startReview('dino'); });
 
   // Auto-picks a mode when arriving via a "Find more" link from /tags
-  // (?start=yolo|clip) — still one explicit user click away (the earlier
+  // (?start=yolo|siglip|dino) — still one explicit user click away (the earlier
   // link click), not a page-load auto-fire.
   const autoStartMode = {{ start | tojson }};
   if (autoStartMode === 'yolo' && yoloBtn && !yoloBtn.disabled) startReview('yolo');
-  else if (autoStartMode === 'clip' && clipBtn && !clipBtn.disabled) startReview('clip');
+  else if (autoStartMode === 'siglip' && siglipBtn && !siglipBtn.disabled) startReview('siglip');
+  else if (autoStartMode === 'dino' && dinoBtn && !dinoBtn.disabled) startReview('dino');
 })();
 
 </script>

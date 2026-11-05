@@ -358,12 +358,17 @@ def test_similar_page_model_param(env):
         r = c.get(f'/similar/{a}?model={m}')
         assert r.status_code == 200 and 'score-badge' in r.text
         assert f'data-model="{m}"' in r.text and 'aria-current' in r.text
-    r = c.get(f'/similar/{ids["img8.jpg"]}?model=dino')   # no dino embedding
-    assert r.status_code == 200 and '/bulk' in r.text and 'id="embed-now-btn"' not in r.text
-    r = c.get(f'/similar/{a}?model=bogus')               # falls back to CLIP (default)
-    assert r.status_code == 200 and 'data-model="clip"' in r.text
+    r = c.get(f'/similar/{ids["img8.jpg"]}?model=dino')   # no dino embedding -> embed-now offered
+    assert r.status_code == 200 and 'id="embed-now-btn"' in r.text
+    r = c.get(f'/similar/{a}?model=bogus')               # falls back to SigLIP 2 (default)
+    assert r.status_code == 200 and 'data-model="siglip"' in r.text and 'score-badge' in r.text
     r = c.get(f'/similar/{a}')
-    assert r.status_code == 200 and 'id="embed-now-btn"' in r.text   # CLIP: no embedding -> embed-now
+    assert r.status_code == 200 and 'score-badge' in r.text and 'id="embed-now-btn"' not in r.text
+    # Legacy CLIP view: no CLIP data -> no CLIP model button, no embed-now (CLIP is never computed).
+    r = c.get(f'/similar/{ids["img8.jpg"]}')
+    assert 'data-model="clip"' not in r.text
+    r = c.get(f'/similar/{a}?model=clip')
+    assert r.status_code == 200 and 'id="embed-now-btn"' not in r.text and 'no legacy CLIP' in r.text
 
 
 def test_similar_api_cards_additive(env):

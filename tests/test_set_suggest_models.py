@@ -85,16 +85,19 @@ def _order(data, ids):
     return [rev[c['id']] for c in data['cards']]
 
 
-def test_default_is_clip_and_unchanged(env):
+def test_default_is_siglip_and_clip_still_selectable(env):
     _app, _db, _m, ids, sid, client = env
     default = _get(client, sid)
+    siglip = _get(client, sid, 'siglip')
+    assert _order(default, ids) == _order(siglip, ids)
+    assert default['model'] == 'siglip' and default['threshold_applied'] is False
+    assert default['cards'] == default['results']
+    # Legacy CLIP stays selectable and behaves as before (absolute threshold, CLIP data only).
     clip = _get(client, sid, 'clip')
-    assert _order(default, ids) == _order(clip, ids)
-    order = _order(default, ids)
+    order = _order(clip, ids)
     assert 'clip_only' in order and 'far' not in order     # threshold applied
     assert 'rej' not in order and 'm1' not in order and 'hid' in order  # CLIP path as before
-    assert default['model'] == 'clip' and default['threshold_applied'] is True
-    assert default['cards'] == default['results']
+    assert clip['model'] == 'clip' and clip['threshold_applied'] is True
 
 
 def test_unknown_model_400(env):

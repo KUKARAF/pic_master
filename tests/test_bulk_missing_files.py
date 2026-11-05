@@ -28,7 +28,7 @@ class FakeClient:
     def record(self, op, name):
         self.sent.append(name)
 
-    def request(self, path, payload, timeout=None):
+    def request(self, path, payload, timeout=None, concurrent=False):
         return {'faces': [], 'error': None}
 
 

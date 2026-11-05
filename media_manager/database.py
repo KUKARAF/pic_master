@@ -490,6 +490,19 @@ class Database(ThreadLocalDB):
                 indexed_at INTEGER NOT NULL
             )
         ''')
+        # Pattern DINO cells: the ALTERNATIVE find-by-pattern index (pattern_dino.py) — same shape
+        # as pattern_windows (one row per file, n * DIM int8 bytes, `algo`-versioned, n=0 = "nothing
+        # describable") but holds DINOv2-L/14-reg patch tokens avg-pooled to 2x2-token cells and
+        # PCA-projected. Separate table so a ResNet scan never walks it. Derived + rebuildable.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pattern_dino_cells (
+                file_id INTEGER PRIMARY KEY,
+                algo TEXT NOT NULL,
+                n INTEGER NOT NULL,
+                data BLOB NOT NULL,
+                indexed_at INTEGER NOT NULL
+            )
+        ''')
         # Region index (region_index.py, instance-level region search): int8 DINOv2 window
         # descriptors (scanned on every query) and RootSIFT features (point-read for the
         # shortlist) live in separate tables so the scan never walks SIFT overflow pages.
@@ -713,6 +726,7 @@ class Database(ThreadLocalDB):
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_body_file_frame ON body_embeddings (file_id, frame_index)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_region_windows_algo ON region_windows (algo)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_windows_algo ON pattern_windows (algo)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_pattern_dino_cells_algo ON pattern_dino_cells (algo)')
         self.conn.commit()
 
     def upsert_file_path(self, path, checksum, size=None, modified_time=None, seen_at=None):
@@ -1197,6 +1211,10 @@ class Database(ThreadLocalDB):
         self.conn.commit()
         return cur.rowcount
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+    # The legacy CLIP `embeddings` table (insert_embedding .. count_indexed, plus the iter_/matrix
+    # helpers) is kept read-only-in-spirit for old data, the legacy tag classifier and the body /
+    # tile / region paths; no background job or ingest hook writes it any more.
     def insert_embedding(self, file_id, embedding_bytes, model, frame_index=0):
         """Upsert the embedding for a file at a given frame (frame_index=0 is the
         default/primary embedding — same meaning as before per-frame support existed)."""
@@ -1540,6 +1558,37 @@ class Database(ThreadLocalDB):
     def count_dino_indexed(self):
         """Count of files with a primary (frame_index=0) DINOv2 embedding."""
         return self._space_count('dino')
+
+    def get_space_embedding(self, space, file_id):
+        """Primary (frame_index=0) embedding bytes of `file_id` in 'siglip' | 'dino', or None."""
+        row = self.conn.cursor().execute(
+            f'SELECT embedding FROM {self._SPACE_TABLES[space]} WHERE file_id = ? AND frame_index = 0',
+            (file_id,)).fetchone()
+        return row[0] if row else None
+
+    def space_ids_with_model(self, space, model, file_ids):
+        """Subset of `file_ids` that already have a primary row in `space` produced by `model`
+        (the complement of _space_needing, for an explicit file list -- chunked IN lookups)."""
+        have = set()
+        table = self._SPACE_TABLES[space]
+        cur = self.conn.cursor()
+        for chunk in self._chunked([int(i) for i in file_ids]):
+            cur.execute(f'SELECT file_id FROM {table} WHERE frame_index = 0 AND model = ? '
+                        f'AND file_id IN ({",".join("?" * len(chunk))})', [model, *chunk])
+            have.update(r[0] for r in cur.fetchall())
+        return have
+
+    def get_space_embeddings_for_files(self, space, file_ids):
+        """[(file_id, embedding_bytes)] primary rows of the given files in `space` (the
+        siglip/dino twin of get_embeddings_for_files)."""
+        out = []
+        table = self._SPACE_TABLES[space]
+        cur = self.conn.cursor()
+        for chunk in self._chunked([int(i) for i in file_ids]):
+            cur.execute(f'SELECT file_id, embedding FROM {table} WHERE frame_index = 0 '
+                        f'AND file_id IN ({",".join("?" * len(chunk))})', chunk)
+            out.extend(cur.fetchall())
+        return out
 
     # --- perceptual hashes (near-duplicate detection, Phase 1) -----------------------
     def insert_phash(self, file_id, phash_bytes, dhash_bytes, width, height, algo,
@@ -2341,7 +2390,7 @@ class Database(ThreadLocalDB):
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
                       'object_region_embeddings',
                       'place_embeddings', 'place_keypoints',
-                      'pattern_tiles', 'pattern_windows', 'region_windows', 'region_sift',
+                      'pattern_tiles', 'pattern_windows', 'pattern_dino_cells', 'region_windows', 'region_sift',
                       'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
         cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
@@ -2367,7 +2416,33 @@ class Database(ThreadLocalDB):
     # Face methods (InsightFace)
     # ------------------------------------------------------------------
 
-    def insert_faces(self, file_id: int, faces: list, model: str) -> None:
+    def insert_faces_many(self, items, model: str) -> None:
+        """insert_faces for several (file_id, faces) pairs in ONE transaction (one commit,
+        one cache invalidation) -- identical rows to calling insert_faces per item."""
+        items = list(items)
+        if not items:
+            return
+        try:
+            for file_id, faces in items:
+                self.insert_faces(file_id, faces, model, commit=False)
+        except BaseException:
+            self.conn.rollback()
+            raise
+        self.conn.commit()
+        self._face_ver += 1
+
+    def get_faces_with_embeddings_for_file(self, file_id: int) -> list:
+        """get_faces_for_file's rows (same filter and order) with the embedding blob
+        appended as a 7th column -- one query instead of one get_face_embedding per face."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT id, bbox, det_score, identity, frame_index, angle, embedding FROM faces "
+            "WHERE file_id = ? AND (identity IS NULL OR identity != '__indexed__') ORDER BY det_score DESC",
+            (file_id,)
+        )
+        return cursor.fetchall()
+
+    def insert_faces(self, file_id: int, faces: list, model: str, commit: bool = True) -> None:
         """Upsert primary-frame face rows for a file (the batch `media faces` CLI
         path — always writes frame_index=NULL).
         faces: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray, 'det_score':
@@ -2394,8 +2469,9 @@ class Database(ThreadLocalDB):
                     (file_id, json.dumps(face['bbox']), face['embedding'].tobytes(), face['det_score'],
                      None, now, float(face.get('angle', 0.0)), FACE_NORM_VERSION)
                 )
-        self.conn.commit()
-        self._face_ver += 1  # invalidate cached face-embeddings matrix
+        if commit:
+            self.conn.commit()
+            self._face_ver += 1  # invalidate cached face-embeddings matrix
 
     def add_manual_face(self, file_id, bbox, embedding_bytes, det_score, frame_index=None,
                         angle=0.0) -> int:
@@ -3011,42 +3087,76 @@ class Database(ThreadLocalDB):
         return row[0] if row else 0
 
     # --- pattern windows (find-by-pattern, pattern_deep.py) ---------------------------
-    def insert_pattern_windows(self, file_id: int, windows, algo: str) -> None:
+    # `table` selects the index: 'pattern_windows' (ResNet18, pattern_deep.py, default) or
+    # 'pattern_dino_cells' (DINOv2-L cells, pattern_dino.py) — identical row shape.
+    _PATTERN_TABLES = ('pattern_windows', 'pattern_dino_cells')
+
+    def _pattern_table(self, table: str) -> str:
+        if table not in self._PATTERN_TABLES:
+            raise ValueError(f'unknown pattern table {table!r}')
+        return table
+
+    def insert_pattern_windows(self, file_id: int, windows, algo: str, table: str = 'pattern_windows') -> None:
         """Replace a file's window descriptors (idempotent re-index).
         windows: int8 ndarray (n, DIM); n == 0 records "indexed, nothing describable"."""
         import numpy as np  # hook-allow: lazy — heavy
+        table = self._pattern_table(table)
         arr = np.ascontiguousarray(windows, dtype=np.int8)
         self.conn.execute(
-            'INSERT OR REPLACE INTO pattern_windows (file_id, algo, n, data, indexed_at) VALUES (?,?,?,?,?)',
+            f'INSERT OR REPLACE INTO {table} (file_id, algo, n, data, indexed_at) VALUES (?,?,?,?,?)',
             (file_id, algo, int(arr.shape[0]), arr.tobytes(), int(time.time())))
         self.conn.commit()
 
-    def count_pattern_indexed(self, algo: str) -> int:
+    def insert_pattern_windows_batch(self, rows, algo: str, table: str = 'pattern_windows') -> None:
+        """Replace many files' descriptors in ONE transaction (the bulk-job write-back).
+        rows: [(file_id, int8 ndarray (n, DIM))]. All-or-nothing; the caller isolates per row on failure."""
+        import numpy as np  # hook-allow: lazy — heavy
+        table = self._pattern_table(table)
+        now = int(time.time())
+        data = []
+        for file_id, windows in rows:
+            arr = np.ascontiguousarray(windows, dtype=np.int8)
+            data.append((file_id, algo, int(arr.shape[0]), arr.tobytes(), now))
+        try:
+            self.conn.executemany(
+                f'INSERT OR REPLACE INTO {table} (file_id, algo, n, data, indexed_at) VALUES (?,?,?,?,?)', data)
+            self.conn.commit()
+        except Exception:  # hook-allow: broad — roll the half-written batch back, then re-raise
+            self.conn.rollback()
+            raise
+
+    def count_pattern_indexed(self, algo: str, table: str = 'pattern_windows') -> int:
         """Files with a current-algo pattern index row (stale-algo rows don't count)."""
         row = self.conn.execute(
-            'SELECT COUNT(*) FROM pattern_windows WHERE algo = ?', (algo,)).fetchone()
+            f'SELECT COUNT(*) FROM {self._pattern_table(table)} WHERE algo = ?', (algo,)).fetchone()
         return row[0] if row else 0
 
-    def get_unpattern_indexed_files(self, algo: str, limit=None) -> list:
+    def count_pattern_stale(self, algo: str, table: str = 'pattern_windows') -> int:
+        """Rows indexed under a DIFFERENT algo tag (they are ignored until re-indexed)."""
+        row = self.conn.execute(
+            f'SELECT COUNT(*) FROM {self._pattern_table(table)} WHERE algo != ?', (algo,)).fetchone()
+        return row[0] if row else 0
+
+    def get_unpattern_indexed_files(self, algo: str, limit=None, table: str = 'pattern_windows') -> list:
         """(id, path) for tracked files with no CURRENT-algo pattern_windows row — so an
         algorithm bump re-queues everything. Caller skips non-images."""
-        sql = '''
+        sql = f'''
             SELECT f.id, f.path
             FROM files_with_path f
-            LEFT JOIN pattern_windows p ON p.file_id = f.id AND p.algo = ?
+            LEFT JOIN {self._pattern_table(table)} p ON p.file_id = f.id AND p.algo = ?
             WHERE p.file_id IS NULL AND f.hidden = 0
         '''
         if limit is not None:
             return self.conn.execute(sql + ' LIMIT ?', (algo, limit)).fetchall()
         return self.conn.execute(sql, (algo,)).fetchall()
 
-    def iter_pattern_windows(self, algo: str, dim: int, files_per_chunk=400):
+    def iter_pattern_windows(self, algo: str, dim: int, files_per_chunk=400, table: str = 'pattern_windows'):
         """Yield (file_ids: int64[k], counts: int64[k], matrix: int8[sum(counts), dim]) over
         every current-algo indexed file — the RAM-bounded find-by-pattern scan primitive.
         Malformed blobs are skipped with a WARNING."""
         import numpy as np  # hook-allow: lazy — heavy
         cursor = self.conn.cursor()
-        cursor.execute('SELECT file_id, n, data FROM pattern_windows WHERE algo = ?', (algo,))
+        cursor.execute(f'SELECT file_id, n, data FROM {self._pattern_table(table)} WHERE algo = ?', (algo,))
         while True:
             rows = cursor.fetchmany(files_per_chunk)
             if not rows:
@@ -3541,6 +3651,12 @@ class Database(ThreadLocalDB):
             for file_id, category_name, score, model in cursor.fetchall():
                 result.setdefault(file_id, []).append((category_name, score, model))
         return result
+
+    def count_category_matches_by_model(self):
+        """{model_id: row_count} over file_category_matches (legacy-CLIP vs current spaces)."""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT model, COUNT(*) FROM file_category_matches GROUP BY model')
+        return {m: n for m, n in cursor.fetchall()}
 
     def get_all_file_category_matches(self):
         """Return [(file_id, checksum, category_name, score), ...] joined for

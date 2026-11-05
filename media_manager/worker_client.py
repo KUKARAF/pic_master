@@ -472,39 +472,123 @@ def get_client(data_root: str) -> WorkerClient:
 # ---------------------------------------------------------------------------
 
 
+FACE_INFLIGHT = int(os.environ.get("MEDIA_FACE_INFLIGHT", 4))      # face requests in flight
+FACE_PATHS_CHUNK = int(os.environ.get("MEDIA_FACE_PATHS_CHUNK", 8))  # files per detect_faces_paths request
+
+
 class RemoteFaceDetector:
     """Drop-in for :class:`face_detector.FaceDetector` backed by the worker."""
 
-    def __init__(self, client: WorkerClient):
+    # Files per detect_faces() call the bulk job should hand over (it processes the
+    # results after each call): big enough to keep FACE_INFLIGHT requests busy.
+    batch_size = int(os.environ.get("MEDIA_FACE_BATCH", 32))
+
+    def __init__(self, client: WorkerClient, data_root=None):
         self.client = client
+        # Library root for shared-disk mode (the worker reads files itself when it can
+        # see the same root); None -> always upload.
+        self.data_root = data_root
         # Callers (e.g. web.py detect-faces) read `detector._model_name` to compute
         # the DB model_id. The worker always runs the default buffalo_l, so mirror it.
         self._model_name = 'buffalo_l'
 
-    def detect_faces(self, paths: list) -> list:
-        results = []
-        for path in paths:
-            basename = os.path.basename(path)
-            image_bytes, read_error = _read_for_upload(path)
-            if read_error:
-                results.append((path, [], read_error))
-                continue
-            self.client.record("detect_faces", basename)
+    @staticmethod
+    def _faces_from_wire(raw) -> list:
+        faces = []
+        for face in (raw or []):
+            faces.append({
+                "bbox": [float(v) for v in face["bbox"]],
+                # .copy() so the array owns its memory instead of pinning the
+                # whole response buffer for the lifetime of the embedding.
+                "embedding": np.frombuffer(face["embedding"], dtype=np.float32).copy(),
+                "det_score": float(face["det_score"]),
+                "angle": float(face.get("angle") or 0.0),
+            })
+        return faces
+
+    def _detect_one_upload(self, path):
+        basename = os.path.basename(path)
+        image_bytes, read_error = _read_for_upload(path)
+        if read_error:
+            return (path, [], read_error)
+        self.client.record("detect_faces", basename)
+        resp = self.client.request(
+            worker_protocol.PATH_DETECT_FACES,
+            {"name": basename, "image": image_bytes},
+            concurrent=True,
+        )
+        return (path, self._faces_from_wire(resp.get("faces")), resp.get("error"))
+
+    def _detect_paths_chunk(self, rels, paths):
+        """One detect_faces_paths request -> [(path, faces, error)] aligned with `paths`;
+        None when the worker does not speak the path protocol (-> upload instead)."""
+        self.client.record("detect_faces", f"{len(rels)} paths")
+        try:
             resp = self.client.request(
-                worker_protocol.PATH_DETECT_FACES,
-                {"name": basename, "image": image_bytes},
-            )
-            faces = []
-            for face in (resp.get("faces") or []):
-                faces.append({
-                    "bbox": [float(v) for v in face["bbox"]],
-                    # .copy() so the array owns its memory instead of pinning the
-                    # whole response buffer for the lifetime of the embedding.
-                    "embedding": np.frombuffer(face["embedding"], dtype=np.float32).copy(),
-                    "det_score": float(face["det_score"]),
-                    "angle": float(face.get("angle") or 0.0),
-                })
-            results.append((path, faces, resp.get("error")))
+                worker_protocol.PATH_DETECT_FACES_PATHS,
+                {"data_root": self.data_root, "paths": rels},
+                timeout=_EMBED_BATCH_TIMEOUT, concurrent=True)
+        except WorkerError as exc:
+            if "no handler" not in str(exc):
+                raise
+            # Old worker: remember (so we stop trying) and upload these items instead.
+            self.client.__dict__.setdefault("_data_root_probe", {})[self.data_root] = (
+                False, time.time() + _PROBE_TTL_NEGATIVE)
+            return None
+        if resp.get("error"):
+            raise WorkerError(f"detect_faces_paths: {resp['error']}")
+        if resp.get("proto") != worker_protocol.FACE_PROTOCOL_VERSION:
+            raise WorkerError(f"detect_faces_paths: worker face protocol {resp.get('proto')!r} != "
+                              f"expected {worker_protocol.FACE_PROTOCOL_VERSION} -- worker needs redeploy")
+        results = resp.get("results") or []
+        if len(results) != len(paths):
+            raise WorkerError(f"detect_faces_paths: worker returned {len(results)} results "
+                              f"for {len(paths)} paths")
+        return [(p, self._faces_from_wire(r.get("faces")), r.get("error"))
+                for p, r in zip(paths, results)]
+
+    def detect_faces(self, paths: list) -> list:
+        """[(path, faces, error)] in input order. Shared-disk mode (worker sees the data root)
+        sends relative paths in chunks of FACE_PATHS_CHUNK; everything else uploads one image
+        per request. Either way up to FACE_INFLIGHT requests are in flight, so upload/decode/
+        CPU work overlaps with the worker's GPU work. Per-image failures stay per-image."""
+        paths = list(paths)
+        n = len(paths)
+        results = [None] * n
+        rels = [None] * n
+        if self.data_root and n and _worker_sees_data_root(self.client, self.data_root):
+            root_real = os.path.realpath(self.data_root)
+            rels = [_rel_under_root(p, root_real) for p in paths]
+        via_paths = [i for i in range(n) if rels[i] is not None]
+        via_upload = [i for i in range(n) if rels[i] is None]
+
+        def run_chunk(idxs):
+            got = self._detect_paths_chunk([rels[i] for i in idxs], [paths[i] for i in idxs])
+            if got is None:
+                return [(i, self._detect_one_upload(paths[i])) for i in idxs]
+            return list(zip(idxs, got))
+
+        def run_upload(i):
+            return [(i, self._detect_one_upload(paths[i]))]
+
+        jobs = [(run_chunk, via_paths[k:k + FACE_PATHS_CHUNK])
+                for k in range(0, len(via_paths), FACE_PATHS_CHUNK)]
+        jobs += [(run_upload, i) for i in via_upload]
+        if len(jobs) <= 1:
+            for fn, arg in jobs:
+                for i, r in fn(arg):
+                    results[i] = r
+        else:
+            with ThreadPoolExecutor(max_workers=max(1, min(FACE_INFLIGHT, len(jobs)))) as pool:
+                futs = [pool.submit(fn, arg) for fn, arg in jobs]
+                try:
+                    for f in futs:  # in order -> deterministic error precedence
+                        for i, r in f.result():
+                            results[i] = r
+                except BaseException:
+                    for f in futs:
+                        f.cancel()
+                    raise
         return results
 
     def embed_bbox(self, img, bbox: list, pad_ratio: float = 0.3) -> dict:
@@ -870,6 +954,141 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
                     done = min(n, done + bs)
                     if on_batch:
                         on_batch(done, n)
+            except BaseException:
+                for f in futs:
+                    f.cancel()
+                raise
+    out.wall_seconds = time.time() - t0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Find-by-pattern, DINOv2-L dense cells (pattern_dino.py) on the worker.
+# Same two transports as embed_both (shared-disk paths when the worker can see data_root, else
+# upload), same "worker needs redeploy" contract: an old worker (HTTP 404), a different protocol
+# version or a different algo tag (other projection) raises WorkerError -- never a silent mix.
+# ---------------------------------------------------------------------------
+
+def _pd_request(client, req: dict, algo, what: str, timeout=_EMBED_BATCH_TIMEOUT, concurrent=False) -> dict:
+    try:
+        resp = client.request(worker_protocol.PATH_PATTERN_DINO, req, timeout=timeout, concurrent=concurrent)
+    except WorkerError as exc:
+        if "no handler" in str(exc):
+            raise WorkerError(f"{what}: worker needs redeploy (does not know "
+                              f"{worker_protocol.PATH_PATTERN_DINO!r})") from exc
+        raise
+    if resp.get("error"):
+        raise WorkerError(f"{what}: {resp['error']}")
+    if resp.get("proto") != worker_protocol.PATTERN_DINO_PROTOCOL_VERSION:
+        raise WorkerError(f"{what}: worker pattern_dino protocol {resp.get('proto')!r} != expected "
+                          f"{worker_protocol.PATTERN_DINO_PROTOCOL_VERSION} -- worker needs redeploy")
+    if algo is not None and resp.get("algo") != algo:
+        raise WorkerError(f"{what}: worker algo {resp.get('algo')!r} != expected {algo!r} "
+                          "(different projection file -- redeploy the worker)")
+    return resp
+
+
+def pattern_dino_query(client, image_bytes: bytes, box, algo: str, mode: str = "both",
+                       rots=(0,), name: str = "<query>"):
+    """Projected float32 (S, dim) query vectors for a drawn box, or None when it can't be
+    described. Raises WorkerError (incl. stale worker / algo mismatch)."""
+    client.record("pattern_query", name)
+    resp = _pd_request(client, {"op": "query", "image": image_bytes, "box": list(box),
+                                "mode": mode, "rots": list(rots)}, algo, "pattern_dino query",
+                       timeout=120)
+    if not resp.get("n"):
+        return None
+    return np.frombuffer(resp["queries"], np.float32).reshape(resp["n"], resp["dim"]).copy()
+
+
+class PatternDinoResult:
+    """Result of :func:`pattern_dino_index`; lists aligned with the input items."""
+
+    def __init__(self, n: int):
+        self.cells = [None] * n     # int8 (n_i, dim) or None
+        self.errors = [None] * n    # str or None
+        self.algo = None
+        self.gpu_seconds = 0.0
+        self.decode_seconds = 0.0
+        self.lock_wait_seconds = 0.0
+        self.workers = 1
+        self.wall_seconds = 0.0
+        self.mode = "upload"        # 'paths' | 'upload' | 'mixed' (as BothResult.mode)
+
+
+def pattern_dino_index(client, items, algo: str, batch_size: int = 16, workers: int = 3,
+                       data_root=None) -> PatternDinoResult:
+    """DINOv2-L cell descriptors for `items` (str paths, or (name, bytes)) via the worker.
+    Per-item failures give None + error text; transport/stale-worker failures raise WorkerError.
+    Shared-disk mode exactly as embed_both (probe, relative paths, bigger batches)."""
+    items = list(items)
+    n = len(items)
+    out = PatternDinoResult(n)
+    t0 = time.time()
+    bs = max(1, int(batch_size))
+    rels = [None] * n
+    if data_root and n and any(isinstance(it, str) for it in items) \
+            and _worker_sees_data_root(client, data_root):
+        root_real = os.path.realpath(data_root)
+        rels = [_rel_under_root(it, root_real) for it in items]
+        if any(r is not None for r in rels):
+            bs = max(bs, PATHS_BATCH_SIZE)
+            workers = max(int(workers), PATHS_WORKERS)
+    n_paths = sum(1 for r in rels if r is not None)
+    out.mode = "paths" if n_paths == n and n else ("mixed" if n_paths else "upload")
+    starts = list(range(0, n, bs))
+    out.workers = max(1, min(int(workers), len(starts) or 1))
+
+    def one(ks, req):
+        client.record("pattern_index", f"{len(ks)} items")
+        resp = _pd_request(client, req, algo, "pattern_dino index", concurrent=True)
+        results = resp.get("results") or []
+        if len(results) != len(ks):
+            raise WorkerError(f"pattern_dino index: worker returned {len(results)} results for {len(ks)} items")
+        return ks, resp, results
+
+    def run_batch(start):
+        idxs = list(range(start, min(n, start + bs)))
+        errs, parts = {}, []
+        p_idx = [k for k in idxs if rels[k] is not None]
+        u_idx = [k for k in idxs if rels[k] is None]
+        if p_idx:
+            parts.append(one(p_idx, {"op": "index", "data_root": data_root,
+                                      "paths": [rels[k] for k in p_idx]}))
+        payload = []
+        for k in u_idx:
+            try:
+                name, data = _item_to_named_bytes(items[k], k)
+            except (OSError, ValueError) as exc:
+                errs[k] = f"read failed: {exc}"
+                continue
+            payload.append((k, {"name": name, "image": data}))
+        if payload:
+            parts.append(one([k for k, _ in payload], {"op": "index", "items": [p for _, p in payload]}))
+        return parts, errs
+
+    def merge(res):
+        parts, errs = res
+        for k, msg in errs.items():
+            out.errors[k] = msg
+        for ks, resp, results in parts:
+            out.algo = resp.get("algo")
+            out.gpu_seconds += float(resp.get("gpu_seconds") or 0.0)
+            out.decode_seconds += float(resp.get("decode_seconds") or 0.0)
+            out.lock_wait_seconds += float(resp.get("lock_wait_seconds") or 0.0)
+            dim = int(resp["dim"])
+            for k, r in zip(ks, results):
+                if r.get("error"):
+                    out.errors[k] = r["error"]
+                else:
+                    out.cells[k] = np.frombuffer(r["cells"], np.int8).reshape(int(r["n"]), dim).copy()
+
+    if starts:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+            futs = [pool.submit(run_batch, s) for s in starts]
+            try:
+                for f in futs:
+                    merge(f.result())
             except BaseException:
                 for f in futs:
                     f.cancel()

@@ -1,5 +1,5 @@
 """
-FastAPI web server for media_manager — gallery UI with CLIP search, tags, and similar-image discovery.
+FastAPI web server for media_manager — gallery UI with SigLIP 2 / DINOv2 search, tags, and similar-image discovery.
 """
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ from pydantic import BaseModel
 
 from media_manager import (
     background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
-    near_dup, object_index, pattern_deep, phasher, region_index, remote_index_builder,
+    near_dup, object_index, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
 )
@@ -51,7 +51,9 @@ from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
 from media_manager.body_index import crop_bodies, match_face_to_body
 from media_manager.broken_finder import is_decode_error
 from media_manager.clip_tag_classifier import (
-    MIN_EXAMPLES_PER_CLASS, classifier_dir, load_probe, score_all, slugify, write_status,
+    DEFAULT_SPACE as TAG_DEFAULT_SPACE, MIN_EXAMPLES_PER_CLASS, NeedsRetrain, SPACES as TAG_SPACES,
+    classifier_dir, current_embedding_model, load_probe, score_all, score_matrix, slugify, space_kind,
+    weights_state, write_status,
 )
 from media_manager.database import FACE_NORM_VERSION, Database
 from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
@@ -73,7 +75,7 @@ from media_manager.media_manager import MediaManager, _parse_query, scan_folder
 from media_manager.object_encoder import ObjectEncoder
 from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
-from media_manager.similarity import adjusted_centroid, mean_normalized_centroid, rank_by_similarity, top_k_indices
+from media_manager.similarity import adjusted_centroid, fuse_zscores, mean_normalized_centroid, rank_by_similarity, top_k_indices
 from media_manager.swipe_support import bias_reorder
 from media_manager.tile_index import generate_tiles
 from media_manager.worker_client import WorkerError
@@ -357,6 +359,15 @@ class RegionSearchBody(BaseModel):
     bbox: list[float]
 
 
+class PatternSearchBody(RegionSearchBody):
+    """Find-by-pattern request. `algo`: 'resnet' (default; pattern_deep texture windows), 'dino'
+    (pattern_dino DINOv2-L cells) or 'fused' (z-score fusion of both). `dino_mode`: query mode
+    for the DINO side ('mask'|'crop'|'both'); `dino_weight`: DINO share of a fused score."""
+    algo: Optional[str] = None
+    dino_mode: Optional[str] = None
+    dino_weight: Optional[float] = None
+
+
 def _gray_placeholder() -> bytes:
     """Return a gray 400×400 JPEG as bytes (used when thumbnail generation fails)."""
     img = PILImage.new('RGB', (400, 400), color=(180, 180, 180))
@@ -526,6 +537,7 @@ def _get_face_detector():
     if _worker_client is not None and _worker_client.is_configured():
         if _face_detector_remote is None:
             _face_detector_remote = worker_client.RemoteFaceDetector(_worker_client)
+        _face_detector_remote.data_root = _embed_data_root  # shared-disk mode when the worker sees it
         return _face_detector_remote
     if _face_detector_local is None:
         _face_detector_local = FaceDetector()
@@ -557,6 +569,9 @@ _clip_indexer_local = None
 _clip_indexer_remote = None
 
 
+# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+# No similarity / search / background-ML job computes CLIP any more; what still calls this is
+# the body index, the tile index, the region-search fallback and the legacy tag classifier.
 def _get_clip_indexer():
     global _clip_indexer_local, _clip_indexer_remote
     if _worker_client is not None and _worker_client.is_configured():
@@ -609,6 +624,47 @@ def _local_embed_shared(embedders, paths, stats=None):
     `stats` (dict) is filled with decode/gpu/lock-wait seconds by the real implementation."""
     from media_manager.embedders import embed_shared  # hook-allow: lazy -- pulls in torch
     return embed_shared(embedders, paths, stats=stats)
+
+
+def _local_pattern_dino_index(embedder, paths, stats=None):
+    """Local DINOv2-L cell descriptors (pattern_dino.describe_files). Isolated so tests can fake it."""
+    return pattern_dino.describe_files(embedder, paths, stats=stats)
+
+
+def _local_pattern_dino_query(embedder, rgb, box, mode, rots):
+    """Local DINOv2-L query vectors (pattern_dino.describe_query). Isolated so tests can fake it."""
+    return pattern_dino.describe_query(embedder, rgb, box, mode=mode, rots=rots)
+
+
+def _pattern_dino_rots():
+    """Query-crop rotations (quarter turns) from $MEDIA_PATTERN_DINO_ROTS, e.g. '0,1,2,3'. Default
+    '0': more rotations = more query vectors = more rotated-pattern recall but more false positives
+    (let bench/bench_pattern_dino.py decide)."""
+    try:
+        r = tuple(sorted({int(x) % 4 for x in os.environ.get('MEDIA_PATTERN_DINO_ROTS', '0').split(',') if x.strip()}))
+    except ValueError:
+        r = (0,)
+    return r or (0,)
+
+
+def _pattern_dino_chunk(paths):
+    """DINOv2-L cells for `paths` -- worker (shared-disk paths or upload) when configured, else the
+    local GPU-only embedder (raises on a machine without a GPU; never a CPU fallback). Returns
+    (cells, errors, timing, mode): aligned lists (int8 (n, dim) | None, str | None), a dict of
+    decode/gpu/lock-wait seconds or None, and the transport mode. A stale worker raises WorkerError."""
+    paths = list(paths)
+    algo = pattern_dino.algo_tag()
+    if _worker_client is not None and _worker_client.is_configured():
+        embedder = _get_dino_embedder()
+        res = worker_client.pattern_dino_index(
+            _worker_client, paths, algo, batch_size=getattr(embedder, 'batch_size', 16),
+            workers=getattr(embedder, 'workers', 3), data_root=_embed_data_root)
+        timing = {'decode_seconds': res.decode_seconds, 'gpu_seconds': res.gpu_seconds,
+                  'lock_wait_seconds': res.lock_wait_seconds, 'workers': res.workers}
+        return list(res.cells), list(res.errors), timing, res.mode
+    stats = {}
+    cells, errs = _local_pattern_dino_index(_get_dino_embedder(), paths, stats)
+    return list(cells), list(errs), (dict(stats, workers=1) if stats else None), 'local'
 
 
 # Set by create_app (like _worker_client); lets _embed_pair_chunk hand the data root to the worker
@@ -679,6 +735,102 @@ def _embed_pair_chunk(sig, dino, paths):
             errs.append(None)
             k += 1
     return pairs, errs, (stats.get('gpu_seconds') if stats else None), None
+
+
+# A video is embedded as the L2-normalised mean of this many frames spread across it
+# (10%..90%) -- one vector per model, in the same space as photos, stored at the video's
+# own file id (frame_index 0) exactly like the legacy CLIP video vector was.
+VIDEO_EMBED_FRAMES = 5
+_VIDEO_GROUP = 16  # videos whose frames go to the embedders in one call
+
+
+def _sample_video_frames(abs_path):
+    """VIDEO_EMBED_FRAMES RGB PIL frames spread across the video (a single frame for a clip
+    shorter than that). Raises ValueError when no frame decodes."""
+    cap = video_decode.open_capture(abs_path)
+    frames = []
+    try:
+        count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        positions = ([int(count * (0.1 + 0.8 * i / (VIDEO_EMBED_FRAMES - 1)))
+                      for i in range(VIDEO_EMBED_FRAMES)] if count > VIDEO_EMBED_FRAMES else [None])
+        for pos in positions:
+            if pos is not None:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
+    finally:
+        cap.release()
+    if not frames:
+        raise ValueError('no decodable frames')
+    return frames
+
+
+def _mean_unit(vecs):
+    """L2-normalised mean of float32 vectors (the vectors themselves when norm is 0)."""
+    mean = np.asarray(vecs, dtype=np.float32).mean(axis=0)
+    norm = float(np.linalg.norm(mean))
+    return mean / norm if norm > 0 else mean
+
+
+def _embed_pair_files(sig, dino, paths):
+    """_embed_pair_chunk for a mix of images and videos (same return shape, aligned with
+    `paths`). Images go straight through; each video is sampled into VIDEO_EMBED_FRAMES
+    temporary JPEGs, ALL frames of a group of videos are embedded in one _embed_pair_chunk
+    call and averaged per video per model. A video with no decodable frame gets an error."""
+    paths = list(paths)
+    vids = [i for i, p in enumerate(paths) if os.path.splitext(p)[1].lower() in VIDEO_EXTENSIONS]
+    if not vids:
+        return _embed_pair_chunk(sig, dino, paths)
+    n = len(paths)
+    pairs, errs = [None] * n, [None] * n
+    gpu, models = None, None
+
+    def _add_gpu(g):
+        nonlocal gpu
+        if g is not None:
+            gpu = (gpu or 0.0) + g
+
+    vset = set(vids)
+    imgs = [i for i in range(n) if i not in vset]
+    if imgs:
+        p, e, g, m = _embed_pair_chunk(sig, dino, [paths[i] for i in imgs])
+        for k, i in enumerate(imgs):
+            pairs[i], errs[i] = p[k], e[k]
+        _add_gpu(g)
+        models = m or models
+    with tempfile.TemporaryDirectory(prefix='mm-vframes-') as tmp:
+        for g0 in range(0, len(vids), _VIDEO_GROUP):
+            flat, owner = [], []
+            for i in vids[g0:g0 + _VIDEO_GROUP]:
+                try:
+                    frames = _sample_video_frames(paths[i])
+                except (ValueError, OSError, cv2.error) as exc:
+                    errs[i] = f'video embedding: {exc}'
+                    continue
+                for k, fr in enumerate(frames):
+                    fp = os.path.join(tmp, f'{i}_{k}.jpg')
+                    fr.convert('RGB').save(fp, format='JPEG', quality=92)
+                    flat.append(fp)
+                    owner.append(i)
+            if not flat:
+                continue
+            p, e, g, m = _embed_pair_chunk(sig, dino, flat)
+            _add_gpu(g)
+            models = m or models
+            ok = {}
+            for k, i in enumerate(owner):
+                if p[k] is not None:
+                    ok.setdefault(i, []).append(p[k])
+                elif errs[i] is None:
+                    errs[i] = e[k] or 'frame embedding failed'
+            for i, got in ok.items():
+                pairs[i] = (_mean_unit([x[0] for x in got]), _mean_unit([x[1] for x in got]))
+                errs[i] = None
+            for fp in flat:
+                with contextlib.suppress(OSError):
+                    os.remove(fp)
+    return pairs, errs, gpu, models
 
 
 _age_estimator = None
@@ -2530,14 +2682,13 @@ def create_app(data_root: str) -> FastAPI:
         return candidate
 
     def _index_uploads_in_background(items):
-        """EXIF date/GPS + CLIP embedding for freshly uploaded files, off the request
+        """EXIF date/GPS + SigLIP 2 / DINOv2 embeddings for freshly uploaded files, off the request
         thread so a big batch returns immediately (both are what a scan would do)."""
         def _run():
             for file_id, abs_path, is_image in items:
                 taken_at, gps_lat, gps_lon = exif_reader.extract_exif_metadata(abs_path)
                 db.update_file_metadata(file_id, taken_at, gps_lat, gps_lon)
-                if is_image:
-                    _ensure_file_embedding(file_id, abs_path)   # best-effort, logs
+                _ensure_file_embedding(file_id, abs_path)   # images and videos; best-effort, logs
         threading.Thread(target=_run, daemon=True, name='upload-index').start()
 
     @app.post('/api/files/upload')
@@ -2552,7 +2703,7 @@ def create_app(data_root: str) -> FastAPI:
         (`files` works as the field name too.) Each file is hashed with the same
         full-file xxh64 a scan uses; content ALREADY in the library is rejected (not
         saved), as is a repeat within the same request. New files are tracked at once
-        and EXIF/CLIP-indexed in the background; non-media files are skipped.
+        and EXIF/SigLIP 2+DINOv2-indexed in the background; non-media files are skipped.
 
         Response: {"saved": [{id, name, path}], "duplicates": [{name, existing_id,
         existing_path}], "skipped": [{name, reason}]}. Status 200 when anything was
@@ -2693,7 +2844,7 @@ def create_app(data_root: str) -> FastAPI:
         kind='identity' (value=name) → that person's photos; kind='set' (value=set id)
         → the set's members; kind='category' (value=category name) → the category's
         resolved members; kind='similar' (value=file id) → visually-similar via the
-        cached embeddings matrix. Excludes ids already in the feed; capped at 20."""
+        cached SigLIP 2 matrix. Excludes ids already in the feed; capped at 20."""
         exclude = set(body.exclude)
         rows = []
         if body.kind == 'identity':
@@ -2711,19 +2862,11 @@ def create_app(data_root: str) -> FastAPI:
                 cs = get_resolved_checksums_for_category(manual, db, cat['id'], cat['name'])
                 rows = [(r['id'], r['path'], r['checksum']) for r in db.get_files_by_checksums(cs)]
         elif body.kind == 'similar':
-            emb = db.get_embedding(int(body.value))
-            if emb is not None:
-                query = np.frombuffer(emb, dtype=np.float32)
-                file_ids, _cksums, matrix = db.get_embeddings_matrix()  # cached
-                if matrix.shape[0]:
-                    scores = db.score_embeddings(query)  # GPU-resident matmul when available
-                    for i in top_k_indices(scores, min(matrix.shape[0], 40)):
-                        fid = int(file_ids[i])
-                        if fid == int(body.value):
-                            continue
-                        r = db.get_file_by_id(fid)
-                        if r is not None:
-                            rows.append((r['id'], r['path'], r['checksum']))
+            # SigLIP 2 neighbours (stills folded into their video, hidden/trashed dropped).
+            for hit in _similar_in_space('siglip', int(body.value), 40)['results']:
+                r = db.get_file_by_id(hit['file_id'])
+                if r is not None:
+                    rows.append((r['id'], r['path'], r['checksum']))
         else:
             raise HTTPException(status_code=400, detail=f'unknown kind {body.kind!r}')
 
@@ -3546,10 +3689,10 @@ def create_app(data_root: str) -> FastAPI:
         return {'ok': True, 'profile_ref': None}
 
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
-    def similar_page(request: Request, file_id: int, model: str = 'clip'):
+    def similar_page(request: Request, file_id: int, model: str = 'siglip'):
         row = _file_or_404(file_id)
         if model not in ('clip', 'siglip', 'dino'):
-            model = 'clip'
+            model = 'siglip'
         filename = os.path.basename(row['path'])
         files = []
         message = ''
@@ -3561,15 +3704,18 @@ def create_app(data_root: str) -> FastAPI:
         if model != 'clip':
             try:
                 d = _similar_in_space(model, file_id, 20)
-                files, message = d['cards'], d.get('message', '') if d.get('no_embedding') else ''
+                files = d['cards']
+                # No embedding yet -> the template offers "embed now" instead of a dead-end message.
+                no_embedding = bool(d.get('no_embedding'))
             except HTTPException as exc:
                 message = html.escape(str(exc.detail))  # template renders message |safe
             except Exception as exc:  # hook-allow: broad -- report any search failure to the UI
                 message = html.escape(f'Similarity search error: {exc}')
         elif emb_bytes is None:
-            # The template shows an "embed now" button instead of a message here.
-            no_embedding = True
+            # Legacy CLIP view: nothing computes CLIP any more, so there is no "embed now" here.
+            message = 'This photo has no legacy CLIP embedding (CLIP is no longer computed). Use SigLIP 2 or DINOv2.'
         else:
+            # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
             try:
                 query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
                 # Cached, write-invalidated matrix shared library-wide — NOT a
@@ -3612,19 +3758,27 @@ def create_app(data_root: str) -> FastAPI:
             'message': message,
             'no_embedding': no_embedding,
             'model': model,
+            'clip_legacy_available': db.count_indexed() > 0,
             'source_is_video': source_is_video,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
         })
 
     @app.get('/api/files/{file_id}/similar')
-    def api_similar_files(file_id: int, limit: int = 50):
-        """Whole-image CLIP similarity as JSON: file_ids ranked most-similar first.
+    def api_similar_files(file_id: int, limit: int = 50, model: str = 'siglip'):
+        """Whole-image similarity as JSON: file_ids ranked most-similar first (SigLIP 2 by
+        default; ?model=dino for visual similarity; ?model=clip is the legacy ViT-B/32 space).
         Lets the photo page's "distance" quick-action open the matches straight
         into the browsable watch-queue (same UX as find-by-face) instead of the
         /similar/{id} results page. Uses the cached embeddings matrix + a
-        GIL-free argpartition top-K."""
+        GIL-free argpartition top-K. Captured video stills are folded into their
+        source video (never listed on their own)."""
         _file_or_404(file_id)
+        if model in ('siglip', 'dino'):
+            return _similar_in_space(model, file_id, limit)
+        if model != 'clip':
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
         emb_bytes = db.get_embedding(file_id)
         if emb_bytes is None:
             # Distinct flag so the client can offer "embed now?" instead of a dead-end toast.
@@ -3909,12 +4063,210 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(_pattern_pending_files()),
         }
 
+    # ---- Find-by-pattern, DINOv2-L cells (pattern_dino.py): the ALTERNATIVE, selectable algorithm.
+    # Same job shape/diagnostics as the SigLIP+DINO embedding job (chunked, the DB write-back of
+    # chunk N overlaps the worker's chunk N+1 on a writer thread, ONE commit per chunk), but a
+    # separate pass: it needs the 448 px dense forward, the embedding pass is a 224 px CLS-only one.
+    PATTERN_DINO_CHUNK = max(1, int(os.environ.get('MEDIA_PATTERN_DINO_CHUNK', 256)))
+    PATTERN_DINO_TABLE = 'pattern_dino_cells'
+
+    def _pattern_dino_pending_files():
+        """Image files with no current-algo DINO-cell index (a refit / ALGO_BASE bump re-queues all)."""
+        return [(fid, rel) for fid, rel in db.get_unpattern_indexed_files(
+            pattern_dino.algo_tag(), table=PATTERN_DINO_TABLE)
+            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS]
+
+    def _run_pattern_dino_index(candidates, job, on_progress=None, should_stop=_never):
+        """Index `candidates` [(file_id, rel_path)] with DINOv2-L cells and write them back.
+        `job` (shaped like pattern_dino_job) gets live done/failed/img_per_sec/eta_seconds/
+        gpu_busy_pct/db_write_pct/decode_threads_avg; should_stop() is checked between chunks
+        (embedded chunks are still written). Per-file failures are logged and counted. Returns
+        (done, failed); raises the first transport / GPU / writer error after the writer drained."""
+        import queue as _queue
+        algo = pattern_dino.algo_tag()
+        t0 = time.time()
+        st = {'done': 0, 'failed': 0, 'db_s': 0.0, 'gpu_s': 0.0, 'decode_s': 0.0, 't_prev': t0, 'ema': None}
+        lock = threading.Lock()
+        wq = _queue.Queue(maxsize=2)   # embedding runs at most 2 chunks ahead of the DB
+        werr = []
+
+        def _store(item):
+            rows, n_chunk, failed, timing = item
+            t_db = time.perf_counter()
+            try:
+                db.insert_pattern_windows_batch([(fid, arr) for fid, arr, _ in rows], algo,
+                                                table=PATTERN_DINO_TABLE)
+            except Exception:  # hook-allow: broad -- batch rolled back; isolate per row
+                traceback.print_exc()
+                for fid, arr, abs_path in rows:
+                    try:
+                        db.insert_pattern_windows(fid, arr, algo, table=PATTERN_DINO_TABLE)
+                    except Exception as exc2:  # hook-allow: broad -- per-item; one bad row must not sink the job
+                        errors.log(abs_path, f'pattern-dino: store failed: {exc2}')
+                        failed += 1
+            db_s = time.perf_counter() - t_db
+            now = time.time()
+            with lock:
+                st['failed'] += failed
+                st['done'] += n_chunk
+                st['db_s'] += db_s
+                if timing:
+                    st['gpu_s'] += timing.get('gpu_seconds') or 0.0
+                    st['decode_s'] += timing.get('decode_seconds') or 0.0
+                rate = n_chunk / max(now - st['t_prev'], 1e-9)
+                st['t_prev'] = now
+                # ETA from the recent speed (EMA), not the since-start average: that includes model load.
+                st['ema'] = rate if st['ema'] is None else 0.8 * st['ema'] + 0.2 * rate
+                wall = max(now - t0, 1e-9)
+                job.update(
+                    done=st['done'], failed=st['failed'], img_per_sec=round(st['ema'], 2),
+                    eta_seconds=round((len(candidates) - st['done']) / st['ema'], 1) if st['ema'] > 0 else None,
+                    db_write_pct=round(100 * min(st['db_s'] / wall, 1.0), 1),
+                    gpu_busy_pct=round(100 * min(st['gpu_s'] / wall, 1.0), 1) if st['gpu_s'] else None,
+                    decode_threads_avg=round(st['decode_s'] / wall, 2) if st['decode_s'] else None)
+                if on_progress is not None:
+                    on_progress(st['done'], st['failed'])
+
+        def _writer():
+            try:
+                while True:
+                    item = wq.get()
+                    if item is None:
+                        return
+                    if werr:
+                        continue   # writer already failed: drain so the producer never blocks
+                    try:
+                        _store(item)
+                    except Exception as exc:  # hook-allow: broad -- surfaced via the job error
+                        traceback.print_exc()
+                        werr.append(exc)
+            finally:
+                db.close()   # this thread's per-thread sqlite connections
+                errors.close()
+
+        writer = threading.Thread(target=_writer, name='pattern-dino-writer', daemon=True)
+        writer.start()
+        err = None
+        try:
+            for i in range(0, len(candidates), PATTERN_DINO_CHUNK):
+                chunk = candidates[i:i + PATTERN_DINO_CHUNK]
+                if werr:
+                    raise werr[0]
+                if should_stop():
+                    break
+                live, failed = [], 0
+                for fid, rel in chunk:
+                    abs_path = _live_abs_path(fid, rel)
+                    if abs_path is None:
+                        errors.log(rel, 'pattern-dino: file not on disk')
+                        failed += 1
+                    else:
+                        live.append((fid, abs_path))
+                rows, timing = [], None
+                if live:
+                    cells, errs, timing, mode = _pattern_dino_chunk([p for _, p in live])
+                    job['transport_mode'] = mode
+                    for (fid, abs_path), c, e in zip(live, cells, errs):
+                        if c is None:
+                            errors.log(abs_path, f'pattern-dino: {e or "no cells returned"}')
+                            failed += 1
+                        else:
+                            rows.append((fid, c, abs_path))
+                wq.put((rows, len(chunk), failed, timing))
+        except Exception as exc:  # hook-allow: broad -- re-raised below once the writer has drained
+            traceback.print_exc()
+            err = exc
+        finally:
+            wq.put(None)    # chunks already embedded still get written (resumability)
+            writer.join()
+        if err is None and werr:
+            err = werr[0]
+        if err is not None:
+            raise err
+        return st['done'], st['failed']
+
+    @app.post('/api/pattern-dino-index/start')
+    def api_pattern_dino_index_start(include_trashed: bool = False):
+        """Build the DINOv2-L find-by-pattern index (alternative to 'Index patterns'). Resumable:
+        only files lacking the CURRENT algo tag are processed, so refitting the projection or a
+        pattern_dino.ALGO_BASE bump re-indexes the library."""
+        if pattern_dino_job['running']:
+            return {'started': False, 'message': 'DINOv2 pattern indexing already running.'}
+        if not pattern_dino.projection_ready():
+            # a normal reply (not an HTTP error) so the /bulk status line shows the instruction
+            return {'started': False, 'message': (
+                'DINOv2 pattern projection missing (media_manager/data/pattern_dino_proj.npz). Fit it on the '
+                'GPU machine: bench/bench_pattern_dino.py --fit, commit the file, redeploy the worker.')}
+        if _worker_client is None or not _worker_client.is_configured():
+            _get_dino_embedder()   # local: a no-GPU RuntimeError is an immediate readable 500, not a dead job
+        candidates = _drop_trashed(_pattern_dino_pending_files(), include_trashed)
+        if not candidates:
+            return {'started': False, 'total': 0, 'message': 'Nothing to index -- every photo already has the current DINOv2 pattern index.'}
+        pattern_dino_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
+                                img_per_sec=0.0, eta_seconds=None, transport_mode=None,
+                                gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)
+
+        def _run():
+            try:
+                _run_pattern_dino_index(candidates, pattern_dino_job)
+            except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
+                pattern_dino_job['error'] = compute.job_error_text(exc)
+            finally:
+                pattern_dino_job['running'] = False
+
+        _spawn_job(_run)
+        return {'started': True, 'total': pattern_dino_job['total']}
+
+    @app.get('/api/pattern-dino-index/status')
+    def api_pattern_dino_index_status():
+        out = {k: pattern_dino_job[k] for k in ('running', 'done', 'total', 'failed', 'error',
+                                                'img_per_sec', 'eta_seconds', 'transport_mode',
+                                                'gpu_busy_pct', 'db_write_pct', 'decode_threads_avg')}
+        ready = pattern_dino.projection_ready()
+        out.update(projection_ready=ready, algo=pattern_dino.algo_tag(), pending=None, stale=None)
+        if ready and not pattern_dino_job['running']:
+            out['pending'] = len(_pattern_dino_pending_files())
+            # rows from an older projection/algo: they are ignored until re-indexed ("needs reindex")
+            out['stale'] = db.count_pattern_stale(pattern_dino.algo_tag(), table=PATTERN_DINO_TABLE)
+        return out
+
+    @app.get('/api/pattern-search/algos')
+    def api_pattern_search_algos():
+        """Which pattern algorithms are searchable right now (for the UI selector)."""
+        dino_ok = pattern_dino.projection_ready()
+        return {'algos': {
+            'resnet': {'indexed': db.count_pattern_indexed(pattern_deep.ALGO_TAG), 'algo': pattern_deep.ALGO_TAG},
+            'dino': {'indexed': db.count_pattern_indexed(pattern_dino.algo_tag(), table=PATTERN_DINO_TABLE)
+                     if dino_ok else 0, 'algo': pattern_dino.algo_tag(), 'projection_ready': dino_ok},
+        }}
+
+    def _pattern_dino_query_vectors(image_bytes, box, mode, name='<query>'):
+        """float32 (S, dim) DINO query vectors for one region: worker when configured (a stale worker
+        raises -> 503 upstream), else the local GPU-only embedder. None = region can't be described."""
+        rots = _pattern_dino_rots()
+        if _worker_client is not None and _worker_client.is_configured():
+            return worker_client.pattern_dino_query(_worker_client, image_bytes, box, pattern_dino.algo_tag(),
+                                                    mode=mode, rots=rots, name=name)
+        rgb = pattern_deep.load_rgb(image_bytes)
+        return None if rgb is None else _local_pattern_dino_query(_get_dino_embedder(), rgb, box, mode, rots)
+
+    def _scan_pattern_scores(table, algo, dim, queries, scorer):
+        """(file_ids, best-cell scores) over every current-algo row of `table`."""
+        fids, scores = [], []
+        for file_ids, counts, matrix in db.iter_pattern_windows(algo, dim, table=table):
+            fids.append(file_ids)
+            scores.append(scorer(matrix, counts, queries))
+        if not fids:
+            return np.zeros(0, np.int64), np.zeros(0, np.float32)
+        return np.concatenate(fids), np.concatenate(scores)
+
     @app.post('/api/files/{file_id}/pattern-search')
-    def api_pattern_search(file_id: int, body: RegionSearchBody, limit: int = 50):
-        """Find-by-pattern: describe the drawn region's texture at its native pixel scale
-        and rank the library by each photo's BEST-matching texture window. Different
-        mechanism from region-search (CLIP/semantic) — this finds the same *pattern*, not
-        the same *thing*. Needs the pattern index (run 'Index patterns' first)."""
+    def api_pattern_search(file_id: int, body: PatternSearchBody, limit: int = 50):
+        """Find-by-pattern: describe the drawn region and rank the library by each photo's BEST
+        matching window/cell. Different mechanism from region-search (CLIP/semantic) -- this finds the
+        same *pattern*, not the same *thing*. `algo` (body): 'resnet' (default; ResNet18 texture
+        statistics at native pixel scale, needs 'Index patterns'), 'dino' (DINOv2-L dense cells,
+        needs 'Index patterns (DINOv2)'), or 'fused' (z-score fusion of both)."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None or not os.path.isfile(abs_path):
@@ -3922,25 +4274,53 @@ def create_app(data_root: str) -> FastAPI:
         x1, y1, x2, y2 = [float(v) for v in body.bbox]
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
-        if db.count_pattern_indexed(pattern_deep.ALGO_TAG) == 0:
+        algo = (body.algo or 'resnet').lower()
+        if algo not in ('resnet', 'dino', 'fused'):
+            raise HTTPException(status_code=400, detail=f"Unknown pattern algo {body.algo!r} (resnet|dino|fused).")
+        mode = (body.dino_mode or os.environ.get('MEDIA_PATTERN_DINO_MODE', 'both')).lower()
+        if mode not in pattern_dino.QUERY_MODES:
+            raise HTTPException(status_code=400, detail=f"Unknown dino_mode {mode!r} ({'|'.join(pattern_dino.QUERY_MODES)}).")
+        use_resnet, use_dino = algo in ('resnet', 'fused'), algo in ('dino', 'fused')
+        if use_resnet and db.count_pattern_indexed(pattern_deep.ALGO_TAG) == 0:
             raise HTTPException(status_code=400, detail='No pattern index yet — run "Index patterns" on /bulk.')
+        if use_dino:
+            if not pattern_dino.projection_ready():
+                raise HTTPException(status_code=409, detail='DINOv2 pattern projection missing -- run bench/bench_pattern_dino.py --fit and redeploy.')
+            if db.count_pattern_indexed(pattern_dino.algo_tag(), table=PATTERN_DINO_TABLE) == 0:
+                raise HTTPException(status_code=400, detail='No DINOv2 pattern index for the current model yet — run "Index patterns (DINOv2)" on /bulk.')
         with open(abs_path, 'rb') as f:
             image_bytes = f.read()
-        queries = _pattern_query_vectors(image_bytes, [x1, y1, x2, y2])
-        if queries is None:
-            raise HTTPException(status_code=400, detail='Region too small to describe a texture.')
-
-        scored_fids, scored = [], []
-        for file_ids, counts, matrix in db.iter_pattern_windows(pattern_deep.ALGO_TAG, pattern_deep.DIM):
-            scored_fids.append(file_ids)
-            scored.append(pattern_deep.score_windows(matrix, counts, queries))
-        if not scored:
-            return {'mode': 'pattern', 'results': []}
-        fids, scores = np.concatenate(scored_fids), np.concatenate(scored)
+        box = [x1, y1, x2, y2]
+        comps, parts = [], {}
+        if use_resnet:
+            queries = _pattern_query_vectors(image_bytes, box)
+            if queries is None:
+                raise HTTPException(status_code=400, detail='Region too small to describe a texture.')
+            parts['resnet'] = _scan_pattern_scores('pattern_windows', pattern_deep.ALGO_TAG, pattern_deep.DIM,
+                                                   queries, pattern_deep.score_windows)
+        if use_dino:
+            try:
+                dq = _pattern_dino_query_vectors(image_bytes, box, mode)
+            except worker_client.WorkerError as exc:   # stale / mismatched worker: loud, no silent fallback
+                raise HTTPException(status_code=503, detail=f'DINOv2 pattern search unavailable: {exc}')
+            if dq is None:
+                raise HTTPException(status_code=400, detail='Region too small to describe.')
+            parts['dino'] = _scan_pattern_scores(PATTERN_DINO_TABLE, pattern_dino.algo_tag(), pattern_dino.dim(),
+                                                 dq, pattern_dino.score_cells)
+        if algo == 'fused':
+            wd = body.dino_weight if body.dino_weight is not None else float(os.environ.get('MEDIA_PATTERN_FUSE_DINO_W', 0.5))
+            wd = min(1.0, max(0.0, wd))
+            fids, scores = pattern_dino.fuse_scores([(*parts['resnet'], 1.0 - wd), (*parts['dino'], wd)])
+            floor = -np.inf
+        else:
+            fids, scores = parts['resnet' if algo == 'resnet' else 'dino']
+            floor = -1.0
+        if not len(fids):
+            return {'mode': 'pattern', 'algo': algo, 'results': []}
         order = [i for i in top_k_indices(scores, min(len(scores), max(1, limit) + 1))]
         results = [{'file_id': int(fids[i]), 'score': round(float(scores[i]), 4)}
-                   for i in order if int(fids[i]) != file_id and scores[i] > -1.0]
-        return {'mode': 'pattern', 'results': results[:limit]}
+                   for i in order if int(fids[i]) != file_id and scores[i] > floor]
+        return {'mode': 'pattern', 'algo': algo, 'results': results[:limit]}
 
     # ------------------------------------------------------------------
     # Find-by-body: person re-ID by outfit/build (see body_index.py).
@@ -3951,11 +4331,9 @@ def create_app(data_root: str) -> FastAPI:
     body_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Two more library-wide bulk jobs surfaced from the navbar's ⚡ menu, same
     # {running,done,total,error} shape as body_index_job (see the ⚡ dropdown in
-    # base.html + runBulkAction in app.js). index_job = CLIP-embed every
-    # not-yet-indexed photo; match_faces_job = match unnamed auto-detected faces
+    # base.html + runBulkAction in app.js). match_faces_job = match unnamed auto-detected faces
     # to known people (no model — pure embedding math, so it also carries a
-    # 'matched' count).
-    index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    # 'matched' count). (The embedding job is pair_job, the SigLIP 2 + DINOv2 one below.)
     match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'rotated': 0, 'error': None}
     # Tile (region) index: per-image CLIP crops of an overlapping grid, so region
     # search can localize small/off-center things (see tile_index.py + the region
@@ -3995,6 +4373,9 @@ def create_app(data_root: str) -> FastAPI:
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
     broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
     pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
+    pattern_dino_job = {'running': False, 'done': 0, 'total': 0, 'failed': 0, 'error': None,
+                        'img_per_sec': 0.0, 'eta_seconds': None, 'transport_mode': None,
+                        'gpu_busy_pct': None, 'db_write_pct': None, 'decode_threads_avg': None}
     region_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Set → morph video (Wan FLF2V). One generation at a time (heavy, minutes/clip);
     # 'done'/'total' are FLF2V pairs completed; 'artifact_id' is set on success.
@@ -4617,116 +4998,16 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
-    VIDEO_EMBED_FRAMES = 5
-
-    def _video_clip_embedding(abs_path, indexer):
-        """One CLIP vector for a whole video: the L2-normalised mean of the embeddings
-        of VIDEO_EMBED_FRAMES frames spread across it (10%..90%), so it lands in the
-        same space as photo embeddings. Raises ValueError when no frame decodes."""
-        cap = video_decode.open_capture(abs_path)
-        frames = []
-        try:
-            count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            positions = ([int(count * (0.1 + 0.8 * i / (VIDEO_EMBED_FRAMES - 1)))
-                          for i in range(VIDEO_EMBED_FRAMES)] if count > VIDEO_EMBED_FRAMES else [None])
-            for pos in positions:
-                if pos is not None:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-        finally:
-            cap.release()
-        if not frames:
-            raise ValueError('no decodable frames')
-        embs = np.asarray(indexer.embed_pil_images(frames), dtype=np.float32)
-        mean = embs.mean(axis=0)
-        norm = float(np.linalg.norm(mean))
-        return mean / norm if norm > 0 else mean
-
-    def _process_clip_index(candidates, on_progress, should_stop=_never):
-        """CLIP-embed each (fid, abs_path), 32 images per model call, videos one by one
-        (_video_clip_embedding) — the loop shared by the /bulk index job and the folder
-        ML job. on_progress(done, failed) after each file; should_stop() before each
-        batch and each file's write (the rest of a stopped batch stays un-embedded).
-        Returns (done, failed)."""
-        indexer = _get_clip_indexer()
-        model_id = indexer.model_id()
-        done = failed = 0
-        videos = [c for c in candidates if os.path.splitext(c[1])[1].lower() in VIDEO_EXTENSIONS]
-        candidates = [c for c in candidates if os.path.splitext(c[1])[1].lower() not in VIDEO_EXTENSIONS]
-        for fid, fpath in videos:
-            if should_stop():
-                return done, failed
-            try:
-                db.insert_embedding(fid, _video_clip_embedding(fpath, indexer).tobytes(), model_id)
-            except (ValueError, OSError, cv2.error) as exc:
-                errors.log(fpath, f'video embedding: {exc}')
-                compute.raise_if_gpu_fatal(exc)
-                failed += 1
-            done += 1
-            on_progress(done, failed)
-        for start in range(0, len(candidates), 32):
-            if should_stop():
-                break
-            batch = candidates[start:start + 32]
-            paths = [p for _fid, p in batch]
-            embeddings, failed_list = indexer.embed_images(paths)
-            failed_messages = dict(failed_list)
-            emb_iter = iter(embeddings)
-            for fid, fpath in batch:
-                if should_stop():
-                    return done, failed
-                if fpath in failed_messages:
-                    errors.log(fpath, failed_messages[fpath])
-                    compute.raise_if_gpu_fatal(failed_messages[fpath])
-                    failed += 1
-                else:
-                    db.insert_embedding(fid, next(emb_iter).tobytes(), model_id)
-                done += 1
-                on_progress(done, failed)
-        return done, failed
-
+    # Legacy aliases of the old "Index unindexed (CLIP)" bulk job: CLIP is no longer computed
+    # by any background job, so these start / report the SigLIP 2 + DINOv2 job instead (old
+    # bookmarks and scripts keep working). The /bulk page no longer offers a CLIP button.
     @app.post('/api/index/start')
     def api_index_start(include_trashed: bool = False):
-        """Bulk-embed every photo that has no CLIP embedding yet — the library-wide
-        equivalent of the /similar page's per-file "embed now". Mirrors
-        MediaManager.embed_files but with progress + the web CLIP accessor (so it
-        offloads to the worker when configured)."""
-        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
-
-        if index_job['running']:
-            return {'started': False, 'message': 'Indexing already running.'}
-        candidates = _drop_trashed([
-            (fid, os.path.join(data_root, rel_path))
-            for fid, rel_path in db.get_unindexed_files(limit=None)
-            if os.path.splitext(rel_path)[1].lower() in SUPPORTED_EXTENSIONS | VIDEO_EXTENSIONS
-        ], include_trashed)
-        index_job.update(running=True, done=0, total=len(candidates), error=None)
-        if (busy := _folder_ml_holds('clip', index_job)):
-            return {'started': False, 'message': busy}
-
-        def _run():
-            try:
-                _process_clip_index(candidates, lambda d, _f: index_job.update(done=d))
-            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                index_job['error'] = compute.job_error_text(exc)
-            finally:
-                index_job['running'] = False
-
-        _spawn_job(_run)
-        return {'started': True, 'total': index_job['total']}
+        return api_siglip_dino_start(include_trashed)
 
     @app.get('/api/index/status')
     def api_index_status():
-        return {
-            'running': index_job['running'],
-            'done': index_job['done'],
-            'total': index_job['total'],
-            'error': index_job['error'],
-            'pending': len(db.get_unindexed_files()),
-            'device': _ml_device_label(),
-        }
+        return api_siglip_dino_status()
 
     # ------------------------------------------------------------------
     # SigLIP 2 + DINOv2 embedding pipeline: bulk job, speed test, search.
@@ -4749,16 +5030,18 @@ def create_app(data_root: str) -> FastAPI:
         return SigLIP2Embedder.model_id(), DINOv2Embedder.model_id()
 
     def _pair_candidates(sig_id, dino_id, include_trashed):
-        """[(file_id, rel_path, need_siglip, need_dino)] for IMAGES lacking either embedding
-        under the current model ids (union), trashed dropped unless include_trashed. Captured
-        video stills are hidden images and ARE embedded (like CLIP) so a video can be found
-        via its frames; search collapses them to the video. Videos themselves are not embedded."""
+        """[(file_id, rel_path, need_siglip, need_dino)] for IMAGES and VIDEOS lacking either
+        embedding under the current model ids (union), trashed dropped unless include_trashed.
+        Captured video stills are hidden images and ARE embedded so a video can be found via
+        its frames (search collapses them to the video); a video itself is embedded as the
+        mean of VIDEO_EMBED_FRAMES sampled frames (see _embed_pair_files)."""
         need = {}
+        exts = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
         for fid, rel in db.get_files_needing_siglip(sig_id):
-            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS:
+            if os.path.splitext(rel)[1].lower() in exts:
                 need[fid] = [rel, True, False]
         for fid, rel in db.get_files_needing_dino(dino_id):
-            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS:
+            if os.path.splitext(rel)[1].lower() in exts:
                 if fid in need:
                     need[fid][2] = True
                 else:
@@ -4773,11 +5056,153 @@ def create_app(data_root: str) -> FastAPI:
                 if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS]
         return _drop_trashed(rows, include_trashed)
 
+    def _run_pair_embedding(candidates, sig, dino, job, on_progress=None, should_stop=_never):
+        """Embed `candidates` [(file_id, rel_path, need_siglip, need_dino)] with SigLIP 2 + DINOv2
+        in one decode pass per file and write them back -- THE pipeline behind both the /bulk
+        job (/api/siglip-dino/start) and the folder "Run missing ML" embed stage. Chunks of
+        PAIR_CHUNK: the embedder runs one chunk ahead of a writer thread that stores each chunk in
+        ONE transaction, and path resolution runs one chunk ahead of the embedder. `job` (a
+        dict shaped like pair_job) receives live stats; on_progress(done, failed) follows every
+        stored chunk; should_stop() is checked between chunks (chunks already embedded are
+        still written). Per-file failures are logged and counted. Returns (done, failed); raises
+        the first transport / GPU / writer error after the writer has drained."""
+        import queue as _queue
+        from concurrent.futures import ThreadPoolExecutor
+        sig_id, dino_id = sig.model_id(), dino.model_id()
+        t0 = time.time()
+        st = {'done': 0, 'failed': 0, 'db_s': 0.0, 'gpu_s': 0.0, 'decode_s': 0.0,
+              't_prev': t0, 'ema': None}
+        lock = threading.Lock()
+        wq = _queue.Queue(maxsize=2)  # bounded: embedding can run at most 2 chunks ahead of the DB
+        werr = []
+
+        def _resolve(chunk):
+            """Resolve on-disk paths for a chunk (runs one chunk ahead of the embedder)."""
+            live, missing = [], []
+            for fid, rel, need_s, need_d in chunk:
+                abs_path = _live_abs_path(fid, rel)
+                if abs_path is None:
+                    missing.append(rel)
+                else:
+                    live.append((fid, abs_path, need_s, need_d))
+            return live, missing
+
+        def _store(item):
+            """DB write-back of one chunk: ONE transaction/commit; on failure fall back to
+            per-row so a single bad row only costs itself."""
+            live, pairs, errs, missing, models, n_chunk, timing = item
+            w_sig, w_dino = (models or (None, None))
+            failed = 0
+            for rel in missing:
+                errors.log(rel, 'siglip+dino: file not on disk')
+                failed += 1
+            srows, drows, ok = [], [], []
+            for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
+                if pair is None:
+                    errors.log(abs_path, f'siglip+dino: {err or "no embedding returned"}')
+                    failed += 1
+                    continue
+                if need_s:
+                    srows.append((fid, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id))
+                if need_d:
+                    drows.append((fid, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id))
+                ok.append(abs_path)
+            t_db = time.perf_counter()
+            try:
+                db.insert_pair_embeddings_batch(srows, drows)
+            except Exception as exc:  # hook-allow: broad -- batch rolled back; isolate per row
+                traceback.print_exc()
+                for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
+                    if pair is None:
+                        continue
+                    try:
+                        db.insert_pair_embeddings_batch(
+                            [r for r in srows if r[0] == fid], [r for r in drows if r[0] == fid])
+                    except Exception as exc2:  # hook-allow: broad -- per-item; one bad row must not sink the job
+                        errors.log(abs_path, f'siglip+dino: store failed: {exc2}')
+                        failed += 1
+            db_s = time.perf_counter() - t_db
+            now = time.time()
+            with lock:
+                st['failed'] += failed
+                st['done'] += n_chunk
+                st['db_s'] += db_s
+                if timing:
+                    st['gpu_s'] += timing.get('gpu_seconds') or 0.0
+                    st['decode_s'] += timing.get('decode_seconds') or 0.0
+                chunk_rate = n_chunk / max(now - st['t_prev'], 1e-9)
+                st['t_prev'] = now
+                # ETA from the recent speed, not the average since start: the average
+                # includes model load/warm-up and overestimates the time left early on.
+                st['ema'] = chunk_rate if st['ema'] is None else 0.8 * st['ema'] + 0.2 * chunk_rate
+                wall = max(now - t0, 1e-9)
+                ema = st['ema']
+                job.update(
+                    done=st['done'], failed=st['failed'], img_per_sec=round(ema, 2),
+                    eta_seconds=round((len(candidates) - st['done']) / ema, 1) if ema > 0 else None,
+                    db_write_pct=round(100 * min(st['db_s'] / wall, 1.0), 1),
+                    gpu_busy_pct=round(100 * min(st['gpu_s'] / wall, 1.0), 1) if st['gpu_s'] else None,
+                    decode_threads_avg=round(st['decode_s'] / wall, 2) if st['decode_s'] else None)
+                if on_progress is not None:
+                    on_progress(st['done'], st['failed'])
+
+        def _writer():
+            try:
+                while True:
+                    item = wq.get()
+                    if item is None:
+                        return
+                    if werr:
+                        continue  # writer already failed: drain so the producer never blocks
+                    try:
+                        _store(item)
+                    except Exception as exc:  # hook-allow: broad -- surfaced via the job error
+                        traceback.print_exc()
+                        werr.append(exc)
+            finally:
+                db.close()  # this thread's per-thread sqlite connections
+                errors.close()
+
+        writer = threading.Thread(target=_writer, name='pair-writer', daemon=True)
+        writer.start()
+        resolver = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pair-resolve')
+        err = None
+        try:
+            chunks = [candidates[i:i + PAIR_CHUNK] for i in range(0, len(candidates), PAIR_CHUNK)]
+            nxt = resolver.submit(_resolve, chunks[0]) if chunks else None
+            for idx, chunk in enumerate(chunks):
+                live, missing = nxt.result()
+                nxt = resolver.submit(_resolve, chunks[idx + 1]) if idx + 1 < len(chunks) else None
+                if werr:
+                    raise werr[0]
+                if should_stop():
+                    break
+                pairs, errs, models, timing = [], [], None, None
+                if live:
+                    pairs, errs, _gpu, models = _embed_pair_files(sig, dino, [x[1] for x in live])
+                    job['transport_mode'] = _last_transport['mode']
+                    timing = _last_transport.get('timing')
+                wq.put((live, pairs, errs, missing, models, len(chunk), timing))
+        except Exception as exc:  # hook-allow: broad -- re-raised below once the writer has drained
+            traceback.print_exc()
+            err = exc
+        finally:
+            # Chunks already embedded still get written (resumability); then join the writer.
+            wq.put(None)
+            writer.join()
+            resolver.submit(db.close).result()
+            resolver.shutdown()
+        if err is None and werr:
+            err = werr[0]
+        if err is not None:
+            raise err
+        return st['done'], st['failed']
+
     @app.post('/api/siglip-dino/start')
     def api_siglip_dino_start(include_trashed: bool = False):
-        """Bulk-embed every image missing a SigLIP 2 or DINOv2 embedding (for the current
-        model ids) in ONE decode pass per image. Resumable: re-running just continues with
-        what's still missing. Per-file failures are logged to the error log and skipped."""
+        """Bulk-embed every image and video missing a SigLIP 2 or DINOv2 embedding (for the
+        current model ids) in ONE decode pass per file. Resumable: re-running just continues
+        with what's still missing. Per-file failures are logged to the error log and skipped."""
         if pair_job['running']:
             return {'started': False, 'message': 'SigLIP 2 + DINOv2 indexing already running.'}
         # Constructed here (not in the thread) so a no-GPU RuntimeError / worker problem is
@@ -4790,130 +5215,15 @@ def create_app(data_root: str) -> FastAPI:
         pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
                         img_per_sec=0.0, eta_seconds=None, transport_mode=None,
                         gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)
+        if (busy := _folder_ml_holds('embed', pair_job)):
+            return {'started': False, 'message': busy}
 
         def _run():
-            import queue as _queue
-            from concurrent.futures import ThreadPoolExecutor
-            t0 = time.time()
-            st = {'done': 0, 'failed': 0, 'db_s': 0.0, 'gpu_s': 0.0, 'decode_s': 0.0,
-                  't_prev': t0, 'ema': None}
-            lock = threading.Lock()
-            wq = _queue.Queue(maxsize=2)  # bounded: embedding can run at most 2 chunks ahead of the DB
-            werr = []
-
-            def _resolve(chunk):
-                """Resolve on-disk paths for a chunk (runs one chunk ahead of the embedder)."""
-                live, missing = [], []
-                for fid, rel, need_s, need_d in chunk:
-                    abs_path = _live_abs_path(fid, rel)
-                    if abs_path is None:
-                        missing.append(rel)
-                    else:
-                        live.append((fid, abs_path, need_s, need_d))
-                return live, missing
-
-            def _store(item):
-                """DB write-back of one chunk: ONE transaction/commit; on failure fall back to
-                per-row so a single bad row only costs itself."""
-                live, pairs, errs, missing, models, n_chunk, timing = item
-                w_sig, w_dino = (models or (None, None))
-                failed = 0
-                for rel in missing:
-                    errors.log(rel, 'siglip+dino: file not on disk')
-                    failed += 1
-                srows, drows, ok = [], [], []
-                for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
-                    if pair is None:
-                        errors.log(abs_path, f'siglip+dino: {err or "no embedding returned"}')
-                        failed += 1
-                        continue
-                    if need_s:
-                        srows.append((fid, np.asarray(pair[0], dtype=np.float32).tobytes(), w_sig or sig_id))
-                    if need_d:
-                        drows.append((fid, np.asarray(pair[1], dtype=np.float32).tobytes(), w_dino or dino_id))
-                    ok.append(abs_path)
-                t_db = time.perf_counter()
-                try:
-                    db.insert_pair_embeddings_batch(srows, drows)
-                except Exception as exc:  # hook-allow: broad -- batch rolled back; isolate per row
-                    traceback.print_exc()
-                    for (fid, abs_path, need_s, need_d), pair, err in zip(live, pairs, errs):
-                        if pair is None:
-                            continue
-                        try:
-                            db.insert_pair_embeddings_batch(
-                                [r for r in srows if r[0] == fid], [r for r in drows if r[0] == fid])
-                        except Exception as exc2:  # hook-allow: broad -- per-item; one bad row must not sink the job
-                            errors.log(abs_path, f'siglip+dino: store failed: {exc2}')
-                            failed += 1
-                db_s = time.perf_counter() - t_db
-                now = time.time()
-                with lock:
-                    st['failed'] += failed
-                    st['done'] += n_chunk
-                    st['db_s'] += db_s
-                    if timing:
-                        st['gpu_s'] += timing.get('gpu_seconds') or 0.0
-                        st['decode_s'] += timing.get('decode_seconds') or 0.0
-                    chunk_rate = n_chunk / max(now - st['t_prev'], 1e-9)
-                    st['t_prev'] = now
-                    # ETA from the recent speed, not the average since start: the average
-                    # includes model load/warm-up and overestimates the time left early on.
-                    st['ema'] = chunk_rate if st['ema'] is None else 0.8 * st['ema'] + 0.2 * chunk_rate
-                    wall = max(now - t0, 1e-9)
-                    ema = st['ema']
-                    pair_job.update(
-                        done=st['done'], failed=st['failed'], img_per_sec=round(ema, 2),
-                        eta_seconds=round((len(candidates) - st['done']) / ema, 1) if ema > 0 else None,
-                        db_write_pct=round(100 * min(st['db_s'] / wall, 1.0), 1),
-                        gpu_busy_pct=round(100 * min(st['gpu_s'] / wall, 1.0), 1) if st['gpu_s'] else None,
-                        decode_threads_avg=round(st['decode_s'] / wall, 2) if st['decode_s'] else None)
-
-            def _writer():
-                try:
-                    while True:
-                        item = wq.get()
-                        if item is None:
-                            return
-                        if werr:
-                            continue  # writer already failed: drain so the producer never blocks
-                        try:
-                            _store(item)
-                        except Exception as exc:  # hook-allow: broad -- surfaced via the job error
-                            traceback.print_exc()
-                            werr.append(exc)
-                finally:
-                    db.close()  # this thread's per-thread sqlite connections
-                    errors.close()
-
-            writer = threading.Thread(target=_writer, name='pair-writer', daemon=True)
-            writer.start()
-            resolver = ThreadPoolExecutor(max_workers=1, thread_name_prefix='pair-resolve')
             try:
-                chunks = [candidates[i:i + PAIR_CHUNK] for i in range(0, len(candidates), PAIR_CHUNK)]
-                nxt = resolver.submit(_resolve, chunks[0]) if chunks else None
-                for idx, chunk in enumerate(chunks):
-                    live, missing = nxt.result()
-                    nxt = resolver.submit(_resolve, chunks[idx + 1]) if idx + 1 < len(chunks) else None
-                    if werr:
-                        raise werr[0]
-                    pairs, errs, models, timing = [], [], None, None
-                    if live:
-                        pairs, errs, _gpu, models = _embed_pair_chunk(sig, dino, [x[1] for x in live])
-                        pair_job['transport_mode'] = _last_transport['mode']
-                        timing = _last_transport.get('timing')
-                    wq.put((live, pairs, errs, missing, models, len(chunk), timing))
+                _run_pair_embedding(candidates, sig, dino, pair_job)
             except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
-                traceback.print_exc()
                 pair_job['error'] = f'{exc.__class__.__name__}: {exc}'
             finally:
-                # Chunks already embedded still get written (resumability); then join the writer.
-                wq.put(None)
-                writer.join()
-                resolver.submit(db.close).result()
-                resolver.shutdown()
-                if werr and not pair_job['error']:
-                    pair_job['error'] = f'{werr[0].__class__.__name__}: {werr[0]}'
                 pair_job['running'] = False
 
         _spawn_job(_run)
@@ -5109,13 +5419,25 @@ def create_app(data_root: str) -> FastAPI:
         return _text_search('siglip2', q, limit, offset)
 
     def _similar_in_space(space, file_id, limit):
-        _file_or_404(file_id)
+        row = _file_or_404(file_id)
         file_ids, checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
         hits = np.flatnonzero(file_ids == file_id) if matrix.shape[0] else []
-        if len(hits) == 0:
-            return {'results': [], 'cards': [], 'no_embedding': True,
-                    'message': f'This photo has no {space} embedding yet. {NO_EMB_HINT}'}
-        query = matrix[int(hits[0])]
+        if len(hits):
+            query = matrix[int(hits[0])]
+        else:
+            # A video not embedded itself yet but with captured stills: query by the mean of
+            # its stills' vectors (frame and video are one item).
+            query = None
+            if os.path.splitext(row['path'])[1].lower() in VIDEO_EXTENSIONS:
+                kids = [c['child_checksum'] for c in manual.get_frame_captures_for(row['checksum'])]
+                kid_ids = [r['id'] for r in db.get_files_by_checksums(kids)] if kids else []
+                vecs = [np.frombuffer(e, dtype=np.float32)
+                        for _fid, e in db.get_space_embeddings_for_files(space, kid_ids)]
+                if vecs:
+                    query = _mean_unit(vecs)
+            if query is None:
+                return {'results': [], 'cards': [], 'no_embedding': True,
+                        'message': f'This photo has no {space} embedding yet. {NO_EMB_HINT}'}
         file_ids, checksums, scores = _score_space(space, query)
         results = _rank_space_results(file_ids, checksums, scores, limit, exclude_ids=(file_id,))
         return {'results': results, 'cards': _cards_for_results(results)}
@@ -5670,33 +5992,31 @@ def create_app(data_root: str) -> FastAPI:
 
     def _process_detect_faces(candidates, detector, counters, on_progress, should_stop=_never,
                               threshold=None):
-        """Detect + auto-match faces on each (fid, rel_path), 8 per model call — the loop
-        shared by the /bulk job and the folder ML job. counters['matched'] is bumped per
-        auto-match; on_progress(done, failed) after each file; should_stop() before each
-        batch and each file's write (the rest of a stopped batch stays undetected).
-        Returns (done, failed)."""
+        """Detect + auto-match faces on each (fid, rel_path) -- the loop shared by the /bulk
+        job and the folder ML job. counters['matched'] is bumped per auto-match;
+        on_progress(done, failed) after each file; should_stop() before each batch and each
+        file's write (the rest of a stopped batch stays undetected). Returns (done, failed).
+
+        Batches are `detector.batch_size` files (8 for the local detector, larger for the
+        worker, which keeps several requests in flight inside one detect_faces call). While
+        a batch's results are being written, the NEXT batch is already being detected (one
+        batch of read-ahead; a stop/error just discards it). A batch's face rows go into
+        ONE transaction and the per-face embedding comes with the face query."""
+        from concurrent.futures import ThreadPoolExecutor  # hook-allow: lazy -- stdlib, local use
         model_id = detector.model_id(detector._model_name)
+        bsize = max(1, int(getattr(detector, 'batch_size', 8) or 8))
         done = failed = 0
-        for start in range(0, len(candidates), 8):
-            if should_stop():
-                break
-            batch = candidates[start:start + 8]
-            results = detector.detect_faces(_batch_abs_paths(batch))
-            for (fid, rel_path), (_p, faces, error) in zip(batch, results):
-                if should_stop():
-                    return done, failed
-                done += 1
-                if error:
-                    errors.log(rel_path, f'detect-faces: {error}')
-                    compute.raise_if_gpu_fatal(error)
-                    failed += 1
-                    on_progress(done, failed)
-                    continue
-                on_progress(done, failed)
-                db.insert_faces(fid, faces, model_id)
-                row = db.get_file_by_id(fid)
-                for face_row in db.get_faces_for_file(fid):
-                    emb = db.get_face_embedding(face_row['id'])
+
+        def _write_and_match(pending):
+            """Insert the pending (fid, faces) rows in one transaction, then auto-match each
+            new face (same decisions as the old per-file loop, in the same order)."""
+            if not pending:
+                return
+            db.insert_faces_many(pending, model_id)
+            for fid, _faces in pending:
+                row = None
+                for face_row in db.get_faces_with_embeddings_for_file(fid):
+                    emb = face_row['embedding']
                     if not emb:
                         continue
                     name, _score = manual.find_matching_identity(emb, threshold=threshold)
@@ -5704,11 +6024,57 @@ def create_app(data_root: str) -> FastAPI:
                         continue
                     if manual.is_face_negated(face_row['id'], name):
                         continue  # a human said this face is not this person
+                    if row is None:
+                        row = db.get_file_by_id(fid)
                     manual.promote_auto_face(face_row['id'], row['checksum'],
                                              json.loads(face_row['bbox']), emb, name, None, None)
                     db.mark_faces_handled([face_row['id']])
                     _link_face_match_to_video(row['checksum'], name)
                     counters['matched'] += 1
+
+        batches = [candidates[i:i + bsize] for i in range(0, len(candidates), bsize)]
+
+        def _detect(batch):
+            return detector.detect_faces(_batch_abs_paths(batch))
+
+        with ThreadPoolExecutor(max_workers=1) as ahead:
+            nxt = None
+            for k, batch in enumerate(batches):
+                if should_stop():
+                    break
+                fut = nxt if nxt is not None else ahead.submit(_detect, batch)
+                nxt = ahead.submit(_detect, batches[k + 1]) if k + 1 < len(batches) else None
+                try:
+                    results = fut.result()
+                except BaseException:
+                    if nxt is not None:
+                        nxt.cancel()
+                    raise
+                pending = []
+                for (fid, rel_path), (_p, faces, error) in zip(batch, results):
+                    if should_stop():
+                        _write_and_match(pending)
+                        if nxt is not None:
+                            nxt.cancel()
+                        return done, failed
+                    done += 1
+                    if error:
+                        errors.log(rel_path, f'detect-faces: {error}')
+                        try:
+                            compute.raise_if_gpu_fatal(error)
+                        except BaseException:
+                            _write_and_match(pending)  # files before it were already done
+                            if nxt is not None:
+                                nxt.cancel()
+                            raise
+                        failed += 1
+                        on_progress(done, failed)
+                        continue
+                    on_progress(done, failed)
+                    pending.append((fid, faces))
+                _write_and_match(pending)
+            if nxt is not None:
+                nxt.cancel()
         return done, failed
 
     @app.post('/api/detect-faces/start')
@@ -6379,6 +6745,9 @@ def create_app(data_root: str) -> FastAPI:
             'pending': 0,
         }
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+    # (The worker-resident index only ships the legacy CLIP + face matrices; web search/similarity
+    # now score the SigLIP 2 / DINOv2 matrices through gpu_search on the web host.)
     @app.post('/api/imdb/rebuild')
     def api_imdb_rebuild():
         """Manually (re)build the worker's in-memory search index: stream the CLIP+face
@@ -6536,6 +6905,9 @@ def create_app(data_root: str) -> FastAPI:
             'error': match_faces_job['error'],
         }
 
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+    # (Optional tile index: CLIP crops. Feeds only the legacy location background ranking and the
+    # region-search / tag-bbox fallbacks; not part of the default pipeline.)
     @app.post('/api/tile-index/start')
     def api_tile_index_start(include_trashed: bool = False):
         """Build the per-image CLIP tile index that powers precise region search —
@@ -6652,7 +7024,7 @@ def create_app(data_root: str) -> FastAPI:
     folder_ml_job = folder_ml.FolderMLJob()
     FOLDER_ML_BULK = {
         'exif': ((metadata_job, 'metadata'),),
-        'clip': ((index_job, 'CLIP index'),),
+        'embed': ((pair_job, 'SigLIP 2 + DINOv2 index'),),
         'tags': ((body_index_job, 'body index (shares the object detector)'),),
         'faces': ((detect_faces_job, 'face detection'),),
         'bodies': ((body_index_job, 'body index'),),
@@ -6766,10 +7138,26 @@ def create_app(data_root: str) -> FastAPI:
             return _process_video_face_scan(triples, detector, {'matched': 0, 'captured': 0},
                                             progress, stop)
 
+        def _embed_stage(files, ctx, progress, stop):
+            """SigLIP 2 + DINOv2 for the folder's files missing either (images and videos) --
+            the /bulk job's own pipeline (_run_pair_embedding), over this explicit list."""
+            sig, dino = ctx
+            sig_id, dino_id = sig.model_id(), dino.model_id()
+            ids = [fid for fid, _rel in files]
+            have_s = db.space_ids_with_model('siglip', sig_id, ids)
+            have_d = db.space_ids_with_model('dino', dino_id, ids)
+            cands = [(fid, rel, fid not in have_s, fid not in have_d) for fid, rel in files]
+            cands = [c for c in cands if c[2] or c[3]]
+            if not cands:
+                return len(files), 0
+            job = {'running': True, 'done': 0, 'total': len(cands), 'failed': 0, 'error': None}
+            done, failed = _run_pair_embedding(cands, sig, dino, job, on_progress=progress, should_stop=stop)
+            return done + (len(files) - len(cands)), failed
+
         R = folder_ml.Runner
         return {
             'exif': R(lambda f, _c, p, s: _process_metadata(f, p, s)),
-            'clip': R(lambda f, _c, p, s: _process_clip_index(_abs(f), p, s), _get_clip_indexer),
+            'embed': R(_embed_stage, lambda: (_get_siglip_embedder(), _get_dino_embedder())),
             'tags': R(lambda f, c, p, s: _process_detections(f, c[0], c[1], p, s), _tags_prepare),
             'faces': R(lambda f, c, p, s: _process_detect_faces(f, c, {'matched': 0}, p, s),
                        _get_face_detector),
@@ -7067,34 +7455,39 @@ def create_app(data_root: str) -> FastAPI:
         detected_classes = [c for c in db.get_detected_classes(file_id) if c not in negated]
         return {'detected_classes': detected_classes, 'detection_bboxes': db.get_detection_bboxes(file_id)}
 
+    def _embed_one_file(file_id, abs_path):
+        """Compute + store the frame_index=0 SigLIP 2 + DINOv2 embeddings of one image or video
+        (same one-decode-pass path as the bulk job; a video is the mean of sampled frames).
+        Raises RuntimeError / WorkerError when no GPU or the worker is down, and RuntimeError
+        with the per-file message when this file cannot be embedded."""
+        sig, dino = _get_siglip_embedder(), _get_dino_embedder()
+        pairs, errs, _gpu, models = _embed_pair_files(sig, dino, [abs_path])
+        if pairs[0] is None:
+            raise RuntimeError(errs[0] or 'no embedding produced')
+        w_sig, w_dino = models or (None, None)
+        db.insert_pair_embeddings_batch(
+            [(file_id, np.asarray(pairs[0][0], dtype=np.float32).tobytes(), w_sig or sig.model_id())],
+            [(file_id, np.asarray(pairs[0][1], dtype=np.float32).tobytes(), w_dino or dino.model_id())])
+
     @app.post('/api/files/{file_id}/embed')
     def api_embed_file(file_id: int):
-        """Build + store the CLIP embedding for a single file on demand — powers
+        """Build + store the SigLIP 2 + DINOv2 embeddings for a single file on demand — powers
         the "embed now" button on the /similar page when a file has no embedding
-        yet (instead of telling the user to run `media embed`). Synchronous, same
-        shape as api_reindex_tags; the lazy CLIP singleton is usually already warm
-        from other endpoints (find-by-body / text search)."""
+        yet (instead of telling the user to run the bulk job). Synchronous. GPU-only:
+        a missing GPU / unreachable worker is a loud 500, never a silent CPU fallback."""
         row = _file_or_404(file_id)
         abs_path = os.path.join(data_root, row['path'])
         if not os.path.isfile(abs_path):
             raise HTTPException(status_code=404, detail='File not found on disk')
         ext = os.path.splitext(abs_path)[1].lower()
-        indexer = _get_clip_indexer()
-        if ext in VIDEO_EXTENSIONS:
-            try:
-                emb = _video_clip_embedding(abs_path, indexer)
-            except (ValueError, OSError, cv2.error) as exc:
-                raise HTTPException(status_code=500, detail=f'Embedding failed: {exc}')
-            db.insert_embedding(file_id, emb.tobytes(), indexer.model_id())
-            return {'embedded': True}
-        if ext not in IMAGE_EXTENSIONS:
+        if ext not in IMAGE_EXTENSIONS and ext not in VIDEO_EXTENSIONS:
             raise HTTPException(status_code=400, detail='Only images and videos can be embedded.')
-
-        embeddings, failed = indexer.embed_images([abs_path])
-        if len(embeddings) == 0:
-            detail = failed[0][1] if failed else 'no embedding produced'
-            raise HTTPException(status_code=500, detail=f'Embedding failed: {detail}')
-        db.insert_embedding(file_id, embeddings[0].tobytes(), indexer.model_id())
+        try:
+            _embed_one_file(file_id, abs_path)
+        except HTTPException:
+            raise
+        except Exception as exc:  # hook-allow: broad -- worker down / no GPU / bad file: surface the message
+            raise HTTPException(status_code=500, detail=f'Embedding failed: {exc}')
         return {'embedded': True}
 
     @app.get('/api/tags')
@@ -7144,9 +7537,60 @@ def create_app(data_root: str) -> FastAPI:
     # so scan far fewer per fetch — repeated refills still cover the library.
     WORKER_YOLO_SAMPLE_SIZE = 8
 
-    def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None):
+    TAG_SPACE_MODELS = ('siglip', 'dino', 'clip')
+
+    def _tag_space_member_embeddings(space, file_ids):
+        """[(file_id, float32 embedding bytes)] of the given files in `space`; files with no
+        embedding there are skipped (reported via coverage, never filled from another model)."""
+        if space == 'clip':
+            return db.get_embeddings_for_files(file_ids)  # DEPRECATION PLANNED: legacy CLIP table
+        if not file_ids:
+            return []
+        ids, _checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
+        if matrix.shape[0] == 0:
+            return []
+        idx = np.flatnonzero(np.isin(ids, np.asarray(list(file_ids), dtype=np.int64)))
+        return [(int(ids[i]), np.ascontiguousarray(matrix[i], dtype=np.float32).tobytes()) for i in idx]
+
+    def _tag_space_rank(space, query, skip_checksums, exclude_ids, count):
+        """[(file_id, score)] best-first (<= count) for a siglip/dino query vector against the
+        space's resident matrix. Drops decided/excluded files, hidden files and captured video
+        stills (a still never surfaces on its own). Raises 409 on a dimension mismatch (the
+        model changed -> re-index/retrain), never a silent wrong-dim dot product."""
+        file_ids, checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
+        if matrix.shape[0] == 0:
+            return []
+        q = np.asarray(query, dtype=np.float32)
+        if q.shape[0] != matrix.shape[1]:
+            raise HTTPException(status_code=409, detail=(
+                f'Query dim {q.shape[0]} != indexed {space} dim {matrix.shape[1]}: the model changed; '
+                f're-run "Index SigLIP 2 + DINOv2" (and retrain this tag\'s classifier).'))
+        scores = matrix.dot(q)
+        return _tag_space_pick(file_ids, checksums, scores, skip_checksums, exclude_ids, count)
+
+    def _tag_space_pick(file_ids, checksums, scores, skip_checksums, exclude_ids, count):
+        order = top_k_indices(scores, None)
+        still_parents = manual.get_all_frame_capture_parents()
+        out = []
+        for i in order:
+            cs, fid = checksums[i], int(file_ids[i])
+            if cs in skip_checksums or fid in exclude_ids or cs in still_parents:
+                continue
+            row = db.get_file_by_id(fid)
+            if row is None or row['hidden']:
+                continue
+            out.append((fid, float(scores[i])))
+            if len(out) >= count:
+                break
+        return out
+
+    def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None, model=TAG_DEFAULT_SPACE):
         """Rank not-yet-decided files against the centroid of files already
-        positively tagged `label`. Returns up to `count` dicts, best score first:
+        positively tagged `label`, in embedding space `model` ('siglip' default | 'dino' |
+        legacy 'clip'). For siglip/dino the absolute TAG_SUGGEST_THRESHOLD (tuned for
+        CLIP-B/32) is not applied: the best remaining candidates are returned, and there is
+        no tile index in those spaces, so no highlight bbox. Members/candidates without an
+        embedding in that space are simply absent (the response never mixes spaces). Returns up to `count` dicts, best score first:
         [{'ref': str, 'file_id': int, 'label': str, 'score': float}, ...].
 
         A file is excluded if it already has a tag row (either polarity) for this
@@ -7159,14 +7603,34 @@ def create_app(data_root: str) -> FastAPI:
         a continuous file-to-file similarity signal into the file-to-centroid
         score, since there's no discrete identity dimension to bias tags by."""
 
+        if model not in TAG_SPACE_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         member_checksums = manual.get_files_by_tag(label, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
-        member_embeddings = db.get_embeddings_for_files(member_ids)
+        member_embeddings = _tag_space_member_embeddings(model, member_ids)
         centroid = mean_normalized_centroid([e for _fid, e in member_embeddings])
         if centroid is None:
             return []
 
         decided = manual.get_decided_checksums_for_tag(label)
+
+        if model != 'clip':
+            pool = _tag_space_rank(model, centroid, decided, exclude_ids, max(count * 3, count))
+            if bias_file_id is not None and bias in ('confirm', 'reject'):
+                bias_rows = _tag_space_member_embeddings(model, [bias_file_id])
+                if bias_rows:
+                    bias_vec = np.frombuffer(bias_rows[0][1], dtype=np.float32)
+                    sign = 1.0 if bias == 'confirm' else -1.0
+                    ids_, _cs, matrix = getattr(db, f'get_{model}_embeddings_matrix')()
+                    pos = {int(f): i for i, f in enumerate(ids_)}
+                    pool.sort(key=lambda it: it[1] + sign * float(matrix[pos[it[0]]].dot(bias_vec)), reverse=True)
+            return _attach_file_meta([
+                {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+                for fid, score in pool[:count]
+            ])
+
+        # --- legacy CLIP path (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2
+        # embedding pipeline; do not extend) ---
         candidates = [
             row for row in db.get_all_embeddings()
             if row[3] not in decided and row[0] not in exclude_ids
@@ -7227,15 +7691,16 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/tags/{label}/suggestions/next')
     def api_next_tag_suggestions(label: str, body: SwipeExcludeBody, count: int = 10,
-                                  bias_file_id: str = '', bias: str = ''):
+                                  bias_file_id: str = '', bias: str = '', model: str = TAG_DEFAULT_SPACE):
         exclude_ids = {int(x) for x in body.exclude if x.isdigit()}
         bias_id = int(bias_file_id) if bias_file_id.strip().isdigit() else None
-        cards = _next_tag_suggestions(label, count, exclude_ids, bias_id, bias or None)
+        cards = _next_tag_suggestions(label, count, exclude_ids, bias_id, bias or None, model=model)
         return {'cards': cards}
 
     # ------------------------------------------------------------------
-    # Per-tag classifier training (experimental) — a CLIP linear classifier
-    # and a fine-tuned YOLO-World checkpoint, each trained from this tag's
+    # Per-tag classifier training (experimental) — a linear classifier on
+    # whole-image embeddings (SigLIP 2 by default, DINOv2 selectable; the legacy
+    # CLIP classifier is read-only) and a fine-tuned YOLO-World checkpoint, each trained from this tag's
     # own confirmed/rejected examples (see clip_tag_classifier.py /
     # yolo_tag_classifier.py). Both always run as a real subprocess, never
     # in-process — training can take anywhere from seconds (CLIP) to minutes
@@ -7246,9 +7711,24 @@ def create_app(data_root: str) -> FastAPI:
     # source of truth for status — no separate DB table to keep in sync.
     # ------------------------------------------------------------------
 
+    # URL/UI kind -> classifier directory kind. 'clip' is the legacy ViT-B/32 classifier
+    # (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend).
+    _CLASSIFIER_DIR_KINDS = {'siglip': 'siglip_model', 'dino': 'dino_model', 'clip': 'clip_model',
+                             'yolo': 'yolo_model'}
+    _DIR_KIND_SPACES = {v['dir_kind']: k for k, v in TAG_SPACES.items()}
+
+    def _dir_kind(kind):
+        if kind not in _CLASSIFIER_DIR_KINDS:
+            raise HTTPException(status_code=400,
+                                detail=f'Unknown classifier kind {kind!r}; expected one of {sorted(_CLASSIFIER_DIR_KINDS)}')
+        return _CLASSIFIER_DIR_KINDS[kind]
+
     def _read_classifier_status(label, kind):
-        """kind is 'clip_model' or 'yolo_model'. Returns None if training was
-        never started for this tag/kind. A 'running' status whose pid is no
+        """kind is a classifier directory kind ('siglip_model', 'dino_model', legacy
+        'clip_model' or 'yolo_model'). Returns None if training was
+        never started for this tag/kind. A finished embedding classifier whose stored
+        weights were trained on a different embedding model than the one now in use is
+        reported as status 'needs_retrain' (never silently applied). A 'running' status whose pid is no
         longer alive (crash, OOM-kill, `kill -9`) is reported back as 'failed'
         here — WITHOUT rewriting the file — so the UI doesn't show
         "training…" forever after something goes wrong outside the normal
@@ -7272,6 +7752,11 @@ def create_app(data_root: str) -> FastAPI:
             # "died unexpectedly" signal.
             if pid and not os.path.exists(f'/proc/{pid}'):
                 return {**status, 'status': 'failed', 'error': 'Training process died unexpectedly.'}
+        space = _DIR_KIND_SPACES.get(kind)
+        if space and status.get('status') == 'done' and weights_state(data_root, label, space) == 'needs_retrain':
+            return {**status, 'status': 'needs_retrain',
+                    'error': f'Trained on a different embedding model than the current '
+                             f'{TAG_SPACES[space]["label"]} ({current_embedding_model(space)}) — retrain.'}
         return status
 
     def _classifier_button_state(kind, label, status, enough, hint):
@@ -7290,10 +7775,10 @@ def create_app(data_root: str) -> FastAPI:
         `log_url` is set whenever a train.log could plausibly exist (anything
         past "never started"), so progress/failure detail beyond the coarse
         status is always one click away."""
-        noun = 'CLIP' if kind == 'clip' else 'YOLO'
+        noun = TAG_SPACES[kind]['label'] if kind in TAG_SPACES else 'YOLO'
         log_url = f'/api/tags/{quote(label)}/train-log?kind={kind}' if status else None
         if status and status.get('status') == 'done':
-            metric = status.get('cv_accuracy') if kind == 'clip' else status.get('held_out_map')
+            metric = status.get('cv_accuracy') if kind in TAG_SPACES else status.get('held_out_map')
             metric_text = f'{round(metric * 100)}%' if isinstance(metric, (int, float)) else 'done'
             return {
                 'kind': kind, 'label': label, 'disabled': False,
@@ -7311,6 +7796,12 @@ def create_app(data_root: str) -> FastAPI:
                 'text': f'{noun}: training…{progress} ({elapsed_min}m)',
                 'title': 'Cancel to stop, or check the log for detail.',
                 'cancel_url': f'/api/tags/{quote(label)}/train-cancel?kind={kind}', 'log_url': log_url,
+            }
+        if status and status.get('status') == 'needs_retrain':
+            return {
+                'kind': kind, 'label': label, 'disabled': not enough, 'href': None,
+                'text': f'{noun}: needs retrain', 'title': status.get('error', ''),
+                'cancel_url': None, 'log_url': log_url,
             }
         if status and status.get('status') == 'failed':
             return {
@@ -7342,19 +7833,28 @@ def create_app(data_root: str) -> FastAPI:
             else:
                 n_negative += 1
         n_boxes = len(manual.get_spatial_tags_for_label(label))
+        siglip_status = _read_classifier_status(label, 'siglip_model')
+        dino_status = _read_classifier_status(label, 'dino_model')
+        # Legacy CLIP classifier: shown only as a note so an old artifact is visibly "needs
+        # retrain" rather than silently the active model. (DEPRECATION PLANNED: superseded by
+        # the SigLIP 2 + DINOv2 embedding pipeline; do not extend.)
         clip_status = _read_classifier_status(label, 'clip_model')
         yolo_status = _read_classifier_status(label, 'yolo_model')
+        enough_embed = n_positive >= MIN_EXAMPLES_PER_CLASS and n_negative >= MIN_EXAMPLES_PER_CLASS
+        embed_hint = (f'Need {MIN_EXAMPLES_PER_CLASS}+ confirmed and {MIN_EXAMPLES_PER_CLASS}+ rejected examples, '
+                      f'whole-image or region (have {n_positive} confirmed, {n_negative} rejected).')
         return {
-            'clip_btn': _classifier_button_state(
-                'clip', label, clip_status, n_positive >= MIN_EXAMPLES_PER_CLASS and n_negative >= MIN_EXAMPLES_PER_CLASS,
-                f'Need {MIN_EXAMPLES_PER_CLASS}+ confirmed and {MIN_EXAMPLES_PER_CLASS}+ rejected examples, '
-                f'whole-image or region (have {n_positive} confirmed, {n_negative} rejected).'
-            ),
+            'siglip_btn': _classifier_button_state('siglip', label, siglip_status, enough_embed, embed_hint),
+            'dino_btn': _classifier_button_state('dino', label, dino_status, enough_embed, embed_hint),
+            'siglip_status': siglip_status,
+            'dino_status': dino_status,
+            'legacy_clip_note': (
+                'Legacy CLIP classifier found — superseded; train a SigLIP 2 classifier.'
+                if clip_status and clip_status.get('status') == 'done' else ''),
             'yolo_btn': _classifier_button_state(
                 'yolo', label, yolo_status, n_boxes >= MIN_BOXES,
                 f'Need {MIN_BOXES}+ labeled bounding boxes (have {n_boxes}).'
             ),
-            'clip_status': clip_status,
             'yolo_status': yolo_status,
         }
 
@@ -7379,6 +7879,8 @@ def create_app(data_root: str) -> FastAPI:
             # Explicit opt-in for a standalone/beefy host with no worker.
             argv = [sys.executable, '-m', module_name,
                     '--data-root', data_root, '--tag', label]
+            if kind in _DIR_KIND_SPACES:
+                argv += ['--space', _DIR_KIND_SPACES[kind]]
         else:
             # No worker AND no opt-in: refuse. Local training (YOLO-World fine-tune
             # especially) is the heaviest job in the app and will exhaust memory on
@@ -7396,24 +7898,53 @@ def create_app(data_root: str) -> FastAPI:
         write_status(out_dir, status='running', pid=None, started_at=int(time.time()))
         subprocess.Popen(argv, start_new_session=True)
 
-    @app.post('/api/tags/{label}/train-clip')
-    def api_train_clip_classifier(label: str):
-
-        existing = _read_classifier_status(label, 'clip_model')
+    def _train_embedding_classifier(label, space):
+        """Shared by train-siglip / train-dino: validates there are enough labeled examples
+        that actually HAVE an embedding in `space` (a photo missing from the space is
+        reported, never silently swapped for another model's vector), then launches."""
+        dir_kind = space_kind(space)
+        existing = _read_classifier_status(label, dir_kind)
         if existing and existing.get('status') == 'running':
-            raise HTTPException(status_code=409, detail='CLIP training is already running for this tag.')
+            raise HTTPException(status_code=409,
+                                detail=f'{TAG_SPACES[space]["label"]} training is already running for this tag.')
 
         polarities = manual.get_whole_image_tag_polarities(label)
-        n_positive = sum(1 for p in polarities.values() if p == 'positive')
-        n_negative = sum(1 for p in polarities.values() if p == 'negative')
+        n_region_pos = n_region_neg = 0
+        for region_row in manual.get_all_spatial_tags_for_label(label):
+            if region_row[-1] == 'positive':
+                n_region_pos += 1
+            else:
+                n_region_neg += 1
+        embedded = set(getattr(db, f'get_{space}_embeddings_matrix')()[1])
+        n_positive = sum(1 for c, p in polarities.items() if p == 'positive' and c in embedded) + n_region_pos
+        n_negative = sum(1 for c, p in polarities.items() if p == 'negative' and c in embedded) + n_region_neg
         if n_positive < MIN_EXAMPLES_PER_CLASS or n_negative < MIN_EXAMPLES_PER_CLASS:
+            n_missing = sum(1 for c in polarities if c not in embedded)
+            hint = (f' {n_missing} labeled photo(s) have no {TAG_SPACES[space]["label"]} embedding yet — '
+                    f'run "Index SigLIP 2 + DINOv2" first.') if n_missing else ''
             raise HTTPException(
                 status_code=400,
                 detail=f'Need at least {MIN_EXAMPLES_PER_CLASS} confirmed and {MIN_EXAMPLES_PER_CLASS} '
-                       f'rejected examples; have {n_positive} confirmed, {n_negative} rejected.'
+                       f'rejected examples with a {TAG_SPACES[space]["label"]} embedding; '
+                       f'have {n_positive} confirmed, {n_negative} rejected.{hint}'
             )
-        _launch_training_subprocess('media_manager.clip_tag_classifier', label, 'clip_model')
-        return {'status': 'running'}
+        _launch_training_subprocess('media_manager.clip_tag_classifier', label, dir_kind)
+        return {'status': 'running', 'space': space}
+
+    @app.post('/api/tags/{label}/train-siglip')
+    def api_train_siglip_classifier(label: str):
+        return _train_embedding_classifier(label, 'siglip')
+
+    @app.post('/api/tags/{label}/train-dino')
+    def api_train_dino_classifier(label: str):
+        return _train_embedding_classifier(label, 'dino')
+
+    @app.post('/api/tags/{label}/train-clip')
+    def api_train_clip_classifier(label: str):
+        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+        raise HTTPException(status_code=410, detail=(
+            'Legacy CLIP classifier training is retired — use train-siglip (SigLIP 2, default) '
+            'or train-dino instead.'))
 
     @app.post('/api/tags/{label}/train-yolo')
     def api_train_yolo_classifier(label: str):
@@ -7432,12 +7963,12 @@ def create_app(data_root: str) -> FastAPI:
         return {'status': 'running'}
 
     @app.get('/api/tags/{label}/train-status')
-    def api_train_status(label: str, kind: str = 'clip'):
-        status = _read_classifier_status(label, 'clip_model' if kind == 'clip' else 'yolo_model')
+    def api_train_status(label: str, kind: str = TAG_DEFAULT_SPACE):
+        status = _read_classifier_status(label, _dir_kind(kind))
         return status or {'status': 'not_trained'}
 
     @app.post('/api/tags/{label}/train-cancel')
-    def api_cancel_training(label: str, kind: str = 'clip'):
+    def api_cancel_training(label: str, kind: str = TAG_DEFAULT_SPACE):
         """Stops a running training subprocess — the only way to do this today
         is to actually kill the OS process (there's no cooperative "please
         stop soon" flag either script checks). SIGTERM first (lets torch/
@@ -7447,7 +7978,7 @@ def create_app(data_root: str) -> FastAPI:
         immediately instead of still saying "running" until someone happens
         to reload."""
 
-        model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
+        model_kind = _dir_kind(kind)
         status = _read_classifier_status(label, model_kind)
         if not status or status.get('status') != 'running':
             raise HTTPException(status_code=400, detail='No training is currently running for this tag.')
@@ -7462,13 +7993,13 @@ def create_app(data_root: str) -> FastAPI:
         return {'status': 'failed'}
 
     @app.get('/api/tags/{label}/train-log')
-    def api_train_log(label: str, kind: str = 'clip'):
+    def api_train_log(label: str, kind: str = TAG_DEFAULT_SPACE):
         """Raw train.log content (the training subprocess's own stdout/stderr,
         see clip_tag_classifier.py's/yolo_tag_classifier.py's main()) — the
         only place per-run detail lives beyond the coarse running/done/failed
         status, e.g. ultralytics' own per-epoch loss table for a YOLO run."""
 
-        model_kind = 'clip_model' if kind == 'clip' else 'yolo_model'
+        model_kind = _dir_kind(kind)
         log_path = os.path.join(classifier_dir(data_root, label, model_kind), 'train.log')
         if not os.path.isfile(log_path):
             return PlainTextResponse('No log yet.')
@@ -7479,7 +8010,12 @@ def create_app(data_root: str) -> FastAPI:
         """Candidate ranking for the "find more" swipe view — same shape as
         _next_tag_suggestions (same decided/exclude filtering, same
         _attach_file_meta response), but scored by a trained classifier
-        instead of centroid-cosine similarity."""
+        instead of centroid-cosine similarity. model_kind: 'yolo' | 'siglip'
+        (default) | 'dino' | legacy 'clip'. A classifier trained on a different
+        embedding model than the current one raises 409 "needs retrain" instead
+        of being applied."""
+        if model_kind not in ('yolo',) + TAG_SPACE_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model_kind!r}')
         decided = manual.get_decided_checksums_for_tag(label)
 
         if model_kind == 'yolo':
@@ -7583,13 +8119,31 @@ def create_app(data_root: str) -> FastAPI:
             ])
 
 
+        if model_kind != 'clip':
+            file_ids, checksums, matrix = getattr(db, f'get_{model_kind}_embeddings_matrix')()
+            try:
+                clf_scores = score_matrix(data_root, label, matrix, model_kind)
+            except NeedsRetrain as exc:
+                raise HTTPException(status_code=409, detail=f'Needs retrain: {exc}')
+            if clf_scores is None or matrix.shape[0] == 0:
+                return []
+            return _attach_file_meta([
+                {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+                for fid, score in _tag_space_pick(file_ids, checksums, clf_scores, decided, exclude_ids, count)
+            ])
+
+        # --- legacy CLIP classifier path (DEPRECATION PLANNED: superseded by the SigLIP 2 +
+        # DINOv2 embedding pipeline; do not extend) ---
         all_embeddings = [
             row for row in db.get_all_embeddings()
             if row[3] not in decided and row[0] not in exclude_ids
         ]
         candidates = [(row[3], row[2]) for row in all_embeddings]
         checksum_to_file_id = {row[3]: row[0] for row in all_embeddings}
-        scores = score_all(data_root, label, candidates)
+        try:
+            scores = score_all(data_root, label, candidates, space='clip')
+        except NeedsRetrain as exc:
+            raise HTTPException(status_code=409, detail=f'Needs retrain: {exc}')
         ranked = sorted(
             ((checksum_to_file_id[c], s) for c, s in scores.items() if c in checksum_to_file_id),
             key=lambda x: -x[1],
@@ -7613,7 +8167,7 @@ def create_app(data_root: str) -> FastAPI:
         return _attach_file_meta(cards)
 
     @app.post('/api/tags/{label}/suggestions/next-by-model')
-    def api_next_tag_suggestions_by_model(label: str, body: SwipeExcludeBody, model: str = 'clip', count: int = 10):
+    def api_next_tag_suggestions_by_model(label: str, body: SwipeExcludeBody, model: str = TAG_DEFAULT_SPACE, count: int = 10):
         exclude_ids = {int(x) for x in body.exclude if x.isdigit()}
         cards = _next_tag_suggestions_by_model(label, model, count, exclude_ids)
         return {'cards': cards}
@@ -7867,7 +8421,8 @@ def create_app(data_root: str) -> FastAPI:
     # (same-scene photos commonly score 0.7-0.9), hence the higher default.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    SET_SUGGEST_MODELS = ('clip', 'siglip', 'dino')
+    # SigLIP 2 is the default; 'clip' (ViT-B/32) stays selectable for legacy data only.
+    SET_SUGGEST_MODELS = ('siglip', 'dino', 'clip')
     SET_SUGGEST_TOPK = 400   # siglip/dino: size of the "passing" pool (no absolute threshold)
 
     def _set_member_embeddings(model, file_ids):
@@ -7892,8 +8447,16 @@ def create_app(data_root: str) -> FastAPI:
         never surfaces on its own); trashed files are kept (the card marks them, as CLIP's
         candidate list does)."""
         file_ids, checksums, scores = _score_space(space, centroid)
+        return _topk_pool_from_scores(file_ids, checksums, scores, skip_checksums, apply_filters, k=k)
+
+    def _topk_pool_from_scores(file_ids, checksums, scores, skip_checksums, apply_filters,
+                               k=SET_SUGGEST_TOPK, display_scores=None):
+        """The ranking walk of _topk_pool_in_space over already-computed `scores` (so a
+        caller can rank by a fused score). `display_scores`, when given, is the same-length
+        array reported as each item's score instead of the ranking score."""
         if scores.shape[0] == 0:
             return []
+        shown = scores if display_scores is None else display_scores
         order = top_k_indices(scores, None)
         still_parents = manual.get_all_frame_capture_parents()
         seen_ids, pool = set(), []
@@ -7917,7 +8480,7 @@ def create_app(data_root: str) -> FastAPI:
                 if fid in seen_ids or cs in skip_checksums:
                     continue
                 seen_ids.add(fid)
-                block.append(((fid, path, cs), float(scores[i])))
+                block.append(((fid, path, cs), float(shown[i])))
             pool.extend(apply_filters(block))
             if len(pool) >= k:
                 break
@@ -7925,8 +8488,8 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
                                      honor_negatives=False, exclude_non_matching_faces=False,
-                                     model='clip', info=None):
-        """Images not yet in the set whose CLIP embedding is close to the set's
+                                     model='siglip', info=None):
+        """Images not yet in the set whose embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
         before taking `limit`, for infinite-scroll pagination; the full ranking
@@ -7964,9 +8527,9 @@ def create_app(data_root: str) -> FastAPI:
         judge a mismatch against. If the set has no confirmed people yet
         either, this is a no-op (same reason).
 
-        `model` ('clip' default | 'siglip' | 'dino'): which embedding space drives
+        `model` ('siglip' default | 'dino' | legacy 'clip'): which embedding space drives
         the ranking — members, rejected photos (for honor_negatives) and candidates
-        are all read from THAT space. 'clip' is the original behavior, untouched.
+        are all read from THAT space. 'clip' is the original (legacy) behavior, untouched.
         For siglip/dino the absolute `threshold` is NOT applied (cosine scales differ
         per model; SET_SUGGEST_THRESHOLD is tuned for CLIP-B/32): the best
         SET_SUGGEST_TOPK candidates after every exclusion are the "passing" pool, and
@@ -8083,6 +8646,32 @@ def create_app(data_root: str) -> FastAPI:
         parts = [p for p in parts if len(p)]
         return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
 
+    # Location "same place" ranking: 'combined' fuses DINOv2 + SigLIP 2 (see
+    # _find_similar_files_for_location). DINOv2 is weighted higher: it matches layout /
+    # instance (same place from another angle), SigLIP 2 adds scene semantics.
+    LOCATION_SUGGEST_MODELS = SET_SUGGEST_MODELS + ('combined',)
+    LOCATION_FUSION_WEIGHTS = {'dino': 0.6, 'siglip': 0.4}
+
+    def _fused_space_scores(positive_ids, negative_ids=None):
+        """(file_ids, checksums, rank, display, coverage) of every file against the
+        DINOv2 + SigLIP 2 centroids of `positive_ids` (Rocchio-pulled from `negative_ids`
+        when given), fused by fuse_zscores. coverage = {space: members embedded}; a space
+        where no positive is embedded is dropped. rank is empty when neither can score."""
+        parts, coverage = [], {}
+        for space, weight in LOCATION_FUSION_WEIGHTS.items():
+            pos = _set_member_embeddings(space, positive_ids)
+            coverage[space] = len(pos)
+            neg = _set_member_embeddings(space, negative_ids) if negative_ids else []
+            centroid = adjusted_centroid(pos, neg) if neg else mean_normalized_centroid(pos)
+            if centroid is None:
+                continue
+            fids, cs, sc = _score_space(space, centroid)
+            parts.append((fids, cs, sc, weight))
+        fids, cs, rank, display = fuse_zscores(parts)
+        return fids, cs, rank, display, coverage
+
+    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+    # (The background-tile ranking reads the CLIP tile index; it only runs for the legacy 'clip' model.)
     def _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives):
         """[(file_id, score)] best first by background tiles, or None when the
         location's own photos have no background tiles to compare (tiles not built for
@@ -8113,8 +8702,8 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True, honor_negatives=False, background=True,
-                                          model='clip', info=None):
-        """Images not yet at this location whose CLIP embedding is close to the
+                                          model='combined', info=None):
+        """Images not yet at this location whose embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
         it for the offset/exclude_ids/avoid_existing semantics, which are
@@ -8135,15 +8724,18 @@ def create_app(data_root: str) -> FastAPI:
         place counts and the people in it don't. Falls back to the whole-image ranking
         when the location's photos have no background tiles yet.
 
-        `model` ('clip' default | 'siglip' | 'dino'): same selector as
-        _find_similar_files_for_set — members, rejected photos and candidates are all read
-        from that model's space; siglip/dino skip the absolute threshold (top
-        SET_SUGGEST_TOPK pool, stills remapped to their video) and IGNORE `background`
-        (the tile index is CLIP-only). `info`, when a dict, receives {'mode':
+        `model` ('combined' default | 'siglip' | 'dino' | legacy 'clip'): members, rejected
+        photos and candidates are all read from that model's space. 'combined' = DINOv2
+        (same place from another angle: layout/instance) fused with SigLIP 2 (scene
+        semantics) by a weighted mean of z-scored cosines (LOCATION_FUSION_WEIGHTS), each
+        space with its own Rocchio-adjusted centroid; a space with no member embeddings is
+        dropped and the other carries the ranking. combined/siglip/dino skip the absolute
+        threshold (top SET_SUGGEST_TOPK pool, stills remapped to their video) and IGNORE
+        `background` (the tile index is CLIP-only, legacy). `info`, when a dict, receives {'mode':
         'background'|'whole', 'model', 'threshold_applied', 'background_applied',
         'coverage', 'model_missing'}."""
 
-        if model not in SET_SUGGEST_MODELS:
+        if model not in LOCATION_SUGGEST_MODELS:
             raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
@@ -8186,6 +8778,31 @@ def create_app(data_root: str) -> FastAPI:
                 return cards
         if info is not None:
             info['mode'] = 'whole'
+
+        if model == 'combined':
+            placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
+            excluded_ids = ([r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
+                            if honor_negatives and excluded_checksum_set else None)
+            fids, cks, rank, display, cov = _fused_space_scores(member_ids, excluded_ids)
+            if info is not None:
+                info.update(coverage={'members_embedded': max(cov.values()) if cov else 0,
+                                      'members_total': len(member_checksums), 'per_space': cov},
+                            model_missing=(not rank.shape[0] and bool(member_checksums)))
+            passing = _topk_pool_from_scores(
+                fids, cks, rank,
+                set(member_checksums) | excluded_checksum_set | set(set_settled_checksums),
+                lambda items: [i for i in items if i[0][2] not in placed_anywhere] if avoid_existing else items,
+                display_scores=display)
+            if exclude_ids:
+                passing = [item for item in passing if item[0][0] not in exclude_ids]
+                page = passing[:limit]
+            else:
+                page = passing[offset:offset + limit]
+            cards = _enrich_rows([(fid, path, True, cs) for (fid, path, cs), _score in page],
+                                 scores={fid: round(score, 3) for (fid, _p, _cs), score in page})
+            for card in cards:
+                card['ref'] = str(card['id'])
+            return cards
 
         member_embeddings = _set_member_embeddings(model, member_ids)
         if info is not None:
@@ -8237,7 +8854,8 @@ def create_app(data_root: str) -> FastAPI:
             card['ref'] = str(card['id'])
         return cards
 
-    def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None):
+    def _find_best_sets_for_file(file_id, checksum, threshold=SET_SUGGEST_THRESHOLD, limit=3, set_ids=None,
+                                 model='siglip'):
         """The reverse of _find_similar_files_for_set: given one photo, rank every
         set it's not already in by how close the photo's embedding is to that set's
         centroid — "which set does this probably belong to". Sets are cheap and
@@ -8250,8 +8868,19 @@ def create_app(data_root: str) -> FastAPI:
         page's quick-access modal, which wants a rank ordering of a small,
         caller-chosen set of sets, not "does this clear the bar to suggest it at
         all". Cheaper than the default path too: only the requested sets' centroids
-        get computed, not every set in the library."""
-        emb_bytes = db.get_embedding(file_id)
+        get computed, not every set in the library.
+
+        `model` ('siglip' default | 'dino' | legacy 'clip'): the embedding space the photo and
+        the sets' members are read from. The absolute `threshold` (tuned for CLIP-B/32) only
+        applies to 'clip'; siglip/dino return the best `limit` sets after the person filter."""
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        if model == 'clip':
+            emb_bytes = db.get_embedding(file_id)
+            threshold_applied = True
+        else:
+            emb_bytes = db.get_space_embedding(model, file_id)
+            threshold_applied = False
         if emb_bytes is None:
             return []
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
@@ -8281,7 +8910,8 @@ def create_app(data_root: str) -> FastAPI:
         for set_row in candidates:
             member_checksums = manual.get_files_by_set(set_row['id'], limit=1000)
             member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
-            member_embeddings = db.get_embeddings_for_files(member_ids)
+            member_embeddings = (db.get_embeddings_for_files(member_ids) if model == 'clip'
+                                 else db.get_space_embeddings_for_files(model, member_ids))
             if not member_embeddings:
                 continue
             vecs = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in member_embeddings])
@@ -8291,7 +8921,7 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             centroid = centroid / norm
             score = float(centroid.dot(query_emb))
-            if set_ids is not None or score >= threshold:
+            if set_ids is not None or not threshold_applied or score >= threshold:
                 # Representative thumbnail = a member photo we already resolved
                 # to a file id above (no extra query).
                 thumb_id = member_ids[0] if member_ids else None
@@ -8316,7 +8946,7 @@ def create_app(data_root: str) -> FastAPI:
         # Self-heal frames captured before embed-at-capture existed: without an
         # embedding _find_best_sets_for_file can only return [] ("No likely sets").
         # Embed on demand here (once) so opening the set picker on an old frame works.
-        if db.get_embedding(file_id) is None:
+        if db.get_space_embedding('siglip', file_id) is None:
             _ensure_file_embedding(file_id, _live_abs_path(file_id, row['path']))
         return {'results': _find_best_sets_for_file(file_id, row['checksum'],
                                                     limit=max(1, min(limit, 24)), set_ids=set_ids)}
@@ -8412,6 +9042,7 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
+            'clip_legacy_available': db.count_indexed() > 0,
             'people_present': people_present,
             'folder_suggestions': folder_suggestions,
             'sort': sort,
@@ -8433,7 +9064,7 @@ def create_app(data_root: str) -> FastAPI:
         ai = db.get_all_ai_generated_checksums()  # never morph AI output back in
         checksums = [c for c in checksums if c not in ai]
         rows = db.get_files_by_checksums(checksums)
-        emb_map = dict(db.get_embeddings_for_files([r['id'] for r in rows]))
+        emb_map = dict(db.get_space_embeddings_for_files('siglip', [r['id'] for r in rows]))
         members = []
         for r in rows:
             ap = _live_abs_path(r['id'], r['path'])
@@ -8442,7 +9073,7 @@ def create_app(data_root: str) -> FastAPI:
                                 'embedding': emb_map.get(r['id'])})
         if len(members) < 2:
             return {'started': False, 'message': 'Need at least 2 member images on disk.'}
-        # Order for a smooth morph: alphabetically-first member, then a greedy CLIP
+        # Order for a smooth morph: alphabetically-first member, then a greedy SigLIP 2
         # nearest-neighbour chain — consecutive FLF2V pairs are then as visually close
         # as possible, instead of the set's arbitrary manual order.
         members = set_video.order_by_similarity(members)
@@ -8727,7 +9358,7 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
                                    honor_negatives: bool = False, exclude_non_matching_faces: bool = False,
-                                   model: str = 'clip'):
+                                   model: str = 'siglip'):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         if model not in SET_SUGGEST_MODELS:
@@ -9100,12 +9731,16 @@ def create_app(data_root: str) -> FastAPI:
         manual.remove_category_exclusion(row['checksum'], category_id)
         return {'ok': True}
 
-    def _next_category_suggestions(category_id, count, exclude_refs):
+    def _next_category_suggestions(category_id, count, exclude_refs, model='siglip'):
         """Rank currently-unresolved-or-differently-resolved files against this ONE
-        category's centroid (mirrors media_manager.py's MediaManager.match_categories
-        exactly — same centroid-vs-temperature-threshold math — but interactive/
-        one-at-a-time instead of batch-write). Returns up to `count` dicts, best
-        score first: [{'ref': str, 'file_id': int, 'score': float}, ...].
+        category's centroid, interactive/one-at-a-time instead of batch-write. Returns up
+        to `count` dicts, best score first: [{'ref': str, 'file_id': int, 'score': float}, ...].
+
+        `model` ('siglip' default | 'dino' | legacy 'clip'): the embedding space the examples,
+        the rejected photos (Rocchio) and the candidates are read from. Only legacy 'clip'
+        applies the category's temperature threshold (it was calibrated on CLIP-B/32 cosines);
+        siglip/dino rank the best candidates after every exclusion, captured stills folded
+        into their source video.
 
         A file is excluded from candidacy if it already manually has THIS category,
         or has been explicitly rejected for THIS category before — categories are
@@ -9127,7 +9762,9 @@ def create_app(data_root: str) -> FastAPI:
         example_checksums = [c for c in manual.get_example_checksums_for_category(category_id)
                              if c not in ai_all]
         example_ids = [r['id'] for r in db.get_files_by_checksums(example_checksums)]
-        example_embeddings = [e for _fid, e in db.get_embeddings_for_files(example_ids)]
+        if model not in SET_SUGGEST_MODELS:
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        example_embeddings = _set_member_embeddings(model, example_ids)
         # Down-swiped (excluded) items don't just get hidden from the queue — they
         # steer the centroid AWAY from their look (Rocchio-style adjusted_centroid,
         # the same one the set-similarity feature uses), so visually-similar photos
@@ -9135,15 +9772,25 @@ def create_app(data_root: str) -> FastAPI:
         rejected_for_this = manual.get_excluded_checksums_for_category(category_id)
         if rejected_for_this:
             rej_ids = [r['id'] for r in db.get_files_by_checksums(list(rejected_for_this))]
-            rej_embeddings = [e for _fid, e in db.get_embeddings_for_files(rej_ids)]
+            rej_embeddings = _set_member_embeddings(model, rej_ids)
             centroid = adjusted_centroid(example_embeddings, rej_embeddings)
         else:
             centroid = mean_normalized_centroid(example_embeddings)
         if centroid is None:
             return []
 
-        all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
         already_has_this = set(example_checksums)
+        if model != 'clip':
+            pool = _topk_pool_in_space(
+                model, centroid, already_has_this | set(rejected_for_this) | set(ai_all),
+                lambda items: [i for i in items if f"file:{i[0][0]}" not in exclude_refs])
+            return _attach_file_meta([
+                {'ref': f"file:{fid}", 'file_id': fid, 'score': round(score, 3)}
+                for (fid, _path, _cs), score in pool[:count]
+            ])
+
+        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+        all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
 
         filtered = [
             c for c in all_candidates
@@ -9191,11 +9838,12 @@ def create_app(data_root: str) -> FastAPI:
         })
 
     @app.post('/api/categories/{category_id}/suggestions/next')
-    def api_next_category_suggestions(category_id: int, body: SwipeExcludeBody, count: int = 10):
+    def api_next_category_suggestions(category_id: int, body: SwipeExcludeBody, count: int = 10,
+                                      model: str = 'siglip'):
         if manual.get_category(category_id) is None:
             raise HTTPException(status_code=404, detail='Category not found')
         exclude_refs = set(body.exclude)
-        cards = _next_category_suggestions(category_id, count, exclude_refs)
+        cards = _next_category_suggestions(category_id, count, exclude_refs, model=model)
         return {'cards': cards}
 
     # ------------------------------------------------------------------
@@ -9264,6 +9912,7 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
             'location_suggest_threshold': LOCATION_SUGGEST_THRESHOLD,
+            'clip_legacy_available': db.count_indexed() > 0,
             'sort': sort,
             'order': order,
         })
@@ -9328,10 +9977,10 @@ def create_app(data_root: str) -> FastAPI:
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
                                         honor_negatives: bool = False, background: bool = True,
-                                        model: str = 'clip'):
+                                        model: str = 'combined'):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
-        if model not in SET_SUGGEST_MODELS:
+        if model not in LOCATION_SUGGEST_MODELS:
             raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
@@ -9363,6 +10012,44 @@ def create_app(data_root: str) -> FastAPI:
         return {'members': len(member_ids), 'tiled_members': len(tiled_members),
                 'tiled_files': db.count_tiled_files(),
                 'images': db.count_files_by_ext(IMAGE_EXTENSIONS)}
+
+    @app.get('/api/locations/{location_id}/text-search')
+    def api_location_text_search(location_id: int, q: str, limit: int = 24, offset: int = 0,
+                                 avoid_existing: bool = True):
+        """"Photos that look like <description>" for a location page: SigLIP 2 text -> image
+        over the whole library, minus photos already here, rejected for here, in a set
+        already linked here (and, with avoid_existing, photos placed at any location).
+        Same card shape/frame rules as the suggestion stack; paged by offset."""
+        if manual.get_location(location_id) is None:
+            raise HTTPException(status_code=404, detail='Location not found')
+        q = (q or '').strip()
+        if not q:
+            raise HTTPException(status_code=400, detail='Empty query.')
+        limit, offset = max(1, min(int(limit), 100)), max(0, int(offset))
+        try:
+            query = np.asarray(_get_siglip_embedder().embed_text(q), dtype=np.float32)
+        except HTTPException:
+            raise
+        except Exception as exc:  # hook-allow: broad -- worker down / no GPU / model load: surface the message
+            raise HTTPException(status_code=502, detail=f'Could not embed the query: {exc}')
+        fids, cks, scores = _score_space('siglip', query)
+        if scores.shape[0] == 0:
+            return {'cards': [], 'results': [], 'offset': offset, 'has_more': False,
+                    'no_embedding': True, 'message': f'No siglip embeddings exist yet. {NO_EMB_HINT}'}
+        skip = (set(manual.get_checksums_for_location(location_id))
+                | manual.get_excluded_checksums_for_location(location_id)
+                | set(manual.get_checksums_for_sets_at_location(location_id)))
+        placed = manual.get_checksums_with_any_location() if avoid_existing else set()
+        pool = _topk_pool_from_scores(
+            fids, cks, scores, skip,
+            lambda items: [i for i in items if i[0][2] not in placed],
+            k=offset + limit + 1)
+        page = pool[offset:offset + limit]
+        cards = _enrich_rows([(fid, path, True, cs) for (fid, path, cs), _s in page],
+                             scores={fid: round(s, 3) for (fid, _p, _cs), s in page})
+        for card in cards:
+            card['ref'] = str(card['id'])
+        return {'cards': cards, 'results': cards, 'offset': offset, 'has_more': len(pool) > offset + limit}
 
     @app.post('/api/files/{file_id}/locations/{location_id}/exclude')
     def api_exclude_file_location(file_id: int, location_id: int):
@@ -11455,9 +12142,8 @@ def create_app(data_root: str) -> FastAPI:
         job = _frame_scan_jobs[file_id]
         face_detector = _get_face_detector()
         object_detector = _get_object_detector()
-        clip_indexer = _get_clip_indexer()
+        sig_embedder, dino_embedder = _get_siglip_embedder(), _get_dino_embedder()
         model_objects = object_detector.model_id()
-        model_clip = clip_indexer.model_id()
 
         try:
             for idx in range(1, frame_count):  # frame 0 handled by the normal pipeline
@@ -11490,9 +12176,15 @@ def create_app(data_root: str) -> FastAPI:
                         db.insert_detections(file_id, frame_detections, model_objects, frame_index=idx)
                         job['objects_found'] += len(frame_detections)
 
-                    embeddings, embed_failed = clip_indexer.embed_images([tmp_path])
-                    if not embed_failed and len(embeddings) > 0:
-                        db.insert_embedding(file_id, embeddings[0].tobytes(), model_clip, frame_index=idx)
+                    pairs, _embed_errs, _gpu, w_models = _embed_pair_chunk(sig_embedder, dino_embedder, [tmp_path])
+                    if pairs[0] is not None:
+                        w_sig, w_dino = w_models or (None, None)
+                        db.insert_pair_embeddings_batch(
+                            [(file_id, np.asarray(pairs[0][0], dtype=np.float32).tobytes(),
+                              w_sig or sig_embedder.model_id())],
+                            [(file_id, np.asarray(pairs[0][1], dtype=np.float32).tobytes(),
+                              w_dino or dino_embedder.model_id())],
+                            frame_index=idx)
                 finally:
                     os.unlink(tmp_path)
                     job['frames_processed'] += 1
@@ -11503,7 +12195,7 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/files/{file_id}/scan-all-frames')
     def api_scan_all_frames(file_id: int):
-        """Kick off face + object detection + CLIP embedding across every frame of
+        """Kick off face + object detection + SigLIP 2/DINOv2 embedding across every frame of
         an animated file (frame 0 is already covered by the normal single-frame
         pipeline), running in a background thread so the request returns
         immediately — poll GET .../scan-all-frames/progress for status. Deliberately
@@ -11558,22 +12250,19 @@ def create_app(data_root: str) -> FastAPI:
         return job
 
     def _ensure_file_embedding(file_id, abs_path):
-        """Compute + store the frame_index=0 CLIP embedding for a file that has none.
-        Heals captured stills saved before embed-at-capture existed (a video's frame
-        had no embedding, so similar-search and "Likely sets" came up empty on it).
+        """Compute + store the frame_index=0 SigLIP 2 + DINOv2 embeddings for a file that is
+        missing either (ingest hook for uploads and captured stills; also heals stills saved
+        before embed-at-capture existed, whose similar-search and "Likely sets" came up empty).
         Best-effort — a failure must never break the caller — so it logs loudly and
-        returns False. Returns True if an embedding exists afterward. Idempotent."""
-        if db.get_embedding(file_id) is not None:
+        returns False. Returns True if both embeddings exist afterward. Idempotent."""
+        if (db.get_space_embedding('siglip', file_id) is not None
+                and db.get_space_embedding('dino', file_id) is not None):
             return True
         if abs_path is None or not os.path.isfile(abs_path):
             return False
         try:
-            indexer = _get_clip_indexer()
-            embs, embed_failed = indexer.embed_images([abs_path])
-            if not embed_failed and len(embs) > 0:
-                db.insert_embedding(file_id, embs[0].tobytes(), indexer.model_id(), frame_index=0)
-                return True
-            errors.log(abs_path, f'ensure-embedding failed: {embed_failed}')
+            _embed_one_file(file_id, abs_path)
+            return True
         except Exception as exc:  # hook-allow: broad — model inference; logged, best-effort
             errors.log(abs_path, f'ensure-embedding error: {exc}')
         return False
@@ -11595,11 +12284,9 @@ def create_app(data_root: str) -> FastAPI:
                                      modified_time=int(os.path.getmtime(abs_path)))
         db.set_file_hidden(new_id, True)   # commits (also persists the upsert above)
         manual.add_frame_capture(checksum, parent_row['checksum'], time_ms)
-        # Embed the still (frame_index 0) so it's first-class for CLIP. Videos aren't
-        # CLIP-embedded themselves — their captured stills are meant to carry that —
-        # but nothing here ever computed one, so a video's frame had no embedding and
-        # everything embedding-backed (similar-search, "Likely sets" suggestions) came
-        # up empty on it.
+        # Embed the still (frame_index 0) so it's first-class for SigLIP 2 + DINOv2: search and
+        # similarity fold the still into its source video, and everything embedding-backed
+        # (similar-search, "Likely sets" suggestions) would otherwise come up empty on it.
         _ensure_file_embedding(new_id, abs_path)
         return new_id
 

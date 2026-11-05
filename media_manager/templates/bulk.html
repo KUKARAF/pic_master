@@ -115,11 +115,7 @@
   <section class="bulk-section">
     <h2>🖼 Photos &amp; indexing</h2>
     <div class="bulk-action-row">
-      <button type="button" class="bulk-action-btn" data-start="/api/index/start" data-status="/api/index/status">⚡ Index unindexed (CLIP)</button>
-      <span class="bulk-action-status" data-role="status"></span>
-    </div>
-    <div class="bulk-action-row">
-      <button type="button" class="bulk-action-btn" data-start="/api/siglip-dino/start" data-status="/api/siglip-dino/status" title="One decode pass per photo feeds SigLIP 2 (text and image search) and DINOv2 (visual similarity). Resumable: re-run to continue. Needs a GPU (local or the worker).">🧬 Index SigLIP 2 + DINOv2</button>
+      <button type="button" class="bulk-action-btn" data-start="/api/siglip-dino/start" data-status="/api/siglip-dino/status" title="One decode pass per photo (videos: a few sampled frames) feeds SigLIP 2 (text and image search) and DINOv2 (visual similarity). Resumable: re-run to continue. Needs a GPU (local or the worker).">🧬 Index SigLIP 2 + DINOv2</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <p class="sub" id="embed-stats" style="margin:2px 2px 8px;">Loading embedding stats…</p>
@@ -150,6 +146,10 @@
     </div>
     <div class="bulk-action-row">
       <button type="button" class="bulk-action-btn" data-start="/api/pattern-index/start" data-status="/api/pattern-index/status" title="Deep texture windows per photo for 🧩 pattern search. Re-run after an update: stale descriptors are ignored until re-indexed">🧩 Index patterns</button>
+      <span class="bulk-action-status" data-role="status"></span>
+    </div>
+    <div class="bulk-action-row">
+      <button type="button" class="bulk-action-btn" data-start="/api/pattern-dino-index/start" data-status="/api/pattern-dino-index/status" title="Alternative 🧩 pattern index: DINOv2-L dense patch-token cells per photo (448 px forward, batched on the GPU worker). Select it per search (texture / DINOv2 / fused). Needs the fitted projection (bench/bench_pattern_dino.py --fit). Resumable; a refit or algorithm change makes the old index stale until re-run.">🧩 Index patterns (DINOv2-L)</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">

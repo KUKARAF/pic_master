@@ -11,7 +11,7 @@ Every model is faked (no real model loads). Covers:
     already done for a stage isn't reprocessed), preview counts == scan_status,
     cooperative cancel between files, 409 while running, /bulk refusal both ways,
     object-index infra abort writes no sentinel, GPU guard / worker-down → 'skipped';
-  * /bulk metadata, CLIP index, face detection and phash still work end-to-end
+  * /bulk metadata, SigLIP 2 + DINOv2 index, face detection and phash still work end-to-end
     through the refactored per-file functions.
 
 Run: python tests/test_folder_ml.py   (or python -m pytest tests/test_folder_ml.py)
@@ -71,24 +71,54 @@ def _status(db, manual, ids):
     return scan_status.status_for_files(db, manual, [(fid, rel) for rel, fid in ids.items()])
 
 
+class FakeEmb:
+    batch_size = 4
+    workers = 1
+
+    def __init__(self, which):
+        self.which = which
+
+    def model_id(self):
+        # The real static ids: the /bulk status probe (_pair_model_ids) compares rows against them.
+        from media_manager.embedders import DINOv2Embedder, SigLIP2Embedder
+        return (SigLIP2Embedder if self.which == 'siglip' else DINOv2Embedder).model_id()
+
+
 class FakeIndexer:
-    model_name = 'fake-clip'
+    """The SigLIP 2 + DINOv2 embedders of the folder / bulk 'embed' stage: records every path
+    that goes through the (faked) shared decode pass; exc makes that pass raise."""
 
     def __init__(self, exc=None):
         self.calls = []
         self.exc = exc
 
-    def model_id(self):
-        return 'fake-clip'
-
-    def embed_images(self, paths):
+    def shared(self, embs, paths, stats=None):
         if self.exc is not None:
             raise self.exc
         self.calls.extend(paths)
-        return [np.ones(4, np.float32) for _ in paths], []
+        return [np.ones((len(paths), 4), np.float32), np.ones((len(paths), 3), np.float32)], []
 
-    def embed_pil_images(self, images):
-        return [np.ones(4, np.float32) for _ in images]
+    def patches(self):
+        return _Patches(
+            patch.object(webmod, '_worker_client', None),
+            patch.object(webmod, '_get_siglip_embedder', lambda: FakeEmb('siglip')),
+            patch.object(webmod, '_get_dino_embedder', lambda: FakeEmb('dino')),
+            patch.object(webmod, '_local_embed_shared', self.shared))
+
+
+class _Patches:
+    """Several patchers as one context manager."""
+
+    def __init__(self, *ps):
+        self.ps = ps
+
+    def __enter__(self):
+        for p in self.ps:
+            p.__enter__()
+
+    def __exit__(self, *exc):
+        for p in reversed(self.ps):
+            p.__exit__(*exc)
 
 
 class FakeFaceDetector:
@@ -124,7 +154,7 @@ def _fakes(indexer=None, faces=None, yolo=None):
     indexer = indexer or FakeIndexer()
     faces = faces or FakeFaceDetector()
     yolo = yolo or FakeYOLO()
-    return (patch.object(webmod, '_get_clip_indexer', lambda: indexer),
+    return (indexer.patches(),
             patch.object(webmod, '_get_face_detector', lambda: faces),
             patch.object(webmod, '_get_object_detector', lambda: yolo))
 
@@ -138,14 +168,14 @@ def _st(kind, done=(), state='partial'):
 
 def test_plan_order_and_defaults():
     files = [(1, 'x.png'), (2, 'y.png'), (3, 'v.mp4'), (4, 'bad.png')]
-    statuses = {1: _st('image', done={'exif', 'clip'}), 2: _st('image'),
-                3: _st('video', done={'stills', 'clip'}), 4: _st('image', state='broken')}
+    statuses = {1: _st('image', done={'exif', 'embed'}), 2: _st('image'),
+                3: _st('video', done={'stills', 'embed'}), 4: _st('image', state='broken')}
     plan = folder_ml.plan(files, statuses)
     keys = [k for k, _f in plan]
-    assert keys == ['exif', 'clip', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
+    assert keys == ['exif', 'embed', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
                     'phash', 'video_faces'], keys            # no tiles, no stills (all done)
     got = dict(plan)
-    assert got['exif'] == [(2, 'y.png')] and got['clip'] == [(2, 'y.png')]
+    assert got['exif'] == [(2, 'y.png')] and got['embed'] == [(2, 'y.png')]
     assert got['faces'] == [(1, 'x.png'), (2, 'y.png')]     # broken file 4 never planned
     assert got['video_faces'] == [(3, 'v.mp4')]
     # Explicit stages: run exactly those (tiles included), in STAGE_ORDER.
@@ -179,9 +209,9 @@ def test_run_plan_order_skip_and_abort():
         raise RuntimeError('Aborted: 5 in a row')
 
     f = [(1, 'x.png')]
-    plan = [(k, f) for k in ('exif', 'clip', 'tags', 'faces', 'objects', 'region')]
+    plan = [(k, f) for k in ('exif', 'embed', 'tags', 'faces', 'objects', 'region')]
     runners = {'exif': folder_ml.Runner(proc('exif')),
-               'clip': folder_ml.Runner(proc('clip'), boom),          # unavailable
+               'embed': folder_ml.Runner(proc('embed'), boom),          # unavailable
                'tags': folder_ml.Runner(proc('tags')),                # claimed by /bulk
                'faces': folder_ml.Runner(proc('faces')),
                'objects': folder_ml.Runner(abort),
@@ -201,9 +231,9 @@ def test_run_plan_order_skip_and_abort():
     st = job.status()
     by = _stages(st)
     assert order == ['exif', 'faces', 'objects'], order
-    assert seen_current == ['exif', 'clip', 'tags', 'faces', 'objects']   # set before claim
+    assert seen_current == ['exif', 'embed', 'tags', 'faces', 'objects']   # set before claim
     assert by['exif']['status'] == 'done' and by['exif']['done'] == 1
-    assert by['clip']['status'] == 'skipped' and 'no model here' in by['clip']['message']
+    assert by['embed']['status'] == 'skipped' and 'no model here' in by['embed']['message']
     assert by['tags']['status'] == 'skipped' and by['tags']['message'] == 'Skipped: busy'
     assert by['objects']['status'] == 'error' and 'Aborted' in by['objects']['message']
     assert by['region']['status'] == 'pending'                            # run stopped
@@ -216,8 +246,9 @@ def test_run_plan_order_skip_and_abort():
 def test_folder_scope_only_missing_and_preview():
     with tempfile.TemporaryDirectory() as tmp:
         db, manual, client, ids = _lib(tmp)
-        # a/2.png already has a CLIP embedding and faces → not reprocessed for those.
-        db.insert_embedding(ids['a/2.png'], np.ones(4, np.float32).tobytes(), 'old')
+        # a/2.png already has the SigLIP 2 + DINOv2 embeddings and faces → not reprocessed for those.
+        db.insert_siglip_embedding(ids['a/2.png'], np.ones(4, np.float32).tobytes(), FakeEmb('siglip').model_id())
+        db.insert_dino_embedding(ids['a/2.png'], np.ones(3, np.float32).tobytes(), FakeEmb('dino').model_id())
         db.insert_faces(ids['a/2.png'], [], 'old')
 
         pv = client.get('/api/fm/ml/preview', params={'path': 'a'}).json()
@@ -230,21 +261,21 @@ def test_folder_scope_only_missing_and_preview():
                        and not st['stages'][s['key']])
             assert s['missing'] == want, (s, want)
             assert s['required'] == (s['key'] != 'tiles')
-        assert _stages(pv)['clip']['missing'] == 2 and _stages(pv)['faces']['missing'] == 2
+        assert _stages(pv)['embed']['missing'] == 2 and _stages(pv)['faces']['missing'] == 2
 
         indexer, faces, yolo = FakeIndexer(), FakeFaceDetector(), FakeYOLO()
         p1, p2, p3 = _fakes(indexer, faces, yolo)
         with p1, p2, p3:
             r = client.post('/api/fm/ml/start', json={
-                'path': 'a', 'stages': ['phash', 'exif', 'clip', 'tags', 'faces']})
+                'path': 'a', 'stages': ['phash', 'exif', 'embed', 'tags', 'faces']})
             assert r.status_code == 200 and r.json()['started'], r.text
             st = _wait(client, '/api/fm/ml/status')
         assert st['error'] is None and not st['cancelled'], st
-        assert [s['key'] for s in st['stages']] == ['exif', 'clip', 'tags', 'faces', 'phash']
+        assert [s['key'] for s in st['stages']] == ['exif', 'embed', 'tags', 'faces', 'phash']
         assert all(s['status'] == 'done' for s in st['stages']), st['stages']
         by = _stages(st)
-        assert by['clip']['total'] == by['clip']['done'] == 2 and by['exif']['total'] == 3
-        # only-missing: a/2.png never went through CLIP / face detection again.
+        assert by['embed']['total'] == by['embed']['done'] == 2 and by['exif']['total'] == 3
+        # only-missing: a/2.png never went through embedding / face detection again.
         embedded = sorted(os.path.relpath(p, tmp) for p in indexer.calls)
         assert embedded == ['a/1.png', 'a/sub/3.png'], embedded
         assert sorted(os.path.relpath(p, tmp) for p in faces.calls) == ['a/1.png', 'a/sub/3.png']
@@ -253,12 +284,12 @@ def test_folder_scope_only_missing_and_preview():
         after = _status(db, manual, ids)
         for rel, fid in ids.items():
             stg = after[fid]['stages']
-            for key in ('exif', 'clip', 'tags', 'faces', 'phash'):
+            for key in ('exif', 'embed', 'tags', 'faces', 'phash'):
                 assert stg[key] == rel.startswith('a/'), (rel, key, stg)   # outside untouched
         assert after[ids['a/1.png']]['stages']['region'] is False          # not requested
         # Nothing missing any more → a default run plans none of those stages.
         pv2 = _stages(client.get('/api/fm/ml/preview', params={'path': 'a'}).json())
-        assert pv2['clip']['missing'] == 0 and pv2['phash']['missing'] == 0
+        assert pv2['embed']['missing'] == 0 and pv2['phash']['missing'] == 0
         # Errors: jail, unknown stage, missing folder.
         assert client.post('/api/fm/ml/start', json={'path': '../x'}).status_code == 400
         assert client.post('/api/fm/ml/start', json={'path': 'a', 'stages': ['x']}).status_code == 400
@@ -402,10 +433,10 @@ def test_unavailable_backends_skip_and_continue():
         env = {k: v for k, v in os.environ.items() if k != 'MEDIA_DEVICE'}
         with p1, p2, p3, patch.object(webmod.compute, 'torch_device', lambda: 'cpu'), \
                 patch.dict(os.environ, env, clear=True):
-            client.post('/api/fm/ml/start', json={'path': 'a', 'stages': ['clip', 'objects', 'phash']})
+            client.post('/api/fm/ml/start', json={'path': 'a', 'stages': ['embed', 'objects', 'phash']})
             st = _wait(client, '/api/fm/ml/status')
         by = _stages(st)
-        assert by['clip']['status'] == 'skipped' and 'worker unreachable' in by['clip']['message']
+        assert by['embed']['status'] == 'skipped' and 'worker unreachable' in by['embed']['message']
         assert by['objects']['status'] == 'skipped' and 'GPU' in by['objects']['message']
         assert by['phash']['status'] == 'done' and by['phash']['done'] == 3
         assert st['error'] is None
@@ -433,7 +464,7 @@ def test_bulk_jobs_still_work():
         n = db.conn.execute('SELECT COUNT(*) FROM faces WHERE bbox != ?', ('[]',)).fetchone()[0]
         assert n == 5
         for st in _status(db, manual, ids).values():
-            assert all(st['stages'][k] for k in ('exif', 'clip', 'faces', 'phash')), st
+            assert all(st['stages'][k] for k in ('exif', 'embed', 'faces', 'phash')), st
 
 
 if __name__ == '__main__':
