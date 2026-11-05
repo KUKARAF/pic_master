@@ -1,7 +1,7 @@
-"""Swipe-card suggestions for a set under a chosen embedding model (clip | siglip | dino).
+"""Swipe-card suggestions for a set under a chosen embedding model (siglip | dino).
 
 All fakes: hand-built low-dimensional vectors written straight into the embedding tables
-(no model, no GPU). CLIP keeps its absolute threshold; siglip/dino take the top-K pool."""
+(no model, no GPU). siglip/dino take the top-K pool (no absolute threshold); the removed CLIP model is a 400."""
 import os
 
 import numpy as np
@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from media_manager.web import create_app
 
-DIMS = {'clip': 8, 'siglip': 10, 'dino': 8}
+DIMS = {'siglip': 10, 'dino': 8}
 
 
 def _vec(dim, **c):
@@ -23,10 +23,7 @@ def _vec(dim, **c):
 
 def _put(db, space, fid, vec):
     b = np.asarray(vec, np.float32).tobytes()
-    if space == 'clip':
-        db.insert_embedding(fid, b, 'clip-test')
-    else:
-        getattr(db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
+    getattr(db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
 
 
 @pytest.fixture
@@ -55,7 +52,6 @@ def env(tmp_path):
     add('y', same(e0=1, e2=0.4))
     add('far', same(e3=1))                      # orthogonal: below any sane threshold
     add('noemb', {})                            # no embedding in any space
-    add('clip_only', {'clip': _vec(8, e0=1, e4=0.05)})
     add('hid', same(e0=1, e5=0.05))
     db.set_file_hidden(ids['hid'][0])
     add('inset', same(e0=1, e6=0.1))            # already in another set
@@ -85,19 +81,16 @@ def _order(data, ids):
     return [rev[c['id']] for c in data['cards']]
 
 
-def test_default_is_siglip_and_clip_still_selectable(env):
+def test_default_is_siglip_and_clip_is_rejected(env):
     _app, _db, _m, ids, sid, client = env
     default = _get(client, sid)
     siglip = _get(client, sid, 'siglip')
     assert _order(default, ids) == _order(siglip, ids)
     assert default['model'] == 'siglip' and default['threshold_applied'] is False
     assert default['cards'] == default['results']
-    # Legacy CLIP stays selectable and behaves as before (absolute threshold, CLIP data only).
-    clip = _get(client, sid, 'clip')
-    order = _order(clip, ids)
-    assert 'clip_only' in order and 'far' not in order     # threshold applied
-    assert 'rej' not in order and 'm1' not in order and 'hid' in order  # CLIP path as before
-    assert clip['model'] == 'clip' and clip['threshold_applied'] is True
+    # CLIP was removed: an explicit, actionable 400 rather than a silent fallback.
+    r = client.post(f'/api/sets/{sid}/similar-files?model=clip', json={'exclude': []})
+    assert r.status_code == 400 and 'removed' in r.json()['detail']
 
 
 def test_unknown_model_400(env):
@@ -114,7 +107,7 @@ def test_model_routing_and_no_threshold(env, model):
     assert data['model'] == model and data['threshold_applied'] is False
     assert data['model_missing'] is False
     assert data['coverage'] == {'members_embedded': 2, 'members_total': 2}
-    assert 'clip_only' not in order and 'noemb' not in order   # no embedding in this space
+    assert 'noemb' not in order   # no embedding in this space
     assert 'far' in order                                       # no absolute threshold
     assert order.index('x') < order.index('y') < order.index('far')
     # hard exclusions: members, rejected, hidden
@@ -143,19 +136,12 @@ def test_toggles(env, model):
     assert _order(r.json(), ids) == neg[1:3]
 
 
-def test_negatives_change_clip_too(env):
-    _app, _db, _m, ids, sid, client = env
-    assert 'x' in _order(_get(client, sid, 'clip', honor_negatives='false'), ids)
-    neg = _order(_get(client, sid, 'clip', honor_negatives='true'), ids)
-    assert 'x' not in neg and 'y' in neg   # x falls under the CLIP threshold once steered away
-
-
 def test_faces_filter_shared(env):
     _app, _db, manual, ids, sid, client = env
     # a confirmed person on a member, a different person on x
     manual.assign_identity_to_photo(ids['m1'][1], 'Alice')
     manual.assign_identity_to_photo(ids['x'][1], 'Bob')
-    for model in ('clip', 'siglip', 'dino'):
+    for model in ('siglip', 'dino'):
         off = _order(_get(client, sid, model, exclude_non_matching_faces='false',
                           honor_negatives='false'), ids)
         on = _order(_get(client, sid, model, exclude_non_matching_faces='true',
@@ -170,7 +156,7 @@ def test_faces_filter_set_without_people_still_excludes(env):
     confirmed in the set, so it is excluded (only unrecognized candidates remain)."""
     _app, _db, manual, ids, sid, client = env
     manual.assign_identity_to_photo(ids['x'][1], 'Bob')
-    for model in ('clip', 'siglip', 'dino'):
+    for model in ('siglip', 'dino'):
         off = _order(_get(client, sid, model, exclude_non_matching_faces='false', honor_negatives='false'), ids)
         on = _order(_get(client, sid, model, exclude_non_matching_faces='true', honor_negatives='false'), ids)
         assert 'x' in off and 'x' not in on and 'y' in on
@@ -207,7 +193,7 @@ def test_faces_filter_member_video_still_people_are_confirmed(env):
     manual.assign_identity_to_photo('t' * 40, 'Bob')
     manual.assign_identity_to_photo(ids['x'][1], 'Bob')
     db.conn.commit()
-    for model in ('clip', 'siglip', 'dino'):
+    for model in ('siglip', 'dino'):
         assert 'x' in _order(_get(client, sid, model, exclude_non_matching_faces='true', honor_negatives='false'), ids)
 
 
@@ -224,11 +210,10 @@ def test_rename_identity_keeps_set_exclusion(env):
 def test_model_missing_signal(env, model):
     app, db, manual, ids, sid, client = env
     s2 = manual.create_set('Empty-in-model', 'st')
-    manual.assign_file_to_set(ids['clip_only'][1], s2)   # member only has CLIP
+    manual.assign_file_to_set(ids['noemb'][1], s2)   # member has no embedding in any space
     data = _get(client, s2, model)
     assert data['model_missing'] is True and data['cards'] == []
     assert data['coverage'] == {'members_embedded': 0, 'members_total': 1}
-    assert _get(client, s2, 'clip')['model_missing'] is False
     # partial coverage: skipped, not missing
     manual.assign_file_to_set(ids['noemb'][1], sid)
     d = _get(client, sid, model)
@@ -257,7 +242,5 @@ def test_topk_cap(env):
         fid = db.upsert_file_path(f'bulk{i}.jpg', f'b{i:038d}', size=1)
         v = _vec(8, e0=1, e1=0.5 + i / 1000)
         _put(db, 'dino', fid, v)
-        _put(db, 'clip', fid, _vec(8, e3=1, e4=1 + i))   # all far in CLIP space
     db.conn.commit()
     assert len(_get(client, sid, 'dino')['cards']) == 400
-    assert len(_get(client, sid, 'clip')['cards']) < 400  # threshold, not top-K

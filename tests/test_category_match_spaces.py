@@ -1,4 +1,4 @@
-"""Batch category auto-match (MediaManager.match_categories) in SigLIP 2 / DINOv2 / legacy CLIP.
+"""Batch category auto-match (MediaManager.match_categories) in SigLIP 2 / DINOv2 (CLIP was removed; its old auto-match rows are only flagged legacy).
 
 Hand-built low-dimensional vectors written straight into the embedding tables (no model, no GPU)."""
 import os
@@ -10,7 +10,7 @@ from media_manager.category_resolver import (
     calibrate_category_threshold, resolve_categories_for_file, resolve_categories_for_checksums)
 from media_manager.media_manager import MediaManager
 
-DIMS = {'clip': 8, 'siglip': 10, 'dino': 8}
+DIMS = {'siglip': 10, 'dino': 8}
 
 
 def _vec(dim, **c):
@@ -32,10 +32,7 @@ def mm(tmp_path):
         m.db.conn.commit()
         for space, d in DIMS.items():
             b = _vec(d, **c).tobytes()
-            if space == 'clip':
-                m.db.insert_embedding(fid, b, 'clip-test')
-            else:
-                getattr(m.db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
+            getattr(m.db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
         ids[name] = (fid, cs)
 
     # category "beach" examples around e0 (+ tiny jitter), background spread on e3..e7
@@ -62,8 +59,7 @@ def _stored(m):
                 'SELECT file_id, category_name, score, model FROM file_category_matches')]}
 
 
-@pytest.mark.parametrize('model,mid', [('siglip', 'siglip-centroid-v1'), ('dino', 'dino-centroid-v1'),
-                                       ('clip', 'clip-centroid-v1')])
+@pytest.mark.parametrize('model,mid', [('siglip', 'siglip-centroid-v1'), ('dino', 'dino-centroid-v1')])
 def test_match_in_each_space_stores_model_id(mm, model, mid):
     matched, skipped, considered = mm.match_categories(model=model)
     got = _stored(mm)
@@ -78,6 +74,8 @@ def test_dry_run_writes_nothing_and_unknown_model(mm):
     assert _stored(mm) == set()
     with pytest.raises(ValueError):
         mm.match_categories(model='nope')
+    with pytest.raises(ValueError, match='removed'):
+        mm.match_categories(model='clip')
 
 
 def test_legacy_rows_flagged_and_superseded_on_rerun(mm):
@@ -101,9 +99,8 @@ def test_legacy_rows_flagged_and_superseded_on_rerun(mm):
 
 def test_legacy_kept_for_files_without_new_space_embedding(mm):
     cs = 'z' * 40
-    fid = mm.db.upsert_file_path('only_clip.jpg', cs, size=1)
+    fid = mm.db.upsert_file_path('only_old.jpg', cs, size=1)   # no SigLIP/DINO embedding
     mm.db.conn.commit()
-    mm.db.insert_embedding(fid, _vec(8, e0=1).tobytes(), 'clip-test')
     mm.db.set_file_category_match(fid, 'beach', 0.9, model='clip-centroid-v1')
     mm.match_categories(model='siglip')
     assert [tuple(r) for r in mm.db.get_file_category_matches(fid)] == [('beach', 0.9, 'clip-centroid-v1')]

@@ -1,7 +1,8 @@
 """/locations/{id} suggestion stack: ranked by visual similarity, never by geography.
 
 A location's suggestions are "photos that look like the ones already here" — the same
-CLIP-centroid ranking the set stack uses. A location's own GPS coordinates must play
+SigLIP 2 / DINOv2 centroid ranking the set stack uses (best-first pool, no absolute cutoff,
+so "unrelated" means "ranked after every look-alike"). A location's own GPS coordinates must play
 no part: two photos taken in the same room rank together because they look alike, and
 a photo with no coordinates at all is just as eligible.
 
@@ -24,8 +25,8 @@ from media_manager.web import create_app
 D = 512
 WITHIN_COS = 0.95
 # For x = unit(d + s*n), n ~ N(0, I_D): E[cos(x, d)] ~ 1/sqrt(1 + s^2 D). Deriving s
-# from the cosine keeps the fixture in the regime the threshold was tuned for; a flat
-# per-component sigma is noise of norm s*sqrt(D) against a unit signal, i.e. static.
+# from the cosine keeps the fixture realistic; a flat per-component sigma is noise of norm
+# s*sqrt(D) against a unit signal, i.e. static.
 SIGMA = float(np.sqrt((1.0 / WITHIN_COS ** 2 - 1.0) / D))
 
 
@@ -47,7 +48,9 @@ def _seed(app, tmp):
         Image.new('RGB', (32, 32), (90, 120, 160)).save(os.path.join(tmp, name + '.jpg'))
         cs = (name * 8)[:40]
         fid = db.upsert_file_path(name + '.jpg', cs, size=100)
-        db.insert_embedding(fid, _unit(theme + SIGMA * rng.standard_normal(D)).tobytes(), 'clip-test')
+        for space in ('siglip', 'dino'):    # the default 'place' model fuses both spaces
+            vec = _unit(theme + SIGMA * rng.standard_normal(D)).tobytes()
+            getattr(db, f'insert_{space}_embedding')(fid, vec, f'{space}-test')
         ids[name] = (fid, cs)
     db.conn.commit()
 
@@ -71,7 +74,7 @@ def run():
     def suggest():
         r = client.post('/api/locations/%d/similar-files?limit=20' % loc_id, json={'exclude': []})
         assert r.status_code == 200, (r.status_code, r.text[:200])
-        return sorted(c['filename'] for c in r.json()['cards'])
+        return [c['filename'] for c in r.json()['cards']]   # best first
 
     ok = True
 
@@ -81,10 +84,10 @@ def run():
         print(('  PASS  ' if cond else '  FAIL  ') + name + (('   [%s]' % (extra,)) if extra else ''))
 
     first = suggest()
-    check('ranks the look-alikes in',
-          set(first) == {'shoot_a.jpg', 'shoot_b.jpg', 'loose_a.jpg', 'loose_b.jpg'}, str(first))
-    check('leaves visually unrelated photos out',
-          not any(n.startswith('other') for n in first), str(first))
+    check('ranks the look-alikes first',
+          set(first[:4]) == {'shoot_a.jpg', 'shoot_b.jpg', 'loose_a.jpg', 'loose_b.jpg'}, str(first))
+    check('ranks visually unrelated photos after every look-alike',
+          all(n.startswith('other') for n in first[4:]), str(first))
     check('never re-offers a photo already at the location',
           not any(n.startswith('member') for n in first), str(first))
 
@@ -99,10 +102,11 @@ def run():
           ids['shoot_a'][1] in manual.get_checksums_for_location(loc_id))
     after = suggest()
     check('one keystroke settles the WHOLE set, not just the swiped photo',
-          set(after) == {'loose_a.jpg', 'loose_b.jpg'}, str(after))
+          set(after[:2]) == {'loose_a.jpg', 'loose_b.jpg'}
+          and not {'shoot_a.jpg', 'shoot_b.jpg'} & set(after), str(after))
 
     client.delete('/api/locations/%d/adopt-set?file_id=%d' % (loc_id, ids['shoot_a'][0]))
-    check('undoing the adopt puts the whole set back', set(suggest()) == set(first), str(suggest()))
+    check('undoing the adopt puts the whole set back', set(suggest()[:4]) == set(first[:4]), str(suggest()))
     check('and unlinks the set', manual.get_locations_for_set(set_id) == [])
 
     # --- reject is remembered ------------------------------------------------------

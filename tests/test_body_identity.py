@@ -7,8 +7,8 @@ rejecting keeps a hard-negative so it's never re-offered, and undo returns it. B
 labels also count toward a person's presence on /person/{name}.
 
 This exercises the DB methods and the HTTP flow directly on stored embeddings, so it
-needs no CLIP model (the embeddings are seeded, exactly as test_location_suggestions
-seeds CLIP vectors).
+needs no embedding model (the embeddings are seeded, exactly as test_location_suggestions
+seeds SigLIP/DINO vectors).
 
 Run standalone: python tests/test_body_identity.py
 """
@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import numpy as np
 from fastapi.testclient import TestClient
 
-# This test seeds CLIP/body embeddings directly and never calls OpenCV, but importing
+# This test seeds body embeddings directly and never calls OpenCV, but importing
 # media_manager.web pulls in modules that `import cv2` at load time — and the full
 # opencv build needs libGL, which this headless box lacks. Stub it so the import chain
 # loads; nothing under test touches it.

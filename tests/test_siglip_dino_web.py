@@ -233,7 +233,7 @@ def test_dim_mismatch_is_clear_409(env):
 def test_embed_stats(env):
     app, c, db, *_ = env
     d = c.get('/api/embed-stats').json()
-    assert set(d['spaces']) == {'clip', 'siglip', 'dino'} and d['library_images'] == 10
+    assert set(d['spaces']) == {'siglip', 'dino'} and d['library_images'] == 10
 
 
 # ---- writer thread / chunk overlap ------------------------------------------------
@@ -364,11 +364,11 @@ def test_similar_page_model_param(env):
     assert r.status_code == 200 and 'data-model="siglip"' in r.text and 'score-badge' in r.text
     r = c.get(f'/similar/{a}')
     assert r.status_code == 200 and 'score-badge' in r.text and 'id="embed-now-btn"' not in r.text
-    # Legacy CLIP view: no CLIP data -> no CLIP model button, no embed-now (CLIP is never computed).
+    # CLIP was removed: no CLIP model button, and a stale ?model=clip bookmark falls back to SigLIP 2.
     r = c.get(f'/similar/{ids["img8.jpg"]}')
     assert 'data-model="clip"' not in r.text
     r = c.get(f'/similar/{a}?model=clip')
-    assert r.status_code == 200 and 'id="embed-now-btn"' not in r.text and 'no legacy CLIP' in r.text
+    assert r.status_code == 200 and 'data-model="siglip"' in r.text and 'data-model="clip"' not in r.text
 
 
 def test_similar_api_cards_additive(env):

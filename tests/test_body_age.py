@@ -71,9 +71,9 @@ class _Env:
         """Label person: a media.db body crop + its manual.db ground-truth label.
         Returns (source_body_id, body_identities.id)."""
         emb = _emb(self.rng)
-        src = self.db.add_manual_body(fid, bbox, emb, 'clip-test')
+        src = self.db.add_manual_body(fid, bbox, emb, 'body-test')
         self.db.conn.commit()
-        bid = self.manual.add_body_label(cs, identity, bbox, emb, 'clip-test',
+        bid = self.manual.add_body_label(cs, identity, bbox, emb, 'body-test',
                                          source_body_id=src, **kw)
         return src, bid
 
@@ -169,7 +169,7 @@ def test_deleting_or_redeciding_a_body_drops_its_age(env, fake):
 
     # Re-decide (relabel) the same body: replaced row, old estimate gone.
     new_bid = env.manual.add_body_label(cs, 'Ivy B', [0, 0, 100, 200], _emb(env.rng),
-                                        'clip-test', source_body_id=src)
+                                        'body-test', source_body_id=src)
     assert new_bid != bid
     assert 'body:%d' % bid not in _age_rows(env.manual, cs)
 

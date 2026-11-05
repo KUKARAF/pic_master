@@ -71,7 +71,7 @@ def test_recovery_restarts_job_after_worker_restart(tmp_path, monkeypatch):
         if len(runs) == 1:
             raise rtt.JobLost('restarted')
 
-    monkeypatch.setattr(rtt, '_drive_clip', drive)
+    monkeypatch.setattr(rtt, '_drive_embedding', drive)
     monkeypatch.setattr(rtt, '_client', lambda root: FakeClient([WorkerUnavailable('x'), {'status': 'failed'}]))
     rtt.train_for_tag(str(tmp_path), 'cat', 'siglip_model')
     assert len(runs) == 2
@@ -80,7 +80,7 @@ def test_recovery_restarts_job_after_worker_restart(tmp_path, monkeypatch):
 
 def test_recovery_fails_actionably_when_worker_never_returns(tmp_path, monkeypatch):
     monkeypatch.setenv('MEDIA_TRAIN_WORKER_RECONNECT_SECS', '5')
-    monkeypatch.setattr(rtt, '_drive_clip', lambda *a, **k: (_ for _ in ()).throw(WorkerUnavailable('down')))
+    monkeypatch.setattr(rtt, '_drive_embedding', lambda *a, **k: (_ for _ in ()).throw(WorkerUnavailable('down')))
     monkeypatch.setattr(rtt, '_client', lambda root: FakeClient([WorkerUnavailable('x')] * 100))
     with pytest.raises(RuntimeError, match='worker not running'):
         rtt.train_for_tag(str(tmp_path), 'cat', 'siglip_model')

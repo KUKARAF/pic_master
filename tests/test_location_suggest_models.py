@@ -1,8 +1,8 @@
-"""Swipe-card suggestions for a location under a chosen embedding model (clip | siglip | dino).
+"""Swipe-card suggestions for a location under a chosen embedding model (place | combined | siglip | dino).
 
 All fakes: hand-built low-dimensional vectors written straight into the embedding tables
-(no model, no GPU). CLIP keeps its absolute threshold (and the optional background-tile
-ranking); siglip/dino take the top-K pool in their own space and ignore `background`."""
+(no model, no GPU). siglip/dino take the top-K pool in their own space and ignore `background`; the removed
+CLIP model is a 400."""
 import os
 
 import numpy as np
@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from media_manager.web import create_app
 
-DIMS = {'clip': 8, 'siglip': 10, 'dino': 8}
+DIMS = {'siglip': 10, 'dino': 8}
 
 
 def _vec(dim, **c):
@@ -23,10 +23,7 @@ def _vec(dim, **c):
 
 def _put(db, space, fid, vec):
     b = np.asarray(vec, np.float32).tobytes()
-    if space == 'clip':
-        db.insert_embedding(fid, b, 'clip-test')
-    else:
-        getattr(db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
+    getattr(db, f'insert_{space}_embedding')(fid, b, f'{space}-test')
 
 
 @pytest.fixture
@@ -54,7 +51,6 @@ def env(tmp_path):
     add('y', same(e0=1, e2=0.4))
     add('far', same(e3=1))
     add('noemb', {})
-    add('clip_only', {'clip': _vec(8, e0=1, e4=0.05)})
     add('hid', same(e0=1, e5=0.05))
     db.set_file_hidden(ids['hid'][0])
     add('placed', same(e0=1, e6=0.1))            # already has another location
@@ -88,7 +84,7 @@ def _order(data, ids):
     return [rev[c['id']] for c in data['cards']]
 
 
-def test_default_is_place_and_clip_still_selectable(env):
+def test_default_is_place_and_clip_is_rejected(env):
     _app, _db, _m, ids, loc, client = env
     default = _get(client, loc)
     comb = _get(client, loc, 'combined')
@@ -96,11 +92,8 @@ def test_default_is_place_and_clip_still_selectable(env):
     assert _order(default, ids) == _order(comb, ids)
     assert default['model'] == 'place' and comb['model'] == 'combined' and default['threshold_applied'] is False
     assert default['background_applied'] is False and default['cards'] == default['results']
-    clip = _get(client, loc, 'clip', background='false')
-    order = _order(clip, ids)
-    assert 'clip_only' in order and 'far' not in order            # legacy: threshold applied
-    assert not {'rej', 'm1', 'settled', 'placed'} & set(order)
-    assert clip['model'] == 'clip' and clip['threshold_applied'] is True and clip['mode'] == 'whole'
+    r = client.post(f'/api/locations/{loc}/similar-files?model=clip', json={'exclude': []})
+    assert r.status_code == 400 and 'removed' in r.json()['detail']
 
 
 def test_unknown_model_400(env):
@@ -117,7 +110,7 @@ def test_model_routing_and_no_threshold(env, model):
     assert data['model'] == model and data['threshold_applied'] is False
     assert data['background_applied'] is False and data['model_missing'] is False
     assert data['coverage'] == {'members_embedded': 2, 'members_total': 2}
-    assert 'clip_only' not in order and 'noemb' not in order
+    assert 'noemb' not in order
     assert 'far' in order
     assert order.index('x') < order.index('y') < order.index('far')
     # members, rejected, hidden, set-settled and already-placed are all excluded
@@ -144,14 +137,7 @@ def test_toggles(env, model):
     assert _order(r.json(), ids) == neg[1:3]
 
 
-def test_negatives_change_clip_too(env):
-    _app, _db, _m, ids, loc, client = env
-    assert 'x' in _order(_get(client, loc, 'clip', background='false', honor_negatives='false'), ids)
-    neg = _order(_get(client, loc, 'clip', background='false', honor_negatives='true'), ids)
-    assert 'x' not in neg and 'y' in neg
-
-
-@pytest.mark.parametrize('model', ['clip', 'siglip', 'dino'])
+@pytest.mark.parametrize('model', ['siglip', 'dino'])
 def test_background_param_ignored(env, model):
     _app, _db, _m, ids, loc, client = env
     on = _get(client, loc, model, background='true')
@@ -163,12 +149,11 @@ def test_background_param_ignored(env, model):
 @pytest.mark.parametrize('model', ['siglip', 'dino'])
 def test_model_missing_signal(env, model):
     _app, _db, manual, ids, loc, client = env
-    loc2 = manual.create_location('Clip-only')
-    manual.add_file_location(ids['clip_only'][1], loc2)
+    loc2 = manual.create_location('No-embeddings')
+    manual.add_file_location(ids['noemb'][1], loc2)   # member with no embedding in any space
     data = _get(client, loc2, model)
     assert data['model_missing'] is True and data['cards'] == []
     assert data['coverage'] == {'members_embedded': 0, 'members_total': 1}
-    assert _get(client, loc2, 'clip', background='false')['model_missing'] is False
     manual.add_file_location(ids['noemb'][1], loc)
     d = _get(client, loc, model)
     assert d['model_missing'] is False
@@ -195,7 +180,5 @@ def test_topk_cap(env):
     for i in range(450):
         fid = db.upsert_file_path(f'bulk{i}.jpg', f'b{i:038d}', size=1)
         _put(db, 'dino', fid, _vec(8, e0=1, e1=0.5 + i / 1000))
-        _put(db, 'clip', fid, _vec(8, e3=1, e4=1 + i))
     db.conn.commit()
     assert len(_get(client, loc, 'dino')['cards']) == 400
-    assert len(_get(client, loc, 'clip', background='false')['cards']) < 400

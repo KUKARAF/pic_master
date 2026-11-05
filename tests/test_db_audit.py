@@ -23,6 +23,14 @@ def _vec(seed, dim=8):
     return np.random.RandomState(seed).rand(dim).astype(np.float32).tobytes()
 
 
+def _legacy_clip_row(db, file_id, blob, model='clip-x'):
+    """Write straight into the unused legacy `embeddings` table (no app code writes it any more);
+    the audit still has to report whatever rows a user's DB carries."""
+    db.conn.execute('INSERT OR REPLACE INTO embeddings (file_id, frame_index, embedding, model, indexed_at) '
+                    'VALUES (?, 0, ?, ?, 0)', (file_id, blob, model))
+    db.conn.commit()
+
+
 @pytest.fixture
 def root(tmp_path):
     media = tmp_path / '.media'
@@ -33,7 +41,7 @@ def root(tmp_path):
         ids.append(db.upsert_file_path(f'/lib/a/b/img{i}.jpg', f'sum{i}', size=10, modified_time=1))
     db.upsert_file_path('/lib/a/c/dup0.jpg', 'sum0', size=10, modified_time=2)  # second path
     for i in ids[:4]:
-        db.insert_embedding(i, _vec(i), 'clip-x')
+        _legacy_clip_row(db, i, _vec(i))
     for i in ids[:2]:
         db.insert_siglip_embedding(i, _vec(i, 16), 'sig-x')
     db.close()
@@ -127,7 +135,7 @@ def test_live_wal_db_readonly(tmp_path):
     media.mkdir()
     db = Database(str(media / 'media.db'))
     i = db.upsert_file_path('/lib/x.jpg', 's', size=1, modified_time=1)
-    db.insert_embedding(i, _vec(1), 'm')
+    _legacy_clip_row(db, i, _vec(1), 'm')
     names = set(os.listdir(media))
     assert 'media.db-wal' in names and 'media.db-shm' in names
     main_sha = hashlib.sha256((media / 'media.db').read_bytes()).hexdigest()

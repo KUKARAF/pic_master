@@ -4,7 +4,7 @@ Every upload lands in uploads/<first 2 hex of its xxh64>/ (256 buckets, so no on
 folder grows huge), tracked with the same full-file checksum a scan computes. Content
 already in the library — or repeated within one request — is rejected, never saved.
 Accepts the multipart field as `file` (curl -F file=@x) or `files` (the web UI).
-Videos only, so the background indexing never loads CLIP.
+Videos only, so the background indexing never loads an embedding model.
 
 Run: python tests/test_files_upload.py   (or python -m pytest tests/test_files_upload.py)
 """

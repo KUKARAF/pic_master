@@ -1,4 +1,4 @@
-"""Tag classifiers / tag suggestions on the SigLIP 2 + DINOv2 embedding spaces (CLIP is legacy).
+"""Tag classifiers / tag suggestions on the SigLIP 2 + DINOv2 embedding spaces (CLIP was removed).
 
 No GPU, no models: embeddings are tiny fake vectors inserted straight into the space tables,
 training runs the (torch, CPU-fine) logistic fit in-process, and worker/subprocess edges are stubbed."""
@@ -11,7 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from media_manager import clip_tag_classifier as ct
+from media_manager import embedding_tag_classifier as ct
 from media_manager import remote_tag_trainer, web, worker_server
 
 DIM = {'siglip': 6, 'dino': 4}
@@ -61,9 +61,11 @@ def env(tmp_path, monkeypatch):
 def test_spaces_and_kinds():
     assert ct.DEFAULT_SPACE == 'siglip'
     assert ct.space_kind('siglip') == 'siglip_model' and ct.space_kind('dino') == 'dino_model'
-    assert ct.space_kind('clip') == 'clip_model'
+    with pytest.raises(ValueError):
+        ct.space_kind('clip')   # the CLIP space is gone
     with pytest.raises(ValueError):
         ct.space_kind('nope')
+    assert ct.CLASSIFIER_KINDS == ('siglip_model', 'dino_model', 'yolo_model')
 
 
 def test_training_with_too_few_embedded_examples_fails_loudly(env):
@@ -110,18 +112,17 @@ def test_dimension_mismatch_and_model_change_need_retrain(env, monkeypatch):
         ct.score_all(str(root), 'cat', [], space='siglip')
 
 
-def test_legacy_unstamped_clip_artifact_is_clip_only(tmp_path):
-    kdir = ct.classifier_dir(str(tmp_path), 'dog', 'clip_model')
-    os.makedirs(kdir)
-    np.savez(os.path.join(kdir, 'weights.npz'), w=np.ones(512, np.float32), b=np.float32(0),
-             embedding_model='ViT-B-32/openai')  # exactly what the pre-migration trainer wrote
-    assert ct.weights_state(str(tmp_path), 'dog', 'clip') == 'ok'
-    assert ct.load_probe(str(tmp_path), 'dog')[0].shape == (512,)
-    # the same legacy file dropped into a siglip dir is rejected, not applied
+def test_legacy_unstamped_clip_artifact_needs_retrain(tmp_path):
+    # exactly what the pre-migration CLIP trainer wrote: no space stamp, 512-d, CLIP model id
     sdir = ct.classifier_dir(str(tmp_path), 'dog', 'siglip_model')
     os.makedirs(sdir)
-    os.replace(os.path.join(kdir, 'weights.npz'), os.path.join(sdir, 'weights.npz'))
+    np.savez(os.path.join(sdir, 'weights.npz'), w=np.ones(512, np.float32), b=np.float32(0),
+             embedding_model='ViT-B-32/openai')
     assert ct.weights_state(str(tmp_path), 'dog', 'siglip') == 'needs_retrain'
+    with pytest.raises(ct.NeedsRetrain):
+        ct.score_matrix(str(tmp_path), 'dog', np.ones((1, 512), np.float32), 'siglip')
+    # a leftover clip_model/ dir is simply never read
+    assert ct.LEGACY_CLIP_DIR_KIND not in ct.CLASSIFIER_KINDS
 
 
 # ---- web layer ----------------------------------------------------------------------------
@@ -149,7 +150,7 @@ def test_train_siglip_launches_with_space(env, monkeypatch):
     monkeypatch.setenv('MEDIA_ALLOW_LOCAL_TRAINING', '1')
     r = c.post('/api/tags/cat/train-siglip')
     assert r.status_code == 200 and r.json()['space'] == 'siglip'
-    assert launched[-1][-2:] == ['--space', 'siglip'] and 'media_manager.clip_tag_classifier' in launched[-1]
+    assert launched[-1][-2:] == ['--space', 'siglip'] and 'media_manager.embedding_tag_classifier' in launched[-1]
     st = c.get('/api/tags/cat/train-status?kind=siglip').json()
     assert st['status'] == 'running'
     # worker configured -> remote driver with the embedding-space kind
@@ -175,8 +176,9 @@ def test_by_model_ranks_in_space_and_default_is_siglip(env):
     assert all('bbox' not in x for x in cards)
     # untrained space -> empty, not an error
     assert c.post('/api/tags/cat/suggestions/next-by-model?model=dino', json={'exclude': []}).json()['cards'] == []
-    # legacy clip with no clip artifact -> empty (no CLIP embeddings are computed behind our back)
-    assert c.post('/api/tags/cat/suggestions/next-by-model?model=clip', json={'exclude': []}).json()['cards'] == []
+    # the removed clip model is reported as "needs retrain" (409), never a crash or a silent empty list
+    r = c.post('/api/tags/cat/suggestions/next-by-model?model=clip', json={'exclude': []})
+    assert r.status_code == 409 and 'retrain' in r.json()['detail'].lower()
     assert c.post('/api/tags/cat/suggestions/next-by-model?model=zzz', json={'exclude': []}).status_code == 400
 
 
@@ -201,7 +203,7 @@ def test_by_model_dimension_mismatch_in_index_is_409(env):
     assert r.status_code == 409
 
 
-def test_centroid_stream_uses_siglip_by_default_without_bbox_or_clip(env):
+def test_centroid_stream_uses_siglip_by_default_without_bbox(env):
     _app, c, db, manual, ids, root = env
     cards = c.post('/api/tags/cat/suggestions/next', json={'exclude': []}).json()['cards']
     got = [x['file_id'] for x in cards]
@@ -209,9 +211,9 @@ def test_centroid_stream_uses_siglip_by_default_without_bbox_or_clip(env):
     assert got and not (set(got) & decided)
     assert got[0] == ids['img10.jpg']          # the cat-like undecided one ranks first
     assert all('bbox' not in x for x in cards)
-    # dino works too; legacy clip has no embeddings -> no centroid -> empty
+    # dino works too; the removed clip model is a 400
     assert c.post('/api/tags/cat/suggestions/next?model=dino', json={'exclude': []}).json()['cards']
-    assert c.post('/api/tags/cat/suggestions/next?model=clip', json={'exclude': []}).json()['cards'] == []
+    assert c.post('/api/tags/cat/suggestions/next?model=clip', json={'exclude': []}).status_code == 400
     # exclude list honoured
     again = c.post('/api/tags/cat/suggestions/next', json={'exclude': [str(ids['img10.jpg'])]}).json()['cards']
     assert ids['img10.jpg'] not in [x['file_id'] for x in again]
@@ -228,16 +230,18 @@ def test_tags_pages_label_siglip_not_clip(env):
 
 def test_legacy_clip_artifact_is_noted_not_crashing(env):
     _app, c, db, manual, ids, root = env
-    kdir = ct.classifier_dir(str(root), 'cat', 'clip_model')
+    kdir = ct.classifier_dir(str(root), 'cat', ct.LEGACY_CLIP_DIR_KIND)
     os.makedirs(kdir)
     np.savez(os.path.join(kdir, 'weights.npz'), w=np.ones(512, np.float32), b=np.float32(0),
              embedding_model='ViT-B-32/openai')
     ct.write_status(kdir, status='done', cv_accuracy=0.9)
     page = c.get('/search?tag=cat').text
-    assert 'Legacy CLIP classifier' in page
-    assert c.get('/api/tags/cat/train-status?kind=clip').json()['status'] == 'done'
-    # legacy path with no CLIP embeddings: harmless empty list
-    assert c.post('/api/tags/cat/suggestions/next-by-model?model=clip', json={'exclude': []}).json()['cards'] == []
+    assert 'old CLIP classifier' in page and 'Retrain it with SigLIP 2' in page
+    # every route that used to take kind/model=clip answers "needs retrain" (409), not a crash
+    r = c.get('/api/tags/cat/train-status?kind=clip')
+    assert r.status_code == 409 and 'retrain' in r.json()['detail'].lower()
+    r = c.post('/api/tags/cat/suggestions/next-by-model?model=clip', json={'exclude': []})
+    assert r.status_code == 409 and 'retrain' in r.json()['detail'].lower()
 
 
 # ---- remote trainer / worker --------------------------------------------------------------
@@ -278,15 +282,15 @@ def test_worker_job_trains_in_the_requested_space_and_embeds_regions_with_it(tmp
     monkeypatch.setattr(worker_server, 'TAG_MODELS_DIR', str(tmp_path))
     monkeypatch.setattr(worker_server.models, 'get_siglip_embedder', lambda: FakeEmb())
     monkeypatch.setattr(worker_server.models, 'get_dino_embedder', lambda: pytest.fail('wrong space'))
-    monkeypatch.setattr(worker_server.models, 'get_clip_indexer', lambda: pytest.fail('CLIP must not run'))
+    assert not hasattr(worker_server.models, 'get_clip_indexer')
     job = worker_server.training_jobs.create('siglip_model', 'cat', 'cat', None)
     for i in range(5):
-        job.clip_whole.append((_vec(6, False, i).tobytes(), 0.0))
-        job.clip_whole.append((_vec(6, True, 50 + i).tobytes(), 1.0))
+        job.whole_examples.append((_vec(6, False, i).tobytes(), 0.0))
+        job.whole_examples.append((_vec(6, True, 50 + i).tobytes(), 1.0))
     buf = io.BytesIO()
     Image.new('RGB', (8, 8)).save(buf, format='JPEG')
-    job.clip_regions.append((buf.getvalue(), 1.0))
-    worker_server._run_clip_job(job)
+    job.region_examples.append((buf.getvalue(), 1.0))
+    worker_server._run_embedding_job(job)
     assert job.status == 'done', job.error
     assert calls == [1]
     data = np.load(io.BytesIO(job.artifact_bytes))
@@ -300,6 +304,9 @@ def test_worker_rejects_unknown_kind_so_stale_worker_cannot_train_wrong_space():
     resp = worker_protocol.unpack(worker_server.handle_train_create(
         '', worker_protocol.pack({'kind': 'bogus_model', 'tag': 't', 'slug': 't'}), 0, 0, None, 0))
     assert resp['job_id'] is None and 'unknown training kind' in resp['error']
+    gone = worker_protocol.unpack(worker_server.handle_train_create(
+        '', worker_protocol.pack({'kind': 'clip_model', 'tag': 't', 'slug': 't'}), 0, 0, None, 0))
+    assert gone['job_id'] is None and 'unknown training kind' in gone['error']   # CLIP training removed
     ok = worker_protocol.unpack(worker_server.handle_train_create(
         '', worker_protocol.pack({'kind': 'dino_model', 'tag': 't', 'slug': 't'}), 0, 0, None, 0))
     assert ok['job_id'] and ok['error'] is None

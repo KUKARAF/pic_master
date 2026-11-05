@@ -2,7 +2,7 @@
 
 Pillow refuses a whole PNG for problems viewers ignore: a compressed text chunk over
 its MAX_TEXT_CHUNK (big AI-workflow / XMP metadata) or a bad CRC on a metadata chunk.
-formats.open_rgb retries without those chunks, so thumbnails, verify_image and CLIP
+formats.open_rgb retries without those chunks, so thumbnails, verify_image and the embedders
 treat them as healthy; genuinely broken pixel data is still damaged. The /trash
 "Re-check damaged files" job clears earlier false flags.
 

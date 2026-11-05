@@ -80,8 +80,6 @@ def test_matrix_cache_invalidation(db, space, table):
     assert mat() is mat()  # cached
     ins(b, _vec(2), 'm1')
     assert mat()[2].shape == (2, 8)
-    # does not disturb the CLIP cache version
-    assert db._emb_ver == 0
 
 
 @pytest.mark.parametrize('space,table', SPACES)
