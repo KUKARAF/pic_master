@@ -4014,7 +4014,7 @@ class ManualDB(ThreadLocalDB):
         return cur.fetchall()
 
     # ---- Body identities (ground-truth "who is this body", mirrors the faces
-    # ---- methods above but for CLIP body crops; see the body_identities table).
+    # ---- methods above but for body crops (DINOv2/SigLIP, see body_index.model_tag); see the body_identities table).
 
     def add_body_label(self, checksum, identity, bbox, embedding_bytes, model,
                        image_width=None, image_height=None, source_body_id=None,
@@ -4072,13 +4072,35 @@ class ManualDB(ThreadLocalDB):
                        WHERE checksum = ? AND identity IS NOT NULL AND rejected = 0''', (checksum,))
         return [(r[0], [r[1], r[2], r[3], r[4]]) for r in cur.fetchall()]
 
-    def get_all_body_label_embeddings(self):
+    def get_all_body_label_embeddings(self, model=None):
         """[(identity, embedding_bytes), ...] over every confirmed body label — the
-        anchor pool for suggesting an identity from a drawn body crop (body match)."""
+        anchor pool for suggesting an identity from a drawn body crop (body match).
+        With `model` only labels embedded in that space (stale ones are skipped)."""
         cur = self.conn.cursor()
         cur.execute('''SELECT identity, embedding FROM body_identities
-                       WHERE identity IS NOT NULL AND rejected = 0''')
+                       WHERE identity IS NOT NULL AND rejected = 0
+                         AND (? IS NULL OR model = ?)''', (model, model))
         return cur.fetchall()
+
+    def get_stale_body_labels(self, model, identity=None):
+        """[(id, checksum, [x1,y1,x2,y2]), ...] confirmed labels whose vector is NOT in
+        space `model` (e.g. old CLIP anchors) -- to be re-cropped and re-embedded."""
+        cur = self.conn.cursor()
+        sql = '''SELECT id, checksum, x1, y1, x2, y2 FROM body_identities
+                  WHERE identity IS NOT NULL AND rejected = 0 AND model != ?'''
+        args = [model]
+        if identity is not None:
+            sql += ' AND identity = ?'
+            args.append(identity)
+        cur.execute(sql, args)
+        return [(r[0], r[1], [r[2], r[3], r[4], r[5]]) for r in cur.fetchall()]
+
+    def update_body_label_embedding(self, label_id, embedding_bytes, model):
+        """Replace a label's vector + space tag in place (stale-anchor refresh)."""
+        cur = self.conn.cursor()
+        cur.execute('UPDATE body_identities SET embedding = ?, model = ? WHERE id = ?',
+                    (embedding_bytes, model, int(label_id)))
+        self.conn.commit()
 
     def reject_body_candidate(self, source_body_id, checksum, identity, bbox,
                               embedding_bytes, model):
@@ -4124,11 +4146,13 @@ class ManualDB(ThreadLocalDB):
         return [{'id': r[0], 'identity': r[1], 'bbox': [r[2], r[3], r[4], r[5]]}
                 for r in cur.fetchall()]
 
-    def get_body_embeddings_for_identity(self, name):
+    def get_body_embeddings_for_identity(self, name, model=None):
         """[embedding_bytes, ...] for every body crop confirmed as this person —
-        the anchors the body-suggestion stream ranks the unlabeled pool against."""
+        the anchors the body-suggestion stream ranks the unlabeled pool against.
+        With `model`, only anchors in that embedding space."""
         cur = self.conn.cursor()
-        cur.execute("SELECT embedding FROM body_identities WHERE identity = ? AND rejected = 0", (name,))
+        cur.execute("SELECT embedding FROM body_identities WHERE identity = ? AND rejected = 0 "
+                    "AND (? IS NULL OR model = ?)", (name, model, model))
         return [row[0] for row in cur.fetchall()]
 
     def get_decided_body_source_ids(self, name):

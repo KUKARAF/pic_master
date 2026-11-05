@@ -29,6 +29,9 @@ sys.modules.setdefault('cv2', MagicMock())
 
 from media_manager.web import create_app  # hook-allow: staged — must import after the cv2 stub above
 
+from media_manager import body_index  # hook-allow: staged
+
+TAG = body_index.model_tag()
 D = 512
 # For x = unit(d + s*n), two independent noisy versions of the same direction d have
 # E[cos(x1, x2)] ~ 1/(1 + s^2 D). s=0.01 -> ~0.95, comfortably above the 0.5 body
@@ -57,7 +60,7 @@ def _seed(app, tmp):
         fid = db.upsert_file_path(name + '.jpg', cs, size=100)
         vec = _unit(theme + SIGMA * rng.standard_normal(D)) if theme is not None \
             else _unit(rng.standard_normal(D))
-        body_id = db.add_manual_body(fid, [0, 0, 20, 40], vec.tobytes(), 'clip-test')
+        body_id = db.add_manual_body(fid, [0, 0, 20, 40], vec.tobytes(), TAG)
         ids[name] = {'fid': fid, 'cs': cs, 'body_id': body_id, 'vec': vec}
     db.conn.commit()
 
@@ -65,7 +68,7 @@ def _seed(app, tmp):
     # it's excluded from Alex's own suggestion stream.
     a = ids['anchor']
     manual.add_body_label(a['cs'], 'Alex', [0, 0, 20, 40], a['vec'].tobytes(),
-                          'clip-test', source_body_id=a['body_id'])
+                          TAG, source_body_id=a['body_id'])
     return ids
 
 
@@ -167,7 +170,7 @@ def main_autolink():
         # Photo 1: a detected body box that fully contains a face box -> naming the
         # face must auto-link that body.
         fid1, cs1 = photo('p1')
-        body1 = db.add_manual_body(fid1, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        body1 = db.add_manual_body(fid1, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), TAG)
         db.conn.commit()
         face1 = manual.add_manual_face(cs1, [10, 10, 30, 30], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
         r = client.post('/api/faces/manual:%d/identity' % face1, json={'name': 'Bob'})
@@ -180,10 +183,10 @@ def main_autolink():
         # Photo 2: a body a human already decided (manual label for someone else) must
         # NOT be clobbered when a face there is named.
         fid2, cs2 = photo('p2')
-        body2 = db.add_manual_body(fid2, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        body2 = db.add_manual_body(fid2, [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(), TAG)
         db.conn.commit()
         manual.add_body_label(cs2, 'Carol', [0, 0, 100, 200], _unit(rng.standard_normal(D)).tobytes(),
-                              'clip-test', source_body_id=body2, source='manual')
+                              TAG, source_body_id=body2, source='manual')
         face2 = manual.add_manual_face(cs2, [10, 10, 30, 30], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
         r = client.post('/api/faces/manual:%d/identity' % face2, json={'name': 'Bob'})
         assert r.status_code == 200, r.text
@@ -193,7 +196,7 @@ def main_autolink():
 
         # Photo 3: a body box that does NOT contain the face -> no link.
         fid3, cs3 = photo('p3')
-        body3 = db.add_manual_body(fid3, [0, 0, 5, 5], _unit(rng.standard_normal(D)).tobytes(), 'clip-test')
+        body3 = db.add_manual_body(fid3, [0, 0, 5, 5], _unit(rng.standard_normal(D)).tobytes(), TAG)
         db.conn.commit()
         face3 = manual.add_manual_face(cs3, [50, 50, 80, 80], _unit(rng.standard_normal(D)).tobytes(), 100, 200)
         r = client.post('/api/faces/manual:%d/identity' % face3, json={'name': 'Bob'})

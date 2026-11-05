@@ -30,7 +30,7 @@ from . import compute, scan_status
 # them — bodies reuse tags' person boxes), videos last with the face scan after the
 # stills. Every scan_status stage appears exactly once.
 STAGE_ORDER = ('exif', 'embed', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
-               'phash', 'tiles', 'stills', 'video_faces')
+               'phash', 'stills', 'video_faces')
 
 # key -> (label, required, kind), from scan_status.STAGES.
 STAGE_INFO = {key: (label, req, kind)
@@ -56,7 +56,7 @@ class Runner:
 class CountingLog:
     """Wraps an ErrorLog-like object (or a log(path, msg) function) and counts the
     calls — how the folder job counts failures of builders that only report them
-    through the error log (body/tile/object index)."""
+    through the error log (body/object index)."""
 
     def __init__(self, inner):
         self._log = inner.log if hasattr(inner, 'log') else inner
@@ -72,9 +72,8 @@ def plan(files, statuses, stages=None):
 
     `files` is [(file_id, rel_path)] (the folder's tracked files), `statuses` is
     scan_status.status_for_files over them. Broken files are never planned. `stages`
-    None = every REQUIRED stage with at least one missing file (the optional tiles
-    stage only when asked for by name); an explicit list runs exactly those stages
-    (still only over files missing them; one with nothing missing is planned empty
+    None = every REQUIRED stage with at least one missing file;
+    an explicit list runs exactly those stages (still only over files missing them; one with nothing missing is planned empty
     and finishes at once). Raises ValueError on an unknown key."""
     if stages is not None:
         unknown = [s for s in stages if s not in STAGE_INFO]

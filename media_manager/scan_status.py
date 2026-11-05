@@ -13,7 +13,8 @@ missing stage X is exactly a file the /bulk page counts as pending for X:
               '__indexed__' sentinel counts
   faces       files.noface = 1, or a faces row with         (get_unface_indexed_files)
               frame_index IS NULL (sentinel bbox '[]' counts)
-  bodies      body_embeddings row, frame_index IS NULL       (get_unbody_indexed_files)
+  bodies      body_embeddings row in the current space (body_index.model_tag()) or a
+              no-person sentinel, frame_index IS NULL        (get_unbody_indexed_files)
               (sentinel bbox '[]' counts)
   objects     any object_region_embeddings row (sentinel)    (get_unobject_indexed_files)
   region      files.hidden = 1, or region_windows row with   (get_unregion_indexed_files)
@@ -21,7 +22,6 @@ missing stage X is exactly a file the /bulk page counts as pending for X:
   pattern     files.hidden = 1, or pattern_windows row with  (get_unpattern_indexed_files)
               algo = pattern_deep.ALGO_TAG
   phash       any phashes row                                (get_unphashed_files)
-  tiles       any tile_embeddings row (optional stage)       (get_untiled_files)
   stills      files.hidden = 1, or >= 3 frame_captures rows  (web _videos_needing_frames)
               whose parent_checksum is the video's checksum
   video_faces files.hidden = 1, or video_frame_scans has     (web _videos_needing_face_scan)
@@ -38,7 +38,7 @@ import os
 import threading
 import time
 
-from . import pattern_deep, region_index
+from . import body_index, pattern_deep, region_index
 from .database import ThreadLocalDB
 from .formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 
@@ -46,14 +46,13 @@ STAGES = {
     'image': [  # (key, label, required)
         ('exif', 'EXIF', True),
         ('embed', 'Similarity embedding (SigLIP 2 + DINOv2)', True),
-        ('tags', 'Auto-tags', True),
+        ('tags', 'Object detection (YOLO-World)', True),
         ('faces', 'Faces', True),
         ('bodies', 'Bodies', True),
         ('objects', 'Objects', True),
         ('region', 'Region index', True),
         ('pattern', 'Pattern index', True),
         ('phash', 'pHash', True),
-        ('tiles', 'Tiles (location / region matching)', False),
     ],
     'video': [
         # One SigLIP 2 + one DINOv2 vector per video (mean of a few sampled frames), in the
@@ -81,12 +80,11 @@ _TABLE_STAGES = {
     'embed_dino': ('embeddings_dino', 'frame_index = 0'),
     'tags': ('detections', 'frame_index IS NULL'),
     'faces': ('faces', 'frame_index IS NULL'),
-    'bodies': ('body_embeddings', 'frame_index IS NULL'),
+    'bodies': ('body_embeddings', "frame_index IS NULL AND (model = ? OR bbox = '[]')"),
     'objects': ('object_region_embeddings', None),
     'region': ('region_windows', 'algo = ?'),
     'pattern': ('pattern_windows', 'algo = ?'),
     'phash': ('phashes', None),
-    'tiles': ('tile_embeddings', None),
 }
 
 _FILE_COLS = 'id, checksum, broken, noface, hidden, metadata_checked_at'
@@ -107,6 +105,8 @@ def _algo_params(key):
         return (region_index.ALGO_TAG,)
     if key == 'pattern':
         return (pattern_deep.ALGO_TAG,)
+    if key == 'bodies':
+        return (body_index.model_tag(),)   # rows in another space (old CLIP) count as missing
     return ()
 
 
@@ -203,7 +203,6 @@ def _status(fid, kind, row, data):
         stages['region'] = bool(hidden) or fid in sets['region']
         stages['pattern'] = bool(hidden) or fid in sets['pattern']
         stages['phash'] = fid in sets['phash']
-        stages['tiles'] = fid in sets['tiles']
     elif kind == 'video':
         stages['embed'] = fid in sets['embed_siglip'] and fid in sets['embed_dino']
         stages['stills'] = bool(hidden) or data['captures'].get(checksum, 0) >= MIN_STILLS

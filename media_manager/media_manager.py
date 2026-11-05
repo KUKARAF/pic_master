@@ -529,20 +529,23 @@ class MediaManager:
         # hook-allow: lazy — model modules (PIL/torch/open_clip)
         from . import body_index
         from .detector import YOLOWorldDetector  # hook-allow: lazy
-        from .indexer import CLIPIndexer, SUPPORTED_EXTENSIONS  # hook-allow: lazy
+        from .indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy
 
         client = self._worker()
         if client.is_configured():
             from . import worker_client  # hook-allow: lazy — pulls cv2/requests
-            print("[media] offloading body indexing (person detection + CLIP) to remote worker")
+            print("[media] offloading body indexing (person detection + embedding) to remote worker")
             detector = worker_client.RemoteYOLODetector(
                 client, conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
-            clip_indexer = worker_client.RemoteCLIPIndexer(client)
+            embedder = (worker_client.RemoteDINOEmbedder(client) if body_index.model_key() == 'dino'
+                        else worker_client.RemoteSigLIPEmbedder(client))
         else:
+            from . import embedders  # hook-allow: lazy — pulls in torch
             detector = YOLOWorldDetector(conf_threshold=body_index.MIN_PERSON_CONFIDENCE, vocab=['person'])
-            clip_indexer = CLIPIndexer()
+            embedder = (embedders.DINOv2Embedder() if body_index.model_key() == 'dino'
+                        else embedders.SigLIP2Embedder())
 
-        unindexed = self.db.get_unbody_indexed_files()
+        unindexed = self.db.get_unbody_indexed_files(body_index.model_tag())
         abs_path = os.path.abspath(os.path.join(self.data_root, path))
         candidates = []
         for file_id, rel_path in unindexed:
@@ -560,7 +563,7 @@ class MediaManager:
 
         for i, (file_id, abs_file) in enumerate(candidates, start=1):
             try:
-                body_index.embed_bodies_for_file(self.db, clip_indexer, file_id, abs_file, detector=detector)
+                body_index.embed_bodies_for_file(self.db, embedder, file_id, abs_file, detector=detector)
                 indexed_count += 1
             except Exception as exc:  # hook-allow: broad — per-file resilience, logged
                 failed_count += 1

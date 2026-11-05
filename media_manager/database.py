@@ -407,7 +407,7 @@ class Database(ThreadLocalDB):
                 handled       INTEGER NOT NULL DEFAULT 0
             )
         ''')
-        # Body embeddings table: CLIP vectors of person crops, for find-by-body
+        # Body embeddings table: DINOv2/SigLIP 2 vectors of person crops (model = space tag; old CLIP rows are stale), for find-by-body
         # (re-identifying a person by outfit/build when the face is hidden). Derived,
         # rebuildable data keyed by file_id like detections/embeddings — not part of
         # the checksum-keyed manual ground truth. bbox is a JSON [x1,y1,x2,y2] like
@@ -2982,29 +2982,42 @@ class Database(ThreadLocalDB):
         return cursor.fetchall()
 
     # ------------------------------------------------------------------
-    # Body embedding methods (find-by-body: CLIP-embedded person crops)
+    # Body embedding methods (find-by-body: embedded person crops; `model` = body_index.model_tag())
     # ------------------------------------------------------------------
 
     def insert_body_embeddings(self, file_id: int, bodies: list, model: str) -> None:
-        """Upsert primary-frame body rows for a file.
+        """Upsert primary-frame body rows for a file under space tag `model`
+        (body_index.model_tag()).
         bodies: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray}
         Always writes at least one sentinel row (bbox='[]', empty blob) so the file
         is never re-queued. DELETE scoped to frame_index IS NULL, mirroring
-        insert_faces."""
+        insert_faces. A row whose bbox is unchanged is UPDATED in place (keeps its id,
+        which manual.db body decisions reference via source_body_id) -- this is how a
+        stale old-space row is re-embedded."""
         cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
+        existing = {}
+        for rid, bbox in cursor.execute(
+                'SELECT id, bbox FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL',
+                (file_id,)).fetchall():
+            existing.setdefault(bbox, rid)
         now = int(time.time())
-        if not bodies:
-            cursor.execute(
-                'INSERT INTO body_embeddings (file_id, bbox, embedding, model, indexed_at) VALUES (?,?,?,?,?)',
-                (file_id, '[]', b'', model, now)
-            )
-        else:
-            for body in bodies:
+        keep = set()
+        rows = ([('[]', b'')] if not bodies else
+                [(json.dumps(b['bbox']), b['embedding'].tobytes()) for b in bodies])
+        for bbox_json, blob in rows:
+            rid = existing.get(bbox_json)
+            if rid is not None and rid not in keep:
+                cursor.execute('UPDATE body_embeddings SET embedding = ?, model = ?, indexed_at = ? WHERE id = ?',
+                               (blob, model, now, rid))
+                keep.add(rid)
+            else:
                 cursor.execute(
                     'INSERT INTO body_embeddings (file_id, bbox, embedding, model, indexed_at) VALUES (?,?,?,?,?)',
-                    (file_id, json.dumps(body['bbox']), body['embedding'].tobytes(), model, now)
-                )
+                    (file_id, bbox_json, blob, model, now))
+                keep.add(cursor.lastrowid)
+        # drop rows whose box vanished (and unreused duplicates)
+        cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL AND id NOT IN (%s)'
+                       % ','.join('?' * len(keep)), (file_id, *keep))
         self.conn.commit()
         self._body_ver += 1  # invalidate cached body-embeddings matrix
 
@@ -3026,14 +3039,29 @@ class Database(ThreadLocalDB):
         self._body_ver += 1  # invalidate cached body-embeddings matrix
         return cursor.lastrowid
 
-    def get_body_embeddings_for_file(self, file_id: int) -> list:
-        """Return non-sentinel (id, bbox, embedding) rows for a file."""
+    def get_body_embeddings_for_file(self, file_id: int, model: str = None) -> list:
+        """Return non-sentinel (id, bbox, embedding) rows for a file. With `model`,
+        only rows in that space (stale old-model rows are invisible)."""
+        cursor = self.conn.cursor()
+        sql = "SELECT id, bbox, embedding FROM body_embeddings WHERE file_id = ? AND bbox != '[]'"
+        args = [file_id]
+        if model is not None:
+            sql += ' AND model = ?'
+            args.append(model)
+        cursor.execute(sql, args)
+        return cursor.fetchall()
+
+    def body_file_state(self, file_id: int, model: str) -> str:
+        """'fresh' (primary rows in space `model`, or a no-person sentinel),
+        'stale' (only other-space rows) or 'none' (never body-indexed)."""
         cursor = self.conn.cursor()
         cursor.execute(
-            "SELECT id, bbox, embedding FROM body_embeddings WHERE file_id = ? AND bbox != '[]'",
-            (file_id,)
-        )
-        return cursor.fetchall()
+            "SELECT SUM(model = ? OR bbox = '[]'), COUNT(*) FROM body_embeddings "
+            "WHERE file_id = ? AND frame_index IS NULL", (model, file_id))
+        fresh, total = cursor.fetchone()
+        if not total:
+            return 'none'
+        return 'fresh' if fresh else 'stale'
 
     def get_body_embedding(self, body_id: int):
         """Return (file_id, bbox, embedding_bytes) for one body row, or None."""
@@ -3052,25 +3080,27 @@ class Database(ThreadLocalDB):
         ''')
         return cursor.fetchall()
 
-    def get_body_embeddings_matrix(self):
+    def get_body_embeddings_matrix(self, model: str = None):
         """Cached, write-invalidated matrix form of get_all_body_embeddings.
         Returns (body_ids: np.ndarray[int64], file_ids: np.ndarray[int64],
         bboxes: list, matrix: float32[N, D]) over the same non-sentinel body
         rows (bbox != '[]' and embedding != b''). Built once and reused across
         requests until a body write bumps self._body_ver. `path` is dropped
-        (resolved later for the top-K only)."""
+        (resolved later for the top-K only). `model` (body_index.model_tag())
+        restricts to one embedding space so stale old-model rows are never mixed in;
+        None = every row (only safe when all rows share a space)."""
         import numpy as np  # hook-allow: lazy — heavy
         with self._matrix_lock:
-            if self._body_cache is not None and self._body_cache[0] == self._body_ver:
+            if (self._body_cache is not None and self._body_cache[0] == (self._body_ver, model)):
                 return self._body_cache[1]
-            ver = self._body_ver
+            ver = (self._body_ver, model)
             cursor = self.conn.cursor()
             cursor.execute('''
                 SELECT b.id, b.file_id, b.bbox, b.embedding
                 FROM body_embeddings b
                 JOIN files_with_path f ON f.id = b.file_id
-                WHERE b.bbox != '[]' AND b.embedding != x''
-            ''')
+                WHERE b.bbox != '[]' AND b.embedding != x'' AND (? IS NULL OR b.model = ?)
+            ''', (model, model))
             rows = cursor.fetchall()
             if not rows:
                 result = (np.array([], dtype=np.int64), np.array([], dtype=np.int64),
@@ -3085,20 +3115,25 @@ class Database(ThreadLocalDB):
             self._body_cache = (ver, result)
             return result
 
-    def get_unbody_indexed_files(self, limit=None) -> list:
+    def get_unbody_indexed_files(self, model: str = None, limit=None) -> list:
         """Return (id, path) for files that have no primary (frame_index IS NULL)
-        row in body_embeddings — independent of whether frame-specific rows exist."""
+        row in body_embeddings — independent of whether frame-specific rows exist.
+        With `model` (body_index.model_tag()) a row only counts if it is in that
+        space or is a no-person sentinel, so files indexed under an old model (CLIP)
+        are reported missing and get re-embedded."""
         cursor = self.conn.cursor()
         sql = '''
             SELECT f.id, f.path
             FROM files_with_path f
             LEFT JOIN body_embeddings b ON b.file_id = f.id AND b.frame_index IS NULL
+                 AND (? IS NULL OR b.model = ? OR b.bbox = '[]')
             WHERE b.file_id IS NULL
         '''
+        args = [model, model]
         if limit is not None:
-            cursor.execute(sql + ' LIMIT ?', (limit,))
+            cursor.execute(sql + ' LIMIT ?', (*args, limit))
         else:
-            cursor.execute(sql)
+            cursor.execute(sql, args)
         return cursor.fetchall()
 
     def count_body_sentinels(self) -> int:

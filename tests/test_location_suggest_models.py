@@ -151,16 +151,9 @@ def test_negatives_change_clip_too(env):
     assert 'x' not in neg and 'y' in neg
 
 
-@pytest.mark.parametrize('model', ['siglip', 'dino'])
-def test_background_ignored_for_non_clip(env, model):
-    _app, db, _m, ids, loc, client = env
-    # give the members CLIP tiles so the background ranking is available for clip
-    tile = [{'bbox': [0, 0, 100, 100], 'embedding': _vec(8, e0=1)}]
-    for n in ('m1', 'm2', 'x', 'y'):
-        db.insert_tile_embeddings(ids[n][0], tile, 'm')
-    db.conn.commit()
-    clip = _get(client, loc, 'clip', background='true')
-    assert clip['mode'] == 'background' and clip['background_applied'] is True
+@pytest.mark.parametrize('model', ['clip', 'siglip', 'dino'])
+def test_background_param_ignored(env, model):
+    _app, _db, _m, ids, loc, client = env
     on = _get(client, loc, model, background='true')
     off = _get(client, loc, model, background='false')
     assert on['mode'] == 'whole' and on['background_applied'] is False

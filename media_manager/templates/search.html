@@ -284,10 +284,10 @@ document.querySelectorAll('.tag-cancel-btn').forEach(function(btn) {
           originalUrl: '/photo/' + card.file_id,
         };
       },
-      // When the suggestion carries a bbox (YOLO detection, or a legacy-CLIP highlight tile —
+      // When the suggestion carries a bbox (YOLO detection —
       // both normalized 0..1), persist the TAG WITH THAT BOX so the swipe builds real
       // spatial training data: confirm = positive region, reject = region hard-negative.
-      // No box (centroid stream, SigLIP/DINOv2 — no tile index in those spaces) → whole-image tag.
+      // No box (centroid stream, SigLIP/DINOv2) → whole-image tag.
       onConfirm: function(card) {
         if (card.bbox && card.bbox.length === 4) {
           return { url: '/api/files/' + card.file_id + '/tags/region', method: 'POST',

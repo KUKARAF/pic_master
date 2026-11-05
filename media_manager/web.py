@@ -42,9 +42,9 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
+    body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
     location_mask, location_place, near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
-    scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
+    scan_status, set_image, set_render, set_video, video_decode, worker_client,
     worker_config,
 )
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
@@ -52,7 +52,7 @@ from media_manager.body_index import crop_bodies, match_face_to_body
 from media_manager.broken_finder import is_decode_error
 from media_manager.clip_tag_classifier import (
     DEFAULT_SPACE as TAG_DEFAULT_SPACE, MIN_EXAMPLES_PER_CLASS, NeedsRetrain, SPACES as TAG_SPACES,
-    classifier_dir, current_embedding_model, load_probe, score_all, score_matrix, slugify, space_kind,
+    classifier_dir, current_embedding_model, score_all, score_matrix, slugify, space_kind,
     weights_state, write_status,
 )
 from media_manager.database import FACE_NORM_VERSION, Database
@@ -77,7 +77,6 @@ from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
 from media_manager.similarity import adjusted_centroid, fuse_zscores, mean_normalized_centroid, rank_by_similarity, top_k_indices
 from media_manager.swipe_support import bias_reorder
-from media_manager.tile_index import generate_tiles
 from media_manager.worker_client import WorkerError
 from media_manager.yolo_tag_classifier import MIN_BOXES
 from media_manager.category_resolver import (
@@ -596,7 +595,7 @@ _clip_indexer_remote = None
 
 # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 # No similarity / search / background-ML job computes CLIP any more; what still calls this is
-# the body index, the tile index, the region-search fallback and the legacy tag classifier.
+# the tile index, the region-search fallback and the legacy tag classifier.
 def _get_clip_indexer():
     global _clip_indexer_local, _clip_indexer_remote
     if _worker_client is not None and _worker_client.is_configured():
@@ -642,6 +641,12 @@ def _get_dino_embedder():
         from media_manager.embedders import DINOv2Embedder  # hook-allow: lazy -- pulls in torch
         _dino_embedder_local = DINOv2Embedder()
     return _dino_embedder_local
+
+
+def _get_body_embedder():
+    """Embedder for body (person-crop) vectors: DINOv2-L by default, SigLIP 2 with
+    MEDIA_BODY_MODEL=siglip (see body_index). Never CLIP."""
+    return _get_dino_embedder() if body_index.model_key() == 'dino' else _get_siglip_embedder()
 
 
 def _local_embed_shared(embedders, paths, stats=None):
@@ -4288,8 +4293,8 @@ def create_app(data_root: str) -> FastAPI:
         """'Search by region'. With the region matching index built (bulk -> Index region
         matching) this is instance-level: DINOv2 windows prefilter the library, then RootSIFT +
         MAGSAC homography verifies the top candidates against the drawn box (mode 'instance').
-        Without it, falls back to the semantic CLIP path: CLIP-embed the crop and rank the tile
-        index (mode 'tiles') or whole-image embeddings (mode 'whole'). Opens matches in the
+        Without it, falls back to the semantic CLIP path: CLIP-embed the crop and rank
+        whole-image embeddings (mode 'whole'). Opens matches in the
         watch-queue."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
@@ -4324,28 +4329,7 @@ def create_app(data_root: str) -> FastAPI:
             raise HTTPException(status_code=500, detail='Could not embed the region.')
         query = np.asarray(embs[0], dtype=np.float32)
 
-        # Prefer the tile index when it's been built: rank each photo by its
-        # BEST-matching tile, which localizes small/off-center regions (a wall in
-        # a corner) that a whole-image embedding would miss. Scanned in RAM-bounded
-        # chunks (see db.iter_tile_embeddings) rather than one giant resident matrix.
-        if db.count_tiled_files() > 0:
-            best = {}  # file_id -> best tile cosine
-            for file_ids, matrix in db.iter_tile_embeddings():
-                if matrix.shape[0] == 0:
-                    continue
-                scores = matrix.dot(query)
-                for idx in range(scores.shape[0]):
-                    fid = int(file_ids[idx])
-                    if fid == file_id:
-                        continue
-                    s = float(scores[idx])
-                    if s > best.get(fid, -1.0):
-                        best[fid] = s
-            ranked = sorted(best.items(), key=lambda kv: -kv[1])[:limit]
-            return {'mode': 'tiles',
-                    'results': [{'file_id': fid, 'score': round(s, 4)} for fid, s in ranked]}
-
-        # Whole-image fallback (no tile index yet): rank the cached whole-image matrix.
+        # Whole-image fallback (no region matching index): rank the cached whole-image matrix.
         file_ids, _checksums, matrix = db.get_embeddings_matrix()
         if matrix.shape[0] == 0:
             return {'mode': 'whole', 'results': []}
@@ -4727,10 +4711,6 @@ def create_app(data_root: str) -> FastAPI:
     # to known people (no model — pure embedding math, so it also carries a
     # 'matched' count). (The embedding job is pair_job, the SigLIP 2 + DINOv2 one below.)
     match_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'rotated': 0, 'error': None}
-    # Tile (region) index: per-image CLIP crops of an overlapping grid, so region
-    # search can localize small/off-center things (see tile_index.py + the region
-    # search endpoint). Same job shape; surfaced in the ⚡ menu as "Index regions".
-    tile_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # DINOv2 region index for object-exemplar search (the library-wide candidate pool).
     object_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'device': None}
     # Face->body backfill: link every already-named face to its containing body crop.
@@ -4794,16 +4774,11 @@ def create_app(data_root: str) -> FastAPI:
         pinned to 'person'; results are NOT written to the detections table — that
         would destructively replace the photo's real tag detections)."""
 
-        own = db.get_body_embeddings_for_file(file_id)
-        if own:
-            return own
-        cursor = db.conn.cursor()
-        cursor.execute(
-            'SELECT COUNT(*) FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL',
-            (file_id,)
-        )
-        if cursor.fetchone()[0] > 0:
-            return []  # already processed: sentinel row says "no people here"
+        tag = body_index.model_tag()
+        state = db.body_file_state(file_id, tag)
+        if state == 'fresh':
+            return db.get_body_embeddings_for_file(file_id, tag)  # [] = sentinel "no people here"
+        # 'none' or 'stale' (only old-space rows, e.g. CLIP): (re)embed below
 
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
@@ -4811,20 +4786,22 @@ def create_app(data_root: str) -> FastAPI:
 
         try:
             body_index.embed_bodies_for_file(
-                db, _get_clip_indexer(), file_id, abs_path, detector=_get_object_detector())
+                db, _get_body_embedder(), file_id, abs_path, detector=_get_object_detector())
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=f'Person detection failed: {exc}')
-        return db.get_body_embeddings_for_file(file_id)
+        return db.get_body_embeddings_for_file(file_id, tag)
 
-    def _body_search(query_row, exclude_file_id: int, limit: int = 40, threshold: float = 0.5):
+    def _body_search(query_row, exclude_file_id: int, limit: int = 40, threshold: float = None):
         """Cosine-rank all body crops against one query crop's embedding. Dedupes to
         the best crop per file (like search_by_face_image) and enriches each result
         with tags/sets/recognized people, same as every other card grid."""
 
+        if threshold is None:
+            threshold = body_index.threshold()
         query_emb = np.frombuffer(query_row[2], dtype=np.float32)
-        # Cached, write-invalidated [N, D] body matrix — no per-request full
-        # re-load + np.stack of every body embedding.
-        body_ids_arr, file_ids_arr, _bboxes, matrix = db.get_body_embeddings_matrix()
+        # Cached, write-invalidated [N, D] body matrix of the CURRENT space only (stale
+        # old-model rows are excluded) — no per-request full re-load + np.stack.
+        body_ids_arr, file_ids_arr, _bboxes, matrix = db.get_body_embeddings_matrix(body_index.model_tag())
         if matrix.shape[0] == 0:
             return []
         scores = matrix.dot(query_emb)
@@ -4940,7 +4917,7 @@ def create_app(data_root: str) -> FastAPI:
                         for _cls, conf, x1, y1, x2, y2 in dets
                         if conf >= body_index.MIN_PERSON_CONFIDENCE]
         count = body_index.embed_bodies_for_file(
-            db, _get_clip_indexer(), file_id, abs_path, person_boxes=person_boxes)
+            db, _get_body_embedder(), file_id, abs_path, person_boxes=person_boxes)
         return {'bodies': count}
 
     @app.post('/api/files/{file_id}/bodies')
@@ -4963,17 +4940,17 @@ def create_app(data_root: str) -> FastAPI:
         pairs = body_index.crop_bodies(abs_path, [[int(x1), int(y1), int(x2), int(y2)]])
         if not pairs:
             raise HTTPException(status_code=400, detail='Region too small or out of bounds')
-        indexer = _get_clip_indexer()
-        embs = indexer.embed_pil_images([crop for _, crop in pairs])
+        tag = body_index.model_tag()
+        embs = body_index.embed_crops(_get_body_embedder(), [crop for _, crop in pairs])
         used_bbox = pairs[0][0]
         emb_bytes = embs[0].astype('float32').tobytes()
-        body_id = db.add_manual_body(file_id, used_bbox, emb_bytes, indexer.model_name)
+        body_id = db.add_manual_body(file_id, used_bbox, emb_bytes, tag)
         identity = (body.name or '').strip()
         if identity:
             # Ground-truth label (survives a media.db rescan); source_body_id ties it
             # to the media.db row so the person's suggestion stream won't re-offer it.
             manual.add_body_label(row['checksum'], identity, used_bbox, emb_bytes,
-                                  indexer.model_name, image_width=body.image_width,
+                                  tag, image_width=body.image_width,
                                   image_height=body.image_height, source_body_id=body_id)
         return {'id': body_id, 'bbox': used_bbox, 'identity': identity or None}
 
@@ -4997,8 +4974,7 @@ def create_app(data_root: str) -> FastAPI:
         pairs = body_index.crop_bodies(abs_path, [[int(x1), int(y1), int(x2), int(y2)]])
         if not pairs:
             raise HTTPException(status_code=400, detail='Region too small or out of bounds')
-        indexer = _get_clip_indexer()
-        embs = indexer.embed_pil_images([crop for _, crop in pairs])
+        embs = body_index.embed_crops(_get_body_embedder(), [crop for _, crop in pairs])
         # _body_search reads query_row[2] as the embedding bytes; id/file_id unused here.
         query_row = (None, file_id, embs[0].astype('float32').tobytes())
         return {'results': _body_search(query_row, exclude_file_id=file_id, limit=limit)}
@@ -5025,9 +5001,8 @@ def create_app(data_root: str) -> FastAPI:
     # signal than faces (same person, different outfit often won't match) — it is for
     # finding someone whose face isn't visible and for within-shoot propagation, not a
     # reliable cross-outfit identity. The UI says so; see find_person_body.html.
-    BODY_SUGGEST_THRESHOLD = 0.5
 
-    def _next_body_suggestions(name, count, exclude_refs, threshold=BODY_SUGGEST_THRESHOLD,
+    def _next_body_suggestions(name, count, exclude_refs, threshold=None,
                                avoid_existing=True):
         """Up to `count` 'is this <name>'s body?' cards, best cosine first. Ranks every
         indexed body crop (db body matrix) against this person's confirmed body anchors
@@ -5035,10 +5010,20 @@ def create_app(data_root: str) -> FastAPI:
         this person (confirmed or rejected) and photos already carrying their body, plus
         whatever the client still holds (`exclude_refs`). Empty anchors → empty (there is
         nothing to rank against), same contract as the face stream's identity_filter."""
-        anchors = manual.get_body_embeddings_for_identity(name)
+        tag = body_index.model_tag()
+        if threshold is None:
+            threshold = body_index.threshold()
+        # Old-space (CLIP) anchors are re-embedded in place first; any that can't be
+        # (photo gone) simply don't count -- anchors from another space are never mixed in.
+        try:
+            body_index.refresh_stale_labels(db, manual, _get_body_embedder(), data_root,
+                                            identity=name, errors=errors)
+        except Exception as exc:  # hook-allow: broad -- model inference; logged, best-effort
+            errors.log(f'[body-suggestions] stale anchor refresh failed for {name}: {exc}')
+        anchors = manual.get_body_embeddings_for_identity(name, tag)
         if not anchors:
             return []
-        body_ids_arr, file_ids_arr, bboxes, matrix = db.get_body_embeddings_matrix()
+        body_ids_arr, file_ids_arr, bboxes, matrix = db.get_body_embeddings_matrix(tag)
         if matrix.shape[0] == 0:
             return []
         anchor_mat = np.stack([np.frombuffer(a, dtype=np.float32) for a in anchors])
@@ -5127,7 +5112,7 @@ def create_app(data_root: str) -> FastAPI:
         if frow is None:
             return None
         parsed = []
-        for brow in db.get_body_embeddings_for_file(frow['id']):
+        for brow in db.get_body_embeddings_for_file(frow['id'], body_index.model_tag()):
             try:
                 bb = json.loads(brow[1])
             except (TypeError, ValueError):
@@ -5255,15 +5240,15 @@ def create_app(data_root: str) -> FastAPI:
         # 3) Body match: the drawn crop vs known body anchors.
         if abs_path is not None:
             try:
-                anchors = manual.get_all_body_label_embeddings()
+                anchors = manual.get_all_body_label_embeddings(body_index.model_tag())
                 pairs = crop_bodies(abs_path, [[int(draw[0]), int(draw[1]), int(draw[2]), int(draw[3])]])
                 if anchors and pairs:
-                    q = _get_clip_indexer().embed_pil_images([pairs[0][1]])[0].astype('float32')
+                    q = body_index.embed_crops(_get_body_embedder(), [pairs[0][1]])[0]
                     names = [a[0] for a in anchors]
                     mat = np.stack([np.frombuffer(a[1], dtype=np.float32) for a in anchors])
                     scores = mat.dot(q)
                     bi = int(scores.argmax())
-                    if float(scores[bi]) >= BODY_SUGGEST_THRESHOLD:
+                    if float(scores[bi]) >= body_index.threshold():
                         return {'name': names[bi], 'source': 'body-match', 'score': round(float(scores[bi]), 3)}
             except Exception as exc:  # hook-allow: broad — model inference; logged, best-effort
                 errors.log(f'[suggest-body-identity] body match failed on {file_id}: {exc}')
@@ -5358,7 +5343,8 @@ def create_app(data_root: str) -> FastAPI:
         # re-detected. Peopleless files are re-detected once and re-sentineled.
         cleared = db.clear_body_sentinels() if retry_empty else 0
         body_index_job.update(
-            running=True, done=0, total=len(db.get_unbody_indexed_files()), error=None)
+            running=True, done=0, total=len(db.get_unbody_indexed_files(body_index.model_tag())),
+            error=None)
         # 'tags' too: both drive the shared YOLO-World detector's vocab.
         if (busy := _folder_ml_holds(('bodies', 'tags'), body_index_job)):
             return {'started': False, 'message': busy}
@@ -5369,8 +5355,8 @@ def create_app(data_root: str) -> FastAPI:
                     body_index_job['done'] = done
                     body_index_job['total'] = total
                 body_index.build_body_index(
-                    db, errors, _get_clip_indexer(), _get_object_detector(), data_root,
-                    on_progress=_progress,
+                    db, errors, _get_body_embedder(), _get_object_detector(), data_root,
+                    on_progress=_progress, manual=manual,
                     exclude_ids=(None if include_trashed else _trashed_file_ids()))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 body_index_job['error'] = compute.job_error_text(exc)
@@ -5387,7 +5373,7 @@ def create_app(data_root: str) -> FastAPI:
             'done': body_index_job['done'],
             'total': body_index_job['total'],
             'error': body_index_job['error'],
-            'pending': len(db.get_unbody_indexed_files()),
+            'pending': len(db.get_unbody_indexed_files(body_index.model_tag())),
             'empty': db.count_body_sentinels(),
             'device': _ml_device_label(),
         }
@@ -7334,113 +7320,10 @@ def create_app(data_root: str) -> FastAPI:
             'error': match_faces_job['error'],
         }
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    # (Optional tile index: CLIP crops. Feeds only the legacy location background ranking and the
-    # region-search / tag-bbox fallbacks; not part of the default pipeline.)
-    @app.post('/api/tile-index/start')
-    def api_tile_index_start(include_trashed: bool = False):
-        """Build the per-image CLIP tile index that powers precise region search —
-        an overlapping grid of crops embedded per photo. Same background-job shape
-        as the body index; CLIP goes through _get_clip_indexer() so it offloads to
-        the worker when configured."""
-
-        if tile_index_job['running']:
-            return {'started': False, 'message': 'Region indexing already running.'}
-        tile_index_job.update(
-            running=True, done=0, total=len(db.get_untiled_files()), error=None)
-        if (busy := _folder_ml_holds('tiles', tile_index_job)):
-            return {'started': False, 'message': busy}
-
-        def _run():
-            try:
-                def _progress(done, total):
-                    tile_index_job['done'] = done
-                    tile_index_job['total'] = total
-                tile_index.build_tile_index(
-                    db, errors, _get_clip_indexer(), data_root, on_progress=_progress,
-                    exclude_ids=(None if include_trashed else _trashed_file_ids()))
-            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                tile_index_job['error'] = compute.job_error_text(exc)
-            finally:
-                tile_index_job['running'] = False
-
-        _spawn_job(_run)
-        return {'started': True, 'total': tile_index_job['total']}
-
-    @app.get('/api/tile-index/status')
-    def api_tile_index_status():
-        return {
-            'running': tile_index_job['running'],
-            'done': tile_index_job['done'],
-            'total': tile_index_job['total'],
-            'error': tile_index_job['error'],
-            'pending': len(db.get_untiled_files()),
-            'device': _ml_device_label(),
-        }
-
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    @app.post('/api/object-index/start')
-    def api_object_index_start(include_trashed: bool = False):
-        """Build the DINOv2 region index (object_region_embeddings) — the candidate pool
-        for object-exemplar location search. Background job; poll .../status. Refuses to
-        run on CPU unless MEDIA_DEVICE=cpu (an undetected GPU is surfaced loudly, not a
-        silent slow fallback)."""
-        if object_index_job['running']:
-            return {'started': False, 'message': 'Object indexing already running.'}
-        if compute.torch_device() == 'cpu' and os.environ.get('MEDIA_DEVICE', '').strip().lower() != 'cpu':
-            return {'started': False, 'message':
-                'Refusing to index on CPU: the GPU is not detected (torch reports 0 devices). '
-                'Fix the GPU/driver, or set MEDIA_DEVICE=cpu to index on CPU deliberately.'}
-        trashed = set() if include_trashed else set(_trashed_file_ids())
-        candidates = [
-            (fid, rel) for (fid, rel) in db.get_unobject_indexed_files()
-            if os.path.splitext(rel)[1].lower() in IMAGE_EXTENSIONS and fid not in trashed
-        ]
-        object_index_job.update(running=True, done=0, total=len(candidates), error=None, device=None)
-        if (busy := _folder_ml_holds('objects', object_index_job)):
-            return {'started': False, 'message': busy}
-
-        def _run():
-            try:
-                enc = _get_object_encoder(data_root)
-                try:
-                    object_index_job['device'] = enc.device_label()
-                except Exception:  # hook-allow: broad — device label is cosmetic
-                    object_index_job['device'] = None
-                object_index.build_object_index(
-                    db, enc, data_root,
-                    image_exts=IMAGE_EXTENSIONS,
-                    abs_path_fn=_live_abs_path,
-                    candidates=candidates,
-                    on_progress=lambda d, t: object_index_job.update(done=d, total=t),
-                    log=errors.log)
-            except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
-                traceback.print_exc()
-                object_index_job['error'] = compute.job_error_text(exc)
-                print(f'[object-index] FAILED: {exc}', flush=True)
-            finally:
-                object_index_job['running'] = False
-
-        _spawn_job(_run)
-        return {'started': True, 'total': object_index_job['total']}
-
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    @app.get('/api/object-index/status')
-    def api_object_index_status():
-        return {
-            'running': object_index_job['running'],
-            'done': object_index_job['done'],
-            'total': object_index_job['total'],
-            'error': object_index_job['error'],
-            'pending': len(db.get_unobject_indexed_files()),
-            'device': object_index_job.get('device'),
-        }
-
-    # ------------------------------------------------------------------
     # File manager "Run missing ML here": every stage a folder's files lack
     # ------------------------------------------------------------------
     # The per-file work is the /bulk jobs' own loops (the _process_* functions above,
-    # body/tile builders' files= and object_index's candidates=), run by folder_ml over
+    # body builder's files= and object_index's candidates=), run by folder_ml over
     # each stage's missing files only. Concurrency with /bulk: each stage maps to the
     # bulk job state dict(s) it collides with (FOLDER_ML_BULK). Both sides SET their own
     # flag first and THEN read the other's — the folder job sets current_stage then
@@ -7461,7 +7344,6 @@ def create_app(data_root: str) -> FastAPI:
         'region': ((region_index_job, 'region matching index'),),
         'pattern': ((pattern_index_job, 'pattern index'),),
         'phash': ((phash_job, 'perceptual hashing'),),
-        'tiles': ((tile_index_job, 'tile index'),),
         'stills': ((capture_frames_job, 'frame capture'),),
         'video_faces': ((video_face_scan_job, 'video face scan'),),
     }
@@ -7528,14 +7410,7 @@ def create_app(data_root: str) -> FastAPI:
             log = folder_ml.CountingLog(errors)
             processed, _total = body_index.build_body_index(
                 db, log, ctx[0], ctx[1], data_root,
-                on_progress=lambda d, _t: progress(d, log.count), files=files, should_stop=stop)
-            return processed, log.count
-
-        def _tiles(files, ctx, progress, stop):
-            log = folder_ml.CountingLog(errors)
-            processed, _total = tile_index.build_tile_index(
-                db, log, ctx, data_root,
-                on_progress=lambda d, _t: progress(d, log.count), files=files, should_stop=stop)
+                on_progress=lambda d, _t: progress(d, log.count), files=files, should_stop=stop, manual=manual)
             return processed, log.count
 
         def _objects_prepare():
@@ -7590,12 +7465,11 @@ def create_app(data_root: str) -> FastAPI:
             'tags': R(lambda f, c, p, s: _process_detections(f, c[0], c[1], p, s), _tags_prepare),
             'faces': R(lambda f, c, p, s: _process_detect_faces(f, c, {'matched': 0}, p, s),
                        _get_face_detector),
-            'bodies': R(_bodies, lambda: (_get_clip_indexer(), _get_object_detector())),
+            'bodies': R(_bodies, lambda: (_get_body_embedder(), _get_object_detector())),
             'objects': R(_objects, _objects_prepare),
             'region': R(lambda f, _c, p, s: _process_region_index(_abs(f), p, s)),
             'pattern': R(lambda f, _c, p, s: _process_pattern_index(_abs(f), p, s)),
             'phash': R(lambda f, _c, p, s: _process_phash(f, p, s)),
-            'tiles': R(_tiles, _get_clip_indexer),
             'stills': R(lambda f, _c, p, s: _process_capture_frames(f, p, s)),
             'video_faces': R(_video_faces, _get_face_detector),
         }
@@ -7641,8 +7515,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/fm/ml/start')
     def api_fm_ml_start(body: FmMLBody):
         """Run every missing stage over the folder's files, each stage only over the
-        files lacking it (folder_ml.plan; stages=None → required stages with work, the
-        optional tiles only when named). 400 unknown stage, 404 no such folder, 409 while
+        files lacking it (folder_ml.plan; stages=None → required stages with work). 400 unknown stage, 404 no such folder, 409 while
         a folder ML job runs. Returns {started: true, ...status}."""
         if folder_ml_job.state['running']:
             raise HTTPException(status_code=409, detail=(
@@ -8081,42 +7954,12 @@ def create_app(data_root: str) -> FastAPI:
 
                 qualifying.sort(key=blended, reverse=True)
 
-        # Whole-image centroid ranking has no inherent "where", so the swipe
-        # fullview (Right arrow) had nothing to highlight for this path. If the
-        # tile index is built, localize each match to its best-matching sub-tile
-        # vs the centroid and attach a normalized bbox — same shape the YOLO path
-        # emits, so swipe-core highlights it identically.
         cards = []
         for row, score in qualifying[:count]:
             card = {'ref': str(row[0]), 'file_id': row[0], 'label': label,
                     'score': round(float(score), 3)}
-            bbox = _best_tile_bbox(row[0], centroid)
-            if bbox is not None:
-                card['bbox'] = bbox
             cards.append(card)
         return _attach_file_meta(cards)
-
-    def _best_tile_bbox(file_id, centroid):
-        """Normalized [x1,y1,x2,y2] of the sub-tile of `file_id` most similar to
-        `centroid` — "where in this photo the tag matches", for the swipe fullview
-        highlight. The whole-image tile is skipped (it can't localize). None when
-        the file has no tile index yet (▦ Index regions not run)."""
-        tiles = db.get_tiles_for_file(file_id)
-        if not tiles:
-            return None
-        w = max((t[2] for t in tiles), default=0) or 1.0
-        h = max((t[3] for t in tiles), default=0) or 1.0
-        best, best_score = None, -2.0
-        for x1, y1, x2, y2, emb in tiles:
-            if (x2 - x1) * (y2 - y1) >= 0.9 * w * h:
-                continue  # the whole-image tile — highlighting it tells you nothing
-            s = float(np.frombuffer(emb, dtype=np.float32).dot(centroid))
-            if s > best_score:
-                best_score, best = s, (x1, y1, x2, y2)
-        if best is None:
-            return None
-        x1, y1, x2, y2 = best
-        return [round(x1 / w, 4), round(y1 / h, 4), round(x2 / w, 4), round(y2 / h, 4)]
 
     @app.post('/api/tags/{label}/suggestions/next')
     def api_next_tag_suggestions(label: str, body: SwipeExcludeBody, count: int = 10,
@@ -8580,21 +8423,9 @@ def create_app(data_root: str) -> FastAPI:
             ((checksum_to_file_id[c], s) for c, s in scores.items() if c in checksum_to_file_id),
             key=lambda x: -x[1],
         )
-        # A whole-image CLIP score has no inherent "where". Localize each match to
-        # the sub-tile that most activates the learned probe weight `w` (argmax of
-        # tile·w — the bias is constant across tiles, so it doesn't affect which
-        # tile wins), so the swipe fullview highlights CLIP matches the same way
-        # the YOLO/centroid paths do. Falls back to no box when the tile index
-        # isn't built for a file (_best_tile_bbox returns None).
-        probe = load_probe(data_root, label)
-        probe_w = probe[0] if probe is not None else None
         cards = []
         for fid, score in ranked[:count]:
             card = {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
-            if probe_w is not None:
-                bbox = _best_tile_bbox(fid, probe_w)
-                if bbox is not None:
-                    card['bbox'] = bbox
             cards.append(card)
         return _attach_file_meta(cards)
 
@@ -9085,31 +8916,6 @@ def create_app(data_root: str) -> FastAPI:
     # rank almost nothing.
     LOCATION_SUGGEST_THRESHOLD = 0.75
 
-    bg_tile_cache = {'sig': None, 'ids': None}   # background tile ids (sorted), per signature
-    bg_rank_cache = {}                           # ranking key -> [(file_id, score)]
-    bg_lock = threading.Lock()
-
-    def _background_tile_ids():
-        """Sorted tile ids that are background (background_tiles.background_mask over
-        every tile + every person box), rebuilt only when tiles/detections change."""
-        sig = db.tile_background_signature()
-        with bg_lock:
-            if bg_tile_cache['sig'] == sig:
-                return sig, bg_tile_cache['ids']
-            ids, fids, tidx, boxes = db.get_tile_boxes()
-            persons = db.get_person_boxes_by_file(body_index.PERSON_LIKE_CLASSES)
-            mask = background_tiles.background_mask(fids, tidx, boxes, persons)
-            bg_tile_cache.update(sig=sig, ids=np.sort(ids[mask]))
-            bg_rank_cache.clear()
-            return sig, bg_tile_cache['ids']
-
-    def _background_tiles_of(file_ids, bg_ids):
-        """(k,D) background-tile matrix of the given files (empty when none)."""
-        parts = [m[np.isin(tids, bg_ids, assume_unique=True)]
-                 for tids, _f, m in db.iter_tile_embeddings_with_ids(file_ids=file_ids)]
-        parts = [p for p in parts if len(p)]
-        return np.concatenate(parts) if parts else np.zeros((0, 0), np.float32)
-
     # Location "same place" ranking: 'combined' fuses DINOv2 + SigLIP 2 (see
     # _find_similar_files_for_location). DINOv2 is weighted higher: it matches layout /
     # instance (same place from another angle), SigLIP 2 adds scene semantics.
@@ -9135,36 +8941,6 @@ def create_app(data_root: str) -> FastAPI:
             parts.append((fids, cs, sc, weight))
         fids, cs, rank, display = fuse_zscores(parts)
         return fids, cs, rank, display, coverage
-
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    # (The background-tile ranking reads the CLIP tile index; it only runs for the legacy 'clip' model.)
-    def _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives):
-        """[(file_id, score)] best first by background tiles, or None when the
-        location's own photos have no background tiles to compare (tiles not built for
-        them yet, or every tile is mostly person). Cached per location + inputs, so the
-        swipe stack's refills page through one ranking instead of rescanning."""
-        sig, bg_ids = _background_tile_ids()
-        key = (location_id, honor_negatives, tuple(sorted(member_ids)),
-               tuple(sorted(excluded_ids)) if honor_negatives else (), sig)
-        with bg_lock:
-            if key in bg_rank_cache:
-                return bg_rank_cache[key]
-        query = _background_tiles_of(member_ids, bg_ids)
-        if len(query) == 0:
-            return None
-        negatives = _background_tiles_of(excluded_ids, bg_ids) if honor_negatives and excluded_ids else None
-
-        def chunks():
-            for tids, fids, m in db.iter_tile_embeddings_with_ids():
-                keep = np.isin(tids, bg_ids, assume_unique=True)
-                yield fids[keep], m[keep]
-
-        ranked = background_tiles.rank_files(chunks(), query, negatives)
-        with bg_lock:
-            if len(bg_rank_cache) > 16:
-                bg_rank_cache.clear()
-            bg_rank_cache[key] = ranked
-        return ranked
 
     # Stage 2 of the 'place' model (location_mask.py): person-masked re-embedding of the top
     # candidates, lazily and cached. MEDIA_LOC_MASK=0 switches it off; MEDIA_LOC_MASK_TOPK /
@@ -9215,10 +8991,8 @@ def create_app(data_root: str) -> FastAPI:
         adjusted_centroid as _find_similar_files_for_set), so photos that merely
         LOOK like a rejected one rank lower too.
 
-        `background` (a UI toggle, default on): rank by BACKGROUND tiles only (the tile
-        index minus tiles covered by person boxes — see background_tiles.py), so the
-        place counts and the people in it don't. Falls back to the whole-image ranking
-        when the location's photos have no background tiles yet.
+        `background`: accepted for old clients and ignored (the CLIP tile-based background
+        ranking is gone; the 'place' model handles people itself).
 
         `model` ('place' default | 'combined' | 'siglip' | 'dino' | legacy 'clip'): 'place' = 'combined'
         corrected for people and co-signals (location_place.py; `why` per card), members, rejected
@@ -9228,8 +9002,8 @@ def create_app(data_root: str) -> FastAPI:
         space with its own Rocchio-adjusted centroid; a space with no member embeddings is
         dropped and the other carries the ranking. combined/siglip/dino skip the absolute
         threshold (top SET_SUGGEST_TOPK pool, stills remapped to their video) and IGNORE
-        `background` (the tile index is CLIP-only, legacy). `info`, when a dict, receives {'mode':
-        'background'|'whole', 'model', 'threshold_applied', 'background_applied',
+        `background`. `info`, when a dict, receives {'mode':
+        'whole', 'model', 'threshold_applied', 'background_applied',
         'coverage', 'model_missing'}."""
 
         if model not in LOCATION_SUGGEST_MODELS:
@@ -9241,38 +9015,6 @@ def create_app(data_root: str) -> FastAPI:
         if info is not None:
             info.update(model=model, threshold_applied=(model == 'clip'), background_applied=False)
 
-        if background and member_ids and model == 'clip':
-            excluded_ids = [r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
-            ranked = _location_background_ranking(location_id, member_ids, excluded_ids, honor_negatives)
-            if ranked is not None:
-                if info is not None:
-                    info['mode'] = 'background'
-                    info['background_applied'] = True
-                placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
-                skip = set(member_ids) | set(exclude_ids or ())
-                want = limit if exclude_ids else offset + limit
-                passing = []   # (row, score) in rank order, filtered like the whole-image path
-                for start in range(0, len(ranked), 500):
-                    block = ranked[start:start + 500]
-                    chunk = [(fid, s) for fid, s in block if s >= threshold and fid not in skip]
-                    rows = {r['id']: r for r in db.get_files_by_ids([fid for fid, _s in chunk])}
-                    for fid, s in chunk:
-                        r = rows.get(fid)
-                        if r is None or r['hidden']:
-                            continue
-                        cs = r['checksum']
-                        if (cs in member_checksums or cs in excluded_checksum_set
-                                or cs in set_settled_checksums or cs in placed_anywhere):
-                            continue
-                        passing.append((r, s))
-                    if len(passing) >= want or block[-1][1] < threshold:   # ranked best-first
-                        break
-                page = passing[:limit] if exclude_ids else passing[offset:offset + limit]
-                cards = _enrich_rows([(r['id'], r['path'], True, r['checksum']) for r, _s in page],
-                                     scores={r['id']: round(s, 3) for r, s in page})
-                for card in cards:
-                    card['ref'] = str(card['id'])
-                return cards
         if info is not None:
             info['mode'] = 'whole'
 
@@ -10508,24 +10250,7 @@ def create_app(data_root: str) -> FastAPI:
         # is what swipe-core.js's fetchMoreUrl contract reads. `mode` says whether the
         # background-tile ranking ran or it fell back to whole images.
         return {'results': results, 'cards': results, 'mode': info.get('mode'),
-                'tiled_files': db.count_tiled_files(),
                 **{k: v for k, v in info.items() if k != 'mode'}}
-
-    @app.get('/api/locations/{location_id}/background-status')
-    def api_location_background_status(location_id: int):
-        """How much of the background-tile ranking can work: this location's photos
-        with tiles, and tiled vs all images in the library (tiles are the optional
-        "Tiles" ML stage)."""
-        if manual.get_location(location_id) is None:
-            raise HTTPException(status_code=404, detail='Location not found')
-        member_ids = [r['id'] for r in db.get_files_by_checksums(
-            list(manual.get_checksums_for_location(location_id)))]
-        tiled_members = set()
-        for _t, fids, _m in db.iter_tile_embeddings_with_ids(file_ids=member_ids):
-            tiled_members.update(int(f) for f in fids)
-        return {'members': len(member_ids), 'tiled_members': len(tiled_members),
-                'tiled_files': db.count_tiled_files(),
-                'images': db.count_files_by_ext(IMAGE_EXTENSIONS)}
 
     @app.get('/api/locations/{location_id}/text-search')
     def api_location_text_search(location_id: int, q: str, limit: int = 24, offset: int = 0,

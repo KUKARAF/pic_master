@@ -3,7 +3,7 @@
 
 Every model is faked (no real model loads). Covers:
 
-  * folder_ml.plan: run order, required-only default (tiles only when named),
+  * folder_ml.plan: run order, required-only default,
     broken files never planned, unknown stage → ValueError;
   * run_plan: stage order, prepare() failure → 'skipped' + run continues, claim()
     message → 'skipped', an aborting stage → 'error' and the run stops;
@@ -173,14 +173,14 @@ def test_plan_order_and_defaults():
     plan = folder_ml.plan(files, statuses)
     keys = [k for k, _f in plan]
     assert keys == ['exif', 'embed', 'tags', 'faces', 'bodies', 'objects', 'region', 'pattern',
-                    'phash', 'video_faces'], keys            # no tiles, no stills (all done)
+                    'phash', 'video_faces'], keys            # no stills (all done)
     got = dict(plan)
     assert got['exif'] == [(2, 'y.png')] and got['embed'] == [(2, 'y.png')]
     assert got['faces'] == [(1, 'x.png'), (2, 'y.png')]     # broken file 4 never planned
     assert got['video_faces'] == [(3, 'v.mp4')]
-    # Explicit stages: run exactly those (tiles included), in STAGE_ORDER.
-    plan = folder_ml.plan(files, statuses, ['tiles', 'exif', 'stills'])
-    assert [k for k, _f in plan] == ['exif', 'tiles', 'stills']
+    # Explicit stages: run exactly those, in STAGE_ORDER.
+    plan = folder_ml.plan(files, statuses, ['stills', 'exif', 'phash'])
+    assert [k for k, _f in plan] == ['exif', 'phash', 'stills']
     assert dict(plan)['stills'] == []
     try:
         folder_ml.plan(files, statuses, ['exif', 'nope'])
@@ -260,7 +260,7 @@ def test_folder_scope_only_missing_and_preview():
             want = sum(1 for st in statuses.values() if s['key'] in st['stages']
                        and not st['stages'][s['key']])
             assert s['missing'] == want, (s, want)
-            assert s['required'] == (s['key'] != 'tiles')
+            assert s['required'] is True
         assert _stages(pv)['embed']['missing'] == 2 and _stages(pv)['faces']['missing'] == 2
 
         indexer, faces, yolo = FakeIndexer(), FakeFaceDetector(), FakeYOLO()

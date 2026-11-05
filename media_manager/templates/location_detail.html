@@ -66,11 +66,6 @@
   Avoid photos that already have a location
 </label>
 <label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
-  <input type="checkbox" id="location-background-toggle" checked>
-  Match the background only (ignore the people in the photos)
-</label>
-<div class="sub" id="location-background-status" style="margin:-2px 0 8px 24px;font-size:0.85em;"></div>
-<label class="sub" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
   <input type="checkbox" id="location-honor-negatives-toggle" checked>
   Honor negatives (steer ranking away from rejected photos, not just hide them)
 </label>
@@ -395,17 +390,14 @@
       '&limit=' + (need || 10) +
       '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
       '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked) +
-      '&background=' + String(!bgToggle || bgToggle.checked) +
       '&model=' + encodeURIComponent(currentModel) +
       '&mask=' + String(!maskToggle || maskToggle.checked);
   }
 
   /* Embedding model driving the suggestions ('place' = combined + people/geo correction, default | 'combined' = DINOv2 + SigLIP 2 | 'siglip' | 'dino' | legacy 'clip',
-     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold and the
-     background (CLIP tile index) option server-side, so both controls are disabled. */
+     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold server-side. */
   const MODEL_KEY = 'mm_location_suggest_model';
   const MODEL_LABELS = { clip: 'CLIP', place: 'Place (people-aware)', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
-  const BG_TIP = 'background matching uses the CLIP tile index; not available for SigLIP/DINOv2';
   const modelSelect = document.getElementById('location-model-select');
   const modelNotice = document.getElementById('location-model-notice');
   const maskToggle = document.getElementById('location-mask-toggle');
@@ -418,18 +410,6 @@
   }
   let currentModel = loadModel();
   if (modelSelect) modelSelect.value = currentModel;
-  function applyModelToBackgroundToggle() {
-    const bg = document.getElementById('location-background-toggle');
-    if (!bg) return;
-    const off = currentModel !== 'clip';
-    bg.disabled = off;
-    const label = bg.closest('label');
-    if (label) {
-      label.style.opacity = off ? '0.5' : '';
-      label.title = off ? BG_TIP : '';
-    }
-  }
-  applyModelToBackgroundToggle();
   function showModelNotice(data) {
     if (!modelNotice) return;
     const cov = data && data.coverage;
@@ -474,27 +454,6 @@
     return ' <span class="sub" style="cursor:help;border-bottom:1px dotted;" title="' + escapeHtml(tips.join('\n')).replace(/"/g, '&quot;') +
       '">place ' + tag + (w.people ? ' \u00b7 same people' : '') + (w.scanned ? '' : ' \u00b7 unscanned') + (w.masked != null ? ' \u00b7 bg-checked' : '') + '</span>';
   }
-
-  // Background matching runs on the (optional) Tiles index — say how much of it exists.
-  const bgToggle = document.getElementById('location-background-toggle');
-  (function () {
-    const el = document.getElementById('location-background-status');
-    if (!el) return;
-    fetch('/api/locations/' + locationId + '/background-status')
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .then(function (d) {
-        if (!d) return;
-        if (!d.tiled_members) {
-          el.innerHTML = 'None of the photos here have tiles yet, so this falls back to whole-image matching ' +
-            '(people dominate). Build tiles: <a href="/files">Files</a> → 🧠 Run missing ML → Tiles, or <a href="/bulk">Bulk</a> → Tile index.';
-        } else {
-          el.textContent = 'Using tiles: ' + d.tiled_members + ' of ' + d.members + ' photos here, ' +
-            d.tiled_files + ' of ' + d.images + ' images in the library (untiled photos can\'t be suggested — ' +
-            'build tiles via Run missing ML → Tiles).';
-        }
-      })
-      .catch(function () {});
-  })();
 
   function setNames(card) {
     return ((card && card.sets) || []).map(function(s) { return s.name; });
@@ -679,7 +638,6 @@
     modelSelect.addEventListener('change', function() {
       currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'place';
       try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) {}
-      applyModelToBackgroundToggle();
       if (modelNotice) modelNotice.style.display = 'none';
       fetchAndLaunch();
     });

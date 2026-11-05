@@ -4181,8 +4181,8 @@
      the photo gets a crosshair), then drag a box around a thing. With the region
      matching index built (/bulk → Index region matching) the box is matched as an
      INSTANCE (DINOv2 windows, SIFT/homography verified — same object, not same
-     category); otherwise the crop is CLIP-embedded and ranked (tile index if built,
-     else whole-image). Matches open in the browsable watch-queue. */
+     category); otherwise the crop is CLIP-embedded and ranked against
+     whole-image embeddings. Matches open in the browsable watch-queue. */
   const searchRegionBtn = document.querySelector('.find-by-region-btn');
   const searchRegionState = wireBoxDraw(searchRegionBtn, '✏️', '🔲', function (bbox) {
     openMatchesAsQueue({

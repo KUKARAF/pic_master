@@ -1,4 +1,4 @@
-"""Find-by-body: find/crop person boxes and CLIP-embed the crops, so a person can
+"""Find-by-body: find/crop person boxes and embed the crops, so a person can
 be re-identified by outfit/build when their face is hidden or blurry — which means
 this must NOT depend on a face, or even on `media index` having run, existing for
 a photo. Matching is appearance-based: strong within the same event/outfit, weak
@@ -25,11 +25,49 @@ peopleless photo. (Confirmed: YOLO-World's 'person' confidence barely drops with
 face occluded or entirely out of frame — detection quality was never the bottleneck,
 trusting the general index's labels was.)
 
+EMBEDDING MODEL (was CLIP; now DINOv2-L by default, SigLIP 2 optional)
+-----------------------------------------------------------------------
+Select with env ``MEDIA_BODY_MODEL`` = ``dino`` (default) | ``siglip``. The crops go
+through the shared worker/local embedders (web._get_dino_embedder / _get_siglip_embedder),
+never CLIP.
+
+Why DINOv2-L by default (decided from the literature and this repo's own bench, NOT
+measured on this task -- no GPU was available when it was chosen; compare on bigboy
+with ``bench/bench_body_model.py`` and flip the env var if SigLIP wins):
+  * Person re-ID by outfit/build is an INSTANCE-level, appearance-matching problem: the
+    same garment colours/patterns/silhouette must match across photos while a different
+    person in a similar-looking scene must not. DINOv2's self-supervised, non-semantic
+    features are the strongest off-the-shelf instance-retrieval features (Oquab et al.
+    2023: Oxford/Paris, Met, copy-detection); SigLIP/CLIP-style contrastive features
+    are trained on alt-text and collapse "a man in a blue shirt" photos together
+    (semantic category dominates the vector), which is exactly the failure that made the
+    old CLIP body search weak. DINO-based person re-ID (e.g. DINOv2 fine-tunes/linear
+    probes on Market-1501/MSMT17, CLIP-ReID needs fine-tuning + prompts to get there)
+    follows the same pattern.
+  * Repo evidence: bench/bench_pattern_dino.py found DINOv2-L cell descriptors beat the
+    ResNet pattern windows for local appearance/texture matching, the same signal a
+    clothing crop needs; SigLIP 2 is used here for text<->image (semantic) search.
+  * Same worker op / GPU lock / cache as the already-deployed similarity embedder, 1024-d
+    (vs 1152-d for SigLIP 2 SO400M), so no new model to ship.
+Caveats: DINOv2's input is squashed to 224x224 (no crop) so tall person boxes are
+anisotropically resized, identically for index and query; thresholds below are per model
+and UNTUNED. SigLIP's strength is semantic (gender/age/garment type), so it may win on
+coarse "same kind of outfit" recall -- hence the switch.
+
+STALE ROWS: body_embeddings.model and body_identities.model hold ``model_tag()``
+(e.g. ``dino:large:1024``). Rows with another tag (the old CLIP ones) are NEVER mixed
+into a search (matrices, anchors and per-file reads are filtered by tag) and count as
+MISSING for the 'bodies' stage, so a rerun re-embeds them in place (row ids, and thus
+the swipe's source_body_id decisions, are preserved when the person box is unchanged).
+Ground-truth labels in manual.db are not deleted: refresh_stale_labels() re-crops and
+re-embeds them under the new tag. 'No person' sentinels are model-independent.
+
 match_face_to_body duplicates the logic in age_estimator_worker.py, which runs in
 an isolated venv and can't import from the main app — keep the two in sync.
 """
 import os
 
+import numpy as np
 from PIL import Image
 
 from . import compute
@@ -50,6 +88,63 @@ MIN_PERSON_CONFIDENCE = 0.3
 # module docstring. 'crowd'/'group of people' are excluded on purpose: one box over
 # many people crops to a blend that's useless for re-identification.
 PERSON_LIKE_CLASSES = ('person', 'child', 'selfie', 'portrait')
+
+
+BODY_MODEL_CHOICES = ('dino', 'siglip')
+BODY_MODEL_DEFAULT = 'dino'
+
+# Cosine floors per space for "show this body as a candidate / match". UNTUNED guesses
+# (DINOv2 CLS cosines of different people sit lower than SigLIP image-image ones);
+# env MEDIA_BODY_THRESHOLD overrides both. Tune on bigboy with bench/bench_body_model.py.
+BODY_THRESHOLDS = {'dino': 0.5, 'siglip': 0.6}
+
+# Dim tables duplicated from embedders.py (which imports torch; this module must not).
+# tests/test_body_model.py asserts they stay in sync.
+_DINO_DIMS = {'small': 384, 'base': 768, 'large': 1024}
+_SIGLIP_DIMS = {'ViT-B-16-SigLIP2': 768, 'ViT-B-32-SigLIP2-256': 768,
+                'ViT-L-16-SigLIP2-256': 1024, 'ViT-SO400M-14-SigLIP2': 1152}
+
+
+def model_key():
+    """'dino' | 'siglip' from MEDIA_BODY_MODEL (default dino)."""
+    key = os.environ.get('MEDIA_BODY_MODEL', BODY_MODEL_DEFAULT).strip().lower()
+    if key not in BODY_MODEL_CHOICES:
+        raise ValueError(f'MEDIA_BODY_MODEL={key!r} not in {BODY_MODEL_CHOICES}')
+    return key
+
+
+def model_dim():
+    if model_key() == 'dino':
+        return _DINO_DIMS[os.environ.get('MEDIA_DINO_MODEL', 'large').strip().lower()]
+    return _SIGLIP_DIMS.get(os.environ.get('MEDIA_SIGLIP_MODEL', 'ViT-SO400M-14-SigLIP2'), 0)
+
+
+def model_tag():
+    """Space tag stored with every body vector, e.g. 'dino:large:1024' or
+    'siglip:ViT-SO400M-14-SigLIP2:1152'. Pure env arithmetic (no torch, no worker
+    round-trip) so DB queries / scan_status can use it freely."""
+    key = model_key()
+    if key == 'dino':
+        variant = os.environ.get('MEDIA_DINO_MODEL', 'large').strip().lower()
+        return f'dino:{variant}:{_DINO_DIMS[variant]}'
+    name = os.environ.get('MEDIA_SIGLIP_MODEL', 'ViT-SO400M-14-SigLIP2')
+    return f'siglip:{name}:{_SIGLIP_DIMS.get(name, 0)}'
+
+
+def threshold():
+    env = os.environ.get('MEDIA_BODY_THRESHOLD')
+    return float(env) if env else BODY_THRESHOLDS[model_key()]
+
+
+def embed_crops(embedder, crops):
+    """Embed PIL crops and verify the vectors live in the configured space."""
+    embs = np.asarray(embedder.embed_pil_images(list(crops)), dtype=np.float32)
+    dim = model_dim()
+    if embs.ndim != 2 or (dim and embs.shape[1] != dim):
+        raise RuntimeError(f'body embedder returned shape {embs.shape}, expected (N, {dim}) for '
+                           f'{model_tag()} -- is the worker running a different model than '
+                           f'MEDIA_BODY_MODEL/MEDIA_DINO_MODEL/MEDIA_SIGLIP_MODEL?')
+    return embs
 
 
 def _containment(face_bbox, person_bbox):
@@ -95,7 +190,7 @@ def crop_bodies(abs_path, bboxes):
     return pairs
 
 
-def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None, detector=None):
+def embed_bodies_for_file(db, embedder, file_id, abs_path, person_boxes=None, detector=None):
     """Crop + embed one file's person boxes and upsert its body_embeddings rows
     (sentinel when none). person_boxes, when given, skips detection entirely (used
     when a caller already has fresh boxes on hand). Otherwise: reuse this file's
@@ -126,16 +221,16 @@ def embed_bodies_for_file(db, clip_indexer, file_id, abs_path, person_boxes=None
     if person_boxes:
         pairs = crop_bodies(abs_path, person_boxes)
         if pairs:
-            embeddings = clip_indexer.embed_pil_images([crop for _, crop in pairs])
+            embeddings = embed_crops(embedder, [crop for _, crop in pairs])
             bodies = [{'bbox': bbox, 'embedding': embeddings[i]}
                       for i, (bbox, _) in enumerate(pairs)]
-    db.insert_body_embeddings(file_id, bodies, clip_indexer.model_name)
+    db.insert_body_embeddings(file_id, bodies, model_tag())
     return len(bodies)
 
 
-def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=None, exclude_ids=None,
-                     files=None, should_stop=None):
-    """Body-index every tracked file that has no body row yet — the background
+def build_body_index(db, errors, embedder, detector, data_root, on_progress=None, exclude_ids=None,
+                     files=None, should_stop=None, manual=None):
+    """Body-index every tracked file with no body row in the current space (model_tag()) yet — the background
     corpus build behind the web UI's "Build body index" button. No longer requires
     `media index` to have run first: files with stored YOLO-World detections reuse
     them (fast path, no model call), everything else gets a dedicated person-only
@@ -144,9 +239,10 @@ def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=
     media_manager.py); a failed file is left un-sentineled so a rebuild retries it.
     `files` [(file_id, rel_path)] restricts the build to those (the file manager's
     folder job; default: every un-body-indexed file). `should_stop()` is checked
-    before each file — True ends the build early. Returns (processed, total)."""
+    before each file — True ends the build early. `manual`, when given, also gets its
+    stale (old-space) ground-truth body labels re-embedded at the end. Returns (processed, total)."""
     if files is None:
-        files = db.get_unbody_indexed_files()
+        files = db.get_unbody_indexed_files(model_tag())
     if exclude_ids:
         files = [f for f in files if f[0] not in exclude_ids]
     total = len(files)
@@ -165,11 +261,43 @@ def build_body_index(db, errors, clip_indexer, detector, data_root, on_progress=
             abs_path = os.path.join(data_root, rel_path)
             if not os.path.isfile(abs_path):
                 raise FileNotFoundError('file missing on disk')
-            embed_bodies_for_file(db, clip_indexer, file_id, abs_path, detector=detector)
+            embed_bodies_for_file(db, embedder, file_id, abs_path, detector=detector)
         except Exception as exc:  # hook-allow: broad — per-file resilience, logged
             errors.log(rel_path, f'body index: {exc}')
             compute.raise_if_gpu_fatal(exc)   # GPU gone: stop, don't fail every remaining file
         processed += 1
         if on_progress:
             on_progress(processed, total)
+    if manual is not None and not (should_stop is not None and should_stop()):
+        refresh_stale_labels(db, manual, embedder, data_root, errors=errors)
     return processed, total
+
+
+def refresh_stale_labels(db, manual, embedder, data_root, identity=None, errors=None):
+    """Re-crop and re-embed ground-truth body labels (manual.db body_identities) whose
+    stored vector is in another space (old CLIP rows), in place under model_tag(). The
+    label (identity, box, checksum, source_body_id) is untouched -- only the vector
+    and its tag change. `identity` limits it to one person. Labels whose photo is gone
+    or whose crop fails are skipped (they stay stale and out of searches). Returns the
+    number refreshed."""
+    tag = model_tag()
+    done = 0
+    for label_id, checksum, bbox in manual.get_stale_body_labels(tag, identity):
+        try:
+            frow = db.get_file_by_checksum(checksum)
+            if frow is None:
+                continue
+            abs_path = os.path.join(data_root, frow['path'])
+            if not os.path.isfile(abs_path):
+                continue
+            pairs = crop_bodies(abs_path, [bbox])
+            if not pairs:
+                continue
+            emb = embed_crops(embedder, [pairs[0][1]])[0]
+            manual.update_body_label_embedding(label_id, emb.tobytes(), tag)
+            done += 1
+        except Exception as exc:  # hook-allow: broad -- per-label resilience, logged
+            if errors is not None:
+                errors.log(checksum, f'body label refresh: {exc}')
+            compute.raise_if_gpu_fatal(exc)
+    return done

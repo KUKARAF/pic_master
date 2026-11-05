@@ -13,7 +13,7 @@ import tempfile
 
 import numpy as np
 
-from media_manager import pattern_deep, region_index, scan_status
+from media_manager import body_index, pattern_deep, region_index, scan_status
 from media_manager.database import Database
 from media_manager.formats import IMAGE_EXTENSIONS, VIDEO_EXTENSIONS
 from media_manager.manual_db import ManualDB
@@ -57,10 +57,6 @@ def _stage(db, fid, key, algo=None):
                                   algo or pattern_deep.ALGO_TAG)
     elif key == 'phash':
         db.insert_phash(fid, b'\0' * 8, b'\0' * 8, 1, 1, 'a')
-    elif key == 'tiles':
-        db.conn.execute('INSERT INTO tile_embeddings (file_id, tile_index, embedding) VALUES (?,0,?)',
-                        (fid, b'\0' * 8))
-        db.conn.commit()
     else:
         raise ValueError(key)
 
@@ -84,7 +80,7 @@ def run_classification():
     db, manual = _dbs()
     f = {}
     for name in ('full.jpg', 'broken.jpg', 'noface.jpg', 'stale.jpg', 'bare.jpg',
-                 'frameonly.jpg', 'hidden.jpg', 'tilesonly.jpg',
+                 'frameonly.jpg', 'hidden.jpg',
                  'v_done.mp4', 'v_two.mp4', 'v_half.mp4', 'notes.txt'):
         f[name] = _add(db, 'dir/' + name)
     required = [k for k, _l, r in scan_status.STAGES['image'] if r]
@@ -110,7 +106,6 @@ def run_classification():
 
     db.conn.execute('UPDATE files SET hidden = 1 WHERE id = ?', (f['hidden.jpg'],))
     db.conn.commit()
-    _stage(db, f['tilesonly.jpg'], 'tiles')
 
     _captures(manual, 'cs-dir/v_done.mp4', 3)
     manual.mark_video_frame_scanned('cs-dir/v_done.mp4')
@@ -124,7 +119,7 @@ def run_classification():
 
     full = by['full.jpg']
     assert full['kind'] == 'image' and full['state'] == 'scanned', full
-    assert all(full['stages'][k] for k in required) and full['stages']['tiles'] is False
+    assert all(full['stages'][k] for k in required)
     assert full['missing'] == []
 
     assert by['broken.jpg']['state'] == 'broken' and by['broken.jpg']['missing'] == []
@@ -143,10 +138,6 @@ def run_classification():
     hid = by['hidden.jpg']
     assert hid['stages']['region'] and hid['stages']['pattern'] and hid['state'] == 'partial', hid
 
-    to = by['tilesonly.jpg']
-    assert to['state'] == 'partial' and to['stages']['tiles'], to
-    assert len(to['missing']) == len(required)
-
     assert by['bare.jpg']['state'] == 'tracked'
     assert len(by['bare.jpg']['missing']) == len(required)
     assert set(by['bare.jpg']['stages']) == set(IMAGE_KEYS)
@@ -158,7 +149,7 @@ def run_classification():
     assert by['v_half.mp4']['stages'] == {'embed': False, 'stills': True, 'video_faces': False}
 
     summ = scan_status.summarize(st)
-    assert summ == {'broken': 2, 'scanned': 2, 'partial': 5, 'tracked': 3, 'total': 12}, summ
+    assert summ == {'broken': 2, 'scanned': 2, 'partial': 4, 'tracked': 3, 'total': 11}, summ
     assert scan_status.summarize(list(st.values())) == summ
     assert scan_status.summarize({}) == {'broken': 0, 'scanned': 0, 'partial': 0,
                                          'tracked': 0, 'total': 0}
@@ -219,13 +210,12 @@ def run_consistency():
     assert missing('exif') == images(db.get_files_without_metadata())
     assert missing('tags') == images(db.get_undetected_files())
     assert missing('faces') == images(db.get_unface_indexed_files())
-    assert missing('bodies') == images(db.get_unbody_indexed_files())
+    assert missing('bodies') == images(db.get_unbody_indexed_files(body_index.model_tag()))
     assert missing('objects') == images(db.get_unobject_indexed_files())
     assert missing('region') == images(db.get_unregion_indexed_files(region_index.ALGO_TAG))
     assert missing('pattern') == images(db.get_unpattern_indexed_files(pattern_deep.ALGO_TAG))
     assert missing('phash') == images(db.get_unphashed_files())
-    untiled = images(db.get_untiled_files())
-    assert {fid for fid, s in st.items() if s['kind'] == 'image' and not s['stages']['tiles']} == untiled
+    assert all(k != 'tiles' for k, _l, _r in scan_status.STAGES['image'])   # tile stage retired
 
     # web._videos_needing_frames / _videos_needing_face_scan (healthy, non-hidden videos).
     counts = manual.get_capture_counts_by_parent()
