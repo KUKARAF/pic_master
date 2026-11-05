@@ -2887,12 +2887,24 @@ class Database(ThreadLocalDB):
 
     # --- Re-normalization backfill ------------------------------------------------
 
+    @staticmethod
+    def _not_video_sql(col):
+        """SQL fragment true when path column `col` is not a video file. The backfill
+        decodes the source with cv2.imread, which on a video fails or yields only a
+        first frame, so such faces can't be re-embedded and must never be stamped as
+        repaired."""
+        from .formats import VIDEO_EXTENSIONS  # hook-allow: lazy — avoid import cycle at module load
+        return ' AND '.join(f"lower({col}) NOT LIKE '%{e}'" for e in sorted(VIDEO_EXTENSIONS))
+
     def count_unnormalized_faces(self) -> int:
         """Faces whose embedding predates the current normalization pipeline. Sentinel
-        rows ('[]' bbox, no vector) are not faces and never need normalizing."""
+        rows ('[]' bbox, no vector) are not faces and never need normalizing; neither
+        are frame faces (frame_index set) or faces whose source is a video — the
+        backfill cannot re-read those from disk (see iter_unnormalized_faces)."""
         cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM faces WHERE norm_version < ? AND bbox != '[]'",
-                    (FACE_NORM_VERSION,))
+        cur.execute(f"SELECT COUNT(*) FROM faces fa JOIN files_with_path f ON f.id = fa.file_id "
+                    f"WHERE fa.norm_version < ? AND fa.bbox != '[]' AND fa.frame_index IS NULL "
+                    f"AND {self._not_video_sql('f.path')}", (FACE_NORM_VERSION,))
         return cur.fetchone()[0]
 
     def iter_unnormalized_faces(self, chunk=200):
@@ -2908,8 +2920,9 @@ class Database(ThreadLocalDB):
         is snapshotted first for the same reason as iter_unsuggested_faces: the caller
         writes to these rows as it goes."""
         cur = self.conn.cursor()
-        cur.execute("SELECT DISTINCT file_id FROM faces WHERE norm_version < ? AND bbox != '[]' "
-                    "ORDER BY file_id", (FACE_NORM_VERSION,))
+        cur.execute(f"SELECT DISTINCT fa.file_id FROM faces fa JOIN files_with_path f ON f.id = fa.file_id "
+                    f"WHERE fa.norm_version < ? AND fa.bbox != '[]' AND fa.frame_index IS NULL "
+                    f"AND {self._not_video_sql('f.path')} ORDER BY fa.file_id", (FACE_NORM_VERSION,))
         file_ids = [r[0] for r in cur.fetchall()]
         for batch in self._chunked(file_ids, min(chunk, 500)):
             placeholders = ','.join('?' for _ in batch)
@@ -2917,7 +2930,7 @@ class Database(ThreadLocalDB):
                 SELECT fa.id, fa.file_id, f.path, fa.bbox, fa.embedding, fa.det_score, fa.angle
                 FROM faces fa
                 JOIN files_with_path f ON f.id = fa.file_id
-                WHERE fa.file_id IN ({placeholders}) AND fa.bbox != '[]'
+                WHERE fa.file_id IN ({placeholders}) AND fa.bbox != '[]' AND fa.frame_index IS NULL
                 ORDER BY fa.file_id, fa.id
             ''', tuple(batch))
             rows = cur.fetchall()

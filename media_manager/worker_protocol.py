@@ -47,6 +47,13 @@ EMBED_PROTOCOL_VERSION = 1
 # An old worker answers HTTP 404 (no handler) -> the client falls back to PATH_DETECT_FACES.
 PATH_DETECT_FACES_PATHS = "detect_faces_paths"
 FACE_PROTOCOL_VERSION = 1
+# Optional field "orient": ORIENT_GATE_VERSION in the replies of detect_faces,
+# detect_faces_paths, embed_bbox and normalize_faces, set by a worker whose detector runs
+# the always-on orientation gate (landmark-roll triggered quarter-turn re-embed). Absent on
+# an older worker, which keeps working with its previous (det_score-gated) behaviour; the
+# host logs that fallback once. embed_bbox requests may carry "auto_orient": bool (default
+# true; false = embed the region exactly as given, for the explicit rotate controls).
+ORIENT_GATE_VERSION = 1
 PATH_DETECT_OBJECTS = "detect_objects"
 PATH_ESTIMATE_AGE = "estimate_age"
 # Per-tag model TRAINING (job/poll pattern) + fine-tuned inference. Unlike the

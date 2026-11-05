@@ -495,7 +495,8 @@ def handle_detect_faces_paths(path, data, request_id, link_id, remote_identity, 
         _face_log.note(timings, n_faces, n_err)
         return worker_protocol.pack({
             "results": results, "wall_seconds": wall, "timings": timings,
-            "proto": worker_protocol.FACE_PROTOCOL_VERSION, "error": None})
+            "proto": worker_protocol.FACE_PROTOCOL_VERSION,
+            "orient": worker_protocol.ORIENT_GATE_VERSION, "error": None})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES_PATHS} -> ERROR {e}", flush=True)
@@ -516,7 +517,8 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
         if error:
             print(f"[worker] {worker_protocol.PATH_DETECT_FACES} ({name}) -> ERROR {error}", flush=True)
         _face_log.note(timings, len(out_faces), 1 if error else 0)
-        return worker_protocol.pack({"faces": out_faces, "error": error, "timings": timings})
+        return worker_protocol.pack({"faces": out_faces, "error": error, "timings": timings,
+                                     "orient": worker_protocol.ORIENT_GATE_VERSION})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> ERROR {e}",
@@ -539,12 +541,14 @@ def handle_embed_bbox(path, data, request_id, link_id, remote_identity, requeste
         bbox = req["bbox"]
         pad_ratio = req.get("pad_ratio", 0.3)
         with models.lock:
-            d = models.get_face_detector().embed_bbox(img, bbox, pad_ratio)
+            d = models.get_face_detector().embed_bbox(
+                img, bbox, pad_ratio, auto_orient=bool(req.get("auto_orient", True)))
         resp = {
             "bbox": d["bbox"],
             "embedding": d["embedding"].astype(np.float32).tobytes(),
             "det_score": float(d["det_score"]),
             "angle": float(d.get("angle", 0.0)),
+            "orient": worker_protocol.ORIENT_GATE_VERSION,
             "error": None,
         }
         print(f"[worker] handled {worker_protocol.PATH_EMBED_BBOX} ({name}) -> "
@@ -600,7 +604,8 @@ def handle_normalize_faces(path, data, request_id, link_id, remote_identity, req
                 changed += 1
         print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> "
               f"{len(out_faces)} faces, {changed} re-angled", flush=True)
-        return worker_protocol.pack({"faces": out_faces, "error": None})
+        return worker_protocol.pack({"faces": out_faces, "error": None,
+                                     "orient": worker_protocol.ORIENT_GATE_VERSION})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> ERROR {e}",

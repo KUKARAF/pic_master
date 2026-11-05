@@ -482,6 +482,9 @@ FACE_PATHS_CHUNK = max(1, int(os.environ.get("MEDIA_FACE_CHUNK")
 class RemoteFaceDetector:
     """Drop-in for :class:`face_detector.FaceDetector` backed by the worker."""
 
+    # True/False once a worker reply showed/lacked the orientation gate (None: no reply yet).
+    orient_gate = None
+
     # Files per detect_faces() call the bulk job should hand over (it processes the
     # results after each call): big enough to keep FACE_INFLIGHT requests busy.
     # Default = 3 rounds of full pipelines (INFLIGHT x CHUNK files each): a batch ends when its
@@ -528,7 +531,23 @@ class RemoteFaceDetector:
             concurrent=True,
         )
         self.face_timing.add(resp.get("timings"))
+        self._note_orient(resp, "detect_faces")
         return (path, self._faces_from_wire(resp.get("faces")), resp.get("error"))
+
+    def _note_orient(self, resp, op):
+        """Record whether the worker that just answered runs the orientation gate
+        (optional "orient" field). An older worker keeps working with its previous
+        det_score-gated behaviour; say so once, loudly, so a confident-but-rotated
+        face it cannot fix is not a silent mystery."""
+        ok = bool(isinstance(resp, dict) and resp.get("orient"))
+        self.orient_gate = ok
+        if not ok and not getattr(self, "_orient_warned", False):
+            self._orient_warned = True
+            print(f"[faces] worker reply to {op} has no 'orient' field: the worker predates the "
+                  f"always-on orientation gate, so confident but rotated faces are NOT "
+                  f"re-oriented (previous behaviour). Redeploy the worker.",
+                  file=sys.stderr, flush=True)
+        return ok
 
     def _detect_paths_chunk(self, rels, paths):
         """One detect_faces_paths request -> [(path, faces, error)] aligned with `paths`;
@@ -556,6 +575,7 @@ class RemoteFaceDetector:
             raise WorkerError(f"detect_faces_paths: worker returned {len(results)} results "
                               f"for {len(paths)} paths")
         self.face_timing.add(resp.get("timings"))  # optional: absent on an older worker
+        self._note_orient(resp, "detect_faces_paths")
         return [(p, self._faces_from_wire(r.get("faces")), r.get("error"))
                 for p, r in zip(paths, results)]
 
@@ -618,16 +638,20 @@ class RemoteFaceDetector:
             self.flight.call(-1)
         return results
 
-    def embed_bbox(self, img, bbox: list, pad_ratio: float = 0.3) -> dict:
+    def embed_bbox(self, img, bbox: list, pad_ratio: float = 0.3,
+                   auto_orient: bool = True) -> dict:
         image_bytes = cv2.imencode('.png', img)[1].tobytes()
         self.client.record("embed_bbox", "<crop>")
         resp = self.client.request(
             worker_protocol.PATH_EMBED_BBOX,
             {"name": "<crop>", "image": image_bytes,
-             "bbox": [float(v) for v in bbox], "pad_ratio": float(pad_ratio)},
+             "bbox": [float(v) for v in bbox], "pad_ratio": float(pad_ratio),
+             "auto_orient": bool(auto_orient)},
         )
         if resp.get("error") or resp.get("embedding") is None:
             raise WorkerError(resp.get("error") or "embed_bbox returned no embedding")
+        if auto_orient:
+            self._note_orient(resp, "embed_bbox")
         return {
             "bbox": resp["bbox"],
             "embedding": np.frombuffer(resp["embedding"], dtype=np.float32).copy(),
@@ -658,6 +682,7 @@ class RemoteFaceDetector:
         )
         if resp.get("error"):
             raise WorkerError(resp["error"])
+        self._note_orient(resp, "normalize_faces")
         out = []
         for face in (resp.get("faces") or []):
             emb = face.get("embedding")

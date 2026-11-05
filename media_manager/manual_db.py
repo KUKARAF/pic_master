@@ -3724,6 +3724,22 @@ class ManualDB(ThreadLocalDB):
                 result[source_face_id] = manual_id
         return result
 
+    def get_trusted_source_ids(self, source_ids, min_trust=3):
+        """The subset of media.db face ids (as source_face_id) whose manual.db row is
+        hand-set (trust >= `min_trust`, default 3 = human-confirmed). Background jobs
+        that would rewrite a face's vector use this to leave those alone."""
+        ids = [int(i) for i in source_ids]
+        found = set()
+        if not ids:
+            return found
+        cur = self.conn.cursor()
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'SELECT source_face_id FROM faces WHERE trust >= ? '
+                        f'AND source_face_id IN ({placeholders})', (int(min_trust), *chunk))
+            found.update(int(r[0]) for r in cur.fetchall())
+        return found
+
     def set_profile_face(self, identity, face_id):
         """Make manual face `face_id` the profile picture of `identity`. False if
         the face doesn't exist, is rejected, or belongs to someone else."""

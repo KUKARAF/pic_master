@@ -8,7 +8,7 @@ FaceDetector's PCN correct+recover merge pass; the quarter-turn backstop; and
 normalize_faces. Everything except section [3] runs on fakes, so no model
 download or real face image is needed.
 """
-import os, sys, math
+import os, sys, math, threading
 import numpy as np
 import cv2
 
@@ -379,7 +379,7 @@ check('higher-scoring sideways read does not win', faces[0]['angle'] == -90.0,
 app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.5})
 d = make_det(app, None); d._pcn_failed = True
 faces = [face(BOX, ROTATION_TTA_TRIGGER, emb_k=0)]
-d._quarter_turn_backstop(striped('left'), faces, set())
+d._quarter_turn_backstop(striped('left'), faces, set(), rolls=[0.0])
 check('confident face skips the sweep entirely', app.calls == 0, str(app.calls))
 check('confident face keeps its embedding and angle',
       faces[0]['embedding'][0] == 1.0 and faces[0]['angle'] == 0.0)
@@ -448,6 +448,189 @@ d = make_det(WarpApp(pcn, {90.0: (0.9, 5, 0.0)}), pcn)
 stored = [face([12, 12, 112, 112], 0.8, emb_k=2)]
 out = d.normalize_faces(img, stored)
 check('normalize_faces recovers no new faces', len(out) == 1, str(len(out)))
+
+
+print("\n[7] always-on orientation gate (fakes)")
+from media_manager.face_detector import ROTATION_GATE_ROLL  # hook-allow: staged — script sections import as they go
+
+check('gate sits below the alignment tolerance, above PCN noise',
+      25.0 <= ROTATION_GATE_ROLL < ROTATION_ALIGN_TOLERANCE, str(ROTATION_GATE_ROLL))
+
+# a) THE BUG: confident (0.88) face whose own landmarks say upside down, PCN missed
+#    it. Upright read of the crop is ALSO rolled 180 and scores the same.
+#    The gate must flip it and report +180.
+app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.88})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.88, emb_k=0)]
+d._quarter_turn_backstop(striped('bottom'), faces, set(), rolls=[180.0])
+check('confident upside-down face is fixed', faces[0]['embedding'][1] == 1.0
+      and faces[0]['angle'] == 180.0, str(faces[0]['angle']))
+check('...and takes the upright read\'s score', faces[0]['det_score'] == 0.9)
+
+# a2) same, sideways, roll comes from the landmarks -> angle convention (cw from upright)
+app = OrientedApp({'top': 0.9, 'left': 0.88, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.88, emb_k=0)]
+d._quarter_turn_backstop(striped('left'), faces, set(), rolls=[-90.0])
+check('confident head-pointing-left face gets angle -90 (cw from upright)',
+      faces[0]['angle'] == -90.0 and faces[0]['embedding'][1] == 1.0, str(faces[0]['angle']))
+
+# b) an upright confident face costs ZERO extra calls (roll known from keypoints)
+app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.9, emb_k=0)]
+d._quarter_turn_backstop(striped('top'), faces, set(), rolls=[ROTATION_GATE_ROLL - 1.0])
+check('upright confident face: zero model calls', app.calls == 0, str(app.calls))
+check('upright confident face untouched', faces[0]['embedding'][0] == 1.0 and faces[0]['angle'] == 0.0)
+# ...and a merely-tilted head just under the gate is also free
+app = OrientedApp({'top': 0.9}); d = make_det(app, None); d._pcn_failed = True
+d._quarter_turn_backstop(striped('top'), [face(BOX, 0.95)], set(), rolls=[-(ROTATION_GATE_ROLL - 0.5)])
+check('tilted-but-under-gate face: zero model calls', app.calls == 0)
+
+# c) weak detection still triggers regardless of roll (old trigger kept as additional)
+app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.55, emb_k=0)]
+d._quarter_turn_backstop(striped('left'), faces, set(), rolls=[0.0])
+check('weak detection still gated even with upright roll', app.calls > 0 and faces[0]['angle'] == -90.0)
+
+# d) guardrail: landmarks say 180 but NO quarter-turn read comes out upright
+#    (every read is sideways) -> no guess, incumbent kept.
+app = OrientedApp({'top': 0.88, 'left': 0.95, 'right': 0.95, 'bottom': 0.95},
+                  rolls={'top': 120.0, 'left': 90.0, 'right': -90.0, 'bottom': 180.0})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.88, emb_k=0)]
+d._quarter_turn_backstop(striped('bottom'), faces, set(), rolls=[180.0])
+check('no upright candidate -> no wrong flip', faces[0]['embedding'][0] == 1.0
+      and faces[0]['angle'] == 0.0)
+
+# e) guardrail: roll trips the gate (landmark noise) but the flat read of the crop is
+#    fine (upright landmarks) and no rotation beats it by the margin -> kept.
+app = OrientedApp({'top': 0.88, 'left': 0.9, 'right': 0.5, 'bottom': 0.5},
+                  rolls={'top': 5.0, 'left': 3.0, 'right': 0.0, 'bottom': 0.0})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.88, emb_k=0)]
+d._quarter_turn_backstop(striped('top'), faces, set(), rolls=[60.0])
+check('gate trip with a sound upright re-read does not flip', faces[0]['embedding'][0] == 1.0
+      and faces[0]['angle'] == 0.0)
+
+# f) PCN-claimed faces stay PCN's call even if their roll is bad
+app = OrientedApp({'top': 0.9, 'bottom': 0.5, 'left': 0.5, 'right': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+faces = [face(BOX, 0.88)]
+d._quarter_turn_backstop(striped('bottom'), faces, {0}, rolls=[180.0])
+check('claimed face skipped by gate', app.calls == 0)
+
+# g) end to end through detect_image: roll comes free from the face's own kps.
+class FullImageApp:
+    """SCRFD stand-in for the whole image: one confident face with a given roll."""
+    def __init__(self, roll, score=0.88, crop_app=None):
+        self.roll, self.score, self.crop_app = roll, score, crop_app
+        self.full_calls = 0
+    def get(self, im):
+        if im.shape[:2] == (500, 500):
+            self.full_calls += 1
+            f = FakeFace(self.score, 0, self.roll, im.shape)
+            f.bbox = np.array(BOX, np.float32)
+            return [f]
+        return self.crop_app.get(im)
+
+crop_app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.88})
+fa = FullImageApp(180.0, crop_app=crop_app)
+d = make_det(fa, None); d._pcn_failed = True
+d._tl = threading.local(); d._pcn_lock = threading.Lock()
+out = d.detect_image(striped('bottom'))
+check('detect_image fixes a confident upside-down face PCN missed',
+      len(out) == 1 and out[0]['angle'] == 180.0 and out[0]['embedding'][1] == 1.0,
+      str(out and out[0]['angle']))
+crop_app = OrientedApp({'top': 0.9})
+fa = FullImageApp(4.0, score=0.9, crop_app=crop_app)
+d = make_det(fa, None); d._pcn_failed = True
+d._tl = threading.local(); d._pcn_lock = threading.Lock()
+out = d.detect_image(striped('top'))
+check('detect_image: upright confident face -> only the one full-image call',
+      fa.full_calls == 1 and crop_app.calls == 0 and out[0]['angle'] == 0.0,
+      f'crop calls={crop_app.calls}')
+
+# h) normalize_faces: stored rows have no kps, a confident one costs ONE crop read
+#    to learn its roll; upright -> byte-identical; upside down -> fixed, idempotent.
+pcn = FakePCN([])
+app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, pcn)
+stored = [face(BOX, 0.9, emb_k=2)]
+out = d.normalize_faces(striped('top'), stored)
+check('backfill: upright confident face unchanged', out[0]['embedding'][2] == 1.0
+      and out[0]['angle'] == 0.0)
+check('backfill: ...for exactly one verification read', app.calls == 1, str(app.calls))
+app = OrientedApp({'top': 0.9, 'left': 0.5, 'right': 0.5, 'bottom': 0.88})
+d = make_det(app, FakePCN([]))
+stored = [face(BOX, 0.9, emb_k=2)]
+once = d.normalize_faces(striped('bottom'), stored)
+check('backfill: confident upside-down stored face gets the gate',
+      once[0]['angle'] == 180.0 and once[0]['embedding'][1] == 1.0, str(once[0]['angle']))
+twice = d.normalize_faces(striped('bottom'), once)
+check('backfill gate idempotent', twice[0]['angle'] == 180.0
+      and float(np.dot(twice[0]['embedding'], once[0]['embedding'])) == 1.0)
+# crop read finds nothing -> alignment can't be judged -> stored vector kept
+app = OrientedApp({'top': 0.0, 'left': 0.9, 'right': 0.9, 'bottom': 0.9})
+d = make_det(app, FakePCN([]))
+out = d.normalize_faces(striped('top'), [face(BOX, 0.9, emb_k=2)])
+check('backfill: unverifiable confident face kept as is', out[0]['embedding'][2] == 1.0
+      and out[0]['angle'] == 0.0)
+
+
+print("\n[8] embed_bbox orientation (fakes)")
+
+class BoxApp:
+    """app.get() for embed_bbox tests: orientation from the crop content as in
+    OrientedApp, but `visible` names the sides it can detect at all."""
+    def __init__(self, scores, rolls=None):
+        self.inner = OrientedApp(scores, rolls)
+    @property
+    def calls(self): return self.inner.calls
+    def get(self, crop): return self.inner.get(crop)
+
+UB = [150, 150, 350, 350]
+# a) upright face in the box: tier 1, no extra calls, angle 0, bbox returned
+app = BoxApp({'top': 0.9})
+d = make_det(app, None); d._pcn_failed = True
+res = d.embed_bbox(striped('top'), UB)
+check('embed_bbox upright: single read', app.calls == 1, str(app.calls))
+check('embed_bbox upright: angle 0 and detected bbox', res['angle'] == 0.0 and res['bbox'] is not None)
+
+# b) face rotated (head pointing left): tier 1 DOES find it (confidently) but its
+#    landmarks are -90 -> quarter-turn sweep, upright read adopted, angle -90, user's box kept
+app = BoxApp({'top': 0.9, 'left': 0.88, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+res = d.embed_bbox(striped('left'), UB)
+check('embed_bbox rotated face: embedding from the upright read', res['embedding'][1] == 1.0)
+check('embed_bbox rotated face: angle -90 (cw from upright)', res['angle'] == -90.0, str(res['angle']))
+check('embed_bbox rotated face: user box kept (bbox None)', res['bbox'] is None)
+check('embed_bbox rotated face: 1 + 3 reads', app.calls == 4, str(app.calls))
+
+# c) upside down and tier 1 sees nothing as-is (only a quarter turn is detectable)
+app = BoxApp({'top': 0.0, 'left': 0.0, 'right': 0.0, 'bottom': 0.0})
+app.inner.scores = {'top': 0.9}
+d = make_det(app, None); d._pcn_failed = True
+res = d.embed_bbox(striped('bottom'), UB)
+check('embed_bbox: nothing as-is, sweep finds the upright read at 180',
+      res['angle'] == 180.0 and res['embedding'][1] == 1.0 and res['det_score'] == 0.9,
+      str(res['angle']))
+
+# d) auto_orient=False keeps the literal behaviour (rotate control)
+app = BoxApp({'top': 0.9, 'left': 0.88, 'right': 0.5, 'bottom': 0.5})
+d = make_det(app, None); d._pcn_failed = True
+res = d.embed_bbox(striped('left'), UB, auto_orient=False)
+check('auto_orient=False embeds as given', res['angle'] == 0.0 and res['embedding'][2] == 1.0
+      and app.calls == 1)
+
+# e) guardrail: tier 1 face reads rolled but every quarter turn is sideways too -> keep incumbent
+app = BoxApp({'top': 0.9, 'left': 0.9, 'right': 0.9, 'bottom': 0.9},
+             rolls={'top': 100.0, 'left': 100.0, 'right': 100.0, 'bottom': 100.0})
+d = make_det(app, None); d._pcn_failed = True
+res = d.embed_bbox(striped('top'), UB)
+check('embed_bbox: no upright candidate keeps the tier-1 read', res['angle'] == 0.0
+      and res['embedding'][1] == 1.0)
 
 
 print("\n" + ("ALL ROTATION TESTS PASSED" if not FAILS else f"{len(FAILS)} FAILURE(S): {FAILS}"))

@@ -149,6 +149,15 @@ ROTATION_ALIGN_TOLERANCE = 45.0
 # so the sweep would mostly re-confirm it at real cost; a weak detection is the
 # signature of a rotated or badly framed face — including ones PCN itself missed.
 ROTATION_TTA_TRIGGER = 0.72
+# ALWAYS-ON orientation gate. The det_score trigger above misses the confident but
+# rotated face (an upside-down face can keep a 0.88 score while its embedding is
+# garbage), so every face created ALSO carries the roll its own InsightFace
+# landmarks imply (free: the keypoints are already computed). Past this |roll| the
+# guarded quarter-turn read runs no matter how confident the detection was; at or
+# below it an upright confident face costs ZERO extra model calls. Deliberately well
+# under ROTATION_ALIGN_TOLERANCE (45, where ArcFace's alignment measurably degrades)
+# yet above PCN's ~25 deg angle noise and an ordinary head tilt.
+ROTATION_GATE_ROLL = 30.0
 # Slack around a user-drawn box in embed_bbox. Unchanged default: it is enough for
 # SCRFD to re-find the face (measured 0.77-0.85) while staying tight enough that a
 # neighbouring face in a crowd shot doesn't wander into the crop.
@@ -441,9 +450,12 @@ class FaceDetector:
         self._tl.timings = timings
         try:
             faces = []
+            rolls = []  # landmark roll per face, aligned with `faces` (None = unknown)
             for face in self._app_get(img, 'scrfd'):
                 if face.det_score < self.det_thresh:
                     continue
+                kps = getattr(face, 'kps', None)
+                rolls.append(None if kps is None else _kps_angle(kps))
                 faces.append({
                     'bbox': [float(v) for v in face.bbox],
                     # normed_embedding, not embedding — InsightFace's raw .embedding
@@ -453,7 +465,7 @@ class FaceDetector:
                     'det_score': float(face.det_score),
                     'angle': 0.0,
                 })
-            self._normalize_in_place(img, faces)
+            self._normalize_in_place(img, faces, rolls=rolls)
             if scale and scale != 1.0:
                 for f in faces:
                     f['bbox'] = [float(v) * scale for v in f['bbox']]
@@ -499,14 +511,17 @@ class FaceDetector:
             })
         return self._normalize_in_place(img, working, recover=False)
 
-    def _normalize_in_place(self, img, faces, recover=True):
+    def _normalize_in_place(self, img, faces, recover=True, rolls=None):
         """THE in-plane rotation normalization pass: PCN correct+recover, then the
-        quarter-turn sweep for weak faces PCN never reported. detect_faces and
-        normalize_faces both route through here so the live pipeline and the
-        backfill cannot drift into two different normalizations. Mutates and
-        returns `faces`."""
+        orientation gate (quarter-turn sweep) for every face PCN did not claim whose
+        detection is weak OR whose own landmarks say it is not upright. detect_faces
+        and normalize_faces both route through here so the live pipeline and the
+        backfill cannot drift into two different normalizations. `rolls` = the
+        landmark roll of each face in `faces` as detected (None: unknown, as for
+        stored rows, which the gate then measures itself). Mutates and returns
+        `faces`."""
         claimed = self._pcn_correct_and_recover(img, faces, recover=recover)
-        self._quarter_turn_backstop(img, faces, claimed)
+        self._quarter_turn_backstop(img, faces, claimed, rolls=rolls)
         return faces
 
     def _pcn_correct_and_recover(self, img, faces, recover=True):
@@ -648,56 +663,91 @@ class FaceDetector:
             'kps': face.kps,
         }
 
-    def _quarter_turn_backstop(self, img, faces, claimed):
-        """Quarter-turn test-time augmentation for weak faces PCN never reported —
-        it has its own recall holes, and before this existed a sideways face SCRFD
-        half-saw kept its distorted vector forever. Faces in `claimed` are PCN's
-        call, not ours.
-
-        Re-crops each weak face on its own (so it fills more of the frame) and
-        re-detects it at 0/90/180/270 degrees, then picks the read whose own
-        landmarks come out upright — NOT the highest-scoring one. That distinction
-        is load-bearing: on an upside-down face SCRFD happily scores the sideways
-        quarter turn highest, and picking by score alone stamped a confidently
-        wrong "+90" angle on it. A rotation is adopted only if it beats the upright
-        read of the same crop by ROTATION_CORRECT_MARGIN (same region, same size,
-        same detector — a fair comparison) or that upright read's landmarks are
-        themselves materially rotated, i.e. its alignment cannot be defended.
-        Failing all that, an upright read that clearly beats the incumbent
-        detection is still adopted: that is how a vector from embed_bbox's
-        unaligned last resort (det_score 0.0) gets recomputed through the properly
-        aligned upright path. Confidently-detected faces skip the sweep entirely,
-        so they cost nothing.
-        """
+    def _quarter_turn_reads(self, crop, upright):
+        """Re-detect `crop` at 0/90/180/270 degrees: [(k, face)] for each quarter
+        turn (clockwise count k) that yields a central face. `upright` is the
+        already-taken k=0 read (or None), so it is never repeated."""
         import cv2  # hook-allow: lazy — heavy dep (cv2)
-        turns = ((1, cv2.ROTATE_90_CLOCKWISE),
-                 (2, cv2.ROTATE_180),
-                 (3, cv2.ROTATE_90_COUNTERCLOCKWISE))
+        reads = [] if upright is None else [(0, upright)]
+        for k, code in ((1, cv2.ROTATE_90_CLOCKWISE), (2, cv2.ROTATE_180),
+                        (3, cv2.ROTATE_90_COUNTERCLOCKWISE)):
+            rot = cv2.rotate(crop, code)
+            got = self._centered_face(self._app_get(rot), rot.shape)
+            if got is not None:
+                reads.append((k, got))
+        return reads
+
+    @staticmethod
+    def _choose_orientation(upright, reads, incumbent_score):
+        """Pick the read to adopt among `reads` of one crop, or None to keep the
+        incumbent. Chooses by landmark uprightness (_alignment_rank), NOT score.
+        A rotation is adopted only if its OWN landmarks come out upright, and then
+        only if it beats the upright read of the same crop by ROTATION_CORRECT_MARGIN
+        (same region, size and detector: a fair comparison) or that upright read's
+        landmarks are themselves materially rotated, i.e. its alignment cannot be
+        defended. An upright read that clearly beats the incumbent is also adopted
+        (how embed_bbox's unaligned det_score-0.0 vector gets recomputed). Returns
+        (k, face)."""
+        if not reads:
+            return None
+        best_k, best = min(reads, key=lambda r: _alignment_rank(r[1]))
+        flat_score = float(upright.det_score) if upright is not None else 0.0
+        if best_k:
+            if abs(_kps_angle(best.kps)) >= ROTATION_ALIGN_TOLERANCE:
+                return None  # every read is sideways: flipping would only guess
+            tilted = (upright is None
+                      or abs(_kps_angle(upright.kps)) >= ROTATION_ALIGN_TOLERANCE)
+            if not tilted and float(best.det_score) < flat_score + ROTATION_CORRECT_MARGIN:
+                return None
+        elif flat_score < incumbent_score + ROTATION_CORRECT_MARGIN:
+            return None
+        elif (abs(_kps_angle(best.kps)) >= ROTATION_ALIGN_TOLERANCE
+              and incumbent_score > 0.0):
+            # Nothing came out upright at any rotation: a re-read that is just as
+            # rotated is noise, not a repair. (Only the unaligned det_score-0.0
+            # vector is worth replacing by any aligned read.)
+            return None
+        return best_k, best
+
+    def _quarter_turn_backstop(self, img, faces, claimed, rolls=None):
+        """THE orientation gate for faces PCN did not claim (it has its own recall
+        holes; a sideways face SCRFD half-saw used to keep its distorted vector
+        forever). Faces in `claimed` are PCN's call, not ours.
+
+        A face enters the gate when its detection is weak (det_score <
+        ROTATION_TTA_TRIGGER) OR its own landmarks say it is more than
+        ROTATION_GATE_ROLL off upright (`rolls[i]`; a confident upside-down face
+        used to slip through). A confident face whose landmarks are upright —
+        nearly every face — costs nothing. With `rolls` unknown (stored rows in
+        normalize_faces) a confident face costs ONE read of its padded crop to
+        learn its roll; if that read finds nothing the alignment cannot be judged
+        and the stored vector is kept.
+
+        Gated faces are re-cropped on their own (so they fill more of the frame)
+        and re-detected at 0/90/180/270; _choose_orientation applies the adoption
+        guardrails. Reading by score alone once stamped a confidently wrong "+90"
+        on an upside-down face, which is why uprightness decides."""
+        import cv2  # hook-allow: lazy — heavy dep (cv2)
         for i, face in enumerate(faces):
-            if i in claimed or face['det_score'] >= ROTATION_TTA_TRIGGER:
+            if i in claimed:
+                continue
+            confident = face['det_score'] >= ROTATION_TTA_TRIGGER
+            roll = rolls[i] if rolls is not None and i < len(rolls) else None
+            if confident and roll is not None and abs(roll) < ROTATION_GATE_ROLL:
                 continue
             try:
                 crop, _x, _y = _padded_crop(img, face['bbox'], ROTATION_TTA_PAD)
                 if crop.size == 0:
                     continue
                 upright = self._centered_face(self._app_get(crop), crop.shape)
-                reads = [] if upright is None else [(0, upright)]
-                for k, code in turns:
-                    rot = cv2.rotate(crop, code)
-                    got = self._centered_face(self._app_get(rot), rot.shape)
-                    if got is not None:
-                        reads.append((k, got))
-                if not reads:
-                    continue
-                best_k, best = min(reads, key=lambda r: _alignment_rank(r[1]))
-                flat_score = float(upright.det_score) if upright is not None else 0.0
-                if best_k:
-                    tilted = (upright is None
-                              or abs(_kps_angle(upright.kps)) >= ROTATION_ALIGN_TOLERANCE)
-                    if not tilted and float(best.det_score) < flat_score + ROTATION_CORRECT_MARGIN:
+                if confident and roll is None:
+                    if upright is None or abs(_kps_angle(upright.kps)) < ROTATION_GATE_ROLL:
                         continue
-                elif flat_score < face['det_score'] + ROTATION_CORRECT_MARGIN:
+                pick = self._choose_orientation(
+                    upright, self._quarter_turn_reads(crop, upright), face['det_score'])
+                if pick is None:
                     continue
+                best_k, best = pick
                 face['embedding'] = best.normed_embedding.astype(np.float32)
                 face['det_score'] = float(best.det_score)
                 # We rotated the crop CLOCKWISE by 90*best_k to bring the face
@@ -735,18 +785,29 @@ class FaceDetector:
                 best, best_dist = face, dist
         return best
 
-    def embed_bbox(self, img, bbox: list, pad_ratio: float = FACE_CROP_PAD_RATIO) -> dict:
+    def embed_bbox(self, img, bbox: list, pad_ratio: float = FACE_CROP_PAD_RATIO,
+                   auto_orient: bool = True) -> dict:
         """Given a full-size BGR numpy image and a user-drawn bbox [x1,y1,x2,y2],
         crop with padding, re-run detection on the crop (so the detector gets a
         second chance now the face fills more of the frame + proper landmarks
         for alignment), and return an embedding translated back to original
         image coordinates (bbox=None in the result signals "use the caller's
-        original bbox"). Three tiers, best first:
+        original bbox"). Tiers, best first:
 
           1. InsightFace finds the face in the padded crop -> aligned embedding.
+             If its own landmarks say it is more than ROTATION_GATE_ROLL off
+             upright, the same orientation gate as detection (_orient_embed_crop)
+             tries the quarter turns and adopts an upright read; an upright face
+             costs no extra call.
           2. It doesn't, but PCN does -> the face is in-plane rotated, so warp it
              upright and re-detect; we still get real landmarks, plus the angle.
-          3. Neither -> an unaligned resize, which is barely an embedding at all.
+          3. Neither -> the quarter-turn sweep of the crop, picked by landmark
+             uprightness (a sideways face SCRFD can't see as-is).
+          4. Still nothing -> an unaligned resize, which is barely an embedding.
+
+        `auto_orient=False` embeds the region exactly as handed over (tiers 1, 2, 4
+        as before): the manual "rotate" control and the rotation retries WANT the
+        literal orientation they asked for. 'angle' is clockwise from upright.
         """
         crop, cx1, cy1 = _padded_crop(img, bbox, pad_ratio)
 
@@ -754,16 +815,25 @@ class FaceDetector:
         face = max(raw_faces, key=lambda f: f.det_score) if raw_faces else None
         if face is not None:
             fx1, fy1, fx2, fy2 = [float(v) for v in face.bbox]
-            return {
+            result = {
                 'bbox': [fx1 + cx1, fy1 + cy1, fx2 + cx1, fy2 + cy1],
                 'embedding': face.normed_embedding.astype(np.float32),
                 'det_score': float(face.det_score),
                 'angle': 0.0,
             }
+            kps = getattr(face, 'kps', None)
+            if auto_orient and kps is not None and abs(_kps_angle(kps)) >= ROTATION_GATE_ROLL:
+                result = self._orient_embed_crop(crop, face) or result
+            return result
 
         rotated = self._embed_rotated_crop(crop, cx1, cy1) if crop.size else None
         if rotated is not None:
             return rotated
+
+        if auto_orient and crop.size:
+            fixed = self._orient_embed_crop(crop, None)
+            if fixed is not None:
+                return fixed
 
         import cv2  # hook-allow: lazy — heavy dep (cv2)
         # LAST RESORT: an UNALIGNED 112x112 resize straight into ArcFace. With no
@@ -779,6 +849,28 @@ class FaceDetector:
             'embedding': feat,
             'det_score': 0.0,
             'angle': 0.0,
+        }
+
+    def _orient_embed_crop(self, crop, incumbent):
+        """Orientation gate for embed_bbox: re-read `crop` at the quarter turns and
+        return a face dict whose embedding comes from the upright read, or None to
+        keep what the caller has. `incumbent` is the crop's own read when tier 1
+        found a face (it doubles as the k=0 read, so nothing is read twice), None
+        when tier 1 found nothing. Always bbox=None: the user's box stays."""
+        try:
+            got = self._choose_orientation(
+                incumbent, self._quarter_turn_reads(crop, incumbent),
+                float(incumbent.det_score) if incumbent is not None else 0.0)
+        except Exception:  # hook-allow: broad — best-effort orientation fix, None keeps the caller's read
+            return None
+        if got is None or got[0] == 0:
+            return None
+        k, best = got
+        return {
+            'bbox': None,
+            'embedding': best.normed_embedding.astype(np.float32),
+            'det_score': float(best.det_score),
+            'angle': _norm_angle(-90.0 * k),
         }
 
     def _embed_rotated_crop(self, crop, cx1, cy1):

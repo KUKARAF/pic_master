@@ -4674,7 +4674,8 @@ def create_app(data_root: str) -> FastAPI:
     face_suggest_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'scored': 0}
     # Re-normalization backfill: re-embed already-detected faces through the current
     # in-plane rotation pipeline ('changed' = rows actually rewritten).
-    renormalize_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'changed': 0}
+    renormalize_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'changed': 0,
+                       'skipped_manual': 0}
     phash_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     video_face_scan_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'captured': 0, 'error': None}
@@ -11552,7 +11553,10 @@ def create_app(data_root: str) -> FastAPI:
             # would point at empty background in the rotated region.
             fx1, fy1, fx2, fy2 = rh - fy2, fx1, rh - fy1, fx2
             rw, rh = rh, rw
-        res = _get_face_detector().embed_bbox(region, [fx1, fy1, fx2, fy2])
+        # auto_orient=False: this is the explicit "embed it at THIS orientation"
+        # path (manual rotate control, rotation retries); the orientation gate would
+        # silently turn a deliberately rotated region back upright.
+        res = _get_face_detector().embed_bbox(region, [fx1, fy1, fx2, fy2], auto_orient=False)
         emb = res.get('embedding') if res else None
         if emb is None:
             return None, 0.0
@@ -12037,6 +12041,17 @@ def create_app(data_root: str) -> FastAPI:
         refreshed_refs = 0
         consecutive_unexpected = 0
         for chunk in db.iter_unnormalized_faces(chunk=200):
+            # Hard rule: a face set by hand (manual.db trust 3) is never altered by a
+            # background job. Those rows are stamped done WITHOUT being examined or
+            # rewritten (neither the media.db vector nor the promoted manual.db
+            # reference row), and counted so the operator can see it.
+            hand_set = manual.get_trusted_source_ids([r[0] for r in chunk])
+            if hand_set:
+                mine = [r[0] for r in chunk if r[0] in hand_set]
+                db.bump_face_norm_version(mine, FACE_NORM_VERSION)
+                renormalize_job['skipped_manual'] += len(mine)
+                renormalize_job['done'] += len(mine)
+                chunk = [r for r in chunk if r[0] not in hand_set]
             by_file = {}
             for row in chunk:
                 by_file.setdefault(row[1], []).append(row)
@@ -12144,7 +12159,7 @@ def create_app(data_root: str) -> FastAPI:
             # which is what makes both the normal and the full pass resumable.
             db.bump_face_norm_version(None, 0)
         renormalize_job.update(running=True, done=0, total=db.count_unnormalized_faces(),
-                               error=None, changed=0)
+                               error=None, changed=0, skipped_manual=0)
 
         def _run():
             try:
@@ -12165,6 +12180,7 @@ def create_app(data_root: str) -> FastAPI:
             'total': renormalize_job['total'],
             'error': renormalize_job['error'],
             'changed': renormalize_job['changed'],
+            'skipped_manual': renormalize_job['skipped_manual'],
         }
 
     def _confirm_auto_face(raw_id, name, trust=3):
@@ -12350,7 +12366,17 @@ def create_app(data_root: str) -> FastAPI:
         result = _get_face_detector().embed_bbox(img, [x1, y1, x2, y2])
         final_bbox = result['bbox'] if result['bbox'] is not None else [x1, y1, x2, y2]
         face_id = manual.add_manual_face(row['checksum'], final_bbox, result['embedding'].tobytes(), img_width, img_height)
-        return {'id': f"manual:{face_id}", 'bbox': final_bbox, 'det_score': result['det_score']}
+        # embed_bbox ran the orientation gate: the vector comes from the face as
+        # found upright, and 'angle' (clockwise from upright) says how it sits in the
+        # photo. Manual rows keep the nearest quarter-turn as their display
+        # `rotation` (k clockwise turns undo an angle of -90*k), so the crop renders
+        # the way it was embedded.
+        angle = float(result.get('angle') or 0.0)
+        quarter_turns = int(round(-angle / 90.0)) % 4
+        if quarter_turns:
+            manual.set_face_rotation(face_id, quarter_turns)
+        return {'id': f"manual:{face_id}", 'bbox': final_bbox, 'det_score': result['det_score'],
+                'angle': round(angle, 2)}
 
     @app.post('/api/files/{file_id}/detect-faces')
     def api_detect_faces(file_id: int):
