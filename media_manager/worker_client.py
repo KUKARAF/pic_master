@@ -35,6 +35,7 @@ import requests
 
 from . import worker_protocol
 from . import worker_config
+from . import face_timing
 
 
 
@@ -472,8 +473,10 @@ def get_client(data_root: str) -> WorkerClient:
 # ---------------------------------------------------------------------------
 
 
-FACE_INFLIGHT = int(os.environ.get("MEDIA_FACE_INFLIGHT", 4))      # face requests in flight
-FACE_PATHS_CHUNK = int(os.environ.get("MEDIA_FACE_PATHS_CHUNK", 8))  # files per detect_faces_paths request
+FACE_INFLIGHT = max(1, int(os.environ.get("MEDIA_FACE_INFLIGHT", 4)))  # face requests in flight
+# Files per detect_faces_paths request. MEDIA_FACE_CHUNK wins; MEDIA_FACE_PATHS_CHUNK is the old name.
+FACE_PATHS_CHUNK = max(1, int(os.environ.get("MEDIA_FACE_CHUNK")
+                              or os.environ.get("MEDIA_FACE_PATHS_CHUNK") or 8))
 
 
 class RemoteFaceDetector:
@@ -481,7 +484,9 @@ class RemoteFaceDetector:
 
     # Files per detect_faces() call the bulk job should hand over (it processes the
     # results after each call): big enough to keep FACE_INFLIGHT requests busy.
-    batch_size = int(os.environ.get("MEDIA_FACE_BATCH", 32))
+    # Default = 3 rounds of full pipelines (INFLIGHT x CHUNK files each): a batch ends when its
+    # slowest request does, so a one-round batch left the pipeline draining every 32 files.
+    batch_size = max(1, int(os.environ.get("MEDIA_FACE_BATCH") or FACE_INFLIGHT * FACE_PATHS_CHUNK * 3))
 
     def __init__(self, client: WorkerClient, data_root=None):
         self.client = client
@@ -491,6 +496,11 @@ class RemoteFaceDetector:
         # Callers (e.g. web.py detect-faces) read `detector._model_name` to compute
         # the DB model_id. The worker always runs the default buffalo_l, so mirror it.
         self._model_name = 'buffalo_l'
+        # Per-job diagnostics (read by web._process_detect_faces): the worker's per-stage
+        # timings summed over replies, how full the request pipeline is, and the transport.
+        self.face_timing = face_timing.FaceTimings()
+        self.flight = face_timing.FlightTracker(FACE_INFLIGHT)
+        self.transport_mode = None
 
     @staticmethod
     def _faces_from_wire(raw) -> list:
@@ -517,6 +527,7 @@ class RemoteFaceDetector:
             {"name": basename, "image": image_bytes},
             concurrent=True,
         )
+        self.face_timing.add(resp.get("timings"))
         return (path, self._faces_from_wire(resp.get("faces")), resp.get("error"))
 
     def _detect_paths_chunk(self, rels, paths):
@@ -544,6 +555,7 @@ class RemoteFaceDetector:
         if len(results) != len(paths):
             raise WorkerError(f"detect_faces_paths: worker returned {len(results)} results "
                               f"for {len(paths)} paths")
+        self.face_timing.add(resp.get("timings"))  # optional: absent on an older worker
         return [(p, self._faces_from_wire(r.get("faces")), r.get("error"))
                 for p, r in zip(paths, results)]
 
@@ -563,32 +575,47 @@ class RemoteFaceDetector:
         via_upload = [i for i in range(n) if rels[i] is None]
 
         def run_chunk(idxs):
-            got = self._detect_paths_chunk([rels[i] for i in idxs], [paths[i] for i in idxs])
-            if got is None:
-                return [(i, self._detect_one_upload(paths[i])) for i in idxs]
-            return list(zip(idxs, got))
+            self.flight.request(+1)
+            try:
+                got = self._detect_paths_chunk([rels[i] for i in idxs], [paths[i] for i in idxs])
+                if got is None:
+                    return [(i, self._detect_one_upload(paths[i])) for i in idxs]
+                return list(zip(idxs, got))
+            finally:
+                self.flight.request(-1)
 
         def run_upload(i):
-            return [(i, self._detect_one_upload(paths[i]))]
+            self.flight.request(+1)
+            try:
+                return [(i, self._detect_one_upload(paths[i]))]
+            finally:
+                self.flight.request(-1)
+
+        self.transport_mode = 'shared-disk' if via_paths and not via_upload else (
+            'upload' if via_upload and not via_paths else ('mixed' if n else self.transport_mode))
 
         jobs = [(run_chunk, via_paths[k:k + FACE_PATHS_CHUNK])
                 for k in range(0, len(via_paths), FACE_PATHS_CHUNK)]
         jobs += [(run_upload, i) for i in via_upload]
-        if len(jobs) <= 1:
-            for fn, arg in jobs:
-                for i, r in fn(arg):
-                    results[i] = r
-        else:
-            with ThreadPoolExecutor(max_workers=max(1, min(FACE_INFLIGHT, len(jobs)))) as pool:
-                futs = [pool.submit(fn, arg) for fn, arg in jobs]
-                try:
-                    for f in futs:  # in order -> deterministic error precedence
-                        for i, r in f.result():
-                            results[i] = r
-                except BaseException:
-                    for f in futs:
-                        f.cancel()
-                    raise
+        self.flight.call(+1)
+        try:
+            if len(jobs) <= 1:
+                for fn, arg in jobs:
+                    for i, r in fn(arg):
+                        results[i] = r
+            else:
+                with ThreadPoolExecutor(max_workers=max(1, min(FACE_INFLIGHT, len(jobs)))) as pool:
+                    futs = [pool.submit(fn, arg) for fn, arg in jobs]
+                    try:
+                        for f in futs:  # in order -> deterministic error precedence
+                            for i, r in f.result():
+                                results[i] = r
+                    except BaseException:
+                        for f in futs:
+                            f.cancel()
+                        raise
+        finally:
+            self.flight.call(-1)
         return results
 
     def embed_bbox(self, img, bbox: list, pad_ratio: float = 0.3) -> dict:

@@ -365,6 +365,17 @@ def pcn_threads() -> int:
         return max(1, min(4, (os.cpu_count() or 2) - 1))
 
 
+def pcn_concurrency() -> int:
+    """Max images running the CPU PCN cascade at once in this process (MEDIA_PCN_CONCURRENCY;
+    0 = unbounded). Default cpu_count // pcn_threads (at least 2): the PCN sessions' intra-op
+    pools plus the concurrent requests would otherwise oversubscribe the cores. MEDIA_PCN_THREADS
+    stays the per-session intra-op thread count; this caps how many such sessions run at once."""
+    try:
+        return max(0, int(os.environ['MEDIA_PCN_CONCURRENCY']))
+    except (KeyError, ValueError):
+        return max(2, (os.cpu_count() or 2) // pcn_threads())
+
+
 class PCNDetector:
     """Lazy-loading rotation-invariant face detector. detect() returns
     [{'bbox':[x1,y1,x2,y2], 'angle':degrees, 'conf':float, 'points':[(x,y)x4]}]."""

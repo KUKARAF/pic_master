@@ -7,7 +7,9 @@ import traceback
 import numpy as np
 
 from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
+import time
 from . import compute
+from .face_timing import FaceTimings, tadd
 
 # OpenCV refuses WebP files over 64 MiB by default (animated WebPs from uploads
 # easily exceed it). Raise the cap before cv2 loads; setdefault so an explicit
@@ -235,6 +237,13 @@ class FaceDetector:
     # of different images overlap. Unset everywhere else (callers that already hold the
     # GPU lock through models.lock).
     _tl = threading.local()
+    # Cumulative per-stage timings of detect_faces() (see face_timing.py); read by the
+    # local-detector job status. Per-instance in __init__; None for __init__-less test doubles.
+    face_timing = None
+    transport_mode = 'local'
+    flight = None
+    # Bounds how many images run the CPU PCN cascade at once (see _pcn_slots).
+    _pcn_sem = None
 
     def __init__(self, model_name='buffalo_l', det_thresh=0.5, ctx_id=None):
         from insightface.app import FaceAnalysis  # hook-allow: lazy — heavy optional dep (insightface)
@@ -251,11 +260,19 @@ class FaceDetector:
         fa_kwargs = {'name': model_name, 'providers': providers}
         if provider_options is not None:
             fa_kwargs['provider_options'] = provider_options
+        # Only the two modules whose output we use. buffalo_l also ships landmark_3d_68,
+        # landmark_2d_106 and genderage, which app.get() would otherwise run on EVERY
+        # detected face of EVERY call (full image, PCN warps, quarter-turn crops) for
+        # attributes nothing reads; the embedding comes from detection (kps) + recognition,
+        # so the output is bit-identical. MEDIA_FACE_ALL_MODULES=1 restores the full set.
+        if os.environ.get('MEDIA_FACE_ALL_MODULES', '').strip().lower() not in ('1', 'true', 'yes'):
+            fa_kwargs['allowed_modules'] = ['detection', 'recognition']
         self.app = FaceAnalysis(**fa_kwargs)
         self.app.prepare(ctx_id=ctx_id, det_size=(640, 640))
         print(f"[faces] providers={providers} ctx_id={ctx_id}", flush=True)
         self._pcn = None
         self._pcn_failed = False
+        self.face_timing = FaceTimings()
 
     def _get_pcn(self):
         """Lazily construct the PCN rotation-invariant detector (onnxruntime, no
@@ -303,21 +320,71 @@ class FaceDetector:
             self._pcn, self._pcn_failed = None, True
             return False
 
-    def _pcn_detect(self, pcn, img):
-        """pcn.detect(img), under the per-thread GPU lock only if PCN is on the GPU."""
-        lock = getattr(self._tl, 'gpu_lock', None)
-        if lock is not None and getattr(pcn, 'on_gpu', False):
-            with lock:
-                return pcn.detect(img)
-        return pcn.detect(img)
+    def _pcn_slots(self):
+        """Process-wide semaphore bounding concurrent CPU PCN cascades (None = unbounded).
+        Every concurrent request runs PCN with `pcn_threads()` intra-op threads, so N
+        requests would otherwise oversubscribe the cores (and starve decode / the GPU
+        feeder threads); pure scheduling, the results are identical."""
+        if self._pcn_sem is None:
+            with self._pcn_lock:
+                if self._pcn_sem is None:
+                    from media_manager.pcn import pcn_detect as _pd  # hook-allow: lazy — cv2/onnxruntime
+                    n = _pd.pcn_concurrency()
+                    FaceDetector._pcn_sem = threading.Semaphore(n) if n > 0 else False
+        return self._pcn_sem or None
 
-    def _app_get(self, img):
-        """InsightFace app.get(img), serialized on the per-thread GPU lock when one is set."""
+    def _pcn_detect(self, pcn, img):
+        """pcn.detect(img): under the per-thread GPU lock if PCN is on the GPU, else under a
+        PCN slot (CPU). Wait and run time are accounted separately."""
+        t = getattr(self._tl, 'timings', None)
         lock = getattr(self._tl, 'gpu_lock', None)
-        if lock is None:
+        if getattr(pcn, 'on_gpu', False):
+            if lock is None:
+                return pcn.detect(img)
+            t0 = time.perf_counter()
+            with lock:
+                t1 = time.perf_counter()
+                try:
+                    return pcn.detect(img)
+                finally:
+                    tadd(t, 'lock_wait_s', t1 - t0)
+                    tadd(t, 'pcn_s', time.perf_counter() - t1)
+        sem = self._pcn_slots()
+        t0 = time.perf_counter()
+        if sem is not None:
+            sem.acquire()
+        t1 = time.perf_counter()
+        try:
+            return pcn.detect(img)
+        finally:
+            if sem is not None:
+                sem.release()
+            tadd(t, 'pcn_wait_s', t1 - t0)
+            tadd(t, 'pcn_s', time.perf_counter() - t1)
+
+    def _app_get(self, img, stage='rec'):
+        """InsightFace app.get(img), serialized on the per-thread GPU lock when one is set.
+        `stage` ('scrfd' = the one full-image pass, 'rec' = warped / crop re-reads) only
+        selects which timing bucket the time inside the lock lands in."""
+        t = getattr(self._tl, 'timings', None)
+        lock = getattr(self._tl, 'gpu_lock', None)
+        if t is None and lock is None:
             return self.app.get(img)
-        with lock:
+        t0 = time.perf_counter()
+        if lock is not None:
+            lock.acquire()
+        t1 = time.perf_counter()
+        try:
             return self.app.get(img)
+        finally:
+            t2 = time.perf_counter()
+            if lock is not None:
+                lock.release()
+            tadd(t, 'lock_wait_s', t1 - t0)
+            tadd(t, stage + '_s', t2 - t1)
+            tadd(t, 'app_get_calls', 1)
+            if stage == 'rec':
+                tadd(t, 'rec_calls', 1)
 
     def pcn_available(self) -> bool:
         """True when the PCN rotation detector is loaded (loading it on first call).
@@ -326,7 +393,7 @@ class FaceDetector:
         as normalized."""
         return self._get_pcn() is not None
 
-    def detect_faces(self, paths: list, gpu_lock=None) -> list:
+    def detect_faces(self, paths: list, gpu_lock=None, timings=None) -> list:
         """Run detection + embedding on a list of image paths.
 
         Returns list of (path, faces, error):
@@ -335,31 +402,46 @@ class FaceDetector:
           angle = in-plane roll in degrees, clockwise from upright (module header);
                   0.0 when the face needed no rotation correction
           error = None on success, str on failure
+
+        `timings` (optional dict) receives the summed per-stage wall times of this call
+        (keys in face_timing.TIMING_KEYS); they are also added to self.face_timing.
         """
         results = []
+        t = {}
         for path in paths:
             ext = os.path.splitext(path)[1].lower()
             if ext not in SUPPORTED_EXTENSIONS:
                 results.append((path, [], 'unsupported extension'))
                 continue
+            t_img = time.perf_counter()
             try:
                 img, scale = _read_bgr_capped(path)
-                results.append((path, self.detect_image(img, scale, gpu_lock), None))
+                tadd(t, 'decode_s', time.perf_counter() - t_img)
+                results.append((path, self.detect_image(img, scale, gpu_lock, timings=t), None))
             except Exception as exc:  # hook-allow: broad — per-image resilience, error reported in result
                 results.append((path, [], str(exc)))
+            tadd(t, 'images', 1)
+            tadd(t, 'total_s', time.perf_counter() - t_img)
+        if timings is not None:
+            for k, v in t.items():
+                tadd(timings, k, v)
+        if self.face_timing is not None:
+            self.face_timing.add(t)
         return results
 
-    def detect_image(self, img, scale=1.0, gpu_lock=None) -> list:
+    def detect_image(self, img, scale=1.0, gpu_lock=None, timings=None) -> list:
         """Faces for one decoded BGR image (the body of :meth:`detect_faces`). `scale`
         (>= 1) maps `img` coordinates back to the original photo's (see
         _read_bgr_capped); boxes are returned in ORIGINAL coordinates. When `gpu_lock` is
         given, only the GPU-bound InsightFace calls hold it (decode and the CPU PCN
         cascade run unlocked, so concurrent images overlap)."""
         prev = getattr(self._tl, 'gpu_lock', None)
+        prev_t = getattr(self._tl, 'timings', None)
         self._tl.gpu_lock = gpu_lock
+        self._tl.timings = timings
         try:
             faces = []
-            for face in self._app_get(img):
+            for face in self._app_get(img, 'scrfd'):
                 if face.det_score < self.det_thresh:
                     continue
                 faces.append({
@@ -378,6 +460,7 @@ class FaceDetector:
             return faces
         finally:
             self._tl.gpu_lock = prev
+            self._tl.timings = prev_t
 
     def normalize_faces(self, img, faces):
         """Given a full-size BGR image and existing face dicts (bbox/embedding/

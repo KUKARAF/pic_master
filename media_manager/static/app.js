@@ -98,6 +98,17 @@
       // Pipeline diagnostics some jobs report (SigLIP+DINO index): where the time goes.
       if (d.gpu_busy_pct != null) s += ' · GPU busy ' + Math.round(d.gpu_busy_pct) + '%';
       if (d.db_write_pct != null) s += ' · DB write ' + Math.round(d.db_write_pct) + '%';
+      // Face scan diagnostics (detect-faces): throughput, where the worker's time goes, how
+      // often the request pipeline ran under-filled, and the transport.
+      if (d.stage_pct) {
+        if (d.img_per_sec) s += ' · ' + d.img_per_sec + ' img/s';
+        var lbl = {decode: 'decode', pcn: 'PCN', scrfd: 'SCRFD', rec: 'recog', gpu_wait: 'GPU-lock wait', other: 'other'};
+        s += ' · time: ' + Object.keys(lbl).filter(function (k) { return d.stage_pct[k] != null; })
+          .map(function (k) { return lbl[k] + ' ' + Math.round(d.stage_pct[k]) + '%'; }).join(', ');
+        if (d.app_get_per_img != null) s += ' · ' + d.app_get_per_img + ' app.get/img';
+        if (d.flight_under_pct != null) s += ' · <' + d.inflight_cap + ' in flight ' + Math.round(d.flight_under_pct) + '% (avg ' + d.inflight_avg + ')';
+        if (d.transport_mode) s += ' · ' + d.transport_mode;
+      }
       // ETA: prefer a server-provided estimate (e.g. the imdb index load),
       // else derive from the smoothed rate. Only shown when finite and work remains.
       var eta = d.eta_seconds != null ? d.eta_seconds

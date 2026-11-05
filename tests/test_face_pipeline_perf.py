@@ -191,7 +191,7 @@ class FakeFaces:
         self.seen = []
         self.gpu_lock_arg = None
 
-    def detect_faces(self, paths, gpu_lock=None):
+    def detect_faces(self, paths, gpu_lock=None, timings=None):
         self.gpu_lock_arg = gpu_lock
         out = []
         for p in paths:

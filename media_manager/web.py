@@ -42,7 +42,7 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, file_inventory, folder_ml, frames, geonames, gpu_search,
+    background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
     near_dup, object_index, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
@@ -4369,7 +4369,8 @@ def create_app(data_root: str) -> FastAPI:
     capture_frames_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     video_face_scan_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'captured': 0, 'error': None}
     estimate_age_job = {'running': False, 'done': 0, 'total': 0, 'error': None, 'failed': 0}
-    detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None}
+    detect_faces_job = {'running': False, 'done': 0, 'total': 0, 'matched': 0, 'error': None,
+                        **face_timing.JOB_STAT_DEFAULTS}
     near_dup_job = {'running': False, 'done': 0, 'total': 0, 'groups': 0, 'error': None}
     broken_scan_job = {'running': False, 'done': 0, 'total': 0, 'marked': 0, 'error': None}
     pattern_index_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
@@ -6006,12 +6007,43 @@ def create_app(data_root: str) -> FastAPI:
         model_id = detector.model_id(detector._model_name)
         bsize = max(1, int(getattr(detector, 'batch_size', 8) or 8))
         done = failed = 0
+        # Live diagnostics (img/s EMA, ETA, per-stage %, in-flight utilisation): the detector
+        # aggregates the worker's per-stage timings; we add DB-write time and job wall.
+        ft, fl = getattr(detector, 'face_timing', None), getattr(detector, 'flight', None)
+        if ft is not None:
+            ft.reset()
+        if fl is not None:
+            fl.reset()
+        t_job = time.perf_counter()
+        st = {'db_s': 0.0, 't_prev': t_job, 'n_prev': 0, 'ema': None}
+
+        def _publish_stats():
+            now = time.perf_counter()
+            if done > st['n_prev']:
+                rate = (done - st['n_prev']) / max(now - st['t_prev'], 1e-9)
+                # recent-rate EMA: the since-start average carries model load / warm-up
+                st['ema'] = rate if st['ema'] is None else 0.7 * st['ema'] + 0.3 * rate
+                st['t_prev'], st['n_prev'] = now, done
+            try:
+                counters.update(face_timing.job_stats(
+                    ft.snapshot() if ft is not None else {}, fl.snapshot() if fl is not None else None,
+                    now - t_job, st['db_s'], done, len(candidates), st['ema']),
+                    transport_mode=getattr(detector, 'transport_mode', None))
+            except Exception:  # hook-allow: broad -- diagnostics must never break the job
+                traceback.print_exc()
 
         def _write_and_match(pending):
             """Insert the pending (fid, faces) rows in one transaction, then auto-match each
             new face (same decisions as the old per-file loop, in the same order)."""
             if not pending:
                 return
+            t_db = time.perf_counter()
+            try:
+                _write_and_match_rows(pending)
+            finally:
+                st['db_s'] += time.perf_counter() - t_db
+
+        def _write_and_match_rows(pending):
             db.insert_faces_many(pending, model_id)
             for fid, _faces in pending:
                 row = None
@@ -6073,6 +6105,7 @@ def create_app(data_root: str) -> FastAPI:
                     on_progress(done, failed)
                     pending.append((fid, faces))
                 _write_and_match(pending)
+                _publish_stats()
             if nxt is not None:
                 nxt.cancel()
         return done, failed
@@ -6087,7 +6120,8 @@ def create_app(data_root: str) -> FastAPI:
         if detect_faces_job['running']:
             return {'started': False, 'message': 'Face detection already running.'}
         candidates = _drop_trashed(_faceless_images(), include_trashed)
-        detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None)
+        detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None,
+                                **face_timing.JOB_STAT_DEFAULTS)
         if (busy := _folder_ml_holds('faces', detect_faces_job)):
             return {'started': False, 'message': busy}
 
@@ -6113,6 +6147,7 @@ def create_app(data_root: str) -> FastAPI:
             'matched': detect_faces_job['matched'],
             'error': detect_faces_job['error'],
             'pending': len(_faceless_images()),
+            **{k: detect_faces_job.get(k) for k in face_timing.JOB_STAT_DEFAULTS},
         }
 
     @app.post('/api/near-dup/compute/start')

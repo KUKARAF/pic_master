@@ -35,6 +35,7 @@ import numpy as np
 
 from . import worker_protocol
 from . import compute
+from . import face_timing
 from . import clip_tag_classifier as ct
 from . import yolo_tag_classifier as yt
 
@@ -402,14 +403,51 @@ def _face_detector_ready():
     return models._face_detector
 
 
-def _detect_faces_concurrent(file_paths):
+class _FaceLog:
+    """Rolls per-request face timings up into ONE worker log line every `every` images
+    (replacing the per-request 'handled ...' lines, which drown the log in a bulk scan)."""
+
+    def __init__(self, every=100):
+        self.every = every
+        self._lock = threading.Lock()
+        self._reset()
+
+    def _reset(self):
+        self._agg = {}
+        self._t0 = None
+        self._faces = 0
+        self._errors = 0
+
+    def note(self, timings, faces=0, errors=0):
+        now = time.time()
+        with self._lock:
+            if self._t0 is None:
+                # first request of the window: back-date by its own time so img/s isn't inflated
+                self._t0 = now - float((timings or {}).get('total_s') or 0.0)
+            for k, v in (timings or {}).items():
+                if isinstance(v, (int, float)):
+                    self._agg[k] = self._agg.get(k, 0) + v
+            self._faces += faces
+            self._errors += errors
+            if self._agg.get('images', 0) < self.every:
+                return
+            line = face_timing.summary_line(self._agg, now - self._t0)
+            line = f"{line}, {self._faces} faces, {self._errors} errors"
+            self._reset()
+        print(line, flush=True)
+
+
+_face_log = _FaceLog()
+
+
+def _detect_faces_concurrent(file_paths, timings=None):
     """FaceDetector.detect_faces over local files WITHOUT holding models.lock for the whole
     call: image decode, JPEG down-scaling and the CPU PCN cascade of concurrent requests
     overlap, and only the GPU-bound InsightFace calls serialize on compute.GPU_LOCK (taken
     inside the detector, per call). Lock order stays load_lock -> GPU_LOCK (the detector
     never asks for load_lock while holding GPU_LOCK), so there is no cycle, and every other
     handler's `with models.lock` still excludes these forwards."""
-    return _face_detector_ready().detect_faces(file_paths, gpu_lock=compute.GPU_LOCK)
+    return _face_detector_ready().detect_faces(file_paths, gpu_lock=compute.GPU_LOCK, timings=timings)
 
 
 def _pack_faces(faces):
@@ -436,6 +474,7 @@ def handle_detect_faces_paths(path, data, request_id, link_id, remote_identity, 
         root_real = os.path.realpath(data_root)
         rels = list(req["paths"])
         results = [{"name": r, "faces": [], "error": None} for r in rels]
+        timings = {}
         todo = []  # (result index, real path)
         for i, rel in enumerate(rels):
             try:
@@ -443,17 +482,19 @@ def handle_detect_faces_paths(path, data, request_id, link_id, remote_identity, 
             except (ValueError, OSError) as e:
                 results[i]["error"] = f"rejected: {e}"
         if todo:
-            got = _detect_faces_concurrent([rp for _, rp in todo])
+            got = _detect_faces_concurrent([rp for _, rp in todo], timings)
             for (i, _rp), (_p, faces, error) in zip(todo, got):
                 results[i]["faces"] = _pack_faces(faces) if error is None else []
                 results[i]["error"] = error
         n_faces = sum(len(r["faces"]) for r in results)
         n_err = sum(1 for r in results if r["error"])
         wall = time.time() - t0
-        print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES_PATHS} ({len(rels)} items) -> "
-              f"{n_faces} faces, {n_err} errors, wall {wall:.2f}s", flush=True)
+        for r in [r for r in results if r["error"]][:5]:  # errors stay loud; successes roll up
+            print(f"[worker] {worker_protocol.PATH_DETECT_FACES_PATHS} {r['name']} -> ERROR {r['error']}",
+                  flush=True)
+        _face_log.note(timings, n_faces, n_err)
         return worker_protocol.pack({
-            "results": results, "wall_seconds": wall,
+            "results": results, "wall_seconds": wall, "timings": timings,
             "proto": worker_protocol.FACE_PROTOCOL_VERSION, "error": None})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
@@ -469,12 +510,13 @@ def handle_detect_faces(path, data, request_id, link_id, remote_identity, reques
         req = worker_protocol.unpack(data)
         name = req.get("name")
         tmp = _write_temp(req["image"], name)
-        _, faces, error = _detect_faces_concurrent([tmp])[0]
+        timings = {}
+        _, faces, error = _detect_faces_concurrent([tmp], timings)[0]
         out_faces = _pack_faces(faces)
-        summary = f"{len(out_faces)} faces" if error is None else f"err={error}"
-        print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> {summary}",
-              flush=True)
-        return worker_protocol.pack({"faces": out_faces, "error": error})
+        if error:
+            print(f"[worker] {worker_protocol.PATH_DETECT_FACES} ({name}) -> ERROR {error}", flush=True)
+        _face_log.note(timings, len(out_faces), 1 if error else 0)
+        return worker_protocol.pack({"faces": out_faces, "error": error, "timings": timings})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
         print(f"[worker] handled {worker_protocol.PATH_DETECT_FACES} ({name}) -> ERROR {e}",
