@@ -60,11 +60,11 @@
       return null;
     },
     onReject: function(card) {
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: other } };
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: other, via: 'swipe' } };
     },
     onUndo: function(card, action) {
       if (action !== 'reject') return null;
-      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: name } };
+      return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: name, via: 'swipe' } };
     },
   });
 })();

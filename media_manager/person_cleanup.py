@@ -8,8 +8,9 @@ the anchors' normalized centroid and put in a band:
     REMOVE     score <  remove_threshold   (far from the anchor; bulk-removable)
     UNCERTAIN  in between                  (reviewed one by one, tinder style)
 
-Only faces that are provably machine-assigned (see `eligibility`) may ever land in
-REMOVE or UNCERTAIN; a face a human set is never a candidate at all.
+ANCHORS are the person's trust-3 (hand-set) faces. Only automatic faces (trust 1) may
+ever land in REMOVE; swipe-approved faces (trust 2) are reviewed one by one on opt-in
+and never bulk-removed; a face a human set (trust 3) is never a candidate at all.
 """
 import numpy as np
 
@@ -38,30 +39,71 @@ def band_for(score, keep, remove):
     return 'uncertain'
 
 
-def eligibility(row):
-    """Who may the cleanup touch?  Returns 'auto', 'legacy' or 'protected'.
+# ---- Trust hierarchy for named faces (`faces.trust`, kept consistent with `faces.origin`) ----
+#   3 MANUAL / ANCHOR  set by hand: typed/picked name, hand-drawn box, picked as cleanup
+#                      anchor, favorite, profile picture.        origin='human'
+#   2 APPROVED         approved through swipe-style review (face/identity swipe, cleanup
+#                      swipe 'keep', bulk confirm-above-threshold). origin='human'
+#   1 AUTO             written by the auto-matcher (find_matching_identity) or a legacy row
+#                      whose origin was never recorded.            origin='auto'
+#   0 UNKNOWN          unnamed / not yet assigned (never a reference or a candidate).
+# Only a user action raises or lowers a face's trust; nothing demotes automatically.
+TRUST_UNKNOWN, TRUST_AUTO, TRUST_APPROVED, TRUST_MANUAL = 0, 1, 2, 3
+TRUST_LABELS = {3: 'anchor', 2: 'approved', 1: 'auto', 0: 'unknown'}
+TRUST_TITLES = {
+    3: 'Set by hand: always an anchor, never touched by cleanup',
+    2: 'Approved by swipe: protected from automatic removal',
+    1: 'Automatic match (older faces without a manual mark count as automatic)',
+    0: 'Unknown',
+}
+# Matcher reference weights (rank among references, see ManualDB.get_trusted_face_matrix).
+TRUST_MATCH_WEIGHTS = {TRUST_MANUAL: 1.0, TRUST_APPROVED: 0.7}
 
-    The `faces.origin` column records how a person-assignment came to be:
-      'auto'   -- promoted by the auto-matcher (find_matching_identity), no human involved
-      'human'  -- a human named/confirmed/assigned it
-      NULL     -- written before the column existed: origin unknown ('legacy')
-    Hand-drawn boxes (bbox_source != 'auto'), faces without a media.db source to return
-    to, and anything that carries a human fingerprint (reviewed_ok, favorite, picked as
-    profile picture) are 'protected' regardless. Legacy rows are only candidates when
-    the caller explicitly opts in (and never when they have a human fingerprint or a
-    manual rotation)."""
+
+def derive_trust(origin, reviewed_ok=0, favorite=0, profile_at=None, bbox_source='auto', identity='x'):
+    """Trust implied by the pre-trust columns. The one-time migration in manual_db mirrors
+    this in SQL (tests keep the two in step); also the fallback for rows lacking a value."""
+    if identity is None:
+        return TRUST_UNKNOWN
+    if favorite or profile_at or bbox_source != 'auto':
+        return TRUST_MANUAL
+    if reviewed_ok:
+        return TRUST_APPROVED
+    if origin == 'human':
+        return TRUST_MANUAL
+    return TRUST_AUTO
+
+
+def face_trust(row):
+    """THE place a face row's trust tier is read: the stored `trust` when set, otherwise
+    derived from the older columns."""
     keys = row.keys()
+    t = row['trust'] if 'trust' in keys else None
+    if t:
+        return int(t)
+    g = lambda k, d=None: row[k] if k in keys else d
+    return derive_trust(g('origin'), g('reviewed_ok', 0), g('favorite', 0), g('profile_at'),
+                        g('bbox_source', 'auto'), g('identity', 'x'))
+
+
+def eligibility(row):
+    """Who may the cleanup touch?  Returns 'auto', 'approved' or 'protected'.
+
+      'auto'       trust 1: removable (bulk or swipe).
+      'approved'   trust 2: never auto-removed; only reviewed one by one when the user
+                   opts in (swipe queue), see ManualDB.cleanup_remove_faces.
+      'protected'  trust 3 (anything set by hand), plus rows with no media.db source to
+                   return to, hand-drawn boxes, rejected / unassigned rows.
+    Older faces whose origin was never recorded were migrated to trust 1."""
     if (row['bbox_source'] != 'auto' or row['source_face_id'] is None
             or row['rejected'] or row['identity'] is None):
         return 'protected'
-    if row['reviewed_ok'] or row['favorite'] or ('profile_at' in keys and row['profile_at']):
+    t = face_trust(row)
+    if t >= TRUST_MANUAL:
         return 'protected'
-    origin = row['origin'] if 'origin' in keys else None
-    if origin == 'auto':
-        return 'auto'
-    if origin is None and not (row['rotation'] if 'rotation' in keys else 0):
-        return 'legacy'
-    return 'protected'
+    if t == TRUST_APPROVED:
+        return 'approved'
+    return 'auto'
 
 
 def quality_score(det_score, width, height, angle_deg):

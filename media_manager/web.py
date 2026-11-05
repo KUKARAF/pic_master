@@ -152,6 +152,9 @@ class IdentityBody(BaseModel):
     # naming it — persisted so the crop renders upright and the embedding is
     # re-computed at this orientation. 0 == unchanged.
     rotate: Optional[int] = 0
+    # How the user arrived at this name: 'swipe' = approved through a swipe-style review
+    # (trust 2); anything else is a hand-set name (trust 3, an anchor). See person_cleanup.
+    via: Optional[str] = None
 
 class CleanupAnchorsBody(BaseModel):
     refs: List[str] = []
@@ -160,7 +163,6 @@ class CleanupAnchorsBody(BaseModel):
 class CleanupApplyBody(BaseModel):
     keep: float = person_cleanup.DEFAULT_KEEP
     remove: float = person_cleanup.DEFAULT_REMOVE
-    include_legacy: bool = False
     confirm: bool = False
     # The count the user saw in the preview; a mismatch (faces arrived/changed since)
     # aborts with 409 instead of silently removing a different set.
@@ -170,7 +172,7 @@ class CleanupApplyBody(BaseModel):
 class CleanupDecideBody(BaseModel):
     ref: str
     action: str  # 'keep' | 'remove'
-    include_legacy: bool = False
+    include_approved: bool = False
 
 
 class ConfirmAboveThresholdBody(BaseModel):
@@ -3569,6 +3571,8 @@ def create_app(data_root: str) -> FastAPI:
             'name': name,
             'default_keep': person_cleanup.DEFAULT_KEEP,
             'default_remove': person_cleanup.DEFAULT_REMOVE,
+            'anchor_max': ANCHOR_MAX,
+            'trust_titles': person_cleanup.TRUST_TITLES, 'trust_labels': person_cleanup.TRUST_LABELS,
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
         })
@@ -3579,28 +3583,60 @@ def create_app(data_root: str) -> FastAPI:
         stills = set(manual.get_all_frame_capture_parents())
         return [r for r in manual.get_identity_face_rows(name) if r['checksum'] not in stills]
 
-    def _cleanup_analysis(name, keep, remove, include_legacy):
-        """Score every cleanup candidate of `name` against its anchors. Pure read."""
+    ANCHOR_MAX = 20   # best-N hand-set faces (by quality) used as the anchor set
+
+    def _cleanup_quality(rows):
+        """{manual face id: quality 0..1} from the media.db detector data."""
+        meta = {}
+        srcs = [int(r['source_face_id']) for r in rows if r['source_face_id'] is not None]
+        for chunk in _chunked(srcs):
+            q = ','.join('?' * len(chunk))
+            for m in db.conn.execute(f'SELECT id, det_score, angle FROM faces WHERE id IN ({q})', chunk):
+                meta[int(m['id'])] = (m['det_score'], m['angle'])
+        out = {}
+        for r in rows:
+            det, angle = meta.get(int(r['source_face_id']) if r['source_face_id'] is not None else -1, (None, 0.0))
+            out[int(r['id'])] = person_cleanup.quality_score(det, r['x2'] - r['x1'], r['y2'] - r['y1'], angle)
+        return out
+
+    def _cleanup_analysis(name, keep, remove, include_approved):
+        """Score every cleanup candidate of `name` against its anchors. Pure read.
+
+        Anchors = the person's hand-set (trust 3) faces, best ANCHOR_MAX by quality; if
+        there are none, the swipe-approved (trust 2) ones; if none, the user must pick.
+        Candidates = automatic faces (trust 1), plus approved faces (trust 2) that are not
+        close to the anchors when `include_approved` (swipe-only: flagged `approved`)."""
         keep, remove = person_cleanup.clamp_thresholds(keep, remove)
         rows = _cleanup_rows(name)
-        by_id = {int(r['id']): r for r in rows}
-        anchor_ids = [a for a in manual.get_cleanup_anchor_ids(name) if a in by_id]
+        tier = {int(r['id']): person_cleanup.face_trust(r) for r in rows}
+        quality = _cleanup_quality(rows)
+        source, pool = 'none', []
+        for t, label in ((3, 'manual'), (2, 'approved')):
+            pool = [r for r in rows if tier[int(r['id'])] == t
+                    and person_cleanup.parse_embedding(r['embedding']) is not None]
+            if pool:
+                source = label
+                break
+        total_anchors = len(pool)
+        pool.sort(key=lambda r: (-quality[int(r['id'])], int(r['id'])))
+        pool = pool[:ANCHOR_MAX]
         anchor_vecs, anchor_used = [], []
-        for a in anchor_ids:
-            v = person_cleanup.parse_embedding(by_id[a]['embedding'])
-            if v is not None:
+        dim = None
+        for r in pool:
+            v = person_cleanup.parse_embedding(r['embedding'])
+            if dim is None:
+                dim = v.shape[0]
+            if v.shape[0] == dim:
                 anchor_vecs.append(v)
-                anchor_used.append(a)
+                anchor_used.append(int(r['id']))
         out = {
             'keep': keep, 'remove': remove, 'total_faces': len(rows),
-            'anchor_ids': anchor_used, 'anchors_stale': len(manual.get_cleanup_anchor_ids(name)) - len(anchor_used),
-            'protected': 0, 'legacy_skipped': 0, 'missing_embedding': 0,
+            'anchor_ids': anchor_used, 'anchor_source': source, 'anchors_total': total_anchors,
+            'anchors_stale': 0, 'protected': 0, 'approved_skipped': 0, 'missing_embedding': 0,
             'candidates': [], 'needs_anchor': not anchor_vecs,
         }
         if not anchor_vecs:
             return out
-        dim = anchor_vecs[0].shape[0]
-        anchor_vecs = [v for v in anchor_vecs if v.shape[0] == dim]
         centroid = person_cleanup.unit_centroid(anchor_vecs)
         if centroid is None:
             out['needs_anchor'] = True  # anchors cancel out: not a usable reference
@@ -3615,8 +3651,8 @@ def create_app(data_root: str) -> FastAPI:
             if elig == 'protected':
                 out['protected'] += 1
                 continue
-            if elig == 'legacy' and not include_legacy:
-                out['legacy_skipped'] += 1
+            if elig == 'approved' and not include_approved:
+                out['approved_skipped'] += 1
                 continue
             v = person_cleanup.parse_embedding(r['embedding'], dim)
             if v is None:
@@ -3624,12 +3660,17 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             sims = amat.dot(v)
             score = float(centroid.dot(v))
+            band = person_cleanup.band_for(score, keep, remove)
+            if elig == 'approved' and band == 'keep':
+                continue    # close to the anchors: nothing to review
             out['candidates'].append({
                 'face_id': fid, 'ref': f'manual:{fid}', 'score': score,
                 'max_anchor_score': float(sims.max()),
                 'nearest_anchor_ref': f'manual:{anchor_used[int(sims.argmax())]}',
                 'source_face_id': r['source_face_id'], 'checksum': r['checksum'],
-                'band': person_cleanup.band_for(score, keep, remove),
+                'approved': elig == 'approved',
+                # approved faces are only ever reviewed one by one: never in the bulk REMOVE band
+                'band': 'uncertain' if (elig == 'approved') else band,
             })
         return out
 
@@ -3644,35 +3685,36 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/people/{name}/cleanup/faces')
     def api_cleanup_faces(name: str, limit: int = 60, offset: int = 0):
         """The person's faces ranked by how clearly visible they are (detector
-        confidence, box size, upright), best first - the anchor picker."""
+        confidence, box size, upright), best first - the anchor picker. `trust` is the
+        tier (3 anchor, 2 approved, 1 auto); `locked` = a hand-set anchor that cannot be
+        un-picked here."""
         name = manual.resolve_identity_name(name)
         rows = _cleanup_rows(name)
-        meta = {}
-        srcs = [int(r['source_face_id']) for r in rows if r['source_face_id'] is not None]
-        for chunk in _chunked(srcs):
-            q = ','.join('?' * len(chunk))
-            for m in db.conn.execute(f'SELECT id, det_score, angle FROM faces WHERE id IN ({q})', chunk):
-                meta[int(m['id'])] = (m['det_score'], m['angle'])
-        anchors = set(manual.get_cleanup_anchor_ids(name))
+        quality = _cleanup_quality(rows)
+        picked = set(manual.get_cleanup_anchor_ids(name))
         items = []
         for r in rows:
-            det, angle = meta.get(int(r['source_face_id']) if r['source_face_id'] is not None else -1, (None, 0.0))
-            q = person_cleanup.quality_score(det, r['x2'] - r['x1'], r['y2'] - r['y1'], angle)
-            items.append({'face_id': int(r['id']), 'ref': f"manual:{r['id']}", 'quality': round(q, 3),
-                          'det_score': det, 'width': round(r['x2'] - r['x1']), 'angle': angle,
-                          'is_anchor': int(r['id']) in anchors, 'checksum': r['checksum'],
-                          'kind': person_cleanup.eligibility(r)})
+            fid = int(r['id'])
+            t = person_cleanup.face_trust(r)
+            items.append({'face_id': fid, 'ref': f'manual:{fid}', 'quality': round(quality[fid], 3),
+                          'width': round(r['x2'] - r['x1']), 'trust': t,
+                          'is_anchor': t >= 3, 'picked': fid in picked, 'locked': t >= 3 and fid not in picked,
+                          'checksum': r['checksum'], 'kind': person_cleanup.eligibility(r)})
         items.sort(key=lambda i: (-i['quality'], i['face_id']))
-        # anchors always listed first so the selection is visible
         page = items[offset:offset + max(1, min(limit, 500))]
         for it in page:
             frow = db.get_file_by_checksum(it['checksum'])
             it['file_id'] = frow['id'] if frow else None
             del it['checksum']
-        return {'faces': page, 'total': len(items), 'anchor_refs': [f'manual:{a}' for a in sorted(anchors)]}
+        return {'faces': page, 'total': len(items),
+                'anchor_refs': sorted(f"manual:{i['face_id']}" for i in items if i['is_anchor']),
+                'locked_refs': sorted(f"manual:{i['face_id']}" for i in items if i['locked'])}
 
     @app.put('/api/people/{name}/cleanup/anchors')
     def api_cleanup_set_anchors(name: str, body: CleanupAnchorsBody):
+        """Set which faces the user picks as anchors. Picking confirms a face by hand
+        (promotes it to trust 3); un-picking puts it back to the tier it had. Faces set by
+        hand before are anchors anyway and are not changed."""
         name = manual.resolve_identity_name(name)
         ids = []
         for ref in body.refs:
@@ -3683,19 +3725,21 @@ def create_app(data_root: str) -> FastAPI:
         mine = {int(r['id']) for r in _cleanup_rows(name)}
         if not set(ids) <= mine:
             raise HTTPException(status_code=400, detail="some faces aren't this person's")
-        stored = manual.set_cleanup_anchors(name, ids)
-        return {'ok': True, 'anchor_refs': [f'manual:{i}' for i in stored]}
+        res = manual.set_cleanup_anchors(name, ids)
+        return {'ok': True, 'anchor_refs': [f'manual:{i}' for i in res['picked']],
+                'demoted_refs': [f'manual:{i}' for i in res['demoted']]}
 
     @app.get('/api/people/{name}/cleanup/preview')
     def api_cleanup_preview(name: str, keep: float = person_cleanup.DEFAULT_KEEP,
                             remove: float = person_cleanup.DEFAULT_REMOVE,
-                            include_legacy: bool = False, limit: int = 120):
+                            include_approved: bool = False, limit: int = 120):
         """Dry run: band counts, score histogram and the lowest-scoring REMOVE faces.
         Writes nothing."""
         name = manual.resolve_identity_name(name)
-        a = _cleanup_analysis(name, keep, remove, include_legacy)
+        a = _cleanup_analysis(name, keep, remove, include_approved)
         cands = a['candidates']
-        bands = {b: [c for c in cands if c['band'] == b] for b in ('keep', 'uncertain', 'remove')}
+        bands = {b: [c for c in cands if c['band'] == b and not c['approved']] for b in ('keep', 'uncertain', 'remove')}
+        approved = [c for c in cands if c['approved']]
         sample = sorted(bands['remove'], key=lambda c: c['score'])[:max(0, min(limit, 500))]
         fids = _cleanup_file_ids(sample)
         last = manual.get_last_cleanup_batch(name)
@@ -3706,14 +3750,16 @@ def create_app(data_root: str) -> FastAPI:
                                                       (last['id'],)).fetchone()[0]}
         return {
             'needs_anchor': a['needs_anchor'], 'anchor_refs': [f'manual:{i}' for i in a['anchor_ids']],
+            'anchor_source': a['anchor_source'], 'anchors_total': a['anchors_total'], 'anchors_used': len(a['anchor_ids']),
             'anchors_stale': a['anchors_stale'],
             'keep': a['keep'], 'remove': a['remove'],
             'defaults': {'keep': person_cleanup.DEFAULT_KEEP, 'remove': person_cleanup.DEFAULT_REMOVE},
-            'counts': {'total_faces': a['total_faces'], 'candidates': len(cands),
+            'counts': {'total_faces': a['total_faces'], 'candidates': len(cands) - len(approved),
                        'keep': len(bands['keep']), 'uncertain': len(bands['uncertain']),
                        'remove': len(bands['remove']), 'protected': a['protected'],
-                       'legacy_skipped': a['legacy_skipped'], 'missing_embedding': a['missing_embedding']},
-            'histogram': person_cleanup.histogram([c['score'] for c in cands]),
+                       'approved_skipped': a['approved_skipped'], 'approved_far': len(approved),
+                       'missing_embedding': a['missing_embedding']},
+            'histogram': person_cleanup.histogram([c['score'] for c in cands if not c['approved']]),
             'remove_sample': [{'ref': c['ref'], 'file_id': fids.get(c['checksum']), 'score': round(c['score'], 3)}
                               for c in sample],
             'last_batch': last_info,
@@ -3723,20 +3769,20 @@ def create_app(data_root: str) -> FastAPI:
     def api_cleanup_apply(name: str, body: CleanupApplyBody):
         """Remove the REMOVE band: un-assign from this person (back to the unknown pool)
         and write the per-identity negative. The set is recomputed server-side; only
-        machine-assigned faces can be removed (re-checked in manual_db)."""
+        automatic faces (trust 1) can be removed in bulk (re-checked in manual_db)."""
         if not body.confirm:
             raise HTTPException(status_code=400, detail='confirm required')
         name = manual.resolve_identity_name(name)
-        a = _cleanup_analysis(name, body.keep, body.remove, body.include_legacy)
+        a = _cleanup_analysis(name, body.keep, body.remove, False)
         if a['needs_anchor']:
             raise HTTPException(status_code=400, detail='pick at least one anchor face first')
-        ids = [c['face_id'] for c in a['candidates'] if c['band'] == 'remove']
+        ids = [c['face_id'] for c in a['candidates'] if c['band'] == 'remove' and not c['approved']]
         if body.expected_remove is not None and body.expected_remove != len(ids):
             raise HTTPException(status_code=409, detail=f'{len(ids)} faces would be removed now, not {body.expected_remove}; '
                                                        'review the preview again')
-        res = manual.cleanup_remove_faces(name, ids, include_legacy=body.include_legacy, kind='bulk',
+        res = manual.cleanup_remove_faces(name, ids, kind='bulk', protect_ids=a['anchor_ids'],
                                           params={'keep': a['keep'], 'remove': a['remove'],
-                                                  'anchors': a['anchor_ids'], 'include_legacy': body.include_legacy})
+                                                  'anchors': a['anchor_ids']})
         if res['removed']:
             db.mark_faces_handled([r['source_face_id'] for r in res['removed']], 0)
         return {'ok': True, 'batch_id': res['batch_id'], 'removed': len(res['removed']), 'skipped': res['skipped']}
@@ -3758,26 +3804,29 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/people/{name}/cleanup/uncertain')
     def api_cleanup_uncertain(name: str, body: SwipeExcludeBody, keep: float = person_cleanup.DEFAULT_KEEP,
-                              remove: float = person_cleanup.DEFAULT_REMOVE, include_legacy: bool = False,
+                              remove: float = person_cleanup.DEFAULT_REMOVE, include_approved: bool = False,
                               count: int = 10):
-        """Swipe feed: the UNCERTAIN band only, most uncertain (score nearest the middle
-        of the band) first."""
+        """Swipe feed: the UNCERTAIN band (most uncertain, score nearest the middle of
+        the band, first) plus - only when `include_approved` - previously approved faces
+        that look far from the anchors (flagged `approved`)."""
         name = manual.resolve_identity_name(name)
-        a = _cleanup_analysis(name, keep, remove, include_legacy)
+        a = _cleanup_analysis(name, keep, remove, include_approved)
         exclude = set(body.exclude)
         mid = (a['keep'] + a['remove']) / 2.0
-        cands = sorted((c for c in a['candidates'] if c['band'] == 'uncertain' and c['ref'] not in exclude),
+        pool = [c for c in a['candidates'] if c['band'] == 'uncertain']
+        cands = sorted((c for c in pool if c['ref'] not in exclude),
                        key=lambda c: abs(c['score'] - mid))[:max(1, min(count, 100))]
         fids = _cleanup_file_ids(cands)
         cards = [{'ref': c['ref'], 'file_id': fids[c['checksum']], 'score': round(c['score'], 3),
-                  'anchor_ref': c['nearest_anchor_ref'], 'face_id': c['face_id']}
+                  'anchor_ref': c['nearest_anchor_ref'], 'face_id': c['face_id'], 'approved': c['approved']}
                  for c in cands if fids.get(c['checksum']) is not None]
-        return {'cards': _attach_file_meta(cards), 'remaining': sum(1 for c in a['candidates'] if c['band'] == 'uncertain')}
+        return {'cards': _attach_file_meta(cards), 'remaining': len(pool)}
 
     @app.post('/api/people/{name}/cleanup/decide')
     def api_cleanup_decide(name: str, body: CleanupDecideBody):
-        """One swipe: 'keep' (sticky: marks the face human-confirmed so it is never asked
-        about again) or 'remove' (un-assign + negative). Rows a human set are refused."""
+        """One swipe: 'keep' (sticky: the face becomes swipe-approved, trust 2) or
+        'remove' (un-assign + negative). Hand-set faces (trust 3) are refused; approved
+        faces only with include_approved."""
         name = manual.resolve_identity_name(name)
         if body.action not in ('keep', 'remove'):
             raise HTTPException(status_code=400, detail="action must be 'keep' or 'remove'")
@@ -3785,11 +3834,11 @@ def create_app(data_root: str) -> FastAPI:
         if kind != 'manual':
             raise HTTPException(status_code=400, detail='manual:<id> ref required')
         if body.action == 'remove':
-            res = manual.cleanup_remove_faces(name, [raw], include_legacy=body.include_legacy, kind='swipe_remove')
+            res = manual.cleanup_remove_faces(name, [raw], include_approved=body.include_approved, kind='swipe_remove')
             if res['removed']:
                 db.mark_faces_handled([res['removed'][0]['source_face_id']], 0)
             return {'ok': bool(res['removed']), 'skipped': res['skipped']}
-        res = manual.cleanup_keep_faces(name, [raw], include_legacy=body.include_legacy)
+        res = manual.cleanup_keep_faces(name, [raw], include_approved=body.include_approved)
         return {'ok': bool(res['kept']), 'skipped': res['skipped']}
 
     @app.delete('/api/people/{name}/cleanup/decide/{face_id}')
@@ -3877,9 +3926,11 @@ def create_app(data_root: str) -> FastAPI:
         person page's face picker (profile picture) uses."""
         canonical = manual.resolve_identity_name(name)
         out = []
+        trusts = {int(r['id']): person_cleanup.face_trust(r) for r in manual.get_identity_face_rows(canonical)}
         for face_id, checksum, _emb in manual.get_faces_for_identity(canonical):
             frow = db.get_file_by_checksum(checksum)
-            out.append({'ref': f'manual:{face_id}', 'file_id': (frow['id'] if frow else None)})
+            out.append({'ref': f'manual:{face_id}', 'file_id': (frow['id'] if frow else None),
+                        'trust': trusts.get(face_id, 1)})
         profile_id = manual.get_profile_face_id(canonical)
         return {'faces': out, 'profile_ref': f'manual:{profile_id}' if profile_id else None}
 
@@ -12018,7 +12069,7 @@ def create_app(data_root: str) -> FastAPI:
             'changed': renormalize_job['changed'],
         }
 
-    def _confirm_auto_face(raw_id, name):
+    def _confirm_auto_face(raw_id, name, trust=3):
         """Core of confirming an auto-detected (media.db) face as `name`: looks up
         its file/bbox/embedding and promotes it into manual.db. Returns the new
         manual-face id, or None if the source auto face no longer exists. Shared
@@ -12033,7 +12084,8 @@ def create_app(data_root: str) -> FastAPI:
         if src_file is None:
             return None
         bbox = json.loads(src['bbox'])
-        new_id = manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None)
+        new_id = manual.promote_auto_face(raw_id, src_file['checksum'], bbox, src['embedding'], name, None, None,
+                                          trust=trust)
         _link_face_match_to_video(src_file['checksum'], name)  # a frame confirm credits the video
         # media.db's faces.handled mirrors "manual.db already has a decision for this
         # face". The review pool filters on it IN SQL (that is the whole point — the old
@@ -12080,19 +12132,20 @@ def create_app(data_root: str) -> FastAPI:
         # renamed, or not.
         name = (body.name or '').strip() or manual.generate_placeholder_identity_name()
         rotate = (body.rotate or 0) % 4
+        trust = 2 if body.via == 'swipe' else 3   # swipe approval = semi-automatic, anything else = by hand
         kind, raw_id = _parse_face_ref(face_id)
         if kind == 'manual':
             row = manual.get_face(raw_id)
             if row is None:
                 raise HTTPException(status_code=404, detail='Face not found')
-            manual.assign_identity(raw_id, name)
+            manual.assign_identity(raw_id, name, trust=trust)
             _persist_face_rotation(face_id, raw_id, rotate)
             _link_face_match_to_video(row['checksum'], name)  # a frame confirm credits the video
             _link_body_for_named_face(row['checksum'], name,
                                       [row['x1'], row['y1'], row['x2'], row['y2']])
             return {'face_id': face_id, 'identity': name}
 
-        new_id = _confirm_auto_face(raw_id, name)
+        new_id = _confirm_auto_face(raw_id, name, trust=trust)
         if new_id is None:
             raise HTTPException(status_code=404, detail='Face not found')
         # The face is now a manual row; persist the chosen orientation on it.
@@ -12144,7 +12197,7 @@ def create_app(data_root: str) -> FastAPI:
         confirmed = 0
         for r in data['results']:
             kind, raw_id = _parse_face_ref(r['ref'])
-            if kind == 'auto' and _confirm_auto_face(raw_id, name) is not None:
+            if kind == 'auto' and _confirm_auto_face(raw_id, name, trust=2) is not None:  # bulk approval = semi-automatic
                 confirmed += 1
         return {'confirmed': confirmed, 'threshold': threshold}
 

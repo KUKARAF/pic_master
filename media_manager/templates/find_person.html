@@ -107,7 +107,7 @@
         );
       },
       confirmRequest: function(f) {
-        return { url: '/api/faces/' + encodeURIComponent(f.ref) + '/identity', method: 'POST', body: { name: personName } };
+        return { url: '/api/faces/' + encodeURIComponent(f.ref) + '/identity', method: 'POST', body: { name: personName, via: 'swipe' } };
       },
       noResultsText: function(threshold) {
         return 'Still no matches at threshold ' + parseFloat(threshold).toFixed(2) + ' — try lowering it further.';
@@ -267,7 +267,7 @@
       return {
         url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity',
         method: 'POST',
-        body: { name: personName, rotate: cardRotate(card) },
+        body: { name: personName, rotate: cardRotate(card), via: 'swipe' },
       };
     },
     onReject: function(card) {
@@ -495,7 +495,7 @@
           };
         },
         onConfirm: function (card) {
-          return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName } };
+          return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/identity', method: 'POST', body: { name: personName, via: 'swipe' } };
         },
         onReject: function (card) {
           roundRejects++;

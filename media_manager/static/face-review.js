@@ -217,13 +217,13 @@
       });
     }
 
-    function saveIdentity(name) {
+    function saveIdentity(name, via) {
       var c = card();
       if (!c) return;
       // The rotation the user landed on IS part of the decision: it's what the
       // candidate list was re-ranked against, so it has to be persisted with the
       // name or the stored embedding stays the scrambled one.
-      post('/api/faces/' + encodeURIComponent(c.ref) + '/identity', { name: name || null, rotate: rotate })
+      post('/api/faces/' + encodeURIComponent(c.ref) + '/identity', { name: name || null, rotate: rotate, via: via || null })
         .catch(function (err) { showToast('Failed to save: ' + err.message); });
       advance('confirm');
     }
@@ -231,7 +231,7 @@
     function confirmSelected() {
       var list = candidates();
       if (!list.length) return;
-      saveIdentity(list[sel].name);
+      saveIdentity(list[sel].name, 'swipe');  // approving a suggestion = semi-automatic (trust 2)
     }
 
     function rejectAll() {

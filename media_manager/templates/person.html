@@ -701,11 +701,23 @@
             var img = document.createElement('img');
             img.src = '/face-crop/' + f.ref;
             img.loading = 'lazy';
-            img.title = f.ref === data.profile_ref ? 'Current profile picture' : 'Use this face';
+            var TL = {3: 'anchor', 2: 'approved', 1: 'auto', 0: 'unknown'};
+            var TT = {3: 'Set by hand: always an anchor', 2: 'Approved by swipe', 1: 'Automatic match', 0: 'Unknown'};
+            img.title = (f.ref === data.profile_ref ? 'Current profile picture' : 'Use this face') +
+              ' · trust: ' + TL[f.trust] + ' (' + TT[f.trust] + ')';
             img.style.cssText = 'width:80px;height:80px;border-radius:50%;object-fit:cover;cursor:pointer;' +
               'border:3px solid ' + (f.ref === data.profile_ref ? 'var(--chip-blue,#8ab4f8)' : 'transparent') + ';';
             img.addEventListener('click', function() { save('PUT', f.ref); });
-            grid.appendChild(img);
+            var cell = document.createElement('span');
+            cell.style.cssText = 'position:relative;display:inline-block;';
+            var tag = document.createElement('span');
+            tag.textContent = TL[f.trust];
+            tag.title = TT[f.trust];
+            tag.style.cssText = 'position:absolute;left:0;bottom:2px;font-size:10px;line-height:1;padding:2px 4px;' +
+              'border-radius:6px;color:#fff;background:' + (f.trust >= 3 ? '#2e7d32' : f.trust === 2 ? '#1565c0' : '#6d6d6d') + ';';
+            cell.appendChild(img);
+            cell.appendChild(tag);
+            grid.appendChild(cell);
           });
           if (data.profile_ref) {
             var auto = document.createElement('button');

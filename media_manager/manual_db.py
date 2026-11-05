@@ -51,6 +51,12 @@ FACE_SAME_BOX_IOU = 0.7
 AUTO_MATCH_THRESHOLD = 0.6
 
 
+def trust_matching_enabled():
+    """Trust-aware auto-matching (see ManualDB.get_trusted_face_matrix). MEDIA_FACE_TRUST_MATCHING=0
+    is the escape hatch back to "every named face is a reference"."""
+    return os.environ.get('MEDIA_FACE_TRUST_MATCHING', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+
 def run_migrations(db_path, apply=False):
     """Checks/applies every pending schema migration in media_manager/migrations/
     against a raw manual.db connection — never through ManualDB, whose
@@ -158,6 +164,7 @@ class ManualDB(ThreadLocalDB):
         self._matrix_lock = threading.Lock()
         self._named_matrix_cache = None   # (version, (identities, matrix))
         self._all_faces_matrix_cache = None  # (version, (face_ids, checksums, identities, matrix))
+        self._trusted_matrix_cache = None  # (version, (identities, matrix, weights))
 
     def _create_tables(self):
         cur = self.conn.cursor()
@@ -772,6 +779,10 @@ class ManualDB(ThreadLocalDB):
         # person_cleanup.eligibility.
         if 'origin' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN origin TEXT')
+        # Trust tier of a named face (3 manual/anchor, 2 swipe-approved, 1 auto, 0 unknown;
+        # see person_cleanup.face_trust). Additive; filled once by _migrate_face_trust.
+        if 'trust' not in existing_face_cols2:
+            cur.execute('ALTER TABLE faces ADD COLUMN trust INTEGER NOT NULL DEFAULT 0')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_checksum ON file_tags (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags (tag_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_checksum ON faces (checksum)')
@@ -869,7 +880,55 @@ class ManualDB(ThreadLocalDB):
             )
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_pc_batches_identity ON person_cleanup_batches (identity)')
+        # An anchor row now means "the user PICKED this face as an anchor": picking promotes
+        # it to trust 3, and the tier/origin it had before is kept here so un-picking can
+        # put it back. (Rows from before the trust tiers have prev_trust NULL; the
+        # migration below promotes them.)
+        anchor_cols = {row[1] for row in cur.execute('PRAGMA table_info(person_cleanup_anchors)')}
+        for col, ddl in (('prev_trust', 'INTEGER'), ('prev_origin', 'TEXT')):
+            if col not in anchor_cols:
+                cur.execute(f'ALTER TABLE person_cleanup_anchors ADD COLUMN {col} {ddl}')
+        cur.execute('''CREATE TABLE IF NOT EXISTS schema_flags (
+                          name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)''')
+        self._migrate_face_trust(cur)
         self.conn.commit()
+
+    def _migrate_face_trust(self, cur):
+        """One-time, additive backfill of faces.origin/trust for rows that predate the
+        trust tiers (flag 'faces_trust_v1' makes it run once; it also only touches named
+        rows still at trust 0, so rows that already carry a trust are never rewritten).
+        Mirrors person_cleanup.derive_trust:
+          favorite / profile picture / hand-drawn box ........ trust 3, origin 'human'
+          reviewed_ok ........................................ trust 2, origin 'human'
+          origin 'human' (nothing else) ...................... trust 3
+          origin 'auto' or never recorded (NULL) ............. trust 1, origin 'auto'
+        Earlier hand picks in person_cleanup_anchors are promoted to 3 (remembering what
+        they were). Unnamed rows are left alone."""
+        if cur.execute("SELECT 1 FROM schema_flags WHERE name = 'faces_trust_v1'").fetchone():
+            return
+        cur.execute("""
+            UPDATE faces SET
+              trust = CASE
+                WHEN favorite > 0 OR profile_at IS NOT NULL OR bbox_source != 'auto' THEN 3
+                WHEN reviewed_ok THEN 2
+                WHEN origin = 'human' THEN 3
+                ELSE 1 END,
+              origin = CASE
+                WHEN favorite > 0 OR profile_at IS NOT NULL OR bbox_source != 'auto' OR reviewed_ok THEN 'human'
+                WHEN origin IS NULL THEN 'auto'
+                ELSE origin END
+            WHERE trust = 0 AND identity IS NOT NULL""")
+        cur.execute("""
+            UPDATE person_cleanup_anchors SET
+              prev_trust = (SELECT CASE WHEN f.reviewed_ok THEN 2 ELSE 1 END FROM faces f WHERE f.id = face_id),
+              prev_origin = (SELECT f.origin FROM faces f WHERE f.id = face_id)
+            WHERE prev_trust IS NULL AND face_id IN (SELECT id FROM faces WHERE trust < 3)""")
+        cur.execute("""
+            UPDATE faces SET trust = 3, origin = 'human'
+            WHERE trust < 3 AND identity IS NOT NULL
+              AND id IN (SELECT face_id FROM person_cleanup_anchors)""")
+        cur.execute("INSERT INTO schema_flags (name, applied_at) VALUES ('faces_trust_v1', ?)",
+                    (int(time.time()),))
 
     # ------------------------------------------------------------------
     # Tags
@@ -2896,7 +2955,7 @@ class ManualDB(ThreadLocalDB):
 
     def promote_auto_face(self, source_face_id, checksum, bbox, embedding_bytes, identity,
                            image_width, image_height, frame_index=None, rotation=0,
-                           auto_matched=False):
+                           auto_matched=False, trust=None):
         """Naming an auto-detected face copies it into manual.db (upsert, keyed on source_face_id
         so renaming the same auto-detected face twice doesn't create a duplicate row). Clears
         any prior rejection — naming a face after all is a stronger, more recent signal.
@@ -2923,23 +2982,31 @@ class ManualDB(ThreadLocalDB):
         `auto_matched=True` is passed ONLY by the auto-matching pipeline (a face the
         machine assigned via find_matching_identity); it records origin='auto'. Every
         other caller is a human decision and records origin='human'. A machine
-        re-promotion never downgrades a row a human already confirmed."""
-        origin = 'auto' if auto_matched else 'human'
+        re-promotion never downgrades a row a human already confirmed.
+
+        `trust` (see person_cleanup.face_trust): auto_matched -> 1; otherwise the caller
+        says 3 (named by hand, the default) or 2 (approved through a swipe / bulk
+        confirm). On re-promotion the stored trust only ever goes up (MAX)."""
+        if trust is None:
+            trust = 1 if auto_matched else 3
+        trust = 1 if auto_matched else int(trust)
+        origin = 'auto' if trust < 2 else 'human'
         x1, y1, x2, y2 = bbox
         cur = self.conn.cursor()
         cur.execute('''
             INSERT INTO faces (checksum, identity, x1,y1,x2,y2, embedding, bbox_source, source_face_id,
                                 image_width, image_height, rejected, created_at, frame_index, rotation,
-                                origin)
-            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?, ?, ?)
+                                origin, trust)
+            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?, ?, ?, ?)
             ON CONFLICT(source_face_id) WHERE source_face_id IS NOT NULL
                 DO UPDATE SET identity=excluded.identity, rejected=0,
                               embedding=excluded.embedding, rotation=excluded.rotation,
                               origin=CASE WHEN faces.origin = 'human' AND excluded.origin = 'auto'
-                                          THEN 'human' ELSE excluded.origin END
+                                          THEN 'human' ELSE excluded.origin END,
+                              trust=MAX(faces.trust, excluded.trust)
         ''', (checksum, identity, x1, y1, x2, y2, embedding_bytes, source_face_id,
               image_width, image_height, int(time.time()), frame_index, int(rotation) % 4,
-              origin))
+              origin, trust))
         cur.execute('SELECT id FROM faces WHERE source_face_id = ?', (source_face_id,))
         new_id = cur.fetchone()[0]
 
@@ -3038,31 +3105,64 @@ class ManualDB(ThreadLocalDB):
         return cur.fetchall()
 
     def get_cleanup_anchor_ids(self, identity):
+        """Faces the user PICKED as anchors on the cleanup page (and thereby promoted to
+        trust 3). The effective anchor set is every trust-3 face; see get_anchor_rows."""
         cur = self.conn.cursor()
-        cur.execute('SELECT face_id FROM person_cleanup_anchors WHERE identity = ? ORDER BY created_at, face_id',
-                    (identity,))
+        cur.execute('SELECT face_id FROM person_cleanup_anchors WHERE identity = ? AND prev_trust IS NOT NULL '
+                    'ORDER BY created_at, face_id', (identity,))
         return [int(r[0]) for r in cur.fetchall()]
 
     def set_cleanup_anchors(self, identity, face_ids):
-        """Replace the person's anchor set. Only faces currently assigned to `identity`
-        are accepted; returns the ids actually stored. Writes nothing to `faces`."""
-        valid = {int(r['id']) for r in self.get_identity_face_rows(identity)}
-        keep = []
+        """Set the faces the user PICKS as anchors. Picking = confirming by hand, so a
+        picked face below trust 3 is promoted to 3 (its previous tier/origin are stored so
+        un-picking restores them). A previously picked face missing from `face_ids` is
+        demoted back, unless it has since been favorited / made the profile picture.
+        Hand-set trust-3 faces are anchors regardless and are never changed here.
+        Only faces currently assigned to `identity` are accepted; returns
+        {'picked': ids now picked, 'demoted': ids put back}."""
+        from media_manager import person_cleanup as pc
+        rows = {int(r['id']): r for r in self.get_identity_face_rows(identity)}
+        wanted = []
         for fid in face_ids:
             fid = int(fid)
-            if fid in valid and fid not in keep:
-                keep.append(fid)
+            if fid in rows and fid not in wanted:
+                wanted.append(fid)
         cur = self.conn.cursor()
+        picked, demoted = [], []
         try:
-            cur.execute('DELETE FROM person_cleanup_anchors WHERE identity = ?', (identity,))
             now = int(time.time())
-            cur.executemany('INSERT INTO person_cleanup_anchors (identity, face_id, created_at) VALUES (?,?,?)',
-                            [(identity, fid, now) for fid in keep])
+            cur.execute('SELECT face_id, prev_trust, prev_origin FROM person_cleanup_anchors '
+                        'WHERE identity = ? AND prev_trust IS NOT NULL', (identity,))
+            existing = {int(r[0]): (r[1], r[2]) for r in cur.fetchall()}
+            for fid, (pt, po) in existing.items():
+                if fid in wanted:
+                    continue
+                row = rows.get(fid)
+                if row is not None and not (row['favorite'] or row['profile_at']) and pc.face_trust(row) == 3:
+                    cur.execute('UPDATE faces SET trust = ?, origin = ? WHERE id = ?', (pt, po, fid))
+                    demoted.append(fid)
+                cur.execute('DELETE FROM person_cleanup_anchors WHERE identity = ? AND face_id = ?',
+                            (identity, fid))
+            for fid in wanted:
+                if fid in existing:
+                    picked.append(fid)
+                    continue
+                row = rows[fid]
+                t = pc.face_trust(row)
+                if t >= 3:
+                    continue        # already a hand-set anchor; nothing to record or change
+                cur.execute('INSERT OR REPLACE INTO person_cleanup_anchors '
+                            '(identity, face_id, created_at, prev_trust, prev_origin) VALUES (?,?,?,?,?)',
+                            (identity, fid, now, t, row['origin']))
+                cur.execute("UPDATE faces SET trust = 3, origin = 'human' WHERE id = ?", (fid,))
+                picked.append(fid)
             self.conn.commit()
         except Exception:
             self.conn.rollback()
             raise
-        return keep
+        if picked or demoted:
+            self._face_ver += 1
+        return {'picked': picked, 'demoted': demoted}
 
     @staticmethod
     def _row_to_json(row):
@@ -3085,17 +3185,20 @@ class ManualDB(ThreadLocalDB):
                     (identity, kind, json.dumps(params or {}), int(time.time())))
         return cur.lastrowid
 
-    def cleanup_remove_faces(self, identity, face_ids, include_legacy=False, kind='bulk', params=None):
+    def cleanup_remove_faces(self, identity, face_ids, include_approved=False, kind='bulk', params=None,
+                             protect_ids=()):
         """Un-assign `face_ids` from `identity` exactly like the old broom did: the manual
         row is deleted (the media.db face falls back into the unknown pool) and a
         per-identity negative is written so it is never re-matched to this person. The
-        pre-change row is logged for undo. Faces that are not currently this person's,
-        are not machine-assigned (person_cleanup.eligibility), or are anchors are
-        SKIPPED, never removed. Returns {batch_id, removed: [{face_id, source_face_id}],
-        skipped: [{face_id, reason}]}; batch_id is None if nothing was removed. Caller
-        must then call media.db mark_faces_handled(source ids, 0)."""
+        pre-change row is logged for undo. SKIPPED, never removed: faces that are not
+        currently this person's, anything set by hand (trust 3, person_cleanup.eligibility
+        'protected'), `protect_ids`, and swipe-approved faces (trust 2) unless this is a
+        one-by-one swipe_remove with include_approved (a bulk removal NEVER takes them).
+        Returns {batch_id, removed: [{face_id, source_face_id}], skipped: [{face_id,
+        reason}]}; batch_id is None if nothing was removed. Caller must then call
+        media.db mark_faces_handled(source ids, 0)."""
         from media_manager import person_cleanup as pc
-        anchors = set(self.get_cleanup_anchor_ids(identity))
+        protect = {int(i) for i in protect_ids}
         cur = self.conn.cursor()
         removed, skipped = [], []
         batch_id = None
@@ -3106,12 +3209,15 @@ class ManualDB(ThreadLocalDB):
                 if row is None or row['identity'] != identity or row['rejected']:
                     skipped.append({'face_id': fid, 'reason': 'not_assigned'})
                     continue
-                if fid in anchors:
+                if fid in protect:
                     skipped.append({'face_id': fid, 'reason': 'anchor'})
                     continue
                 elig = pc.eligibility(row)
-                if elig == 'protected' or (elig == 'legacy' and not include_legacy):
-                    skipped.append({'face_id': fid, 'reason': 'protected' if elig == 'protected' else 'legacy'})
+                if elig == 'protected':
+                    skipped.append({'face_id': fid, 'reason': 'protected'})
+                    continue
+                if elig == 'approved' and not (include_approved and kind == 'swipe_remove'):
+                    skipped.append({'face_id': fid, 'reason': 'approved'})
                     continue
                 if batch_id is None:
                     batch_id = self._cleanup_batch(cur, identity, kind, params)
@@ -3131,11 +3237,12 @@ class ManualDB(ThreadLocalDB):
             self._face_ver += 1
         return {'batch_id': batch_id, 'removed': removed, 'skipped': skipped}
 
-    def cleanup_keep_faces(self, identity, face_ids, include_legacy=False):
-        """Sticky keep for swipe-right: a machine-assigned face the user vouched for is
-        marked human-confirmed (origin='human', reviewed_ok=1) so it is never a cleanup
-        candidate again. Rows that are not eligible (in particular anything a human
-        already set) are NOT rewritten. Returns {batch_id, kept, skipped}."""
+    def cleanup_keep_faces(self, identity, face_ids, include_approved=False):
+        """Sticky keep for swipe-right: an automatic face the user vouched for becomes
+        APPROVED (trust 2, origin='human', reviewed_ok=1) so it is never a bulk-removal
+        candidate again. Hand-set faces (trust 3) are NOT rewritten; an already approved
+        face is left as is (it is only offered with include_approved). Returns
+        {batch_id, kept, skipped}."""
         from media_manager import person_cleanup as pc
         cur = self.conn.cursor()
         kept, skipped = [], []
@@ -3148,14 +3255,15 @@ class ManualDB(ThreadLocalDB):
                     skipped.append({'face_id': fid, 'reason': 'not_assigned'})
                     continue
                 elig = pc.eligibility(row)
-                if elig == 'protected' or (elig == 'legacy' and not include_legacy):
-                    skipped.append({'face_id': fid, 'reason': 'protected' if elig == 'protected' else 'legacy'})
+                if elig == 'protected' or (elig == 'approved' and not include_approved):
+                    skipped.append({'face_id': fid, 'reason': 'protected' if elig == 'protected' else 'approved'})
                     continue
                 if batch_id is None:
                     batch_id = self._cleanup_batch(cur, identity, 'swipe_keep', None)
                 cur.execute('INSERT INTO person_cleanup_items (batch_id, face_id, source_face_id, added_negative, prev_row) '
                             'VALUES (?,?,?,0,?)', (batch_id, fid, row['source_face_id'], self._row_to_json(row)))
-                cur.execute("UPDATE faces SET origin = 'human', reviewed_ok = 1 WHERE id = ?", (fid,))
+                cur.execute("UPDATE faces SET origin = 'human', reviewed_ok = 1, trust = MAX(trust, 2) WHERE id = ?",
+                            (fid,))
                 kept.append(fid)
             self.conn.commit()
         except Exception:
@@ -3182,7 +3290,7 @@ class ManualDB(ThreadLocalDB):
     def undo_cleanup_batch(self, batch_id):
         """Undo one logged batch: removed faces get their row back (same id, same
         identity/embedding/flags) and the negative this batch added is dropped; kept
-        faces get their old origin/reviewed_ok back. A removed face whose source was
+        faces get their old origin/reviewed_ok/trust back. A removed face whose source was
         meanwhile assigned elsewhere is not resurrected (reported in `skipped`).
         Returns {restored: [{face_id, source_face_id}], skipped: [...]} or None if the
         batch is unknown / already undone."""
@@ -3199,8 +3307,9 @@ class ManualDB(ThreadLocalDB):
                 prev = self._row_from_json(item['prev_row'])
                 fid = int(item['face_id'])
                 if batch['kind'] == 'swipe_keep':
-                    cur.execute('UPDATE faces SET origin = ?, reviewed_ok = ? WHERE id = ? AND identity = ?',
-                                (prev.get('origin'), prev.get('reviewed_ok') or 0, fid, identity))
+                    cur.execute('UPDATE faces SET origin = ?, reviewed_ok = ?, trust = ? WHERE id = ? AND identity = ?',
+                                (prev.get('origin'), prev.get('reviewed_ok') or 0, prev.get('trust') or 0,
+                                 fid, identity))
                     restored.append({'face_id': fid, 'source_face_id': item['source_face_id']})
                     continue
                 src = item['source_face_id']
@@ -3239,10 +3348,14 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
         self._face_ver += 1
 
-    def assign_identity(self, manual_face_id, name):
+    def assign_identity(self, manual_face_id, name, trust=3):
+        """Name a manual.db face. Default trust 3 (a hand-set face, always an anchor);
+        pass 2 for a swipe approval. Trust only goes up here (MAX)."""
+        trust = max(2, int(trust))
         cur = self.conn.cursor()
-        cur.execute("UPDATE faces SET identity = ?, rejected = 0, origin = 'human' WHERE id = ?",
-                    (name.strip(), manual_face_id))
+        cur.execute("UPDATE faces SET identity = ?, rejected = 0, origin = 'human', "
+                    "trust = MAX(trust, ?) WHERE id = ?",
+                    (name.strip(), trust, manual_face_id))
         self.conn.commit()
         self._face_ver += 1
 
@@ -3324,6 +3437,9 @@ class ManualDB(ThreadLocalDB):
         returns the new count."""
         cur = self.conn.cursor()
         cur.execute('UPDATE faces SET favorite = max(0, favorite + ?) WHERE id = ?', (delta, manual_face_id))
+        if delta > 0:  # favoriting is a hand mark: the face is an anchor (never lowered again here)
+            cur.execute("UPDATE faces SET trust = 3, origin = 'human' WHERE id = ? AND identity IS NOT NULL "
+                        "AND trust < 3", (manual_face_id,))
         self.conn.commit()
         self._face_ver += 1
         row = cur.execute('SELECT favorite FROM faces WHERE id = ?', (manual_face_id,)).fetchone()
@@ -3617,7 +3733,9 @@ class ManualDB(ThreadLocalDB):
             return False
         cur.execute('UPDATE faces SET profile_at = NULL WHERE identity = ? AND profile_at IS NOT NULL', (identity,))
         cur.execute('UPDATE faces SET profile_at = ? WHERE id = ?', (int(time.time()), face_id))
+        cur.execute("UPDATE faces SET trust = 3, origin = 'human' WHERE id = ? AND trust < 3", (face_id,))
         self.conn.commit()
+        self._face_ver += 1
         return True
 
     def clear_profile_face(self, identity):
@@ -3789,26 +3907,77 @@ class ManualDB(ThreadLocalDB):
             self._all_faces_matrix_cache = (self._face_ver, result)
             return result
 
+    def get_trusted_face_matrix(self):
+        """(identities, matrix, weights) of the faces auto-matching may score against.
+
+        Rule (MEDIA_FACE_TRUST_MATCHING=0 disables it: all named faces, weight 1):
+          * an identity with ANY face of trust >= 2 is represented ONLY by its trust >= 2
+            faces, weighted 1.0 (trust 3, hand-set) / 0.7 (trust 2, swipe-approved);
+          * an identity with no such face (brand new, or only auto-matched faces) falls
+            back to all its faces (trust 1 / legacy), weight 1.0.
+        So an auto-matched face can never become the reference that attracts the next
+        auto match (the cascade that filled people with look-alikes). Cached per
+        self._face_ver like get_named_face_matrix (rebuilt on any faces write); when
+        nothing is excluded the matrix IS the named-face matrix object (no copy)."""
+        import numpy as np  # hook-allow: lazy — heavy
+        from media_manager import person_cleanup as pc
+        enabled = trust_matching_enabled()
+        ver = self._face_ver   # stamp the cache with the version it was READ at
+        with self._matrix_lock:
+            cached = self._trusted_matrix_cache
+            if cached is not None and cached[0] == (ver, enabled):
+                return cached[1]
+        if not enabled:
+            names, matrix = self.get_named_face_matrix()
+            result = (names, matrix, np.ones(len(names), dtype=np.float32))
+        else:
+            cur = self.conn.cursor()
+            cur.execute("SELECT identity, embedding, trust FROM faces "
+                        "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''")
+            rows, dim = self._usable_embedding_rows(cur.fetchall(), 'get_trusted_face_matrix')
+            if not rows:
+                result = ([], np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float32))
+            else:
+                has_trusted = {r[0] for r in rows if (r[2] or 0) >= pc.TRUST_APPROVED}
+                keep = [r for r in rows if r[0] not in has_trusted or (r[2] or 0) >= pc.TRUST_APPROVED]
+                weights = np.asarray([pc.TRUST_MATCH_WEIGHTS.get(int(r[2] or 0), 1.0) for r in keep],
+                                     dtype=np.float32)
+                if len(keep) == len(rows):
+                    matrix = self.get_named_face_matrix()[1]
+                else:
+                    matrix = np.frombuffer(b''.join(r[1] for r in keep),
+                                           dtype=np.float32).reshape(len(keep), dim)
+                result = ([r[0] for r in keep], matrix, weights)
+        with self._matrix_lock:
+            self._trusted_matrix_cache = ((ver, enabled), result)
+        return result
+
     def find_matching_identity(self, embedding_bytes, threshold=None):
         """Return (identity, score) for the closest known person if similarity clears
         `threshold` (defaults to AUTO_MATCH_THRESHOLD), else (None, None). Powers
-        auto-matching a newly detected face to an existing identity without asking."""
+        auto-matching a newly detected face to an existing identity without asking.
+
+        References follow get_trusted_face_matrix (hand-set / approved faces only once an
+        identity has any). The threshold applies to the raw cosine; the trust weight
+        (1.0 hand-set, 0.7 approved) only ranks candidates that already clear it."""
         if threshold is None:
             threshold = AUTO_MATCH_THRESHOLD
         import numpy as np  # hook-allow: lazy — heavy
-        # Cached, write-invalidated K×D matrix — no per-call re-SELECT/re-stack of
-        # every named embedding (this method runs once per newly detected face).
-        names, matrix = self.get_named_face_matrix()
+        names, matrix, weights = self.get_trusted_face_matrix()
         if matrix.shape[0] == 0:
             return None, None
         query = np.frombuffer(embedding_bytes, dtype=np.float32)
-        # GPU fast-path (resident named-face matrix) with an automatic numpy
-        # fallback baked into score_named_faces — `scores` is aligned to `names`.
-        scores = self.score_named_faces(query)
-        best_idx = int(scores.argmax())
-        if scores[best_idx] >= threshold:
-            return names[best_idx], float(scores[best_idx])
-        return None, None
+        from media_manager import gpu_search  # hook-allow: lazy — numpy/torch GPU path
+        nc = self._named_matrix_cache
+        key = 'named_faces' if nc is not None and nc[1][1] is matrix else 'trusted_faces'
+        scores = gpu_search.matvec(key, self._face_ver, matrix, query)
+        if scores is None:
+            scores = matrix.dot(query)  # numpy fallback (CPU / no-GPU)
+        ok = scores >= threshold
+        if not ok.any():
+            return None, None
+        best_idx = int(np.where(ok, scores * weights, -np.inf).argmax())
+        return names[best_idx], float(scores[best_idx])
 
     def get_embeddings_for_identity(self, name):
         """Return [embedding_bytes, ...] for every face already confirmed as this person

@@ -646,7 +646,8 @@ class MediaManager:
             if name is None:
                 continue
             bbox = json.loads(row['bbox'])
-            self.manual.promote_auto_face(face_id, file_row['checksum'], bbox, emb_bytes, name, None, None)
+            self.manual.promote_auto_face(face_id, file_row['checksum'], bbox, emb_bytes, name, None, None,
+                                          auto_matched=True)
 
     def search_by_face_image(self, image_path, limit=50, similarity_threshold=0.4):
         """Given an image path, detect the first face and find similar faces in the library.

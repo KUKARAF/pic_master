@@ -9,14 +9,19 @@
 </div>
 
 <p class="sub" style="margin-bottom:14px;max-width:720px;">
-  Pick one or more <strong>clear, definitely-{{ name }}</strong> faces as anchors. Every other
-  automatically matched face is compared to them: close ones are kept, far ones can be removed in
+  Every face you set <strong>by hand</strong> is an anchor automatically (the clearest {{ anchor_max }} are used).
+  Every automatically matched face is compared to the anchors: close ones are kept, far ones can be removed in
   one go (back to the unknown pool, and barred from {{ name }}), and the ones in between are
-  decided one by one. Faces you assigned by hand are never touched.
+  decided one by one. Faces you set by hand are never touched, and faces you approved by swiping are never
+  removed automatically. <strong>Older faces without a manual mark count as automatic</strong>, so check the preview
+  below before removing; <em>Undo last cleanup</em> restores exactly what was removed.
 </p>
+<p class="sub" id="cl-anchor-note" style="margin:0 0 10px;"></p>
 
-<div class="section-title" style="margin-bottom:6px;">1 · Pick anchors <span class="sub" id="cl-anchor-count"></span></div>
-<p class="sub" style="margin:0 0 8px;">Sorted by how clearly visible the face is (detector confidence, size, upright). Click to select / deselect.</p>
+<div class="section-title" style="margin-bottom:6px;">1 · Anchors <span class="sub" id="cl-anchor-count"></span></div>
+<p class="sub" style="margin:0 0 8px;">Sorted by how clearly visible the face is (detector confidence, size, upright).
+  Click a face to pick it as an anchor (this confirms it by hand: it becomes a hand-set face). Click a face you picked
+  to un-pick it and put it back to what it was. Faces already set by hand stay anchors. Badges: anchor / approved / auto.</p>
 <div id="cl-faces" class="cl-grid"><span class="sub">Loading…</span></div>
 <button type="button" id="cl-more" class="btn-similar" style="display:none;margin:8px 0 18px;">Show more faces</button>
 
@@ -30,8 +35,8 @@
     <button type="button" id="cl-defaults" class="btn-similar">Reset defaults</button>
   </div>
   <label class="sub" style="display:block;margin:6px 0;">
-    <input type="checkbox" id="cl-legacy"> Also include older faces whose origin wasn't recorded
-    (could include ones you confirmed before this was tracked)</label>
+    <input type="checkbox" id="cl-approved"> Also review previously approved faces that look far from the anchors
+    (one by one in the swipe below; never removed automatically)</label>
   <div id="cl-hist" class="cl-hist"></div>
   <p id="cl-counts" class="sub"></p>
 
@@ -52,7 +57,7 @@
       <button type="button" class="swipe-btn swipe-btn-confirm" id="cl-keep-btn" title="Yes, it is them: keep (↑)">✓</button>
     </div>
     <div class="swipe-hint">
-      <strong>↑</strong> keep (never asked again) · <strong>↓</strong> remove (→ unknown, not {{ name }}) ·
+      <strong>↑</strong> keep (approved, never removed automatically) · <strong>↓</strong> remove (→ unknown, not {{ name }}) ·
       <strong>←</strong> not sure · <strong>→</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo
     </div>
   </div>
@@ -66,6 +71,10 @@
   .cl-face.selected { border-color:var(--chip-blue,#8ab4f8); }
   .cl-face .cl-tag { position:absolute; left:0; right:0; bottom:0; font-size:10px; padding:1px 3px;
     background:rgba(0,0,0,.65); color:#fff; text-align:center; }
+  .cl-badge { position:absolute; left:3px; top:3px; font-size:10px; line-height:1; padding:2px 4px; border-radius:6px;
+    background:rgba(0,0,0,.7); color:#fff; }
+  .cl-badge.t3 { background:#2e7d32; } .cl-badge.t2 { background:#1565c0; } .cl-badge.t1 { background:#6d6d6d; }
+  .cl-face.locked { cursor:default; }
   .cl-sliders { display:flex; flex-wrap:wrap; gap:18px; align-items:center; margin-bottom:6px; }
   .cl-sliders label { display:flex; flex-direction:column; gap:2px; min-width:200px; }
   .cl-hist { display:flex; align-items:flex-end; gap:1px; height:90px; max-width:640px; margin:8px 0 2px; }
@@ -89,6 +98,10 @@
   let offset = 0, total = 0;
   let preview = null, stack = null, timer = null;
 
+  const TRUST_TITLES = {{ trust_titles | tojson }};
+  const TRUST_LABELS = {{ trust_labels | tojson }};
+  function badge(t) { return '<span class="cl-badge t' + t + '" title="' + TRUST_TITLES[t] + '">' + TRUST_LABELS[t] + '</span>'; }
+
   function json(r) { if (!r.ok) return r.json().then(function (e) { throw new Error(e.detail || r.status); }); return r.json(); }
 
   function setAnchorLabel() {
@@ -100,11 +113,17 @@
     faces.forEach(function (f) {
       const div = document.createElement('div');
       div.className = 'cl-face' + (anchors.has(f.ref) ? ' selected' : '');
-      div.title = 'quality ' + f.quality + (f.kind === 'protected' ? ' · set by hand' : '');
-      div.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.quality.toFixed(2) + '</span>';
+      div.title = 'quality ' + f.quality + ' · ' + TRUST_TITLES[f.trust];
+      if (f.locked) div.classList.add('locked');
+      div.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.quality.toFixed(2) + '</span>' + badge(f.trust);
       div.addEventListener('click', function () {
-        if (anchors.has(f.ref)) anchors.delete(f.ref); else anchors.add(f.ref);
+        if (f.locked) { if (window.showToast) showToast('Set by hand: always an anchor'); return; }
+        if (f._prev === undefined) f._prev = f.trust;
+        if (anchors.has(f.ref)) { anchors.delete(f.ref); f.trust = f._prev; } else { anchors.add(f.ref); f.trust = 3; }
         div.classList.toggle('selected', anchors.has(f.ref));
+        const old = div.querySelector('.cl-badge');
+        if (old) old.outerHTML = badge(f.trust);
+        div.title = 'quality ' + f.quality + ' · ' + TRUST_TITLES[f.trust];
         saveAnchors();
       });
       grid.appendChild(div);
@@ -141,7 +160,7 @@
   }
 
   function params() {
-    return 'keep=' + $('cl-keep').value + '&remove=' + $('cl-remove').value + '&include_legacy=' + ($('cl-legacy').checked ? 1 : 0);
+    return 'keep=' + $('cl-keep').value + '&remove=' + $('cl-remove').value + '&include_approved=' + ($('cl-approved').checked ? 1 : 0);
   }
 
   function sliderLabels() {
@@ -154,11 +173,19 @@
     fetch(base + '/preview?' + params()).then(json).then(function (p) {
       preview = p;
       $('cl-score-section').style.display = p.needs_anchor ? 'none' : 'block';
-      if (p.needs_anchor) { stack = null; return; }
+      if (p.needs_anchor) {
+        stack = null;
+        $('cl-anchor-note').textContent = 'No face of ' + personName + ' was set by hand or approved yet: pick one or more clear anchor faces below.';
+        return;
+      }
       const c = p.counts;
+      $('cl-anchor-note').textContent = 'Using ' + p.anchors_used + ' of ' + p.anchors_total + ' ' +
+        (p.anchor_source === 'approved' ? 'approved (swiped) faces, because none were set by hand' : 'hand-set faces') +
+        ' as anchors' + (p.anchors_total > p.anchors_used ? ' (the clearest ones)' : '') + '.';
       $('cl-counts').textContent = c.keep + ' keep · ' + c.uncertain + ' uncertain · ' + c.remove + ' remove  (of ' +
-        c.candidates + ' scored). ' + c.protected + ' set by hand or confirmed: never touched' +
-        (c.legacy_skipped ? ' · ' + c.legacy_skipped + ' older faces excluded' : '') +
+        c.candidates + ' automatic faces scored). ' + c.protected + ' set by hand: never touched · ' +
+        c.approved_skipped + ' approved by swipe: never removed automatically' +
+        (c.approved_far ? ' · ' + c.approved_far + ' approved but far from the anchors (in the swipe)' : '') +
         (c.missing_embedding ? ' · ' + c.missing_embedding + ' without a usable embedding' : '') +
         (p.anchors_stale ? ' · ' + p.anchors_stale + ' anchor(s) no longer valid' : '');
       $('cl-unc-count').textContent = '(' + c.uncertain + ' to review)';
@@ -208,7 +235,7 @@
   $('cl-keep').value = DEF.keep; $('cl-remove').value = DEF.remove;
   $('cl-keep').addEventListener('input', onSlider);
   $('cl-remove').addEventListener('input', onSlider);
-  $('cl-legacy').addEventListener('change', refresh);
+  $('cl-approved').addEventListener('change', function () { refresh(); if (stack) stack.reset(); });
   $('cl-defaults').addEventListener('click', function () {
     $('cl-keep').value = DEF.keep; $('cl-remove').value = DEF.remove; refresh();
   });
@@ -220,7 +247,7 @@
     const btn = this; btn.disabled = true; $('cl-status').textContent = 'Removing…';
     fetch(base + '/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ keep: Number($('cl-keep').value), remove: Number($('cl-remove').value),
-        include_legacy: $('cl-legacy').checked, confirm: true, expected_remove: n }) })
+        confirm: true, expected_remove: n }) })
       .then(json).then(function (d) {
         $('cl-status').textContent = 'Removed ' + d.removed + ' faces.';
         refresh();
@@ -251,16 +278,16 @@
           imageUrl: cropUrl(card.ref),
           questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>? ' +
             '<img src="' + cropUrl(card.anchor_ref) + '" alt="anchor" style="height:56px;vertical-align:middle;border-radius:6px;margin-left:8px;" draggable="false">',
-          scoreText: 'similarity to anchor ' + card.score.toFixed(2),
+          scoreText: (card.approved ? 'previously approved · ' : '') + 'similarity to anchor ' + card.score.toFixed(2),
           metaHtml: window.swipeCardMeta ? swipeCardMeta(card) : '',
           originalUrl: '/photo/' + card.file_id,
         };
       },
       onConfirm: function (card) {
-        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'keep', include_legacy: $('cl-legacy').checked } };
+        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'keep', include_approved: $('cl-approved').checked } };
       },
       onReject: function (card) {
-        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'remove', include_legacy: $('cl-legacy').checked } };
+        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'remove', include_approved: $('cl-approved').checked } };
       },
       onUndo: function (card) {
         return { url: base + '/decide/' + card.face_id, method: 'DELETE' };
