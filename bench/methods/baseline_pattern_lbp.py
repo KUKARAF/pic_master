@@ -7,7 +7,7 @@ import numpy as np
 
 from harness import Method, max_per_group, top_k
 from media_manager import pattern_descriptor
-from media_manager.tile_index import generate_tiles
+from media_manager.object_encoder import generate_tiles
 
 
 class PatternLBP(Method):

@@ -35,6 +35,8 @@ EMBEDDING_TABLES = ('embeddings', 'embeddings_siglip', 'embeddings_dino', 'tile_
                     'body_embeddings', 'object_region_embeddings', 'place_embeddings', 'faces')
 BLOB_FLAG_TABLES = ('embeddings', 'embeddings_siglip', 'embeddings_dino', 'tile_embeddings',
                     'body_embeddings', 'region_windows', 'pattern_windows')
+# 'clip' = the legacy `embeddings` table: unused by the app (CLIP was removed) but audited as long as
+# a user's DB still carries it.
 SPACES = {'clip': 'embeddings', 'siglip': 'embeddings_siglip', 'dino': 'embeddings_dino'}
 
 

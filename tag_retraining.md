@@ -1,10 +1,16 @@
 # Teaching CLIP new concepts — options
 
+> **Historical note.** CLIP (ViT-B/32) has since been removed from the app; `/tags` training now
+> fits the same kind of linear probe over frozen **SigLIP 2** (default) or **DINOv2** embeddings
+> (`embedding_tag_classifier.py`). The analysis below was written for the CLIP era and is kept for
+> the reasoning (frozen-embedding probe limits, LAION/DINOv2/LoRA options); read "CLIP" as "the
+> frozen embedding model".
+
 ## The core problem
 
 The `/tags` CLIP "training" is a **linear probe**, not fine-tuning. For each tag it
 fits a single `Linear(512 → 1)` logistic regression over the tag's confirmed/rejected
-photos' **frozen** CLIP embeddings (`clip_tag_classifier.fit_from_examples`), producing
+photos' **frozen** CLIP embeddings (`embedding_tag_classifier.fit_from_examples`), producing
 a 512-dim weight vector. Inference is `sigmoid(embedding · w + b)` — a dot product.
 CLIP itself never moves.
 

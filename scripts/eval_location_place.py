@@ -23,7 +23,7 @@ Columns of the printed table (means over evaluated locations):
             100 suggestions; LOWER IS BETTER. A variant that wins P@20 but also fills the top
             with bait is matching people, not the place. Locations with no recurring identity
             have no probe and are left out of the bait columns (n_probe says how many had one).
-Variants are clip-free: siglip, dino, combined (0.6 DINOv2 + 0.4 SigLIP 2) and place (combined +
+Variants: siglip, dino, combined (0.6 DINOv2 + 0.4 SigLIP 2) and place (combined +
 people-aware correction). The stage-2 masked re-embedding needs the GPU worker and is not
 evaluated here.
 

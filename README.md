@@ -2,7 +2,7 @@
 
 Media manager — like git for your media files. Scan directories, track files by
 content hash, then layer ML on top: object detection (YOLO-World), visual
-similarity search (CLIP), face detection/recognition (InsightFace), find-by-body
+similarity + semantic search (SigLIP 2 / DINOv2), face detection/recognition (InsightFace), find-by-body
 (re-identify a person by outfit/build when their face is hidden — web UI only),
 EXIF metadata, and a local web gallery.
 
@@ -22,7 +22,7 @@ cd pic_master
 pip install -e .
 ```
 
-This installs the `media` CLI. Model weights (YOLO, CLIP, InsightFace) are
+This installs the `media` CLI. Model weights (YOLO, SigLIP 2, DINOv2, InsightFace) are
 downloaded automatically on first use.
 
 GPU note: the compute device is auto-selected — **CUDA → XPU (Intel Arc) → MPS →
@@ -40,7 +40,7 @@ CPU/CUDA `torch`. To actually use a GPU:
   torchvision::nms does not exist`:
   `pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu`
   — on a host with the Intel GPU runtime (kernel i915/xe + Level-Zero +
-  compute-runtime). CLIP and YOLO-World run
+  compute-runtime). SigLIP 2, DINOv2 and YOLO-World run
   on the Arc GPU; InsightFace faces run via OpenVINO. Age/gender (MiVOLO) runs in
   its own isolated venv, which `media age-setup` builds with `torch==2.7.1+xpu`
   (Battlemage needs torch ≥ 2.6, so the age venv no longer uses the old 2.5.1) —
@@ -170,13 +170,13 @@ development. Everything else works fine without this step.
 
 ## Optional: ML worker (offload heavy models to a local HTTP service)
 
-Face detection/embedding, CLIP, and YOLO-World are memory-hungry. On a
+Face detection/embedding, SigLIP 2 / DINOv2, and YOLO-World are memory-hungry. On a
 low-RAM host (or one running the web UI with multiple workers) they can OOM. The
 `media worker` command runs those models as a small **HTTP service** — on the
 same box or a separate, beefier one — and the host offloads to it. When a worker
 is reachable, `media faces` / `media index` / `media embed` / `media bodies`, the
 web reindex/embed/face endpoints, find-by-body, **per-tag classifier training**
-(the CLIP and YOLO-World "Train" buttons), **and age/gender estimation** all send
+(the SigLIP 2 / DINOv2 and YOLO-World "Train" buttons), **and age/gender estimation** all send
 their work to it — each dispatch is logged (`[worker] outsourced …`) and shown in
 the web UI's worker badge. For the *inference* offloads the host transparently
 falls back to running locally if the worker is unreachable; **training and
@@ -218,7 +218,7 @@ note near the top of this README.
 **2. Start the worker, bound so the host can reach it:**
 
 ```bash
-media worker --host 0.0.0.0 --port 4243     # add --preload to load models at startup (faces, SigLIP 2, DINOv2, YOLO-World; legacy CLIP stays lazy)
+media worker --host 0.0.0.0 --port 4243     # add --preload to load models at startup (faces, SigLIP 2, DINOv2, YOLO-World)
 ```
 
 It prints its URL and serves until Ctrl-C. Leave it running (tmux/screen, a
@@ -239,7 +239,7 @@ offload to the worker. You can also set `MEDIA_WORKER_ADDR` (a URL) /
 
 ### Per-tag classifier training on the worker
 
-When a worker is configured, clicking **Train** on a tag trains its CLIP linear
+When a worker is configured, clicking **Train** on a tag trains its SigLIP 2 / DINOv2 linear
 classifier and/or YOLO-World fine-tune **on the worker**, not the host — the
 host only gathers the tag's examples, downscales the images, and streams them
 over. Progress, logs, and cancel work exactly as with local training (the same
@@ -248,7 +248,7 @@ metadata/status the UI already polls). Two things to know:
 - **The worker keeps its trained YOLO checkpoints** (under
   `~/.cache/media_manager/tag_models/` on the worker) and also serves the
   fine-tuned detection for the "find more" swipe, so the heavy YOLO model never
-  loads on the host. The small CLIP weights come back to the host. If the
+  loads on the host. The small linear-classifier weights come back to the host. If the
   worker's cache is wiped or the worker is replaced, a tag's YOLO suggestions
   will report a missing model — just retrain it.
 - **No local fallback for training.** If the worker is configured but
@@ -281,8 +281,8 @@ on the worker when one is configured, with local fallback):
 - **🎯 Index region matching** — per photo: DINOv2 ViT-S/14 window descriptors
   (int8) + ~300 RootSIFT features. 🔲 then finds the *same object/region* (DINO
   prefilter, SIFT + MAGSAC geometric verification of the top 200). Without it, 🔲
-  falls back to the semantic CLIP tile index (**▦ Index regions (CLIP)**), which
-  returns similar *kinds* of things. ~53 KB per photo.
+  answers "Index region matching first" (there is no semantic fallback any more).
+  ~53 KB per photo.
 - **🧩 Index patterns** — per photo: ~250 native-scale deep texture windows
   (ResNet18 early features, fixed PCA-96, int8) for 🧩 to find the same surface
   (wallpaper, fabric). ~24 KB per photo. Descriptors carry an algorithm tag, so
@@ -302,7 +302,7 @@ media_manager/
 ├── hasher.py             # Content hashing (xxhash)
 ├── database.py           # SQLite schema and operations
 ├── detector.py           # YOLO-World object detection
-├── indexer.py            # CLIP embedding / similarity
+├── embedders.py          # SigLIP 2 + DINOv2 embedders (torch, GPU-only)
 ├── face_detector.py      # InsightFace detection + embeddings
 ├── exif_reader.py        # EXIF capture time + GPS
 ├── age_estimator.py      # MiVOLO client (isolated-venv subprocess)

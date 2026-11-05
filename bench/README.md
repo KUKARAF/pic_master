@@ -14,7 +14,7 @@ is removed from the ranking before scoring.
 ```
 export LD_LIBRARY_PATH="$(dirname $(find /nix -name libGL.so.1 2>/dev/null | head -1)):$LD_LIBRARY_PATH"
 cd /var/home/rafa/dev/pic_master/media_manager
-/var/home/rafa/dev/pic_master/.venv/bin/python -I bench/harness.py --method baseline_clip_tiles \
+/var/home/rafa/dev/pic_master/.venv/bin/python -I bench/harness.py --method region_integrated \
     [--task region|pattern] [--real-only] [--json bench/results/NAME.json]
 ```
 
@@ -73,17 +73,19 @@ Notes
   `conf@10` ("same-category confusion"): mean fraction of the top 10 that are hard negatives.
 - Cost: index ms/image and KiB/image (first build), query latency p50/p95.
 
-The baselines reuse the production code with the same semantics as `web.py`
-(`api_region_search`: CLIP ViT-B/32 over `generate_tiles`, best-tile max cosine;
-`api_pattern_search`: LBP+HSV+Gabor descriptor over the same tiles, best-tile max cosine).
-Baseline timings are CPU (CLIP: `device=cpu`, no GPU locally).
+The pattern baseline reuses the production code with the same semantics as `web.py`
+(`api_pattern_search`: LBP+HSV+Gabor descriptor over the same tiles, best-tile max cosine).
+The region baseline was the old CLIP ViT-B/32 tile search; CLIP has since been removed from the
+app, so `methods/baseline_clip_tiles.py` is gone and its numbers below (and
+`results/baseline_clip_tiles.json`) are kept as the historical reference the DINOv2 + RootSIFT
+region search was measured against. Baseline timings are CPU (no GPU locally).
 
 ## Baseline results
 
 Corpus 1739 images; 66 region cases (41 real, 25 synthetic), 61 pattern cases (29 real, 32 synthetic).
 CPU only, measured while the machine was heavily loaded (index times are pessimistic).
 
-Region, `baseline_clip_tiles` (index ~5 s/img under load, 28 KiB/img; query p50 179 ms, p95 200 ms):
+Region, `baseline_clip_tiles` (removed; historical; index ~5 s/img under load, 28 KiB/img; query p50 179 ms, p95 200 ms):
 
 | split | R@1 | R@5 | R@10 | R@50 | H@1 | MRR | mAP | HN@10 | HN>pos | conf@10 |
 |---|---|---|---|---|---|---|---|---|---|---|

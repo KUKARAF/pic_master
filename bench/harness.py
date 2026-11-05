@@ -1,6 +1,6 @@
 """Evaluation harness for region (instance) and pattern (texture) search methods.
 
-    python -I bench/harness.py --method baseline_clip_tiles [--task region|pattern]
+    python -I bench/harness.py --method region_integrated [--task region|pattern]
                                [--real-only] [--json out.json]
 
 A method (see Method below) is plugged in by dropping bench/methods/<file>.py that

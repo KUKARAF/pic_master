@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Benchmark SigLIP2 / DINOv2 / CLIP embedders on a folder; optional SigLIP2 text sanity.
+"""Benchmark SigLIP2 / DINOv2 embedders on a folder; optional SigLIP2 text sanity.
 
   python scripts/bench_embedders.py FOLDER -n 200 [--devices auto,cpu] -q "a dog" -q "sunset"
 """
@@ -40,7 +40,7 @@ def main():
     ap.add_argument('-n', type=int, default=200)
     ap.add_argument('--devices', default='auto', help='comma list of auto|cpu|cuda|xpu')
     ap.add_argument('--allow-cpu', action='store_true', help='one-off CPU comparison only (embedders are GPU-only)')
-    ap.add_argument('--models', default='siglip2,dino,clip')
+    ap.add_argument('--models', default='siglip2,dino')
     ap.add_argument('-q', '--query', action='append', default=[])
     a = ap.parse_args()
     paths = collect(a.folder, a.n)
@@ -61,8 +61,7 @@ def main():
                     from media_manager.embedders import DINOv2Embedder as E
                     emb = E(_allow_cpu=a.allow_cpu)
                 else:
-                    from media_manager.indexer import CLIPIndexer as E
-                    emb = E()
+                    raise ValueError(f'unknown model {name!r} (expected siglip2 or dino)')
                 emb.embed_images(paths[:8])  # warmup (kernel compile / lazy init)
                 sync()
                 t = time.perf_counter()

@@ -1,6 +1,11 @@
 # Region (R) and Pattern (P) search: why they fail, options, shortlist
 
 Research agent output. No source code was changed. Date: 2026-10-26.
+
+> **Historical note.** The CLIP tile index analysed here (tile_index.py, indexer.py, `tile_embeddings`) has since
+> been removed; region search is now the instance-level DINOv2 window + RootSIFT index (region_index.py), and
+> an empty region index answers 409 "Index region matching first" instead of falling back to CLIP. The old
+> `tile_embeddings` table is kept as unused data.
 Scope: photo-view buttons "region" (CLIP tiles) and "pattern" (LBP+HSV+Gabor).
 Target: instance / pattern-instance retrieval over ~100k images, <2 s per query on 4 CPU cores, optional remote GPU worker.
 
@@ -338,7 +343,6 @@ Decisions / gaps:
   static-shape OpenVINO IR), while E1 needs dense 448-px token maps, so `region_index.py` loads the same
   DINOv2-reg family (ViT-S/14) through torch.hub on the central compute device. Query p50 ~2.1 s on
   this CPU-only box (DINO forward x3 dominates); the worker GPU should be faster.
-- The CLIP tile path stays as the fallback when no region index exists (response `mode: tiles|whole`;
-  the new path reports `mode: instance`). Existing CLIP tiles were computed on un-rotated pixels for
-  EXIF-rotated photos; re-run "Index regions (CLIP)" after clearing `tile_embeddings` if that matters.
+- (Superseded: the CLIP tile fallback has been removed; with no region index the endpoint answers 409
+  asking for "Index region matching" first. The new path reports `mode: instance`.)
 - Old `pattern_tiles` rows are left in place and ignored.

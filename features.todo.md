@@ -10,10 +10,11 @@
 - [x] `media find_broken` — detect corrupted images/videos
 - [x] `.mediaignore` support (git-ignore syntax)
 
-## Phase 2: CLIP Image Search (in progress)
+## Phase 2: Image Search (in progress)
+> CLIP (ViT-B-32) was replaced by SigLIP 2 + DINOv2 (`embeddings_siglip` / `embeddings_dino`, `media embed`); the old `embeddings` table is unused and kept. Items below are the original plan.
 - [x] `embeddings` table in SQLite (file_id, embedding BLOB, model, indexed_at)
-- [x] `media index [path]` — run CLIP (ViT-B-32), store float32 embeddings
-- [x] `media search <query>` — encode text with CLIP, cosine similarity over all embeddings
+- [x] `media index [path]` — run object detection (originally CLIP embeddings)
+- [x] `media search <query>` — originally CLIP text encoding + cosine similarity (now SigLIP 2 text search in the web UI)
 - [ ] Install and test end-to-end (`pip install -e .` with open-clip-torch)
 - [ ] Progress bar for `media index` (reuse HashEstimator pattern)
 - [ ] `media index --reindex` flag to force re-embedding already indexed files
@@ -48,9 +49,9 @@
 - [x] `media web [--host] [--port]` — FastAPI server on localhost:8000
 - [x] Gallery grid with thumbnails, tag chips, ⭐ "i am feeling lucky" similar-image button
 - [x] Photo detail page — full image, metadata, live tag add/remove
-- [x] CLIP text search (`/search?q=`)
+- [x] Text search (`/search?q=`; SigLIP 2)
 - [x] Tag search (`/search?tag=`)
-- [x] Similar images page (CLIP cosine similarity, top 20)
+- [x] Similar images page (SigLIP 2 / DINOv2 cosine similarity, top 20)
 - [x] Tags API (add, remove, list, search by tag)
 - [x] Thumbnail generation + cache in `.media/thumbs/`
 - [x] Faces stub (placeholder UI until Phase 4 is done)
