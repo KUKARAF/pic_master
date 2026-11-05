@@ -88,12 +88,13 @@ def _order(data, ids):
     return [rev[c['id']] for c in data['cards']]
 
 
-def test_default_is_combined_and_clip_still_selectable(env):
+def test_default_is_place_and_clip_still_selectable(env):
     _app, _db, _m, ids, loc, client = env
     default = _get(client, loc)
     comb = _get(client, loc, 'combined')
+    # no photo here has person data and no member has GPS/sets, so 'place' == 'combined' order
     assert _order(default, ids) == _order(comb, ids)
-    assert default['model'] == 'combined' and default['threshold_applied'] is False
+    assert default['model'] == 'place' and comb['model'] == 'combined' and default['threshold_applied'] is False
     assert default['background_applied'] is False and default['cards'] == default['results']
     clip = _get(client, loc, 'clip', background='false')
     order = _order(clip, ids)

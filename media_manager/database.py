@@ -147,6 +147,7 @@ class Database(ThreadLocalDB):
         self._place_ver = 0  # bumped on place_embeddings writes (same pattern as above)
         self._siglip_ver = 0  # bumped on embeddings_siglip writes (SigLIP 2 text+image space)
         self._dino_ver = 0  # bumped on embeddings_dino writes (DINOv2 image-only space)
+        self._det_ver = 0  # bumped on detections writes (location_place's person-area cache)
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
         self._emb_cache = None
@@ -2025,6 +2026,7 @@ class Database(ThreadLocalDB):
             rows
         )
         self.conn.commit()
+        self._det_ver += 1
 
     def get_detected_classes(self, file_id):
         """Return list of distinct detected class names for a file's primary frame,
@@ -2099,6 +2101,7 @@ class Database(ThreadLocalDB):
                 (file_id, int(time.time()))
             )
         self.conn.commit()
+        self._det_ver += 1
 
     def clear_detections(self, file_id) -> int:
         """Drop every auto-detected class on a file's PRIMARY frame; returns how many
@@ -2132,6 +2135,7 @@ class Database(ThreadLocalDB):
                 (file_id, int(time.time()))
             )
         self.conn.commit()
+        self._det_ver += 1
         return removed
 
     def get_undetected_files(self, limit=None):
@@ -3693,6 +3697,7 @@ class Database(ThreadLocalDB):
         cursor.execute('DELETE FROM embeddings_dino WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         self.conn.commit()
+        self._det_ver += 1
         # Invalidate all cached matrices: this cleared embeddings, body, and
         # (unless skip_faces) faces rows for the file.
         self._emb_ver += 1

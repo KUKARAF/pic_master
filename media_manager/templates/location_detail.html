@@ -77,7 +77,8 @@
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Suggest using
   <select id="location-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
-    <option value="combined">DINOv2 + SigLIP 2 (same place, recommended)</option>
+    <option value="place">Place, people-aware (recommended)</option>
+    <option value="combined">DINOv2 + SigLIP 2</option>
     <option value="siglip">SigLIP 2 (scene)</option>
     <option value="dino">DINOv2 (layout)</option>
     {% if clip_legacy_available %}<option value="clip">CLIP (ViT-B/32, legacy)</option>{% endif %}
@@ -393,11 +394,11 @@
       '&model=' + encodeURIComponent(currentModel);
   }
 
-  /* Embedding model driving the suggestions ('combined' = DINOv2 + SigLIP 2 default | 'siglip' | 'dino' | legacy 'clip',
+  /* Embedding model driving the suggestions ('place' = combined + people/geo correction, default | 'combined' = DINOv2 + SigLIP 2 | 'siglip' | 'dino' | legacy 'clip',
      the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold and the
      background (CLIP tile index) option server-side, so both controls are disabled. */
   const MODEL_KEY = 'mm_location_suggest_model';
-  const MODEL_LABELS = { clip: 'CLIP', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
+  const MODEL_LABELS = { clip: 'CLIP', place: 'Place (people-aware)', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
   const BG_TIP = 'background matching uses the CLIP tile index; not available for SigLIP/DINOv2';
   const modelSelect = document.getElementById('location-model-select');
   const modelNotice = document.getElementById('location-model-notice');
@@ -406,7 +407,7 @@
       const m = localStorage.getItem(MODEL_KEY);
       if (m && MODEL_LABELS[m] && (m !== 'clip' || (modelSelect && modelSelect.querySelector('option[value=clip]')))) return m;
     } catch (e) {}
-    return 'combined';
+    return 'place';
   }
   let currentModel = loadModel();
   if (modelSelect) modelSelect.value = currentModel;
@@ -425,13 +426,36 @@
   function showModelNotice(data) {
     if (!modelNotice) return;
     const cov = data && data.coverage;
+    const psc = data && data.person_scan_coverage;
     if (data && data.model_missing && cov) {
       modelNotice.textContent = cov.members_embedded + ' of ' + cov.members_total + ' photos here have no ' +
         MODEL_LABELS[currentModel] + ' embedding yet \u2014 run Index SigLIP 2 + DINOv2 on /bulk';
       modelNotice.style.display = '';
+    } else if (psc && psc.pool_total && psc.unscanned_pct >= 20) {
+      modelNotice.textContent = psc.unscanned_pct + '% of the candidate photos are not yet person-scanned, so people ' +
+        'cannot be discounted for them \u2014 run the object index / face scan for better place matches.';
+      modelNotice.style.display = '';
     } else {
       modelNotice.style.display = 'none';
     }
+  }
+
+  /* Compact "why" badge for the place model: base similarity plus what the people/geo
+     correction did, with the full breakdown in the tooltip. */
+  function whyBadge(w) {
+    if (!w) return '';
+    const sg = function(x) { return (x > 0 ? '+' : '') + x.toFixed(2); };
+    const tips = ['place score ' + w.place + ' (cosine ' + w.cos + ')'];
+    tips.push(w.scanned ? 'people cover ' + Math.round((w.person_area || 0) * 100) + '% of the frame'
+                        : 'not person-scanned yet (no people adjustment)');
+    if (w.person_penalty) tips.push('people-in-frame ' + sg(w.person_penalty));
+    if (w.people_penalty) tips.push('same people (' + (w.people || []).join(', ') + ') ' + sg(w.people_penalty));
+    if (w.geo) tips.push('GPS ' + sg(w.geo) + (w.geo_km != null ? ' (' + w.geo_km + ' km)' : ''));
+    if (w.co) tips.push('same shoot / set / folder ' + sg(w.co));
+    if (w.masked != null) tips.push('background-only (masked) similarity ' + w.masked);
+    const tag = w.total ? sg(w.total) : '\u00b10';
+    return ' <span class="sub" style="cursor:help;border-bottom:1px dotted;" title="' + escapeHtml(tips.join('\n')).replace(/"/g, '&quot;') +
+      '">place ' + tag + (w.people ? ' \u00b7 same people' : '') + (w.scanned ? '' : ' \u00b7 unscanned') + '</span>';
   }
 
   // Background matching runs on the (optional) Tiles index — say how much of it exists.
@@ -535,7 +559,7 @@
         return {
           imageUrl: '/thumb/' + card.id,
           questionHtml: 'Add <strong>' + escapeHtml(name) + '</strong> to this location?',
-          scoreText: typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '',
+          scoreText: (typeof card.score === 'number' ? 'Similarity: ' + card.score.toFixed(3) : '') + whyBadge(card.why),
           metaHtml: swipeCardMeta(card),
           originalUrl: '/photo/' + card.id,
         };
@@ -636,7 +660,7 @@
   // the stack so no card ranked by the previous model lingers.
   if (modelSelect) {
     modelSelect.addEventListener('change', function() {
-      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'combined';
+      currentModel = MODEL_LABELS[modelSelect.value] ? modelSelect.value : 'place';
       try { localStorage.setItem(MODEL_KEY, currentModel); } catch (e) {}
       applyModelToBackgroundToggle();
       if (modelNotice) modelNotice.style.display = 'none';

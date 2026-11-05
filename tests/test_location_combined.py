@@ -88,7 +88,7 @@ def test_fuse_zscores_math():
 
 def test_default_combined_ranking(env):
     _app, _db, _m, ids, loc, client, _mp = env
-    d = _post(client, loc)
+    d = _post(client, loc, model='combined')
     names = _names(d, ids)
     assert d['model'] == 'combined' and d['threshold_applied'] is False and d['background_applied'] is False
     assert d['coverage']['members_total'] == 2 and d['coverage']['per_space'] == {'dino': 2, 'siglip': 2}

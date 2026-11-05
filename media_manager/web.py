@@ -43,7 +43,7 @@ from pydantic import BaseModel
 
 from media_manager import (
     background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
-    near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
+    location_place, near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
 )
@@ -8947,7 +8947,9 @@ def create_app(data_root: str) -> FastAPI:
     # Location "same place" ranking: 'combined' fuses DINOv2 + SigLIP 2 (see
     # _find_similar_files_for_location). DINOv2 is weighted higher: it matches layout /
     # instance (same place from another angle), SigLIP 2 adds scene semantics.
-    LOCATION_SUGGEST_MODELS = SET_SUGGEST_MODELS + ('combined',)
+    # 'place' (the default) = 'combined' + a people-aware correction from stored data only
+    # (location_place.py: person-area weight, same-identity damping, GPS/time/set co-signals).
+    LOCATION_SUGGEST_MODELS = SET_SUGGEST_MODELS + ('combined', 'place')
     LOCATION_FUSION_WEIGHTS = {'dino': 0.6, 'siglip': 0.4}
 
     def _fused_space_scores(positive_ids, negative_ids=None):
@@ -9000,7 +9002,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True, honor_negatives=False, background=True,
-                                          model='combined', info=None):
+                                          model='place', info=None):
         """Images not yet at this location whose embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
@@ -9022,7 +9024,8 @@ def create_app(data_root: str) -> FastAPI:
         place counts and the people in it don't. Falls back to the whole-image ranking
         when the location's photos have no background tiles yet.
 
-        `model` ('combined' default | 'siglip' | 'dino' | legacy 'clip'): members, rejected
+        `model` ('place' default | 'combined' | 'siglip' | 'dino' | legacy 'clip'): 'place' = 'combined'
+        corrected for people and co-signals (location_place.py; `why` per card), members, rejected
         photos and candidates are all read from that model's space. 'combined' = DINOv2
         (same place from another angle: layout/instance) fused with SigLIP 2 (scene
         semantics) by a weighted mean of z-scored cosines (LOCATION_FUSION_WEIGHTS), each
@@ -9077,11 +9080,18 @@ def create_app(data_root: str) -> FastAPI:
         if info is not None:
             info['mode'] = 'whole'
 
-        if model == 'combined':
+        if model in ('combined', 'place'):
             placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
             excluded_ids = ([r['id'] for r in db.get_files_by_checksums(list(excluded_checksum_set))]
                             if honor_negatives and excluded_checksum_set else None)
             fids, cks, rank, display, cov = _fused_space_scores(member_ids, excluded_ids)
+            place_why = {}
+            if model == 'place' and rank.shape[0]:
+                rank, place_why, place_info = location_place.apply_place_correction(
+                    db, manual, rank, display, fids, cks, member_ids, member_checksums,
+                    location=manual.get_location(location_id))
+                if info is not None:
+                    info.update(place_info)
             if info is not None:
                 info.update(coverage={'members_embedded': max(cov.values()) if cov else 0,
                                       'members_total': len(member_checksums), 'per_space': cov},
@@ -9098,8 +9108,14 @@ def create_app(data_root: str) -> FastAPI:
                 page = passing[offset:offset + limit]
             cards = _enrich_rows([(fid, path, True, cs) for (fid, path, cs), _score in page],
                                  scores={fid: round(score, 3) for (fid, _p, _cs), score in page})
+            why_by_cs = {cks[i]: w for i, w in place_why.items()}
+            for still_cs, video_cs in manual.get_all_frame_capture_parents().items():
+                if still_cs in why_by_cs:      # a still surfaces as its video: it carries the still's why
+                    why_by_cs.setdefault(video_cs, why_by_cs[still_cs])
             for card in cards:
                 card['ref'] = str(card['id'])
+                if place_why and card.get('checksum') in why_by_cs:
+                    card['why'] = why_by_cs[card['checksum']]
             return cards
 
         member_embeddings = _set_member_embeddings(model, member_ids)
@@ -10275,7 +10291,7 @@ def create_app(data_root: str) -> FastAPI:
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
                                         honor_negatives: bool = False, background: bool = True,
-                                        model: str = 'combined'):
+                                        model: str = 'place'):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
         if model not in LOCATION_SUGGEST_MODELS:
