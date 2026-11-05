@@ -44,7 +44,7 @@
 
 {% block scripts %}
 <script>
-/* The find-by-body match needs a YOLO-World + CLIP pass over this photo the
+/* The find-by-body match needs a YOLO-World + embedding pass over this photo the
    first time it's opened (see _ensure_own_bodies in web.py) — too slow to run
    inline in the page request, so the page renders instantly with a loading
    spinner and this fetches the actual result afterward (mirrors person.html's
@@ -127,7 +127,7 @@
     );
   }
 
-  // Deferred behind an explicit click — this is a YOLO-World + CLIP pass
+  // Deferred behind an explicit click — this is a YOLO-World + embedding pass
   // over the WHOLE library's body embeddings (see _ensure_own_bodies/
   // _body_search in web.py), real CPU cost that shouldn't fire just from
   // landing on this page (mirrors swipe-core.js's same "Start reviewing"

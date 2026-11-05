@@ -81,7 +81,6 @@
     <option value="combined">DINOv2 + SigLIP 2</option>
     <option value="siglip">SigLIP 2 (scene)</option>
     <option value="dino">DINOv2 (layout)</option>
-    {% if clip_legacy_available %}<option value="clip">CLIP (ViT-B/32, legacy)</option>{% endif %}
   </select>
 </label>
 <div id="location-model-notice" class="sub" style="display:none;margin-bottom:10px;color:#b45309;"></div>
@@ -208,7 +207,6 @@
 <div class="section-title" style="margin-top:36px;margin-bottom:12px;">
   Find objects
 </div>
-<!-- DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend. -->
 <div id="object-search-section">
   <p class="sub" style="margin-bottom:12px;">
     Mark an object on one of this location's photos, give it a name, then search
@@ -348,7 +346,7 @@
 
 <script>
 /* Suggested photos for this location — a swipe stack mirroring set_detail.html's,
-   ranked by CLIP similarity to the photos already assigned here (deliberately
+   ranked by embedding similarity to the photos already assigned here (deliberately
    NOT by GPS distance: two different places can sit metres apart, and a place's
    look is what actually identifies the rest of its photos). Starts empty and
    fetches its first batch only once you press the engine's own "Start
@@ -394,17 +392,16 @@
       '&mask=' + String(!maskToggle || maskToggle.checked);
   }
 
-  /* Embedding model driving the suggestions ('place' = combined + people/geo correction, default | 'combined' = DINOv2 + SigLIP 2 | 'siglip' | 'dino' | legacy 'clip',
-     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold server-side. */
+  /* Embedding model driving the suggestions ('place' = combined + people/geo correction, default | 'combined' = DINOv2 + SigLIP 2 | 'siglip' | 'dino'), remembered per browser. siglip/dino ignore the match threshold server-side. */
   const MODEL_KEY = 'mm_location_suggest_model';
-  const MODEL_LABELS = { clip: 'CLIP', place: 'Place (people-aware)', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
+  const MODEL_LABELS = { place: 'Place (people-aware)', combined: 'DINOv2 + SigLIP 2', siglip: 'SigLIP 2', dino: 'DINOv2' };
   const modelSelect = document.getElementById('location-model-select');
   const modelNotice = document.getElementById('location-model-notice');
   const maskToggle = document.getElementById('location-mask-toggle');
   function loadModel() {
     try {
       const m = localStorage.getItem(MODEL_KEY);
-      if (m && MODEL_LABELS[m] && (m !== 'clip' || (modelSelect && modelSelect.querySelector('option[value=clip]')))) return m;
+      if (m && MODEL_LABELS[m]) return m;   // a saved removed model ('clip') falls through to the default
     } catch (e) {}
     return 'place';
   }
@@ -586,8 +583,8 @@
       // unambiguously "no more similar photos", never "not compared yet" —
       // that case can't even get here, the stack isn't built without photos.
       emptyStateHtml: function(stackEl) {
-        const topK = currentModel !== 'clip';
-        const tip = 'Not used for ' + MODEL_LABELS[currentModel] + ': its similarity scale differs from CLIP, so the best 400 candidates are shown instead of applying a threshold.';
+        const topK = true;   // siglip/dino/combined/place all rank a top-K pool; no absolute threshold
+        const tip = 'Not used for ' + MODEL_LABELS[currentModel] + ': its similarity scale differs per model, so the best 400 candidates are shown instead of applying a threshold.';
         stackEl.innerHTML =
           '<div class="swipe-empty">' +
             '<p style="margin-bottom:10px;">' + (topK ? 'No more photos similar to this location from ' + MODEL_LABELS[currentModel] + '.'
@@ -647,8 +644,8 @@
   });
 
   // A non-default saved model is fetched up front so the missing-embeddings
-  // notice can show; the legacy CLIP model keeps the original lazy first fetch.
-  if (currentModel !== 'clip') fetchAndLaunch(); else launchStack([]);
+  // notice can show.
+  fetchAndLaunch();
 })();
 </script>
 

@@ -1,6 +1,6 @@
 """Media-worker offload — CLIENT side.
 
-Offloads the heavy ML (face detection/embedding, CLIP image/text embedding,
+Offloads the heavy ML (face detection/embedding, SigLIP 2 / DINOv2 image/text embedding,
 YOLO-World object detection) to a *worker* reached over plain HTTP, so a
 low-powered machine can index a library without carrying torch/insightface/YOLO
 itself. The wire contract lives in :mod:`worker_protocol` (msgpack dicts sent as
@@ -12,7 +12,7 @@ This module provides:
 * :class:`WorkerClient` — a per-``data_root`` singleton that owns an HTTP session
   and serializes requests to the worker.
 * ``Remote*`` proxy classes that are DROP-IN replacements for
-  ``FaceDetector`` / ``CLIPIndexer`` / ``YOLOWorldDetector`` — same method
+  ``FaceDetector`` / ``SigLIP2Embedder`` / ``YOLOWorldDetector`` — same method
   signatures, same return *types* (numpy float32 arrays of the same shape, same
   tuple/dict shapes) so the DB-writing code downstream is unchanged.
 
@@ -367,7 +367,6 @@ class WorkerClient:
         _check_algo(resp, algo)
         return np.frombuffer(resp["windows"], np.int8).reshape(resp["n"], dim).copy()
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def region_query(self, image_bytes: bytes, box, algo: str, name: str = "<query>"):
         """DINOv2 query vectors float32 (3, DIM) for one drawn region (instance-level region
         search). `box` is [x1,y1,x2,y2] in EXIF-upright image px. Raises WorkerError on
@@ -378,7 +377,6 @@ class WorkerClient:
         _check_algo(resp, algo)
         return np.frombuffer(resp["vecs"], np.float32).reshape(resp["n"], -1).copy()
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def region_index(self, image_bytes: bytes, algo: str, dim: int, name: str = "<image>"):
         """Region-index payload for one image: (windows int8 (n, dim), sift pts float16 (k, 2),
         sift desc uint8 (k, 128)). Same failure contract as region_query."""
@@ -704,76 +702,6 @@ class RemoteFaceDetector:
     def model_id(*args, **kwargs) -> str:
         from .face_detector import FaceDetector  # hook-allow: lazy — model module, only for id
         return FaceDetector.model_id(*args, **kwargs)
-
-
-class RemoteCLIPIndexer:
-    """Drop-in for :class:`indexer.CLIPIndexer` backed by the worker."""
-
-    def __init__(self, client: WorkerClient):
-        self.client = client
-        # Must equal the model the worker uses so the DB 'model' column matches.
-        from .indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
-        self.model_name = CLIPIndexer.model_id()
-
-    def embed_images(self, paths):
-        vectors = []
-        failed = []
-        for path in paths:
-            basename = os.path.basename(path)
-            image_bytes, read_error = _read_for_upload(path)
-            if read_error:
-                failed.append((path, read_error))
-                continue
-            self.client.record("embed_image", basename)
-            resp = self.client.request(
-                worker_protocol.PATH_EMBED_IMAGE,
-                {"name": basename, "image": image_bytes},
-            )
-            emb = resp.get("embedding")
-            if emb is None or resp.get("error"):
-                failed.append((path, resp.get("error") or "no embedding returned"))
-            else:
-                vectors.append(np.frombuffer(emb, dtype=np.float32).copy())
-
-        if vectors:
-            embeddings = np.stack(vectors).astype(np.float32)
-        else:
-            embeddings = np.empty((0,), dtype=np.float32)  # match CLIPIndexer.embed_images
-        return embeddings, failed
-
-    def embed_pil_images(self, images):
-        if not images:
-            return np.empty((0,), dtype=np.float32)
-        vectors = []
-        for img in images:
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            image_bytes = buf.getvalue()
-            self.client.record("embed_image", "<crop>")
-            resp = self.client.request(
-                worker_protocol.PATH_EMBED_IMAGE,
-                {"name": "<crop>", "image": image_bytes},
-            )
-            emb = resp.get("embedding")
-            if emb is None or resp.get("error"):
-                raise WorkerError(resp.get("error") or "no embedding returned")
-            vectors.append(np.frombuffer(emb, dtype=np.float32).copy())
-        return np.stack(vectors).astype(np.float32)
-
-    def embed_text(self, text):
-        self.client.record("embed_text", text[:40])
-        resp = self.client.request(
-            worker_protocol.PATH_EMBED_TEXT,
-            {"text": text},
-        )
-        if resp.get("error"):
-            raise WorkerError(resp["error"])
-        return np.frombuffer(resp["embedding"], dtype=np.float32).copy()
-
-    @staticmethod
-    def model_id(*args, **kwargs):
-        from .indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
-        return CLIPIndexer.model_id(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

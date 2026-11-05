@@ -132,7 +132,6 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
-      <!-- DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend. -->
       <button type="button" class="bulk-action-btn" data-start="/api/region-index/start" data-status="/api/region-index/status" title="DINOv2 windows + SIFT features per photo: 🔲 region search finds the same object/region (verified by geometry), not just the same category">🎯 Index region matching</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
@@ -149,7 +148,6 @@
       <span class="bulk-action-status" data-role="status"></span>
     </div>
     <div class="bulk-action-row">
-      <!-- DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend. -->
       <button type="button" class="bulk-action-btn" data-start="/api/object-index/start" data-status="/api/object-index/status">📌 Index objects</button>
       <span class="bulk-action-status" data-role="status"></span>
     </div>
@@ -272,7 +270,7 @@
     fetch('/api/embed-stats').then(function (r) { return r.json(); }).then(function (d) {
       if (!d.spaces) { statsEl.textContent = d.detail || 'stats unavailable'; return; }
       var sp = d.spaces, parts = [];
-      [['clip', 'CLIP (legacy, not re-run by this job)'], ['siglip', 'SigLIP 2'], ['dino', 'DINOv2']].forEach(function (k) {
+      [['siglip', 'SigLIP 2'], ['dino', 'DINOv2']].forEach(function (k) {
         var x = sp[k[0]];
         parts.push(k[1] + ': ' + x.rows.toLocaleString() + ' (' + x.dim + '-d, ' + mb(x.bytes) + ')');
       });

@@ -1,6 +1,6 @@
 """Host-side driver that runs per-tag training on the remote Reticulum worker
 instead of locally — a drop-in replacement subprocess for
-``clip_tag_classifier`` / ``yolo_tag_classifier`` when a worker is configured.
+``embedding_tag_classifier`` / ``yolo_tag_classifier`` when a worker is configured.
 
 It honours the SAME on-disk contract those local trainers use (metadata.json via
 ``write_status``, a ``train.log`` under ``classifier_dir``), so web.py's status /
@@ -17,7 +17,7 @@ this is label-invariant and cuts RNS transfer ~10-50x), ships them to the worker
 in batches, then polls the worker job and mirrors its progress into
 metadata.json / train.log. YOLO checkpoints stay on the worker (served by
 tag_detect); the small weights.npz artifact of an embedding-space classifier
-(kind siglip_model | dino_model | legacy clip_model) is pulled back so score_all can
+(kind siglip_model | dino_model) is pulled back so score_all can
 run locally; the host validates its dimension against the uploaded embeddings and
 re-stamps it with the space/model id, so a worker that trained in the wrong space
 can never leave a silently-wrong artifact behind.
@@ -33,7 +33,7 @@ import signal
 import sys
 import time
 
-from media_manager.clip_tag_classifier import (
+from media_manager.embedding_tag_classifier import (
     SPACES, all_embeddings_for_space, classifier_dir, current_embedding_model, save_weights, slugify, write_status,
     MIN_EXAMPLES_PER_CLASS)
 from media_manager.yolo_tag_classifier import MIN_BOXES
@@ -42,7 +42,7 @@ from media_manager.manual_db import ManualDB
 
 _MAX_LONG_SIDE = 640          # ultralytics trains at imgsz=640; no point shipping bigger
 _YOLO_UPLOAD_BATCH = 16       # images per train_add — keeps each RNS request modest
-_CLIP_UPLOAD_BATCH = 64   # (embedding-classifier batches; name kept)
+_EMBED_UPLOAD_BATCH = 64   # embedding-classifier examples per train_add
 _KIND_TO_SPACE = {v['dir_kind']: k for k, v in SPACES.items()}
 _POLL_INTERVAL = 3.0
 _MAX_POLL_ERRORS = 5          # consecutive status-poll failures before giving up (worker up but erroring)
@@ -134,7 +134,7 @@ def _drive_with_recovery(data_root, tag_label, out_dir, pid, started_at, kind):
             if kind == 'yolo_model':
                 _drive_yolo(data_root, tag_label, out_dir, pid, started_at)
             else:
-                _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind)
+                _drive_embedding(data_root, tag_label, out_dir, pid, started_at, kind)
             return
         except (JobLost, WorkerUnavailable) as exc:
             restarts += 1
@@ -257,7 +257,7 @@ def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
                      done_extra={'n_boxes': len(rows), 'n_images': n_images})
 
 
-def _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind='siglip_model'):
+def _drive_embedding(data_root, tag_label, out_dir, pid, started_at, kind='siglip_model'):
     from PIL import Image as PILImage  # hook-allow: lazy — PIL only needed for this path
 
     client = _client(data_root)
@@ -289,7 +289,7 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind='siglip_mod
         batch.append({'label': label, 'embedding': emb})
         n_pos += label
         n_neg += (1 - label)
-        if len(batch) >= _CLIP_UPLOAD_BATCH:
+        if len(batch) >= _EMBED_UPLOAD_BATCH:
             client.train_add(job_id, kind, batch)
             batch = []
 
@@ -319,7 +319,7 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind='siglip_mod
             n_pos += label
             n_neg += (1 - label)
             n_region += 1
-            if len(batch) >= _CLIP_UPLOAD_BATCH:
+            if len(batch) >= _EMBED_UPLOAD_BATCH:
                 client.train_add(job_id, kind, batch)
                 batch = []
     if batch:

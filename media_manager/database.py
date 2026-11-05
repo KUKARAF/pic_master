@@ -139,10 +139,8 @@ class Database(ThreadLocalDB):
         # only when the underlying table changes. Each write bumps the matching
         # version counter; each accessor rebuilds iff its cached version is
         # stale. Single-process shared cache (fine for uvicorn --workers 1).
-        self._emb_ver = 0
         self._face_ver = 0
         self._body_ver = 0
-        self._tile_ver = 0
         self._objreg_ver = 0  # bumped on object_region_embeddings writes (same pattern)
         self._place_ver = 0  # bumped on place_embeddings writes (same pattern as above)
         self._siglip_ver = 0  # bumped on embeddings_siglip writes (SigLIP 2 text+image space)
@@ -150,7 +148,6 @@ class Database(ThreadLocalDB):
         self._det_ver = 0  # bumped on detections writes (location_place's person-area cache)
         self._matrix_lock = threading.Lock()
         # Each cache slot holds (version_it_was_built_at, built_result_tuple).
-        self._emb_cache = None
         self._face_cache = None
         self._body_cache = None
         self._siglip_cache = None
@@ -282,13 +279,11 @@ class Database(ThreadLocalDB):
                 UNIQUE(name, studio)
             )
         ''')
-        # Embeddings table: stores CLIP embeddings for image search. frame_index is
-        # part of the identity (not nullable) — an embedding is always "of some
-        # specific image," so frame 0 (the default/primary embedding, same meaning as
-        # before frame support existed) is a real value, not a NULL "whole file"
-        # placeholder. A composite PK with NULL in one column wouldn't enforce the
-        # uniqueness we want anyway, since SQL treats each NULL as distinct.
-        # CREATE TABLE IF NOT EXISTS handles both fresh DBs and old DBs (migration).
+        # LEGACY, UNUSED: the old CLIP (ViT-B/32) whole-image embeddings table. CLIP has been
+        # removed from the app -- nothing reads or writes this table any more (SigLIP 2 /
+        # DINOv2 live in embeddings_siglip / embeddings_dino). It is deliberately NOT dropped,
+        # so existing user data is left untouched; rows of a removed file are still purged
+        # with the file (see remove_paths_under). Safe to `DROP TABLE embeddings` by hand.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS embeddings (
                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -299,9 +294,9 @@ class Database(ThreadLocalDB):
                 PRIMARY KEY (file_id, frame_index)
             )
         ''')
-        # Extra whole-image embedding spaces alongside CLIP, same shape/semantics as
-        # `embeddings` (PK (file_id, frame_index); frame 0 = primary): SigLIP 2
-        # (text+image) and DINOv2 (image-only). `model` is the embedder id so a model
+        # Whole-image embedding spaces (PK (file_id, frame_index); frame_index is part of the
+        # identity -- frame 0 is the primary embedding): SigLIP 2 (text+image) and DINOv2
+        # (image-only). `model` is the embedder id so a model
         # change is detected and re-embedded (see get_files_needing_siglip/dino).
         for _t in ('embeddings_siglip', 'embeddings_dino'):
             cursor.execute(f'''
@@ -425,15 +420,10 @@ class Database(ThreadLocalDB):
                 frame_index INTEGER
             )
         ''')
-        # Tile embeddings table: per-image grid crops, each CLIP-embedded, backing
-        # region search (a query crop can match a small/off-center region that the
-        # whole-image embedding would wash out). Derived, rebuildable data keyed by
-        # file_id like embeddings/detections/faces/body_embeddings — not part of the
-        # checksum-keyed manual ground truth. bbox (x1,y1,x2,y2) is in ORIGINAL image
-        # pixels; embedding is raw float32 (D,) np.tobytes(). Wholesale-replaced per
-        # file on re-index (see insert_tile_embeddings), so no sentinel/frame_index
-        # bookkeeping is needed. CREATE TABLE IF NOT EXISTS is itself the migration —
-        # it runs on every init, giving existing DBs the table (and index) too.
+        # LEGACY, UNUSED: the old CLIP "tile" region-search table (per-image grid crops,
+        # each CLIP-embedded). The CLIP tile index was removed; nothing reads or writes this
+        # table any more (region search is region_index.py, DINOv2 windows + RootSIFT).
+        # Kept (not dropped) so existing user data is untouched; purged with its file.
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS tile_embeddings (
                 id INTEGER PRIMARY KEY,
@@ -547,7 +537,7 @@ class Database(ThreadLocalDB):
         # Place embeddings: one Visual-Place-Recognition descriptor per image for
         # "same physical location" retrieval, computed with people MASKED OUT (so a
         # location match keys on the scene/background, not who's in frame — unlike the
-        # whole-image `embeddings` CLIP vector, which is dominated by people). Derived,
+        # whole-image SigLIP/DINO vector, which is dominated by people). Derived,
         # rebuildable, keyed by file_id; `model` versions the encoder (AnyLoc/EigenPlaces
         # etc.) so a stale descriptor can be detected and re-indexed. embedding is raw
         # float32 (D,) L2-normalized np.tobytes(). One row per file (primary frame only).
@@ -689,29 +679,6 @@ class Database(ThreadLocalDB):
         # table to reclaim one integer isn't worth it, so the column is simply left
         # behind as dead data: nothing reads or writes it either way.
 
-        # embeddings' PK changed shape (file_id -> (file_id, frame_index)), which SQLite
-        # can't ALTER in place — rebuild the table if it's still the old single-column-PK
-        # shape. Every existing row is by definition the file's only/primary embedding,
-        # so it becomes frame_index=0, matching what a fresh scan would have written.
-        embeddings_cols = {row[1] for row in cursor.execute('PRAGMA table_info(embeddings)')}
-        if 'frame_index' not in embeddings_cols:
-            cursor.execute('ALTER TABLE embeddings RENAME TO embeddings_old')
-            cursor.execute('''
-                CREATE TABLE embeddings (
-                    file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-                    frame_index INTEGER NOT NULL DEFAULT 0,
-                    embedding BLOB NOT NULL,
-                    model TEXT NOT NULL,
-                    indexed_at INTEGER NOT NULL,
-                    PRIMARY KEY (file_id, frame_index)
-                )
-            ''')
-            cursor.execute('''
-                INSERT INTO embeddings (file_id, frame_index, embedding, model, indexed_at)
-                SELECT file_id, 0, embedding, model, indexed_at FROM embeddings_old
-            ''')
-            cursor.execute('DROP TABLE embeddings_old')
-
         # Indexes for performance
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_path ON file_paths (path)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_file_paths_file ON file_paths (file_id)')
@@ -802,7 +769,7 @@ class Database(ThreadLocalDB):
                    CASE WHEN e.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_embedding,
                    f.checksum
             FROM files_with_path f
-            LEFT JOIN embeddings e ON e.file_id = f.id
+            LEFT JOIN embeddings_siglip e ON e.file_id = f.id AND e.frame_index = 0
             WHERE f.ai_generated = 1
             ORDER BY f.first_seen DESC, f.id DESC
             LIMIT ?
@@ -1121,9 +1088,6 @@ class Database(ThreadLocalDB):
             return {'rows': rows, 'dim': dim, 'bytes': rows * dim * 4}
 
         return {
-            'clip': stat("SELECT COUNT(*) FROM embeddings WHERE frame_index=0",
-                         "SELECT length(embedding) FROM embeddings WHERE frame_index=0 "
-                         "AND embedding IS NOT NULL LIMIT 1"),
             'siglip': stat("SELECT COUNT(*) FROM embeddings_siglip WHERE frame_index=0",
                            "SELECT length(embedding) FROM embeddings_siglip WHERE frame_index=0 "
                            "AND embedding IS NOT NULL LIMIT 1"),
@@ -1135,9 +1099,18 @@ class Database(ThreadLocalDB):
             'body': stat("SELECT COUNT(*) FROM body_embeddings WHERE bbox != '[]'",
                          "SELECT length(embedding) FROM body_embeddings "
                          "WHERE bbox != '[]' AND embedding != x'' LIMIT 1"),
-            'tile': stat("SELECT COUNT(*) FROM tile_embeddings",
-                         "SELECT length(embedding) FROM tile_embeddings LIMIT 1"),
         }
+
+    def legacy_table_rows(self):
+        """{table: row_count} for the unused legacy CLIP tables (`embeddings`, `tile_embeddings`).
+        Nothing reads or writes them any more; the data is kept, and /stats just reports it."""
+        out = {}
+        for table in ('embeddings', 'tile_embeddings'):
+            try:
+                out[table] = self.conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+            except sqlite3.Error:
+                out[table] = 0
+        return out
 
     def loaded_matrix_bytes(self):
         """Actual RAM (bytes) of each embedding matrix currently resident in the
@@ -1147,8 +1120,7 @@ class Database(ThreadLocalDB):
         /stats."""
         out = {}
         # (label, cache attribute, index of the matrix within the cached result tuple)
-        for label, attr, idx in (('clip', '_emb_cache', 2),
-                                  ('face', '_face_cache', 2),
+        for label, attr, idx in (('face', '_face_cache', 2),
                                   ('siglip', '_siglip_cache', 2),
                                   ('dino', '_dino_cache', 2),
                                   ('body', '_body_cache', 3)):
@@ -1166,24 +1138,10 @@ class Database(ThreadLocalDB):
         """Size of this database file on disk, or 0 if missing."""
         return os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0
 
-    def iter_clip_embeddings(self, chunk=10000):
-        """Stream (file_ids: list[int], vecs: bytes) chunks of whole-image CLIP
-        embeddings via fetchmany — used to SHIP the CLIP matrix to the imdb worker
-        without ever materializing all ~478 MB on this (low-RAM) host. `vecs` is the
-        concatenated little-endian float32 blobs for the chunk's rows, in id order."""
-        cur = self.conn.cursor()
-        cur.execute('SELECT file_id, embedding FROM embeddings '
-                    'WHERE frame_index = 0 AND embedding IS NOT NULL ORDER BY file_id')
-        while True:
-            rows = cur.fetchmany(chunk)
-            if not rows:
-                break
-            yield [r[0] for r in rows], b''.join(r[1] for r in rows)
-
     def iter_face_embeddings(self, chunk=10000):
         """Stream (file_ids: list[int], vecs: bytes) chunks of face (ArcFace)
         embeddings — one row per detected face, `id` is its file_id so a face-search
-        result maps straight to the photo. Streams like iter_clip_embeddings so the
+        result maps straight to the photo. Streams like iter_siglip_embeddings so the
         ~444 MB face matrix is never fully resident on the host."""
         cur = self.conn.cursor()
         cur.execute("SELECT file_id, embedding FROM faces "
@@ -1231,35 +1189,6 @@ class Database(ThreadLocalDB):
         self.conn.commit()
         return cur.rowcount
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    # The legacy CLIP `embeddings` table (insert_embedding .. count_indexed, plus the iter_/matrix
-    # helpers) is kept read-only-in-spirit for old data, the legacy tag classifier and the body /
-    # tile / region paths; no background job or ingest hook writes it any more.
-    def insert_embedding(self, file_id, embedding_bytes, model, frame_index=0):
-        """Upsert the embedding for a file at a given frame (frame_index=0 is the
-        default/primary embedding — same meaning as before per-frame support existed)."""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO embeddings (file_id, frame_index, embedding, model, indexed_at)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (file_id, frame_index, embedding_bytes, model, int(time.time())))
-        self.conn.commit()
-        self._emb_ver += 1  # invalidate cached embeddings matrix
-
-    def get_all_embeddings(self):
-        """Return list of (file_id, path, embedding_bytes, checksum) joining with
-        files. Scoped to the primary (frame_index=0) embedding only — frame-specific
-        embeddings from 'scan all frames' don't participate in whole-file similarity
-        search/gallery flags until that's deliberately built."""
-        cursor = self.conn.cursor()
-        cursor.execute('''
-            SELECT e.file_id, f.path, e.embedding, f.checksum
-            FROM embeddings e
-            JOIN files_with_path f ON f.id = e.file_id
-            WHERE e.frame_index = 0
-        ''')
-        return cursor.fetchall()
-
     @staticmethod
     def _stack_embeddings(blobs, label):
         """Stack a list of float32 embedding BLOBs into one (N, D) float32
@@ -1294,61 +1223,6 @@ class Database(ThreadLocalDB):
         matrix = np.frombuffer(b''.join(good), np.float32).reshape(len(good), D)
         return matrix, keep
 
-    def get_embeddings_matrix(self):
-        """Cached, write-invalidated matrix form of get_all_embeddings for
-        whole-file similarity search. Returns
-        (file_ids: np.ndarray[int64], checksums: list[str], matrix: float32[N, D])
-        over the same rows as get_all_embeddings (primary frame_index=0). The
-        heavy numpy matrix is built ONCE and reused across requests until an
-        embeddings write bumps self._emb_ver — avoiding the per-request
-        full-table BLOB fetchall()+rebuild that drives the web-server OOM.
-        `path` is intentionally not selected (resolved later for the top-K
-        only)."""
-        import numpy as np  # hook-allow: lazy — heavy
-        with self._matrix_lock:
-            if self._emb_cache is not None and self._emb_cache[0] == self._emb_ver:
-                return self._emb_cache[1]
-            ver = self._emb_ver
-            cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT e.file_id, f.checksum, e.embedding
-                FROM embeddings e
-                JOIN files_with_path f ON f.id = e.file_id
-                WHERE e.frame_index = 0
-            ''')
-            rows = cursor.fetchall()
-            if not rows:
-                result = (np.array([], dtype=np.int64), [], np.empty((0, 0), np.float32))
-                self._emb_cache = (ver, result)
-                return result
-            matrix, keep = self._stack_embeddings([r[2] for r in rows], 'embeddings-matrix')
-            file_ids = np.array([rows[i][0] for i in range(len(rows)) if keep[i]], dtype=np.int64)
-            checksums = [rows[i][1] for i in range(len(rows)) if keep[i]]
-            result = (file_ids, checksums, matrix)
-            self._emb_cache = (ver, result)
-            return result
-
-    def score_embeddings(self, query):
-        """Cosine-score the whole-image CLIP matrix against `query`, returning a
-        float32 [N] scores array aligned row-for-row with get_embeddings_matrix()
-        (same file_ids/checksums order). GPU fast-path: keep the [N, D] matrix
-        resident in VRAM (keyed by 'emb' + self._emb_ver, the same counter that
-        invalidates the numpy cache) and upload just the query. On CPU — or any
-        machine without a usable GPU — gpu_search.matvec returns None and we fall
-        back to the exact numpy BLAS dot used everywhere else, so behavior is
-        byte-identical off-GPU. `query` may be any array-like of the embedding
-        dim; empty library → empty array (mirrors the callers' shape guard)."""
-        import numpy as np  # hook-allow: lazy — heavy
-        from . import gpu_search  # hook-allow: lazy — numpy/torch GPU path
-        _file_ids, _checksums, matrix = self.get_embeddings_matrix()
-        q = np.asarray(query, dtype=np.float32)
-        if matrix.shape[0] == 0:
-            return np.empty(0, dtype=np.float32)
-        scores = gpu_search.matvec('emb', self._emb_ver, matrix, q)
-        if scores is None:
-            scores = matrix.dot(q)  # numpy fallback (CPU / no-GPU) — unchanged path
-        return scores
-
     def score_all_faces(self, query):
         """Cosine-score every non-sentinel face embedding against `query`,
         returning a float32 [N] scores array aligned with get_face_embeddings_matrix()
@@ -1366,50 +1240,8 @@ class Database(ThreadLocalDB):
             scores = matrix.dot(q)  # numpy fallback (CPU / no-GPU) — unchanged path
         return scores
 
-    def get_embeddings_for_files(self, file_ids):
-        """Return [(file_id, embedding_bytes), ...] for a specific set of files'
-        primary embeddings — used to build a representative CLIP vector for e.g.
-        "images like this set"."""
-        if not file_ids:
-            return []
-        placeholders = ','.join('?' for _ in file_ids)
-        cursor = self.conn.cursor()
-        cursor.execute(
-            f'SELECT file_id, embedding FROM embeddings WHERE frame_index = 0 AND file_id IN ({placeholders})',
-            tuple(file_ids)
-        )
-        return cursor.fetchall()
-
-    def get_unindexed_files(self, limit=None):
-        """Return (id, path) for files that have no primary (frame_index=0)
-        embedding — independent of whether frame-specific embeddings exist."""
-        cursor = self.conn.cursor()
-        if limit is None:
-            cursor.execute('''
-                SELECT f.id, f.path
-                FROM files_with_path f
-                LEFT JOIN embeddings e ON e.file_id = f.id AND e.frame_index = 0
-                WHERE e.file_id IS NULL
-            ''')
-        else:
-            cursor.execute('''
-                SELECT f.id, f.path
-                FROM files_with_path f
-                LEFT JOIN embeddings e ON e.file_id = f.id AND e.frame_index = 0
-                WHERE e.file_id IS NULL
-                LIMIT ?
-            ''', (limit,))
-        return cursor.fetchall()
-
-    def count_indexed(self):
-        """Return the count of files with a primary (frame_index=0) embedding."""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(*) FROM embeddings WHERE frame_index = 0')
-        row = cursor.fetchone()
-        return row[0] if row else 0
-
     # --- SigLIP 2 / DINOv2 whole-image embedding spaces ------------------------------
-    # Same shape and semantics as the CLIP `embeddings` table (frame_index=0 is the
+    # One table per space (frame_index=0 is the
     # primary embedding), one set of methods per space. Space-agnostic internals take
     # the table + version attr; the public per-space wrappers below are what callers use.
     _SPACE_TABLES = {'siglip': 'embeddings_siglip', 'dino': 'embeddings_dino'}
@@ -1909,19 +1741,12 @@ class Database(ThreadLocalDB):
                    CASE WHEN e.file_id IS NOT NULL THEN 1 ELSE 0 END AS has_embedding,
                    f.checksum
             FROM files_with_path f
-            LEFT JOIN embeddings e ON e.file_id = f.id
+            LEFT JOIN embeddings_siglip e ON e.file_id = f.id AND e.frame_index = 0
             WHERE f.hidden = 0
             ORDER BY {column} {direction}, f.id {direction}
             LIMIT ? OFFSET ?
         ''', (limit, offset))
         return cursor.fetchall()
-
-    def get_embedding(self, file_id):
-        """Return the primary (frame_index=0) embedding bytes for a file, or None."""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT embedding FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
-        row = cursor.fetchone()
-        return row[0] if row else None
 
     def get_random_faceless_files(self, limit=200):
         """Random sample of files with NO real (non-sentinel) detected face, excluding
@@ -2420,10 +2245,8 @@ class Database(ThreadLocalDB):
         self.conn.commit()
         if files_removed:
             # Deleted rows from embeddings/faces/body_embeddings/tile_embeddings — invalidate all.
-            self._emb_ver += 1
             self._face_ver += 1
             self._body_ver += 1
-            self._tile_ver += 1
             self._objreg_ver += 1
             self._siglip_ver += 1
             self._dino_ver += 1
@@ -2455,10 +2278,8 @@ class Database(ThreadLocalDB):
         cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
         self.conn.commit()
         # Removed embedding/face/body/tile rows — invalidate the cached matrices.
-        self._emb_ver += 1
         self._face_ver += 1
         self._body_ver += 1
-        self._tile_ver += 1
         self._objreg_ver += 1
         self._siglip_ver += 1
         self._dino_ver += 1
@@ -3158,41 +2979,6 @@ class Database(ThreadLocalDB):
         self._body_ver += 1  # invalidate cached body-embeddings matrix
         return cursor.rowcount
 
-    # ------------------------------------------------------------------
-    # Tile embeddings methods (region search)
-    # ------------------------------------------------------------------
-
-    def insert_tile_embeddings(self, file_id: int, tiles: list, model: str) -> None:
-        """Replace the tile-embedding rows for a file (idempotent re-index).
-        tiles: list of {'bbox': [x1,y1,x2,y2], 'embedding': np.ndarray} — one per
-        grid crop, bbox in ORIGINAL image pixels. DELETEs any existing rows for the
-        file first so a re-index never leaves stale/duplicate tiles, then inserts
-        each with tile_index = its position in the list. Mirrors
-        insert_body_embeddings; unlike it there is no sentinel row — a file with no
-        tiles simply gets no rows (get_untiled_files re-queues it), which is fine
-        because the tile scan skips non-images rather than marking them done here."""
-        import numpy as np  # hook-allow: lazy — heavy
-        cursor = self.conn.cursor()
-        cursor.execute('DELETE FROM tile_embeddings WHERE file_id = ?', (file_id,))
-        for tile_index, tile in enumerate(tiles):
-            x1, y1, x2, y2 = tile['bbox']
-            cursor.execute(
-                'INSERT INTO tile_embeddings (file_id, tile_index, x1, y1, x2, y2, embedding, model) '
-                'VALUES (?,?,?,?,?,?,?,?)',
-                (file_id, tile_index, x1, y1, x2, y2,
-                 tile['embedding'].astype(np.float32).tobytes(), model)
-            )
-        self.conn.commit()
-        self._tile_ver += 1  # invalidate anything keyed off the tile version
-
-    def count_tiled_files(self) -> int:
-        """Number of distinct files that have at least one tile-embedding row.
-        Used to decide tile-vs-whole-image search and to show a "pending" status."""
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT COUNT(DISTINCT file_id) FROM tile_embeddings')
-        row = cursor.fetchone()
-        return row[0] if row else 0
-
     # --- pattern windows (find-by-pattern, pattern_deep.py) ---------------------------
     # `table` selects the index: 'pattern_windows' (ResNet18, pattern_deep.py, default) or
     # 'pattern_dino_cells' (DINOv2-L cells, pattern_dino.py) — identical row shape.
@@ -3339,35 +3125,8 @@ class Database(ThreadLocalDB):
         n, pts, desc = row
         return (np.frombuffer(pts, np.float16).reshape(n, 2), np.frombuffer(desc, np.uint8).reshape(n, 128))
 
-    def get_tiles_for_file(self, file_id):
-        """(x1, y1, x2, y2, embedding_bytes) for every tile of one file, in tile
-        order. Used to localize a whole-image match to its best sub-region (e.g.
-        the swipe fullview highlight for centroid tag suggestions). [] if untiled."""
-        cursor = self.conn.cursor()
-        cursor.execute(
-            'SELECT x1, y1, x2, y2, embedding FROM tile_embeddings '
-            'WHERE file_id = ? ORDER BY tile_index', (file_id,))
-        return cursor.fetchall()
-
-    def get_untiled_files(self, limit=None) -> list:
-        """Return (id, path) for tracked files that have NO tile_embeddings row.
-        Mirrors get_unbody_indexed_files; the caller skips non-images, so there is
-        no kind filter here."""
-        cursor = self.conn.cursor()
-        sql = '''
-            SELECT f.id, f.path
-            FROM files_with_path f
-            LEFT JOIN tile_embeddings t ON t.file_id = f.id
-            WHERE t.file_id IS NULL
-        '''
-        if limit is not None:
-            cursor.execute(sql + ' LIMIT ?', (limit,))
-        else:
-            cursor.execute(sql)
-        return cursor.fetchall()
-
     # --- Place (Visual Place Recognition) embeddings + cached local features -------
-    # Location matching uses these instead of the whole-image `embeddings` CLIP vector
+    # Location matching uses these instead of the whole-image SigLIP/DINO vector
     # so it keys on the scene with people masked out. A sentinel row (empty embedding,
     # x'') marks "processed, no usable place signal" so the build job won't re-queue it;
     # every read of real descriptors excludes it (embedding != x'').
@@ -3390,8 +3149,7 @@ class Database(ThreadLocalDB):
 
     def get_all_place_embeddings(self):
         """(file_id, path, embedding_bytes, checksum) for every file with a REAL place
-        descriptor — same row shape as get_all_embeddings so the location ranking can
-        drop it straight into rank_by_similarity(..., embedding_index=2). Sentinels
+        descriptor — same row shape as get_all_siglip_embeddings. Sentinels
         (empty embedding) are excluded."""
         cursor = self.conn.cursor()
         cursor.execute('''
@@ -3418,7 +3176,7 @@ class Database(ThreadLocalDB):
 
     def get_unplace_indexed_files(self, limit=None) -> list:
         """(id, path) for tracked files with NO place_embeddings row at all (sentinel
-        rows count as done). Mirrors get_untiled_files; caller skips non-images."""
+        rows count as done). Mirrors get_unbody_indexed_files; caller skips non-images."""
         cursor = self.conn.cursor()
         sql = '''
             SELECT f.id, f.path
@@ -3464,64 +3222,6 @@ class Database(ThreadLocalDB):
         ).fetchone()
         return row[0] if row else None
 
-    def get_tile_boxes(self):
-        """(ids, file_ids, tile_idx, boxes (n,4)) numpy arrays over every tile row —
-        the geometry background_tiles needs to decide which tiles are background."""
-        import numpy as np  # hook-allow: lazy — heavy
-        rows = self.conn.execute('SELECT id, file_id, tile_index, x1, y1, x2, y2 '
-                                 'FROM tile_embeddings ORDER BY id').fetchall()
-        if not rows:
-            return (np.zeros(0, np.int64),) * 3 + (np.zeros((0, 4), np.float32),)
-        arr = np.array([tuple(r) for r in rows], dtype=np.float64)
-        return (arr[:, 0].astype(np.int64), arr[:, 1].astype(np.int64),
-                arr[:, 2].astype(np.int64), np.nan_to_num(arr[:, 3:7]).astype(np.float32))
-
-    def iter_tile_embeddings_with_ids(self, batch_size=20000, file_ids=None):
-        """Yield (tile_ids, file_ids, matrix) chunks over all tile rows (or only the
-        given files'), ordered by id; malformed blobs are skipped from all three."""
-        import numpy as np  # hook-allow: lazy — heavy
-        cursor = self.conn.cursor()
-        if file_ids is not None:
-            file_ids = list(file_ids)
-            if not file_ids:
-                return
-            for chunk in self._chunked(file_ids):
-                ph = ','.join('?' * len(chunk))
-                cursor.execute(f'SELECT id, file_id, embedding FROM tile_embeddings '
-                               f'WHERE file_id IN ({ph}) ORDER BY id', tuple(chunk))
-                yield from self._tile_chunks(cursor, batch_size, np)
-            return
-        cursor.execute('SELECT id, file_id, embedding FROM tile_embeddings ORDER BY id')
-        yield from self._tile_chunks(cursor, batch_size, np)
-
-    @staticmethod
-    def _tile_chunks(cursor, batch_size, np):
-        ids, fids, blobs, dim = [], [], [], None
-        for row_id, file_id, blob in cursor:
-            if not blob or len(blob) % 4:
-                continue
-            if dim is None:
-                dim = len(blob) // 4
-            if len(blob) // 4 != dim:
-                continue
-            ids.append(row_id)
-            fids.append(file_id)
-            blobs.append(blob)
-            if len(blobs) >= batch_size:
-                yield (np.array(ids, np.int64), np.array(fids, np.int64),
-                       np.frombuffer(b''.join(blobs), np.float32).reshape(len(blobs), dim))
-                ids, fids, blobs = [], [], []
-        if blobs:
-            yield (np.array(ids, np.int64), np.array(fids, np.int64),
-                   np.frombuffer(b''.join(blobs), np.float32).reshape(len(blobs), dim))
-
-    def tile_background_signature(self):
-        """Changes whenever tiles or detections are added/removed — the cache key for
-        the background-tile mask (two cheap aggregate queries)."""
-        t = self.conn.execute('SELECT COUNT(*), MAX(id) FROM tile_embeddings').fetchone()
-        d = self.conn.execute('SELECT COUNT(*), MAX(id) FROM detections').fetchone()
-        return tuple(t) + tuple(d)
-
     def get_person_boxes_by_file(self, class_names=('person',), min_conf=0.3):
         """{file_id: [[x1,y1,x2,y2], ...]} person boxes (primary frame) for every file
         — the batched counterpart of get_person_detections_for_file."""
@@ -3533,51 +3233,6 @@ class Database(ThreadLocalDB):
                   AND frame_index IS NULL AND x1 IS NOT NULL''', (*class_names, min_conf)):
             out.setdefault(fid, []).append([x1, y1, x2, y2])
         return out
-
-    def iter_tile_embeddings(self, batch_size=20000):
-        """Yield (file_ids: np.ndarray[int64], matrix: np.ndarray[k, D] float32)
-        chunks over ALL tile rows, ordered by id, up to batch_size rows per chunk.
-
-        This is the RAM-bounded region-search primitive: the library may hold
-        hundreds of thousands of tiles, so — unlike get_body_embeddings_matrix —
-        we deliberately never build or cache one full matrix. Each chunk's blobs
-        are joined and reshaped in a single allocation (D inferred from the first
-        blob length // 4). A malformed/empty blob is skipped with a printed
-        WARNING (the scan keeps going), and file_ids stay aligned to matrix rows
-        because the skipped row is dropped from both."""
-        import numpy as np  # hook-allow: lazy — heavy
-        cursor = self.conn.cursor()
-        cursor.execute('SELECT id, file_id, embedding FROM tile_embeddings ORDER BY id')
-        batch_fids = []
-        batch_blobs = []
-        D = None
-
-        def _flush():
-            nonlocal D
-            fids = np.array(batch_fids, dtype=np.int64)
-            matrix = np.frombuffer(b''.join(batch_blobs), np.float32).reshape(len(batch_blobs), D)
-            return fids, matrix
-
-        for row_id, file_id, blob in cursor:
-            if not blob or (len(blob) % 4) != 0:
-                print(f"[iter_tile_embeddings] WARNING: skipping tile row id {row_id} "
-                      f"(file_id {file_id}): blob length {len(blob) if blob else 0} not a float32 vector")
-                continue
-            row_D = len(blob) // 4
-            if D is None:
-                D = row_D
-            elif row_D != D:
-                print(f"[iter_tile_embeddings] WARNING: skipping tile row id {row_id} "
-                      f"(file_id {file_id}): D={row_D} != expected D={D}")
-                continue
-            batch_fids.append(file_id)
-            batch_blobs.append(blob)
-            if len(batch_blobs) >= batch_size:
-                yield _flush()
-                batch_fids = []
-                batch_blobs = []
-        if batch_blobs:
-            yield _flush()
 
     # --- object region embeddings (DINOv2 object-exemplar search) --------------------
     def insert_object_regions(self, file_id: int, regions: list, model: str) -> None:
@@ -3611,7 +3266,7 @@ class Database(ThreadLocalDB):
 
     def get_unobject_indexed_files(self, limit=None) -> list:
         """Return (id, path) for tracked files that have NO object_region_embeddings
-        row. Mirrors get_untiled_files; the caller skips non-images, so there is no
+        row. Mirrors get_unbody_indexed_files; the caller skips non-images, so there is no
         kind filter here."""
         cursor = self.conn.cursor()
         sql = '''
@@ -3795,7 +3450,6 @@ class Database(ThreadLocalDB):
         cursor.execute('DELETE FROM detections WHERE file_id = ? AND frame_index IS NULL', (file_id,))
         if not skip_faces:
             cursor.execute('DELETE FROM faces WHERE file_id = ? AND frame_index IS NULL', (file_id,))
-        cursor.execute('DELETE FROM embeddings WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM embeddings_siglip WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM embeddings_dino WHERE file_id = ? AND frame_index = 0', (file_id,))
         cursor.execute('DELETE FROM body_embeddings WHERE file_id = ? AND frame_index IS NULL', (file_id,))
@@ -3803,7 +3457,6 @@ class Database(ThreadLocalDB):
         self._det_ver += 1
         # Invalidate all cached matrices: this cleared embeddings, body, and
         # (unless skip_faces) faces rows for the file.
-        self._emb_ver += 1
         self._siglip_ver += 1
         self._dino_ver += 1
         self._body_ver += 1

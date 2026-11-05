@@ -1,6 +1,6 @@
 """Runs INSIDE the isolated `.age-venv` (see age_estimator.py), never imported by the
 main app process. MiVOLO's own code hard-pins an old timm/ultralytics that conflict
-with this project's YOLO-World detector and CLIP indexer, so this whole feature lives
+with this project's YOLO-World detector and embedders, so this whole feature lives
 in its own virtualenv and talks to the main process over stdin/stdout JSON instead of
 being importable in-process.
 

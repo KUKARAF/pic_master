@@ -1,5 +1,3 @@
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-# (object search index)
 """Build the object-region index for instance-level object-exemplar search.
 
 For each un-indexed image this computes DINOv2 region embeddings (an overlapping

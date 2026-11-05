@@ -23,7 +23,7 @@
           data-inventory="{{ '1' if (fm.inventory or {}).refreshed_at else '0' }}"
           title="Add the untracked photos/videos under this folder (and its subfolders) to the library — the same as running `media add` on it. Duplicates of files already in the library and .mediaignore'd files are skipped.">📥 Track this folder</button>
   <button type="button" id="fm-ml-btn" class="stage-btn-accent" data-folder="{{ folder }}"
-          title="Run the scan stages (objects, CLIP, faces, …) that are still missing for tracked files under this folder — you pick which stages first.">🧠 Run missing ML here</button>
+          title="Run the scan stages (objects, embeddings, faces, …) that are still missing for tracked files under this folder — you pick which stages first.">🧠 Run missing ML here</button>
   {% endif %}
 </div>
 <div id="upload-status" class="sub" style="display:none;margin-bottom:12px;"></div>

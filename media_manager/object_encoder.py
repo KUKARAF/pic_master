@@ -1,13 +1,9 @@
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-# (DINOv2 object/region matching)
 """DINOv2 region/crop embedder for INSTANCE-level object retrieval.
 
-Where the CLIP tile index (``tile_index.py``) answers "what *kind* of thing is in
-this crop" (a leaf, a car, a wall), this answers "find *this specific* object/region
-again across the library" — same-instance similarity, not category similarity. For
-that, DINOv2 (self-supervised ViT, Apache-2.0) is markedly stronger than CLIP: its
-patch/token features cluster same-instance crops far more tightly than CLIP's
-semantic-but-instance-blind embedding. We use the **dinov2-with-registers** weights
+This answers "find *this specific* object/region again across the library" —
+same-instance similarity, not category similarity. For that, DINOv2 (self-supervised
+ViT, Apache-2.0) is markedly stronger than a semantic embedding: its patch/token
+features cluster same-instance crops far more tightly. We use the **dinov2-with-registers** weights
 (``facebook/dinov2-with-registers-*``): the register tokens absorb the high-norm
 attention artifacts of plain DINOv2, giving cleaner dense/patch features and a
 slightly better global (CLS) descriptor for retrieval.
@@ -26,7 +22,7 @@ degraded — see "no silent failures"):
 Both take a fixed 224x224 ImageNet-normalized input (patch 14 → a 16x16 = 256-patch
 grid, + 1 CLS + 4 register tokens = 261 sequence positions) and use the pooled CLS
 token (768-d for ViT-B/14) as the crop descriptor, L2-normalized so retrieval is a
-plain dot product — same convention as the CLIP indexer and pattern_descriptor.
+plain dot product — same convention as the SigLIP/DINO embedders and pattern_descriptor.
 
 The module imports on a CPU-only box with none of the ML runtime deps installed:
 ``numpy`` and ``PIL`` are baseline, and ``openvino`` / ``torch`` / ``transformers``
@@ -87,7 +83,69 @@ import numpy as np
 from PIL import Image
 
 from . import compute
-from .tile_index import generate_tiles
+
+# Tiles smaller than this on either side embed to noise, so drop them (matches the
+# degenerate-crop guard in body_index.crop_bodies).
+MIN_TILE_PX = 8
+
+# Grid scales to lay down on top of the whole-image tile: a 2x2 and a 3x3, each
+# with ~50% overlap so an object straddling a cell boundary still lands wholly
+# inside some neighbouring tile.
+GRID_SCALES = (2, 3)
+
+
+def generate_tiles(width, height):
+    """Deterministic overlapping multi-scale grid of (x1, y1, x2, y2) crops in
+    ORIGINAL pixel coords.
+
+    Scheme:
+      - Tile 1 is always the WHOLE image (0, 0, width, height).
+      - For each grid n in {2, 3} we lay down an n x n grid of ~50%-overlapping
+        windows. Each tile is `dim * 2/(n+1)` on a side (so a 2x2 gives half-size
+        tiles, a 3x3 gives ~half-size tiles too) and the top-left corners step by
+        `dim / (n+1)`, i.e. half a tile — a classic 50%-overlap sliding window.
+        That yields (n+1-1)=n positions per axis, hence up to n*n tiles per scale.
+      - Coords are clamped to [0, width] x [0, height], rounded to ints, and any
+        tile under MIN_TILE_PX on a side (or a duplicate of one already emitted) is
+        dropped — which is what makes tiny images degrade to just the whole tile.
+
+    For a landscape image this is 1 (whole) + 4 (2x2) + 9 (3x3) = 14 tiles; after
+    de-duping the near-identical whole-frame-ish tiles it lands around ~13. Tiny
+    images (e.g. 20x20) collapse to mostly just the whole tile once the sub-tiles
+    fall under MIN_TILE_PX or dedupe away.
+    """
+    tiles = []
+    seen = set()
+
+    def _add(x1, y1, x2, y2):
+        x1 = max(0, min(width, int(round(x1))))
+        y1 = max(0, min(height, int(round(y1))))
+        x2 = max(0, min(width, int(round(x2))))
+        y2 = max(0, min(height, int(round(y2))))
+        if x2 - x1 < MIN_TILE_PX or y2 - y1 < MIN_TILE_PX:
+            return
+        key = (x1, y1, x2, y2)
+        if key in seen:
+            return
+        seen.add(key)
+        tiles.append((x1, y1, x2, y2))
+
+    # Whole image first so it's always tile 0.
+    _add(0, 0, width, height)
+
+    for n in GRID_SCALES:
+        tile_w = width * 2.0 / (n + 1)
+        tile_h = height * 2.0 / (n + 1)
+        step_x = width / (n + 1)
+        step_y = height / (n + 1)
+        for row in range(n):
+            for col in range(n):
+                x1 = col * step_x
+                y1 = row * step_y
+                _add(x1, y1, x1 + tile_w, y1 + tile_h)
+
+    return tiles
+
 
 # Fixed network geometry for the ViT-B/14 (and -S/-L/14) dinov2-with-registers
 # backbones: a 224x224 input at patch 14 gives a 16x16 patch grid. Static, so the
@@ -226,10 +284,9 @@ class ObjectEncoder:
         return out
 
     def embed_regions(self, image) -> list:
-        """Embed the deterministic CLIP-tile grid of one image.
+        """Embed the deterministic tile grid of one image.
 
-        image: a PIL.Image or a path. Reuses tile_index.generate_tiles so the boxes
-        match the CLIP tile grid convention (whole image + 2x2 + 3x3, ~50% overlap).
+        image: a PIL.Image or a path. Uses generate_tiles (whole image + 2x2 + 3x3, ~50% overlap).
         Returns ``[ ((x1,y1,x2,y2) in ORIGINAL pixels, vec float32 L2-norm), ... ]``,
         dropping any tile whose crop failed. This is what the library indexing job
         calls per image."""

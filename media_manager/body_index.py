@@ -25,7 +25,7 @@ peopleless photo. (Confirmed: YOLO-World's 'person' confidence barely drops with
 face occluded or entirely out of frame — detection quality was never the bottleneck,
 trusting the general index's labels was.)
 
-EMBEDDING MODEL (was CLIP; now DINOv2-L by default, SigLIP 2 optional)
+EMBEDDING MODEL (DINOv2-L by default, SigLIP 2 optional; CLIP was removed)
 -----------------------------------------------------------------------
 Select with env ``MEDIA_BODY_MODEL`` = ``dino`` (default) | ``siglip``. The crops go
 through the shared worker/local embedders (web._get_dino_embedder / _get_siglip_embedder),

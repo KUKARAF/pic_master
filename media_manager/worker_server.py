@@ -1,6 +1,6 @@
 """Reticulum media-worker *server*.
 
-Runs the heavy ML models (InsightFace faces, CLIP embeddings, YOLO-World object
+Runs the heavy ML models (InsightFace faces, SigLIP 2 / DINOv2 embeddings, YOLO-World object
 detection) and exposes them over Reticulum so a thin client on another host can
 offload work to it. The wire contract (destination naming, request paths,
 (de)serialization) lives in :mod:`worker_protocol` and is shared verbatim with
@@ -36,7 +36,7 @@ import numpy as np
 from . import worker_protocol
 from . import compute
 from . import face_timing
-from . import clip_tag_classifier as ct
+from . import embedding_tag_classifier as ct
 from . import yolo_tag_classifier as yt
 
 
@@ -46,7 +46,7 @@ DEFAULT_CONF_THRESHOLD = 0.15
 class _InferenceLock:
     """``models.lock``: exclusive model-load lock PLUS the process-wide GPU lock.
 
-    Every non-embedding handler (CLIP, faces, YOLO, MiVOLO, ...) keeps using
+    Every non-embedding handler (faces, YOLO, MiVOLO, ...) keeps using
     ``with models.lock:`` and so still excludes every other model call, embedding forwards
     included. The SigLIP+DINO bulk-embed path instead takes only ``models.load_lock`` (lazy
     model construction) and then ``compute.GPU_LOCK`` around each forward pass, so one
@@ -87,7 +87,6 @@ class WorkerModels:
         self.load_lock = threading.Lock()
         self.lock = _InferenceLock(self.load_lock, compute.GPU_LOCK)
         self._face_detector = None
-        self._clip_indexer = None
         self._object_detector = None
         self._siglip = None
         self._dino = None
@@ -113,13 +112,6 @@ class WorkerModels:
             self._face_detector = FaceDetector()
         return self._face_detector
 
-    def get_clip_indexer(self):
-        if self._clip_indexer is None:
-            print("[worker] loading CLIPIndexer...", flush=True)
-            from .indexer import CLIPIndexer  # hook-allow: lazy — model load
-            self._clip_indexer = CLIPIndexer()
-        return self._clip_indexer
-
     def get_object_detector(self):
         if self._object_detector is None:
             print("[worker] loading YOLOWorldDetector...", flush=True)
@@ -133,8 +125,6 @@ class WorkerModels:
         ids = []
         if self._face_detector is not None:
             ids.append(self._face_detector.model_id())
-        if self._clip_indexer is not None:
-            ids.append(self._clip_indexer.model_name)
         if self._object_detector is not None:
             ids.append(self._object_detector.model_id())
         if self._siglip is not None:
@@ -150,7 +140,7 @@ models = WorkerModels()
 # Age/gender (MiVOLO) runs in its OWN isolated .age-venv subprocess (see
 # age_estimator.py) to avoid RAM contention with the three in-process models.
 # BUT that subprocess still runs on the SAME Arc GPU (torch-XPU / Level-Zero), so
-# running it WHILE an OpenVINO face/CLIP/YOLO inference is live means two GPU
+# running it WHILE an OpenVINO face/YOLO inference is live means two GPU
 # runtimes contend on one device — the intermittent "[GPU] CL_OUT_OF_RESOURCES"
 # driver crash. So age estimation now takes the SAME models.lock as the OpenVINO
 # paths: the venv stays isolated for RAM, but GPU work is serialized end-to-end
@@ -266,7 +256,7 @@ def handle_pattern(path, data, request_id, link_id, remote_identity, requested_a
                   flush=True)
             return worker_protocol.pack({"descriptors": out, "algo": pd.ALGO_TAG, "error": None})
         # No boxes → index mode: lay down the shared tile grid and describe each tile.
-        from media_manager.tile_index import generate_tiles  # hook-allow: lazy — pulls PIL
+        from media_manager.object_encoder import generate_tiles  # hook-allow: lazy
         h, w = bgr.shape[:2]
         tiles = generate_tiles(w, h)
         descs = pd.descriptors_for_boxes(bgr, [list(t) for t in tiles])
@@ -364,7 +354,6 @@ def handle_pattern_dino(path, data, request_id, link_id, remote_identity, reques
                                      "error": str(e)})
 
 
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def handle_region(path, data, request_id, link_id, remote_identity, requested_at):
     """Instance-level region search (region_index.py), DINOv2 on the worker's compute device.
       req {image, box}  -> {vecs: float32 bytes (S, DIM), n: S, algo}                  (query)
@@ -611,52 +600,6 @@ def handle_normalize_faces(path, data, request_id, link_id, remote_identity, req
         print(f"[worker] handled {worker_protocol.PATH_NORMALIZE_FACES} ({name}) -> ERROR {e}",
               flush=True)
         return worker_protocol.pack({"faces": [], "error": str(e)})
-
-
-def handle_embed_image(path, data, request_id, link_id, remote_identity, requested_at):
-    name = None
-    tmp = None
-    try:
-        req = worker_protocol.unpack(data)
-        name = req.get("name")
-        tmp = _write_temp(req["image"], name)
-        with models.lock:
-            emb, failed = models.get_clip_indexer().embed_images([tmp])
-        if failed or emb.shape[0] == 0:
-            err = failed[0][1] if failed else "no embedding"
-            print(f"[worker] handled {worker_protocol.PATH_EMBED_IMAGE} ({name}) -> "
-                  f"err={err}", flush=True)
-            return worker_protocol.pack({"embedding": None, "error": err})
-        print(f"[worker] handled {worker_protocol.PATH_EMBED_IMAGE} ({name}) -> "
-              f"embedded dim={emb.shape[1]}", flush=True)
-        return worker_protocol.pack({
-            "embedding": emb[0].astype(np.float32).tobytes(), "error": None})
-    except Exception as e:  # hook-allow: broad — report error to caller/job
-        traceback.print_exc()
-        print(f"[worker] handled {worker_protocol.PATH_EMBED_IMAGE} ({name}) -> ERROR {e}",
-              flush=True)
-        return worker_protocol.pack({"embedding": None, "error": str(e)})
-    finally:
-        if tmp is not None:
-            _cleanup(tmp)
-
-
-def handle_embed_text(path, data, request_id, link_id, remote_identity, requested_at):
-    text = None
-    try:
-        req = worker_protocol.unpack(data)
-        text = req["text"]
-        with models.lock:
-            v = models.get_clip_indexer().embed_text(text)
-        print(f"[worker] handled {worker_protocol.PATH_EMBED_TEXT} ({text!r}) -> "
-              f"embedded dim={v.shape[0]}", flush=True)
-        return worker_protocol.pack({
-            "embedding": v.astype(np.float32).tobytes(), "error": None})
-    except Exception as e:  # hook-allow: broad — report error to caller/job
-        traceback.print_exc()
-        print(f"[worker] handled {worker_protocol.PATH_EMBED_TEXT} ({text!r}) -> ERROR {e}",
-              flush=True)
-        return worker_protocol.pack({"embedding": None, "error": str(e)})
 
 
 def _embed_shared(embedders_, sources, stats=None, labels=None):
@@ -1000,7 +943,7 @@ def handle_estimate_age(path, data, request_id, link_id, remote_identity, reques
         bodies = [{"ref": b["face_ref"], "bbox": b["bbox"]} for b in (req.get("bodies") or [])]
         tmp = _write_temp(req["image"], name)
         # Shares models.lock (NOT a separate lock) so MiVOLO's GPU work never runs
-        # concurrently with OpenVINO face/CLIP/YOLO inference — see the note by
+        # concurrently with OpenVINO face/YOLO inference — see the note by
         # _age_estimator above (prevents Arc CL_OUT_OF_RESOURCES).
         with models.lock:
             results = _get_age_estimator().estimate(tmp, faces, bodies)
@@ -1024,7 +967,7 @@ def handle_estimate_age(path, data, request_id, link_id, remote_identity, reques
 # above: each job carries an id, accumulates uploaded data into a scratch dir,
 # and runs in its OWN daemon thread that does NOT hold models.lock — so ping and
 # inference stay responsive during a multi-minute fine-tune. YOLO checkpoints are
-# persisted under TAG_MODELS_DIR and served by handle_tag_detect; the small CLIP
+# persisted under TAG_MODELS_DIR and served by handle_tag_detect; the small embedding-classifier
 # artifact (weights.npz) is handed back in the final status response. Per-job
 # progress/log is tracked explicitly (ultralytics' own stdout can't be captured
 # per-job without clobbering other requests' prints).
@@ -1049,16 +992,16 @@ class TrainingJob:
         self.metrics = {}
         self.cancel_event = threading.Event()
         self.thread = None
-        self.artifact_bytes = None       # clip weights.npz bytes, set on done
+        self.artifact_bytes = None       # embedding-classifier weights.npz bytes, set on done
         self.scratch_dir = tempfile.mkdtemp(prefix=f'mmtrain_{slug}_')
         self._log = collections.deque(maxlen=300)
         # YOLO staging: [(staging_image_path, [[cx,cy,w,h] normalized, ...]), ...]
         self.yolo_examples = []
         self._yolo_counter = 0
-        # embedding classifier (siglip|dino|legacy clip): whole-image [(emb_bytes, label)]
+        # embedding classifier (siglip|dino): whole-image [(emb_bytes, label)]
         # and region [(crop_jpeg, label)]
-        self.clip_whole = []
-        self.clip_regions = []
+        self.whole_examples = []
+        self.region_examples = []
 
     def log(self, msg):
         self._log.append(f'[{int(time.time())}] {msg}')
@@ -1172,30 +1115,28 @@ def _run_yolo_job(job):
         shutil.rmtree(os.path.join(job.scratch_dir, 'staging'), ignore_errors=True)
 
 
-_EMBED_KIND_TO_SPACE = {'siglip_model': 'siglip', 'dino_model': 'dino', 'clip_model': 'clip'}
+_EMBED_KIND_TO_SPACE = {'siglip_model': 'siglip', 'dino_model': 'dino'}
 
 
 def _worker_embedder_for_space(space):
     """The worker's image embedder for a tag-classifier space. Caller holds models.lock."""
     if space == 'siglip':
         return models.get_siglip_embedder()
-    if space == 'dino':
-        return models.get_dino_embedder()
-    return models.get_clip_indexer()  # DEPRECATION PLANNED: legacy CLIP; superseded by SigLIP 2 + DINOv2, do not extend.
+    return models.get_dino_embedder()
 
 
-def _run_clip_job(job):
-    """Embedding-space tag classifier (kind siglip_model | dino_model | legacy clip_model)."""
+def _run_embedding_job(job):
+    """Embedding-space tag classifier (kind siglip_model | dino_model)."""
     try:
         space = _EMBED_KIND_TO_SPACE[job.kind]
         xs, ys = [], []
-        for emb_bytes, label in job.clip_whole:
+        for emb_bytes, label in job.whole_examples:
             xs.append(np.frombuffer(emb_bytes, dtype=np.float32))
             ys.append(label)
-        if job.clip_regions:
+        if job.region_examples:
             from PIL import Image as PILImage  # hook-allow: lazy — heavy
             crops, labels = [], []
-            for crop_bytes, label in job.clip_regions:
+            for crop_bytes, label in job.region_examples:
                 crops.append(PILImage.open(io.BytesIO(crop_bytes)).convert('RGB'))
                 labels.append(label)
             job.log(f'embedding {len(crops)} region crops on the worker {space} model')
@@ -1322,9 +1263,9 @@ def handle_train_add(path, data, request_id, link_id, remote_identity, requested
             for item in batch:
                 label = float(item['label'])
                 if item.get('embedding') is not None:
-                    job.clip_whole.append((item['embedding'], label))
+                    job.whole_examples.append((item['embedding'], label))
                 elif item.get('image') is not None:
-                    job.clip_regions.append((item['image'], label))
+                    job.region_examples.append((item['image'], label))
         return worker_protocol.pack({'received': len(batch), 'error': None})
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
@@ -1340,7 +1281,7 @@ def handle_train_run(path, data, request_id, link_id, remote_identity, requested
         if job.status != 'created':
             raise ValueError(f'job {job.job_id} already {job.status}')
         job.status = 'running'
-        target = _run_yolo_job if job.kind == 'yolo_model' else _run_clip_job
+        target = _run_yolo_job if job.kind == 'yolo_model' else _run_embedding_job
         job.thread = threading.Thread(target=target, args=(job,), daemon=True)
         job.thread.start()
         print(f"[worker] handled {worker_protocol.PATH_TRAIN_RUN} ({job.job_id}) -> started",
@@ -1429,7 +1370,7 @@ def handle_tag_detect(path, data, request_id, link_id, remote_identity, requeste
 
 # --- imdb: resident in-memory search index --------------------------------------
 class ImdbIndex:
-    """The worker's resident CLIP + face embedding matrices for search offload, plus
+    """The worker's resident SigLIP 2 + face embedding matrices for search offload, plus
     a receive buffer used WHILE a build streams in from the host. The host ships the
     matrix in bounded chunks (imdb_build_begin → many imdb_build_chunk → imdb_build_end)
     so neither side ever holds the whole ~1 GB blob in one message; only the final
@@ -1473,7 +1414,7 @@ class ImdbIndex:
     def status(self):
         with self.lock:
             out = {}
-            for kind in ('clip', 'face'):
+            for kind in ('siglip', 'face'):
                 m = self.matrices.get(kind)
                 building = kind in self._buf
                 if m is not None:
@@ -1530,7 +1471,7 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
         return worker_protocol.pack(resp)
     except Exception as e:  # hook-allow: broad — report error to caller/job
         traceback.print_exc()
-        return worker_protocol.pack({'clip': {}, 'face': {}, 'error': str(e)})
+        return worker_protocol.pack({'siglip': {}, 'face': {}, 'error': str(e)})
 
 
 # Map of request path -> handler, used both by run() and the loopback test.
@@ -1543,8 +1484,6 @@ HANDLERS = {
     worker_protocol.PATH_DETECT_FACES_PATHS: handle_detect_faces_paths,
     worker_protocol.PATH_EMBED_BBOX: handle_embed_bbox,
     worker_protocol.PATH_NORMALIZE_FACES: handle_normalize_faces,
-    worker_protocol.PATH_EMBED_IMAGE: handle_embed_image,
-    worker_protocol.PATH_EMBED_TEXT: handle_embed_text,
     worker_protocol.PATH_EMBED_BOTH_BATCH: handle_embed_both_batch,
     worker_protocol.PATH_EMBED_BOTH_PATHS: handle_embed_both_paths,
     worker_protocol.PATH_PROBE_DATA_ROOT: handle_probe_data_root,
@@ -1616,8 +1555,7 @@ def run(host="127.0.0.1", port=4243, preload=False):
         # old worker die before it could serve anything.)
         def _preload():
             # SigLIP 2 + DINOv2 are the similarity/search embedders (every embed request goes
-            # through them), so they load alongside the faces; legacy CLIP (body/tile/tag
-            # classifier paths) stays lazy: its first request loads it on demand.
+            # through them), so they load alongside the faces.
             for name, getter in (("FaceDetector", models.get_face_detector),
                                   ("SigLIP2Embedder", models.get_siglip_embedder),
                                   ("DINOv2Embedder", models.get_dino_embedder),

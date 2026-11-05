@@ -3,26 +3,25 @@ confirmations/rejections already in manual.db, scores every photo's already-
 computed embedding with a single learned weight vector.
 
 The embedding SPACE is selectable (see SPACES): 'siglip' (SigLIP 2, 1152-d,
-the default), 'dino' (DINOv2-L, 1024-d, image-only) or 'clip' (legacy ViT-B/32,
-512-d).  Each space has its own artifact directory (.media/tag_classifiers/
-{slug}/{siglip,dino,clip}_model/) and weights.npz records the space + embedding
-model id it was trained on, so an artifact is never silently applied to vectors
-from a different space: scoring raises NeedsRetrain on any mismatch, and
-weights_state() reports 'needs_retrain' for the UI.  (Module name kept for import
-compatibility; it is no longer CLIP-only.)
+the default) or 'dino' (DINOv2-L, 1024-d, image-only).  Each space has its own
+artifact directory (.media/tag_classifiers/{slug}/{siglip,dino}_model/) and
+weights.npz records the space + embedding model id it was trained on, so an
+artifact is never silently applied to vectors from a different space: scoring
+raises NeedsRetrain on any mismatch, and weights_state() reports 'needs_retrain'
+for the UI.
 
-DEPRECATION PLANNED: the 'clip' space (and the clip_model artifacts / tile-index
-highlight that goes with it) is superseded by the SigLIP 2 + DINOv2 embedding
-pipeline; do not extend.  It is kept only so already-trained CLIP classifiers
-keep loading (and are flagged for retraining) instead of crashing.
+The old CLIP (ViT-B/32) space is gone.  A leftover clip_model/ directory from
+before is never read or scored (LEGACY_CLIP_DIR_KIND is only used so the UI can
+say "retrain in SigLIP 2"); unstamped weights.npz files are treated as CLIP-era
+and raise NeedsRetrain in any current space.
 
-Meant to be run as a standalone subprocess (see web.py's train-clip route),
+Meant to be run as a standalone subprocess (see web.py's train routes),
 never imported into the running web app's own process — a multi-second-plus
 training run must never share the app's GIL. Run directly:
 
-    python -m media_manager.clip_tag_classifier --data-root /path/to/repo --tag "monstera plant" [--space siglip|dino|clip]
+    python -m media_manager.embedding_tag_classifier --data-root /path/to/repo --tag "monstera plant" [--space siglip|dino]
 
-Output lands in .media/tag_classifiers/{slug}/{siglip,dino,clip}_model/ — see write_status
+Output lands in .media/tag_classifiers/{slug}/{siglip,dino}_model/ — see write_status
 for the exact files and the {running,done,failed} status contract every
 caller (web.py's status routes, tags.html/search.html) reads back.
 """
@@ -45,9 +44,10 @@ DEFAULT_SPACE = 'siglip'
 SPACES = {
     'siglip': {'dir_kind': 'siglip_model', 'label': 'SigLIP 2', 'dim': 1152, 'legacy': False},
     'dino': {'dir_kind': 'dino_model', 'label': 'DINOv2', 'dim': 1024, 'legacy': False},
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    'clip': {'dir_kind': 'clip_model', 'label': 'CLIP (legacy)', 'dim': 512, 'legacy': True},
 }
+# Pre-SigLIP artifact directory kind. Never trained, read or scored any more; the UI only
+# looks for it to tell the user to retrain in SigLIP 2.
+LEGACY_CLIP_DIR_KIND = 'clip_model'
 CLASSIFIER_KINDS = tuple(v['dir_kind'] for v in SPACES.values()) + ('yolo_model',)
 
 
@@ -69,24 +69,19 @@ def space_kind(space):
 
 def current_embedding_model(space):
     """Model id the space's embeddings are produced with right now (env-aware, no
-    torch import — mirrors embedders.SigLIP2Embedder/DINOv2Embedder.model_id and
-    indexer.CLIPIndexer.model_id defaults)."""
+    torch import — mirrors embedders.SigLIP2Embedder/DINOv2Embedder.model_id)."""
     check_space(space)
     if space == 'siglip':
         return (f"{os.environ.get('MEDIA_SIGLIP_MODEL', 'ViT-SO400M-14-SigLIP2')}/"
                 f"{os.environ.get('MEDIA_SIGLIP_PRETRAINED', 'webli')}")
-    if space == 'dino':
-        variant = os.environ.get('MEDIA_DINO_MODEL', 'large').lower()
-        hub = {'small': 'dinov2_vits14_reg', 'base': 'dinov2_vitb14_reg', 'large': 'dinov2_vitl14_reg'}
-        return f"{hub.get(variant, variant)}/cls"
-    return 'ViT-B-32/openai'
+    variant = os.environ.get('MEDIA_DINO_MODEL', 'large').lower()
+    hub = {'small': 'dinov2_vits14_reg', 'base': 'dinov2_vitb14_reg', 'large': 'dinov2_vitl14_reg'}
+    return f"{hub.get(variant, variant)}/cls"
 
 
 def all_embeddings_for_space(db, space):
     """[(file_id, path, embedding_bytes, checksum)] of primary embeddings in `space`."""
     check_space(space)
-    if space == 'clip':
-        return db.get_all_embeddings()  # DEPRECATION PLANNED: legacy CLIP table
     return getattr(db, f'get_all_{space}_embeddings')()
 
 
@@ -95,11 +90,8 @@ def _make_embedder(space):
     if space == 'siglip':
         from media_manager.embedders import SigLIP2Embedder  # hook-allow: lazy — pulls torch/open_clip
         return SigLIP2Embedder()
-    if space == 'dino':
-        from media_manager.embedders import DINOv2Embedder  # hook-allow: lazy — pulls torch
-        return DINOv2Embedder()
-    from media_manager.indexer import CLIPIndexer  # hook-allow: lazy — pulls torch/open_clip
-    return CLIPIndexer()  # DEPRECATION PLANNED: legacy CLIP
+    from media_manager.embedders import DINOv2Embedder  # hook-allow: lazy — pulls torch
+    return DINOv2Embedder()
 
 
 def slugify(label):
@@ -111,8 +103,8 @@ def slugify(label):
 
 
 def classifier_dir(data_root, tag_label, kind):
-    """kind is one of CLASSIFIER_KINDS ('siglip_model', 'dino_model', legacy
-    'clip_model', or 'yolo_model') — shared with yolo_tag_classifier.py
+    """kind is one of CLASSIFIER_KINDS ('siglip_model', 'dino_model' or
+    'yolo_model') — shared with yolo_tag_classifier.py
     and web.py so every caller agrees on the exact same path for a given tag."""
     return os.path.join(os.path.abspath(data_root), '.media', 'tag_classifiers', slugify(tag_label), kind)
 
@@ -336,14 +328,14 @@ def save_weights(path, w, b, space):
 
 def _load_checked(data_root, tag_label, space):
     """(w, b) or None if no artifact exists; raises NeedsRetrain on a space/model mismatch
-    (legacy artifacts without a stamp are only valid in the 'clip' space)."""
+    (an artifact without a space stamp predates SigLIP/DINO — it was CLIP — so it is never valid)."""
     check_space(space)
     weights_path = os.path.join(classifier_dir(data_root, tag_label, space_kind(space)), 'weights.npz')
     if not os.path.isfile(weights_path):
         return None
     data = np.load(weights_path)
     stamped = str(data['embedding_model']) if 'embedding_model' in data.files else None
-    stamped_space = str(data['space']) if 'space' in data.files else 'clip'
+    stamped_space = str(data['space']) if 'space' in data.files else 'clip'   # unstamped == CLIP era
     if stamped_space != space or (stamped is not None and stamped != current_embedding_model(space)):
         raise NeedsRetrain(
             f'"{tag_label}" classifier was trained on {stamped or "an unknown model"} ({stamped_space}), '
@@ -393,15 +385,6 @@ def score_matrix(data_root, tag_label, matrix, space=DEFAULT_SPACE):
             f'"{tag_label}" classifier has dim {w.shape[0]} but {SPACES[space]["label"]} embeddings '
             f'have dim {matrix.shape[1]} — retrain it.')
     return (1.0 / (1.0 + np.exp(-(matrix @ w + b)))).astype(np.float32)
-
-
-def load_probe(data_root, tag_label, space='clip'):
-    """This tag's trained linear-probe weight vector `w` (np.float32) and bias `b`, or
-    None if the tag has no done model in `space`. Only the legacy 'clip' space is
-    useful for localization (web.py dots `w` against the CLIP sub-tile index for the
-    swipe highlight; there is no SigLIP/DINO tile index), hence that default.
-    DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend."""
-    return _load_checked(data_root, tag_label, space)
 
 
 def main():

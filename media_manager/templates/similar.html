@@ -11,10 +11,8 @@
 
 <div class="similar-model-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
   <span class="sub">Model:</span>
-  {% for key, label, hint in [('siglip', 'SigLIP 2', 'Semantic similarity (default)'), ('dino', 'DINOv2', 'Visual / instance similarity'), ('clip', 'CLIP (legacy)', 'Legacy whole-image CLIP ViT-B/32; no longer computed')] %}
-  {% if key != 'clip' or clip_legacy_available or model == 'clip' %}
+  {% for key, label, hint in [('siglip', 'SigLIP 2', 'Semantic similarity (default)'), ('dino', 'DINOv2', 'Visual / instance similarity')] %}
   <a href="/similar/{{ source_id }}?model={{ key }}" class="btn-similar similar-model-btn{{ ' is-active' if model == key }}" data-model="{{ key }}" title="{{ hint }}"{% if model == key %} aria-current="true" style="outline:2px solid var(--accent);"{% endif %}>{{ label }}</a>
-  {% endif %}
   {% endfor %}
 </div>
 
@@ -50,7 +48,7 @@
   var hasParam = /[?&]model=/.test(location.search);
   var saved = null;
   try { saved = localStorage.getItem('similarModel'); } catch (e) {}
-  if (!hasParam && saved && saved !== current && /^(clip|siglip|dino)$/.test(saved)) {
+  if (!hasParam && saved && saved !== current && /^(siglip|dino)$/.test(saved)) {
     location.replace(location.pathname + '?model=' + saved);
     return;
   }

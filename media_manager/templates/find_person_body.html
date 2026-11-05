@@ -50,7 +50,7 @@
 <script src="/static/swipe-core.js"></script>
 <script>
 /* Identity-scoped body-suggestion stream — the body sibling of find_person.html.
-   Each card is one indexed body crop ranked by CLIP similarity to this person's
+   Each card is one indexed body crop ranked by embedding similarity to this person's
    confirmed body crops (see _next_body_suggestions). Confirm writes a ground-truth
    body label; reject keeps a hard-negative so it isn't re-offered. */
 (function() {

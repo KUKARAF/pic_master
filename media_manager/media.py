@@ -366,7 +366,7 @@ def main():
                           help='Force reprocessing (clear detections/faces/embedding) for already-tracked files found in this scan')
 
     # media folder-to-video <path> - morph video from every image in a folder,
-    # ordered BY FILENAME (not set CLIP-similarity). Mirrors `set generate-video`.
+    # ordered BY FILENAME (not set similarity). Mirrors `set generate-video`.
     f2v = sub.add_parser(
         'folder-to-video',
         help='Generate a morph video from a folder (Wan FLF2V; images ordered by filename; needs the B70 gen service)')
@@ -409,8 +409,8 @@ def main():
     category_match = category_sub.add_parser('match', help='Run embedding-centroid auto-matching against category examples (default: SigLIP 2)')
     category_match.add_argument('path', nargs='?', default='.', help='Path to scope matching to (default: whole repo)')
     category_match.add_argument('--dry-run', action='store_true', help='Report matches without writing to the DB')
-    category_match.add_argument('--model', choices=('siglip', 'dino', 'clip'), default='siglip',
-                                help="Embedding space (default siglip; 'clip' is legacy and uses the CLIP-tuned category temperature)")
+    category_match.add_argument('--model', choices=('siglip', 'dino'), default='siglip',
+                                help='Embedding space (default siglip)')
 
     # media age-setup - build the isolated MiVOLO venv (machine-level, not per-repo)
     age_setup = sub.add_parser(
@@ -755,13 +755,13 @@ def main():
                     ap = os.path.join(m.data_root, fr['path'])
                     if os.path.isfile(ap):
                         members.append({'name': os.path.basename(fr['path']), 'path': ap,
-                                        'embedding': m.db.get_embedding(fr['id'])})
+                                        'embedding': m.db.get_space_embedding('dino', fr['id'])})
             if len(members) < 2:
                 print("ERROR: need at least 2 readable member images to morph",
                       file=sys.stderr)
                 m.close(); sys.exit(1)
             # Same smooth-morph ordering as the web path: alphabetically-first member,
-            # then a greedy CLIP nearest-neighbour chain.
+            # then a greedy DINOv2 nearest-neighbour chain.
             members = set_video.order_by_similarity(members)
             paths = [mm['path'] for mm in members]
             out = set_render.output_path(m.data_root, args.name, 'morph', 'mp4')
@@ -969,8 +969,8 @@ def main():
             matched, skipped, considered = m.match_categories(args.path, dry_run=args.dry_run, model=args.model)
             legacy = sum(n for mid, n in m.db.count_category_matches_by_model().items()
                          if mid == 'clip-centroid-v1')
-            if legacy and args.model != 'clip':
-                print(f"Note: {legacy} legacy CLIP auto-match row(s) remain (flagged legacy); "
+            if legacy:
+                print(f"Note: {legacy} auto-match row(s) from the removed CLIP model remain (flagged legacy); "
                       "files re-scanned in the new space had theirs replaced.")
             verb = "Would match" if args.dry_run else "Matched"
             print(f"{verb} {matched} file(s); skipped {skipped} with a manual override; considered {considered} total.")

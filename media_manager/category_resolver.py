@@ -11,15 +11,14 @@ best one. Lives in its own module, not web.py and not media.py, since both
 the CLI (media.py's MediaManager.match_categories, to skip files already
 excluded) and web.py need this, and media.py must not import web.py."""
 
-# Model id stored in file_category_matches.model per embedding space. The CLIP id is
-# LEGACY: its scores were thresholded with CLIP-calibrated per-category temperatures and
-# are not comparable with SigLIP/DINO cosines. Legacy rows are never deleted by the
-# migration; they are flagged (see 'legacy' below) and replaced file-by-file when
+# Model id stored in file_category_matches.model per embedding space. Rows written by the
+# removed CLIP model ('clip-centroid-v1', see LEGACY_CATEGORY_MATCH_MODELS) may still exist in
+# a user's DB: their scores are not comparable with SigLIP/DINO cosines. They are never
+# deleted; they are flagged (see 'legacy' below) and replaced file-by-file when
 # `media category match` is rerun in a current space.
 CATEGORY_MATCH_MODEL_IDS = {
     'siglip': 'siglip-centroid-v1',
     'dino': 'dino-centroid-v1',
-    'clip': 'clip-centroid-v1',
 }
 LEGACY_CATEGORY_MATCH_MODELS = frozenset({'clip-centroid-v1'})
 
@@ -30,7 +29,7 @@ def is_legacy_category_match(model):
 
 def calibrate_category_threshold(member_scores, all_scores, member_pct=10.0, sigma=None):
     """Per-category cosine threshold valid in any embedding space, derived from the
-    category's own data instead of an absolute (CLIP-tuned) number.
+    category's own data instead of an absolute number.
     member_scores: cosines of the category's examples to its centroid.
     all_scores:    cosines of the whole candidate pool to the centroid.
     The threshold is the larger of (a) the `member_pct` percentile of member scores

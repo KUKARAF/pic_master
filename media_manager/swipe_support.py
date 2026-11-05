@@ -3,7 +3,7 @@ categories, tags) — the generic "buffer/exclude/bias" mechanics factored out o
 the original face-suggestion implementation so each feature's own ranking
 function doesn't reimplement this part. Ranking/scoring itself stays per-feature
 (faces score against named identities, sets/categories/tags score against a
-CLIP centroid via similarity.py) — this module only handles what's identical
+SigLIP/DINO centroid via similarity.py) — this module only handles what's identical
 across all of them."""
 
 

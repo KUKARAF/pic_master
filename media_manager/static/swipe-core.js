@@ -113,7 +113,7 @@ window.initSwipeStack = function (config) {
   let queue = (config.initialCards || []).slice(0, BUFFER_SIZE);
   const known = new Set(queue.map(c => c.ref)); // queued or already-decided refs
   let fetching = false;
-  // Every one of these streams is a CLIP-embedding-vs-whole-library (or
+  // Every one of these streams is an embedding-vs-whole-library (or
   // similar) scan server-side — real CPU cost, not a cheap lookup. Firing it
   // the instant the page loads meant just opening a couple of tabs could
   // stack up several of these concurrently and starve everything else on the
@@ -123,7 +123,7 @@ window.initSwipeStack = function (config) {
   // (matches today's behavior for any page that does that), or if the page
   // itself already gated construction behind its own explicit user action
   // (config.autoStart: true — e.g. search.html's own "Start review"/"Review
-  // with YOLO"/"Review with CLIP" buttons, which only call initSwipeStack at
+  // with YOLO"/"Review with SigLIP 2" buttons, which only call initSwipeStack at
   // all once one of them is clicked, so there's no need to also show this
   // engine's OWN internal Start button afterward).
   let started = queue.length > 0 || !!config.autoStart;

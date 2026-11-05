@@ -107,7 +107,7 @@ def order_by_similarity(items):
     possible — the whole reason a morph looks continuous instead of jumpy.
 
     Start with the alphabetically-first member (a stable, predictable anchor), then
-    greedily append the most CLIP-similar remaining member at each step (a
+    greedily append the most similar remaining member at each step (a
     nearest-neighbour chain). `items` is a list of dicts, each
     {'name': str, 'path': str, 'embedding': bytes|None}. Members with no embedding
     can't be placed by similarity, so they're appended at the end in name order.

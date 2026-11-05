@@ -1,13 +1,13 @@
 """Central compute-device selection for the ML models.
 
-Historically each model picked its own device: CLIP did
+Historically each model picked its own device: the torch models did
 ``'cuda' if torch.cuda.is_available() else 'cpu'`` and the InsightFace detector
 hardcoded ``providers=['CUDAExecutionProvider', 'CPUExecutionProvider']``. That
 only ever accelerated on NVIDIA/CUDA — on an Intel Arc GPU (or anything without
 CUDA) every model silently ran on CPU and left the GPU idle.
 
 This module is the single place that answers "what should I run on?" for both
-the torch models (CLIP, YOLO-World, MiVOLO age/gender) and the onnxruntime
+the torch models (SigLIP 2, DINOv2, YOLO-World, MiVOLO age/gender) and the onnxruntime
 models (InsightFace face detect/embed, PCN). Point every model at these helpers
 so adding a backend is a one-line change here, not a repo-wide grep.
 

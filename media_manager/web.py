@@ -50,9 +50,9 @@ from media_manager import (
 from media_manager.age_estimator import MODEL_ID, AgeGenderEstimator
 from media_manager.body_index import crop_bodies, match_face_to_body
 from media_manager.broken_finder import is_decode_error
-from media_manager.clip_tag_classifier import (
-    DEFAULT_SPACE as TAG_DEFAULT_SPACE, MIN_EXAMPLES_PER_CLASS, NeedsRetrain, SPACES as TAG_SPACES,
-    classifier_dir, current_embedding_model, score_all, score_matrix, slugify, space_kind,
+from media_manager.embedding_tag_classifier import (
+    DEFAULT_SPACE as TAG_DEFAULT_SPACE, LEGACY_CLIP_DIR_KIND, MIN_EXAMPLES_PER_CLASS, NeedsRetrain, SPACES as TAG_SPACES,
+    classifier_dir, current_embedding_model, score_matrix, slugify, space_kind,
     weights_state, write_status,
 )
 from media_manager.database import FACE_NORM_VERSION, Database
@@ -75,7 +75,7 @@ from media_manager.media_manager import MediaManager, _parse_query, scan_folder
 from media_manager.object_encoder import ObjectEncoder
 from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
-from media_manager.similarity import adjusted_centroid, fuse_zscores, mean_normalized_centroid, rank_by_similarity, top_k_indices
+from media_manager.similarity import adjusted_centroid, fuse_zscores, mean_normalized_centroid, top_k_indices
 from media_manager.swipe_support import bias_reorder
 from media_manager.worker_client import WorkerError
 from media_manager.yolo_tag_classifier import MIN_BOXES
@@ -589,25 +589,6 @@ def _get_object_detector():
     return _object_detector_local
 
 
-_clip_indexer_local = None
-_clip_indexer_remote = None
-
-
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-# No similarity / search / background-ML job computes CLIP any more; what still calls this is
-# the tile index, the region-search fallback and the legacy tag classifier.
-def _get_clip_indexer():
-    global _clip_indexer_local, _clip_indexer_remote
-    if _worker_client is not None and _worker_client.is_configured():
-        if _clip_indexer_remote is None:
-            _clip_indexer_remote = worker_client.RemoteCLIPIndexer(_worker_client)
-        return _clip_indexer_remote
-    if _clip_indexer_local is None:
-        from media_manager.indexer import CLIPIndexer  # hook-allow: lazy — pulls in torch/open_clip
-        _clip_indexer_local = CLIPIndexer()
-    return _clip_indexer_local
-
-
 _siglip_embedder_local = None
 _dino_embedder_local = None
 _siglip_embedder_remote = None
@@ -645,7 +626,7 @@ def _get_dino_embedder():
 
 def _get_body_embedder():
     """Embedder for body (person-crop) vectors: DINOv2-L by default, SigLIP 2 with
-    MEDIA_BODY_MODEL=siglip (see body_index). Never CLIP."""
+    MEDIA_BODY_MODEL=siglip (see body_index)."""
     return _get_dino_embedder() if body_index.model_key() == 'dino' else _get_siglip_embedder()
 
 
@@ -817,7 +798,7 @@ def _embed_pair_chunk(sig, dino, paths):
 
 # A video is embedded as the L2-normalised mean of this many frames spread across it
 # (10%..90%) -- one vector per model, in the same space as photos, stored at the video's
-# own file id (frame_index 0) exactly like the legacy CLIP video vector was.
+# own file id (frame_index 0).
 VIDEO_EMBED_FRAMES = 5
 _VIDEO_GROUP = 16  # videos whose frames go to the embedders in one call
 
@@ -933,7 +914,7 @@ def _get_age_estimator():
 
 
 def _ml_device_label():
-    """Device label for the torch/CLIP bulk jobs' status, so /bulk shows GPU vs CPU
+    """Device label for the torch bulk jobs' status, so /bulk shows GPU vs CPU
     live. These offload to the worker when one is configured (so the compute isn't
     local at all); otherwise they run on this host's torch accelerator."""
     if _worker_client is not None and _worker_client.is_configured():
@@ -945,7 +926,6 @@ _object_encoder = None
 _object_matcher = None
 
 
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def _get_object_encoder(data_root):
     """Local DINOv2 region/crop encoder for object-exemplar search (object_encoder.py).
     B70-local (runs where the GPU is), not offloaded. Lazy singleton."""
@@ -955,7 +935,6 @@ def _get_object_encoder(data_root):
     return _object_encoder
 
 
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
 def _get_object_matcher():
     """Local local-feature geometric verifier for same-object confirmation
     (object_matcher.py). B70-local. Lazy singleton."""
@@ -4088,8 +4067,8 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/similar/{file_id}', response_class=HTMLResponse)
     def similar_page(request: Request, file_id: int, model: str = 'siglip'):
         row = _file_or_404(file_id)
-        if model not in ('clip', 'siglip', 'dino'):
-            model = 'siglip'
+        if model not in ('siglip', 'dino'):
+            model = 'siglip'   # also covers the removed legacy 'clip' view
         filename = os.path.basename(row['path'])
         files = []
         message = ''
@@ -4097,55 +4076,15 @@ def create_app(data_root: str) -> FastAPI:
         source_is_video = os.path.splitext(row['path'])[1].lower() in VIDEO_EXTENSIONS
         all_tags = manual.list_all_tags()
 
-        emb_bytes = db.get_embedding(file_id) if model == 'clip' else None
-        if model != 'clip':
-            try:
-                d = _similar_in_space(model, file_id, 20)
-                files = d['cards']
-                # No embedding yet -> the template offers "embed now" instead of a dead-end message.
-                no_embedding = bool(d.get('no_embedding'))
-            except HTTPException as exc:
-                message = html.escape(str(exc.detail))  # template renders message |safe
-            except Exception as exc:  # hook-allow: broad -- report any search failure to the UI
-                message = html.escape(f'Similarity search error: {exc}')
-        elif emb_bytes is None:
-            # Legacy CLIP view: nothing computes CLIP any more, so there is no "embed now" here.
-            message = 'This photo has no legacy CLIP embedding (CLIP is no longer computed). Use SigLIP 2 or DINOv2.'
-        else:
-            # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-            try:
-                query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-                # Cached, write-invalidated matrix shared library-wide — NOT a
-                # per-request get_all_embeddings() rebuild, which allocated a fresh
-                # ~478 MB matrix on every "find similar" click and, under the request
-                # threadpool, ratcheted RSS via glibc arena retention (the "leak").
-                file_ids, checksums, matrix = db.get_embeddings_matrix()
-                if matrix.shape[0]:
-                    # GPU-resident matmul when a GPU is present (matrix cached in
-                    # VRAM, only the query uploaded); byte-identical numpy dot on CPU.
-                    scores = db.score_embeddings(query_emb)
-                    k = min(matrix.shape[0], 21)  # 20 results + room to drop self
-                    ranked = []  # (file_id, checksum, score)
-                    for i in top_k_indices(scores, k):
-                        fid = int(file_ids[i])
-                        if fid == file_id:
-                            continue
-                        ranked.append((fid, checksums[i], float(scores[i])))
-                        if len(ranked) >= 20:
-                            break
-                    # Resolve paths for just the top matches (not the whole library).
-                    row_by_cs = {r['checksum']: r for r in
-                                 db.get_files_by_checksums([cs for _f, cs, _s in ranked])}
-                    rows, scoremap = [], {}
-                    for fid, cs, score in ranked:
-                        fr = row_by_cs.get(cs)
-                        if fr is None:
-                            continue
-                        rows.append((fr['id'], fr['path'], True, cs))
-                        scoremap[fr['id']] = round(score, 4)
-                    files = _enrich_rows(rows, scores=scoremap)
-            except Exception as exc:  # hook-allow: broad — report any search failure to the UI
-                message = f'Similarity search error: {exc}'
+        try:
+            d = _similar_in_space(model, file_id, 20)
+            files = d['cards']
+            # No embedding yet -> the template offers "embed now" instead of a dead-end message.
+            no_embedding = bool(d.get('no_embedding'))
+        except HTTPException as exc:
+            message = html.escape(str(exc.detail))  # template renders message |safe
+        except Exception as exc:  # hook-allow: broad -- report any search failure to the UI
+            message = html.escape(f'Similarity search error: {exc}')
 
         return templates.TemplateResponse(request, 'similar.html', {
             'source_file': dict(row),
@@ -4155,7 +4094,6 @@ def create_app(data_root: str) -> FastAPI:
             'message': message,
             'no_embedding': no_embedding,
             'model': model,
-            'clip_legacy_available': db.count_indexed() > 0,
             'source_is_video': source_is_video,
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
@@ -4164,41 +4102,22 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/files/{file_id}/similar')
     def api_similar_files(file_id: int, limit: int = 50, model: str = 'siglip'):
         """Whole-image similarity as JSON: file_ids ranked most-similar first (SigLIP 2 by
-        default; ?model=dino for visual similarity; ?model=clip is the legacy ViT-B/32 space).
+        default; ?model=dino for visual similarity).
         Lets the photo page's "distance" quick-action open the matches straight
         into the browsable watch-queue (same UX as find-by-face) instead of the
         /similar/{id} results page. Uses the cached embeddings matrix + a
         GIL-free argpartition top-K. Captured video stills are folded into their
         source video (never listed on their own)."""
         _file_or_404(file_id)
-        if model in ('siglip', 'dino'):
-            return _similar_in_space(model, file_id, limit)
-        if model != 'clip':
+        if model == 'clip':
+            raise HTTPException(status_code=400, detail=(
+                'The CLIP model has been removed -- use model=siglip (SigLIP 2) or model=dino (DINOv2).'))
+        if model not in ('siglip', 'dino'):
             raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
-        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-        emb_bytes = db.get_embedding(file_id)
-        if emb_bytes is None:
-            # Distinct flag so the client can offer "embed now?" instead of a dead-end toast.
-            return {'results': [], 'no_embedding': True, 'message': 'This photo has no embedding yet.'}
-        query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
-        file_ids, _checksums, matrix = db.get_embeddings_matrix()
-        if matrix.shape[0] == 0:
-            return {'results': []}
-        scores = db.score_embeddings(query_emb)  # GPU-resident matmul when available
-        k = min(matrix.shape[0], max(1, limit) + 1)  # +1 to absorb self-match
-        results = []
-        for i in top_k_indices(scores, k):
-            fid = int(file_ids[i])
-            if fid == file_id:
-                continue
-            results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
-            if len(results) >= limit:
-                break
-        return {'results': results}
+        return _similar_in_space(model, file_id, limit)
 
     # Instance-level region search (region_index.py): DINOv2 windows + RootSIFT/MAGSAC.
     # Same offload shape as find-by-pattern — worker first, local fallback.
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _region_index_payload(image_bytes, name):
         """(windows int8, sift pts f16, sift desc u8) for an image, or None if undecodable."""
         wc = _worker_client
@@ -4210,7 +4129,6 @@ def create_app(data_root: str) -> FastAPI:
         pil = region_index.load_pil(image_bytes)
         return None if pil is None else region_index.describe_image(pil)
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _region_query_vectors(image_bytes, pil, box, name='<query>'):
         """float32 (3, DIM) DINO query vectors for the drawn box — worker first, local fallback."""
         wc = _worker_client
@@ -4222,7 +4140,7 @@ def create_app(data_root: str) -> FastAPI:
         return region_index.describe_query(pil, box)
 
     def _region_pending_files():
-        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
+        from media_manager.formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
         return [(fid, rel) for fid, rel in db.get_unregion_indexed_files(region_index.ALGO_TAG)
                 if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
 
@@ -4250,7 +4168,6 @@ def create_app(data_root: str) -> FastAPI:
             on_progress(done, failed)
         return done, failed
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/region-index/start')
     def api_region_index_start(include_trashed: bool = False):
         """Build the instance-level region index: 35 int8 DINOv2 window descriptors + ~300
@@ -4276,7 +4193,6 @@ def create_app(data_root: str) -> FastAPI:
         _spawn_job(_run)
         return {'started': True, 'total': region_index_job['total']}
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.get('/api/region-index/status')
     def api_region_index_status():
         return {
@@ -4287,14 +4203,12 @@ def create_app(data_root: str) -> FastAPI:
             'pending': len(_region_pending_files()),
         }
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/files/{file_id}/region-search')
     def api_region_search(file_id: int, body: RegionSearchBody, limit: int = 50):
-        """'Search by region'. With the region matching index built (bulk -> Index region
-        matching) this is instance-level: DINOv2 windows prefilter the library, then RootSIFT +
+        """'Search by region'. Instance-level: DINOv2 windows prefilter the library, then RootSIFT +
         MAGSAC homography verifies the top candidates against the drawn box (mode 'instance').
-        Without it, falls back to the semantic CLIP path: CLIP-embed the crop and rank
-        whole-image embeddings (mode 'whole'). Opens matches in the
+        Needs the region matching index (bulk -> Index region matching); while it is empty this
+        answers 409 with that instruction (there is no semantic fallback). Opens matches in the
         watch-queue."""
         row = _file_or_404(file_id)
         abs_path = _live_abs_path(file_id, row['path'])
@@ -4304,49 +4218,32 @@ def create_app(data_root: str) -> FastAPI:
         if x2 - x1 < 2 or y2 - y1 < 2:
             raise HTTPException(status_code=400, detail='Region too small.')
         upright = open_upright_rgb(abs_path)  # box is in the EXIF-rotated frame
-        if db.count_region_indexed(region_index.ALGO_TAG) > 0:
-            with open(abs_path, 'rb') as f:
-                image_bytes = f.read()
-            q = _region_query_vectors(image_bytes, upright, [x1, y1, x2, y2])
-            qp, qd = region_index.query_sift(upright, [x1, y1, x2, y2])
-            scored_fids, scored = [], []
-            for file_ids, counts, matrix in db.iter_region_windows(region_index.ALGO_TAG, region_index.DIM):
-                scored_fids.append(file_ids)
-                scored.append(region_index.score_windows(matrix, counts, q))
-            if not scored_fids:
-                return {'mode': 'instance', 'results': []}
-            fids, scores = np.concatenate(scored_fids), np.concatenate(scored)
-            scores[fids == file_id] = -2.0   # never match the query photo itself
-            fused, inliers = region_index.rerank(fids, scores, qp, qd, db.get_region_sift)
-            order = top_k_indices(fused, min(len(fused), max(1, limit) + 1))
-            results = [{'file_id': int(fids[i]), 'score': round(float(fused[i]), 4),
-                        'inliers': inliers.get(int(fids[i]), 0)}
-                       for i in order if int(fids[i]) != file_id and scores[i] > -1.0]
-            return {'mode': 'instance', 'results': results[:limit]}
-        crop = upright.crop((x1, y1, x2, y2))
-        embs = _get_clip_indexer().embed_pil_images([crop])
-        if len(embs) == 0:
-            raise HTTPException(status_code=500, detail='Could not embed the region.')
-        query = np.asarray(embs[0], dtype=np.float32)
-
-        # Whole-image fallback (no region matching index): rank the cached whole-image matrix.
-        file_ids, _checksums, matrix = db.get_embeddings_matrix()
-        if matrix.shape[0] == 0:
-            return {'mode': 'whole', 'results': []}
-        scores = db.score_embeddings(query)  # GPU-resident matmul when available
-        results = []
-        for i in top_k_indices(scores, min(matrix.shape[0], max(1, limit) + 1)):
-            fid = int(file_ids[i])
-            if fid == file_id:
-                continue
-            results.append({'file_id': fid, 'score': round(float(scores[i]), 4)})
-            if len(results) >= limit:
-                break
-        return {'mode': 'whole', 'results': results}
+        if db.count_region_indexed(region_index.ALGO_TAG) == 0:
+            raise HTTPException(status_code=409, detail=(
+                'The region matching index is empty -- build it first: open Bulk and run '
+                '"Index region matching", then search again.'))
+        with open(abs_path, 'rb') as f:
+            image_bytes = f.read()
+        q = _region_query_vectors(image_bytes, upright, [x1, y1, x2, y2])
+        qp, qd = region_index.query_sift(upright, [x1, y1, x2, y2])
+        scored_fids, scored = [], []
+        for file_ids, counts, matrix in db.iter_region_windows(region_index.ALGO_TAG, region_index.DIM):
+            scored_fids.append(file_ids)
+            scored.append(region_index.score_windows(matrix, counts, q))
+        if not scored_fids:
+            return {'mode': 'instance', 'results': []}
+        fids, scores = np.concatenate(scored_fids), np.concatenate(scored)
+        scores[fids == file_id] = -2.0   # never match the query photo itself
+        fused, inliers = region_index.rerank(fids, scores, qp, qd, db.get_region_sift)
+        order = top_k_indices(fused, min(len(fused), max(1, limit) + 1))
+        results = [{'file_id': int(fids[i]), 'score': round(float(fused[i]), 4),
+                    'inliers': inliers.get(int(fids[i]), 0)}
+                   for i in order if int(fids[i]) != file_id and scores[i] > -1.0]
+        return {'mode': 'instance', 'results': results[:limit]}
 
     # ------------------------------------------------------------------
     # Find-by-pattern: native-scale deep texture windows (see pattern_deep.py). The WORKER
-    # does the compute (like the CLIP/face offloads); the web only orchestrates + stores.
+    # does the compute (like the face offloads); the web only orchestrates + stores.
     # Falls back to local compute when the worker is unavailable or stale (surfaced in the
     # error log, per no-silent-failures).
     # ------------------------------------------------------------------
@@ -4376,7 +4273,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _pattern_pending_files():
         """Image files with no current-algo pattern index (an ALGO_TAG bump re-queues all)."""
-        from media_manager.indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy — pulls in torch/open_clip
+        from media_manager.formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS
         return [(fid, rel) for fid, rel in db.get_unpattern_indexed_files(pattern_deep.ALGO_TAG)
                 if os.path.splitext(rel)[1].lower() in SUPPORTED_EXTENSIONS]
 
@@ -4639,7 +4536,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/files/{file_id}/pattern-search')
     def api_pattern_search(file_id: int, body: PatternSearchBody, limit: int = 50):
         """Find-by-pattern: describe the drawn region and rank the library by each photo's BEST
-        matching window/cell. Different mechanism from region-search (CLIP/semantic) -- this finds the
+        matching window/cell. Different mechanism from region-search -- this finds the
         same *pattern*, not the same *thing*. `algo` (body): 'resnet' (default; ResNet18 texture
         statistics at native pixel scale, needs 'Index patterns'), 'dino' (DINOv2-L dense cells,
         needs 'Index patterns (DINOv2)'), or 'fused' (z-score fusion of both)."""
@@ -4727,7 +4624,7 @@ def create_app(data_root: str) -> FastAPI:
     # becomes the loaded city count on completion.
     fetch_cities_job = {'running': False, 'done': 0, 'total': 0, 'error': None}
     # Manual rebuild of the worker's in-memory search index ("imdb"): streams the
-    # CLIP+face matrices to the worker over RNS (see remote_index_builder). Tracks the
+    # SigLIP 2+face matrices to the worker over RNS (see remote_index_builder). Tracks the
     # live rows-sent + per-kind timings so /stats-style UI can show the ~1 GB transfer.
     imdb_build_job = {'running': False, 'kind': None, 'rows_sent': 0, 'total': 0,
                       'seconds': 0.0, 'results': None, 'error': None}
@@ -4762,7 +4659,7 @@ def create_app(data_root: str) -> FastAPI:
     generate_photo_job = {'running': False, 'file_id': None, 'kind': None,
                           'error': None, 'artifact_id': None}
     # Folder → morph video (Wan FLF2V). Like generate_video_job but sourced from a
-    # /files folder and ordered strictly BY FILENAME (not CLIP similarity). One at a
+    # /files folder and ordered strictly BY FILENAME (not similarity). One at a
     # time; 'done'/'total' are FLF2V pairs; 'artifact_id' is set on success.
     folder_video_job = {'running': False, 'path': None, 'done': 0, 'total': 0,
                         'error': None, 'artifact_id': None}
@@ -4778,7 +4675,7 @@ def create_app(data_root: str) -> FastAPI:
         state = db.body_file_state(file_id, tag)
         if state == 'fresh':
             return db.get_body_embeddings_for_file(file_id, tag)  # [] = sentinel "no people here"
-        # 'none' or 'stale' (only old-space rows, e.g. CLIP): (re)embed below
+        # 'none' or 'stale' (only old-space rows): (re)embed below
 
         abs_path = _live_abs_path(file_id, row['path'])
         if abs_path is None:
@@ -4838,7 +4735,7 @@ def create_app(data_root: str) -> FastAPI:
     def body_similar_page(request: Request, file_id: int, body_id: Optional[int] = None):
         """Page shell only — deliberately does NOT call _ensure_own_bodies/_body_search
         here. The first visit to this page for a not-yet-indexed photo needs a full
-        YOLO-World + CLIP pass (see _ensure_own_bodies), which is too slow to run
+        YOLO-World + embedding pass (see _ensure_own_bodies), which is too slow to run
         inline in a page request; the template's JS fetches
         /api/files/{file_id}/body-similar after render instead, showing a loading
         state meanwhile (mirrors person.html's lazily-loaded photo grid)."""
@@ -4923,7 +4820,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/files/{file_id}/bodies')
     def api_add_manual_body(file_id: int, body: BodyLabelBody):
         """Add one hand-drawn body box as a searchable body embedding (mirrors
-        api_add_manual_face, but crops+CLIP-embeds instead of face recognition).
+        api_add_manual_face, but crops+embeds instead of face recognition).
         Backs the photo view's "Label person" region tool. If `name` is given, the
         crop is ALSO written as a ground-truth body label (manual.db body_identities)
         so the person is findable by body — otherwise it stays an anonymous crop,
@@ -4957,7 +4854,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.post('/api/files/{file_id}/body-search')
     def api_body_search(file_id: int, body: ManualFaceBody, limit: int = 50):
         """Rank the library by how closely each indexed body matches a user-DRAWN box
-        on this photo — crops + CLIP-embeds exactly that region and searches the body
+        on this photo — crops + embeds exactly that region and searches the body
         index. Unlike /body-similar (which auto-detects the whole image and needs a
         pre-pick when several people share the frame), this searches the precise body
         the user selected, so a multi-person photo gives good results. The query crop
@@ -4997,7 +4894,7 @@ def create_app(data_root: str) -> FastAPI:
 
     # ---- Find a person BY BODY: rank the unlabeled body pool against one person's
     # ---- confirmed body crops (the ground-truth anchors in manual.db body_identities).
-    # CLIP body similarity keys on clothing/pose/build, so this is a far weaker identity
+    # Body similarity keys on clothing/pose/build, so this is a far weaker identity
     # signal than faces (same person, different outfit often won't match) — it is for
     # finding someone whose face isn't visible and for within-shoot propagation, not a
     # reliable cross-outfit identity. The UI says so; see find_person_body.html.
@@ -5013,7 +4910,7 @@ def create_app(data_root: str) -> FastAPI:
         tag = body_index.model_tag()
         if threshold is None:
             threshold = body_index.threshold()
-        # Old-space (CLIP) anchors are re-embedded in place first; any that can't be
+        # Old-space anchors are re-embedded in place first; any that can't be
         # (photo gone) simply don't count -- anchors from another space are never mixed in.
         try:
             body_index.refresh_stale_labels(db, manual, _get_body_embedder(), data_root,
@@ -5102,7 +4999,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _link_body_for_named_face(checksum, identity, face_bbox):
         """Auto-link the detected body that CONTAINS this named face to `identity`
-        (source='face-link'), reusing that body's stored CLIP embedding as a free
+        (source='face-link'), reusing that body's stored body embedding as a free
         search anchor — so naming a face makes the person findable by body with no
         manual body labeling. No-op when the photo has no detected body or none
         contains the face (match_face_to_body returns None), and it never clobbers a
@@ -5174,7 +5071,7 @@ def create_app(data_root: str) -> FastAPI:
           2. face-match: a DETECTED face on the box already has a precomputed
              suggested_identity (GPU-free), else recognize one by expanding the box up
              to include the head and matching against known people;
-          3. body-match: rank the body crop against known body anchors (CLIP).
+          3. body-match: rank the body crop against known body anchors.
         Returns {name, source, score} or {name: None}. A suggestion only — nothing is
         written here; the user still confirms in the modal."""
         if len(body.bbox) != 4:
@@ -5378,9 +5275,8 @@ def create_app(data_root: str) -> FastAPI:
             'device': _ml_device_label(),
         }
 
-    # Legacy aliases of the old "Index unindexed (CLIP)" bulk job: CLIP is no longer computed
-    # by any background job, so these start / report the SigLIP 2 + DINOv2 job instead (old
-    # bookmarks and scripts keep working). The /bulk page no longer offers a CLIP button.
+    # Legacy aliases of the old single-model "Index unindexed" bulk job: they start / report the
+    # SigLIP 2 + DINOv2 job instead (old bookmarks and scripts keep working).
     @app.post('/api/index/start')
     def api_index_start(include_trashed: bool = False):
         return api_siglip_dino_start(include_trashed)
@@ -5626,11 +5522,11 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/api/embed-stats')
     def api_embed_stats():
-        """Row counts / dims / matrix bytes for the CLIP, SigLIP 2 and DINOv2 spaces (+ how much
+        """Row counts / dims / matrix bytes for the SigLIP 2 and DINOv2 spaces (+ how much
         of each is currently resident in RAM), for the /bulk page."""
         emb = db.embedding_stats()
         return {
-            'spaces': {k: emb[k] for k in ('clip', 'siglip', 'dino')},
+            'spaces': {k: emb[k] for k in ('siglip', 'dino')},
             'loaded_bytes': db.loaded_matrix_bytes(),
             'library_images': len(_library_image_rows(False)),
         }
@@ -7160,12 +7056,11 @@ def create_app(data_root: str) -> FastAPI:
             'pending': 0,
         }
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-    # (The worker-resident index only ships the legacy CLIP + face matrices; web search/similarity
-    # now score the SigLIP 2 / DINOv2 matrices through gpu_search on the web host.)
+    # (The worker-resident index only ships the SigLIP 2 + face matrices; web search/similarity
+    # score the SigLIP 2 / DINOv2 matrices through gpu_search on the web host.)
     @app.post('/api/imdb/rebuild')
     def api_imdb_rebuild():
-        """Manually (re)build the worker's in-memory search index: stream the CLIP+face
+        """Manually (re)build the worker's in-memory search index: stream the SigLIP 2+face
         matrices to the worker over RNS. Runs in a background thread; the host side
         streams from media.db chunk-by-chunk so this process never materializes the full
         matrix. Requires a configured worker (imdb lives ON the worker)."""
@@ -7176,7 +7071,7 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False,
                     'message': 'No worker configured — the imdb index lives on the worker.'}
         emb = db.embedding_stats()
-        total_rows = emb['clip']['rows'] + emb['face']['rows']
+        total_rows = emb['siglip']['rows'] + emb['face']['rows']
         imdb_build_job.update(running=True, kind=None, rows_sent=0, total=total_rows,
                               seconds=0.0, results=None, error=None)
         sent_by_kind = {}
@@ -7373,7 +7268,7 @@ def create_app(data_root: str) -> FastAPI:
         index` does (same merged vocab and model_id; a failed image is logged without a
         sentinel so it retries). No /bulk job runs this stage; the folder ML job does.
         The vocab is re-set before every batch because the detector singleton is shared
-        with the body index's person-only pass. Hooks/return as _process_clip_index."""
+        with the body index's person-only pass. Hooks/return as _process_region_index."""
         model_id = YOLOWorldDetector.model_id()
         done = failed = 0
         for start in range(0, len(candidates), 32):
@@ -7703,7 +7598,7 @@ def create_app(data_root: str) -> FastAPI:
 
         # A swipe suggestion's box is normalized (0..1); scale to pixels now that the
         # real dimensions are known, so it's stored in the same original-pixel space as
-        # a hand-labeled region (CLIP training crops by these pixels; YOLO re-normalizes
+        # a hand-labeled region (embedding-classifier training crops by these pixels; YOLO re-normalizes
         # by the stored dims — both need the box consistent with width/height).
         if body.normalized:
             x1 *= width; x2 *= width; y1 *= height; y2 *= height
@@ -7823,13 +7718,7 @@ def create_app(data_root: str) -> FastAPI:
         manual.delete_tag_label(label)
         return {'ok': True}
 
-    # CLIP tag-relevance (single object/concept label) sits closer to the
-    # face-identity similarity regime than the same-scene-photo regime that
-    # justified SET_SUGGEST_THRESHOLD=0.75, so this borrows SUGGEST_THRESHOLD's
-    # value rather than inventing a new one without data.
-    TAG_SUGGEST_THRESHOLD = 0.45
-
-    # Real per-image YOLO inference (unlike CLIP's cheap embedding dot-product)
+    # Real per-image YOLO inference (unlike the cheap embedding dot-product)
     # — how many undecided candidates one "find more via YOLO" fetch scans per
     # call. Bounded so a real library doesn't turn one fetch into hundreds of
     # sequential/batched model calls (see _next_tag_suggestions_by_model).
@@ -7839,13 +7728,11 @@ def create_app(data_root: str) -> FastAPI:
     # so scan far fewer per fetch — repeated refills still cover the library.
     WORKER_YOLO_SAMPLE_SIZE = 8
 
-    TAG_SPACE_MODELS = ('siglip', 'dino', 'clip')
+    TAG_SPACE_MODELS = ('siglip', 'dino')
 
     def _tag_space_member_embeddings(space, file_ids):
         """[(file_id, float32 embedding bytes)] of the given files in `space`; files with no
         embedding there are skipped (reported via coverage, never filled from another model)."""
-        if space == 'clip':
-            return db.get_embeddings_for_files(file_ids)  # DEPRECATION PLANNED: legacy CLIP table
         if not file_ids:
             return []
         ids, _checksums, matrix = getattr(db, f'get_{space}_embeddings_matrix')()
@@ -7888,10 +7775,9 @@ def create_app(data_root: str) -> FastAPI:
 
     def _next_tag_suggestions(label, count, exclude_ids, bias_file_id=None, bias=None, model=TAG_DEFAULT_SPACE):
         """Rank not-yet-decided files against the centroid of files already
-        positively tagged `label`, in embedding space `model` ('siglip' default | 'dino' |
-        legacy 'clip'). For siglip/dino the absolute TAG_SUGGEST_THRESHOLD (tuned for
-        CLIP-B/32) is not applied: the best remaining candidates are returned, and there is
-        no tile index in those spaces, so no highlight bbox. Members/candidates without an
+        positively tagged `label`, in embedding space `model` ('siglip' default | 'dino').
+        No absolute threshold is applied: the best remaining candidates are returned (no
+        highlight bbox). Members/candidates without an
         embedding in that space are simply absent (the response never mixes spaces). Returns up to `count` dicts, best score first:
         [{'ref': str, 'file_id': int, 'label': str, 'score': float}, ...].
 
@@ -7916,50 +7802,19 @@ def create_app(data_root: str) -> FastAPI:
 
         decided = manual.get_decided_checksums_for_tag(label)
 
-        if model != 'clip':
-            pool = _tag_space_rank(model, centroid, decided, exclude_ids, max(count * 3, count))
-            if bias_file_id is not None and bias in ('confirm', 'reject'):
-                bias_rows = _tag_space_member_embeddings(model, [bias_file_id])
-                if bias_rows:
-                    bias_vec = np.frombuffer(bias_rows[0][1], dtype=np.float32)
-                    sign = 1.0 if bias == 'confirm' else -1.0
-                    ids_, _cs, matrix = getattr(db, f'get_{model}_embeddings_matrix')()
-                    pos = {int(f): i for i, f in enumerate(ids_)}
-                    pool.sort(key=lambda it: it[1] + sign * float(matrix[pos[it[0]]].dot(bias_vec)), reverse=True)
-            return _attach_file_meta([
-                {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
-                for fid, score in pool[:count]
-            ])
-
-        # --- legacy CLIP path (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2
-        # embedding pipeline; do not extend) ---
-        candidates = [
-            row for row in db.get_all_embeddings()
-            if row[3] not in decided and row[0] not in exclude_ids
-        ]
-        ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
-        qualifying = [(row, score) for row, score in ranked if score >= TAG_SUGGEST_THRESHOLD]
-
+        pool = _tag_space_rank(model, centroid, decided, exclude_ids, max(count * 3, count))
         if bias_file_id is not None and bias in ('confirm', 'reject'):
-
-            bias_rows = db.get_embeddings_for_files([bias_file_id])
+            bias_rows = _tag_space_member_embeddings(model, [bias_file_id])
             if bias_rows:
                 bias_vec = np.frombuffer(bias_rows[0][1], dtype=np.float32)
                 sign = 1.0 if bias == 'confirm' else -1.0
-
-                def blended(item):
-                    row, score = item
-                    sim_to_bias = float(np.frombuffer(row[2], dtype=np.float32).dot(bias_vec))
-                    return score + sign * sim_to_bias
-
-                qualifying.sort(key=blended, reverse=True)
-
-        cards = []
-        for row, score in qualifying[:count]:
-            card = {'ref': str(row[0]), 'file_id': row[0], 'label': label,
-                    'score': round(float(score), 3)}
-            cards.append(card)
-        return _attach_file_meta(cards)
+                ids_, _cs, matrix = getattr(db, f'get_{model}_embeddings_matrix')()
+                pos = {int(f): i for i, f in enumerate(ids_)}
+                pool.sort(key=lambda it: it[1] + sign * float(matrix[pos[it[0]]].dot(bias_vec)), reverse=True)
+        return _attach_file_meta([
+            {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+            for fid, score in pool[:count]
+        ])
 
     @app.post('/api/tags/{label}/suggestions/next')
     def api_next_tag_suggestions(label: str, body: SwipeExcludeBody, count: int = 10,
@@ -7971,33 +7826,35 @@ def create_app(data_root: str) -> FastAPI:
 
     # ------------------------------------------------------------------
     # Per-tag classifier training (experimental) — a linear classifier on
-    # whole-image embeddings (SigLIP 2 by default, DINOv2 selectable; the legacy
-    # CLIP classifier is read-only) and a fine-tuned YOLO-World checkpoint, each trained from this tag's
-    # own confirmed/rejected examples (see clip_tag_classifier.py /
+    # whole-image embeddings (SigLIP 2 by default, DINOv2 selectable) and a fine-tuned YOLO-World checkpoint, each trained from this tag's
+    # own confirmed/rejected examples (see embedding_tag_classifier.py /
     # yolo_tag_classifier.py). Both always run as a real subprocess, never
-    # in-process — training can take anywhere from seconds (CLIP) to minutes
+    # in-process — training can take anywhere from seconds (embedding classifiers) to minutes
     # (YOLO), and this app already hit real GIL-contention problems earlier
     # from heavy in-process computation (see the /sets/{id} "opening 2 tabs
     # makes everything else unresponsive" incident that led to --workers).
-    # metadata.json (see clip_tag_classifier.write_status) is the single
+    # metadata.json (see embedding_tag_classifier.write_status) is the single
     # source of truth for status — no separate DB table to keep in sync.
     # ------------------------------------------------------------------
 
-    # URL/UI kind -> classifier directory kind. 'clip' is the legacy ViT-B/32 classifier
-    # (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend).
-    _CLASSIFIER_DIR_KINDS = {'siglip': 'siglip_model', 'dino': 'dino_model', 'clip': 'clip_model',
-                             'yolo': 'yolo_model'}
+    # URL/UI kind -> classifier directory kind.
+    _CLASSIFIER_DIR_KINDS = {'siglip': 'siglip_model', 'dino': 'dino_model', 'yolo': 'yolo_model'}
     _DIR_KIND_SPACES = {v['dir_kind']: k for k, v in TAG_SPACES.items()}
 
+    _CLIP_REMOVED_MSG = ('Needs retrain: CLIP has been removed, so the old CLIP classifier is no longer '
+                         'used. Train a SigLIP 2 (or DINOv2) classifier for this tag instead.')
+
     def _dir_kind(kind):
+        if kind == 'clip':
+            raise HTTPException(status_code=409, detail=_CLIP_REMOVED_MSG)
         if kind not in _CLASSIFIER_DIR_KINDS:
             raise HTTPException(status_code=400,
                                 detail=f'Unknown classifier kind {kind!r}; expected one of {sorted(_CLASSIFIER_DIR_KINDS)}')
         return _CLASSIFIER_DIR_KINDS[kind]
 
     def _read_classifier_status(label, kind):
-        """kind is a classifier directory kind ('siglip_model', 'dino_model', legacy
-        'clip_model' or 'yolo_model'). Returns None if training was
+        """kind is a classifier directory kind ('siglip_model', 'dino_model', 'yolo_model'; or
+        the retired 'clip_model', only ever probed to show the retrain note). Returns None if training was
         never started for this tag/kind. A finished embedding classifier whose stored
         weights were trained on a different embedding model than the one now in use is
         reported as status 'needs_retrain' (never silently applied). A 'running' status whose pid is no
@@ -8098,8 +7955,8 @@ def create_app(data_root: str) -> FastAPI:
         polarities = manual.get_whole_image_tag_polarities(label)
         n_positive = sum(1 for p in polarities.values() if p == 'positive')
         n_negative = sum(1 for p in polarities.values() if p == 'negative')
-        # Region crops (see get_all_spatial_tags_for_label/clip_tag_classifier.py's
-        # _add_region_examples) count toward CLIP's threshold too — a hard-negative
+        # Region crops (see get_all_spatial_tags_for_label/embedding_tag_classifier.py's
+        # _add_region_examples) count toward the training threshold too — a hard-negative
         # region (e.g. a dog boxed "not monstera plant") is just as valid a
         # training example as a whole-image rejection.
         for region_row in manual.get_all_spatial_tags_for_label(label):
@@ -8110,10 +7967,9 @@ def create_app(data_root: str) -> FastAPI:
         n_boxes = len(manual.get_spatial_tags_for_label(label))
         siglip_status = _read_classifier_status(label, 'siglip_model')
         dino_status = _read_classifier_status(label, 'dino_model')
-        # Legacy CLIP classifier: shown only as a note so an old artifact is visibly "needs
-        # retrain" rather than silently the active model. (DEPRECATION PLANNED: superseded by
-        # the SigLIP 2 + DINOv2 embedding pipeline; do not extend.)
-        clip_status = _read_classifier_status(label, 'clip_model')
+        # A leftover pre-SigLIP CLIP classifier is never read or scored; it only triggers a note
+        # telling the user to retrain in SigLIP 2.
+        clip_status = _read_classifier_status(label, LEGACY_CLIP_DIR_KIND)
         yolo_status = _read_classifier_status(label, 'yolo_model')
         enough_embed = n_positive >= MIN_EXAMPLES_PER_CLASS and n_negative >= MIN_EXAMPLES_PER_CLASS
         embed_hint = (f'Need {MIN_EXAMPLES_PER_CLASS}+ confirmed and {MIN_EXAMPLES_PER_CLASS}+ rejected examples, '
@@ -8124,8 +7980,10 @@ def create_app(data_root: str) -> FastAPI:
             'siglip_status': siglip_status,
             'dino_status': dino_status,
             'legacy_clip_note': (
-                'Legacy CLIP classifier found — superseded; train a SigLIP 2 classifier.'
-                if clip_status and clip_status.get('status') == 'done' else ''),
+                'An old CLIP classifier exists for this tag, but CLIP has been removed -- it is no '
+                'longer used. Retrain it with SigLIP 2 (or DINOv2).'
+                if clip_status and clip_status.get('status') == 'done'
+                and not any(st and st.get('status') == 'done' for st in (siglip_status, dino_status)) else ''),
             'yolo_btn': _classifier_button_state(
                 'yolo', label, yolo_status, n_boxes >= MIN_BOXES,
                 f'Need {MIN_BOXES}+ labeled bounding boxes (have {n_boxes}).'
@@ -8203,7 +8061,7 @@ def create_app(data_root: str) -> FastAPI:
                        f'rejected examples with a {TAG_SPACES[space]["label"]} embedding; '
                        f'have {n_positive} confirmed, {n_negative} rejected.{hint}'
             )
-        _launch_training_subprocess('media_manager.clip_tag_classifier', label, dir_kind)
+        _launch_training_subprocess('media_manager.embedding_tag_classifier', label, dir_kind)
         return {'status': 'running', 'space': space}
 
     @app.post('/api/tags/{label}/train-siglip')
@@ -8216,9 +8074,9 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.post('/api/tags/{label}/train-clip')
     def api_train_clip_classifier(label: str):
-        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
+        # CLIP was removed; the route stays only so old clients get an explanation, not a 404.
         raise HTTPException(status_code=410, detail=(
-            'Legacy CLIP classifier training is retired — use train-siglip (SigLIP 2, default) '
+            'CLIP classifier training has been removed — use train-siglip (SigLIP 2, default) '
             'or train-dino instead.'))
 
     @app.post('/api/tags/{label}/train-yolo')
@@ -8270,7 +8128,7 @@ def create_app(data_root: str) -> FastAPI:
     @app.get('/api/tags/{label}/train-log')
     def api_train_log(label: str, kind: str = TAG_DEFAULT_SPACE):
         """Raw train.log content (the training subprocess's own stdout/stderr,
-        see clip_tag_classifier.py's/yolo_tag_classifier.py's main()) — the
+        see embedding_tag_classifier.py's/yolo_tag_classifier.py's main()) — the
         only place per-run detail lives beyond the coarse running/done/failed
         status, e.g. ultralytics' own per-epoch loss table for a YOLO run."""
 
@@ -8286,9 +8144,11 @@ def create_app(data_root: str) -> FastAPI:
         _next_tag_suggestions (same decided/exclude filtering, same
         _attach_file_meta response), but scored by a trained classifier
         instead of centroid-cosine similarity. model_kind: 'yolo' | 'siglip'
-        (default) | 'dino' | legacy 'clip'. A classifier trained on a different
+        (default) | 'dino'. A legacy 'clip' request gets 409 "needs retrain". A classifier trained on a different
         embedding model than the current one raises 409 "needs retrain" instead
         of being applied."""
+        if model_kind == 'clip':
+            raise HTTPException(status_code=409, detail=_CLIP_REMOVED_MSG)
         if model_kind not in ('yolo',) + TAG_SPACE_MODELS:
             raise HTTPException(status_code=400, detail=f'Unknown model {model_kind!r}')
         decided = manual.get_decided_checksums_for_tag(label)
@@ -8310,14 +8170,14 @@ def create_app(data_root: str) -> FastAPI:
                     return []
 
             candidates = [
-                row for row in db.get_all_embeddings()
+                row for row in db.get_all_siglip_embeddings()   # (file_id, path, emb, checksum): the indexed-photo pool
                 if row[3] not in decided and row[0] not in exclude_ids
             ]
             if not candidates:
                 return []
 
             # Real model inference per image (not a cheap embedding dot-product
-            # like the CLIP path) — scanning the WHOLE undecided-photo pool
+            # like the SigLIP/DINO classifier path) — scanning the WHOLE undecided-photo pool
             # synchronously on every single fetch was the actual cause of the
             # swipe stream getting stuck on "searching" forever on a real
             # library. Bounded random sample keeps each fetch fast; repeated
@@ -8394,40 +8254,17 @@ def create_app(data_root: str) -> FastAPI:
             ])
 
 
-        if model_kind != 'clip':
-            file_ids, checksums, matrix = getattr(db, f'get_{model_kind}_embeddings_matrix')()
-            try:
-                clf_scores = score_matrix(data_root, label, matrix, model_kind)
-            except NeedsRetrain as exc:
-                raise HTTPException(status_code=409, detail=f'Needs retrain: {exc}')
-            if clf_scores is None or matrix.shape[0] == 0:
-                return []
-            return _attach_file_meta([
-                {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
-                for fid, score in _tag_space_pick(file_ids, checksums, clf_scores, decided, exclude_ids, count)
-            ])
-
-        # --- legacy CLIP classifier path (DEPRECATION PLANNED: superseded by the SigLIP 2 +
-        # DINOv2 embedding pipeline; do not extend) ---
-        all_embeddings = [
-            row for row in db.get_all_embeddings()
-            if row[3] not in decided and row[0] not in exclude_ids
-        ]
-        candidates = [(row[3], row[2]) for row in all_embeddings]
-        checksum_to_file_id = {row[3]: row[0] for row in all_embeddings}
+        file_ids, checksums, matrix = getattr(db, f'get_{model_kind}_embeddings_matrix')()
         try:
-            scores = score_all(data_root, label, candidates, space='clip')
+            clf_scores = score_matrix(data_root, label, matrix, model_kind)
         except NeedsRetrain as exc:
             raise HTTPException(status_code=409, detail=f'Needs retrain: {exc}')
-        ranked = sorted(
-            ((checksum_to_file_id[c], s) for c, s in scores.items() if c in checksum_to_file_id),
-            key=lambda x: -x[1],
-        )
-        cards = []
-        for fid, score in ranked[:count]:
-            card = {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
-            cards.append(card)
-        return _attach_file_meta(cards)
+        if clf_scores is None or matrix.shape[0] == 0:
+            return []
+        return _attach_file_meta([
+            {'ref': str(fid), 'file_id': fid, 'label': label, 'score': round(score, 3)}
+            for fid, score in _tag_space_pick(file_ids, checksums, clf_scores, decided, exclude_ids, count)
+        ])
 
     @app.post('/api/tags/{label}/suggestions/next-by-model')
     def api_next_tag_suggestions_by_model(label: str, body: SwipeExcludeBody, model: str = TAG_DEFAULT_SPACE, count: int = 10):
@@ -8679,20 +8516,27 @@ def create_app(data_root: str) -> FastAPI:
         manual.rename_studio(studio, new_name)
         return {'name': new_name}
 
-    # Cosine similarity above this, an image outside the set is suggested as a
-    # possible member. CLIP image-image similarity runs hotter than face similarity
-    # (same-scene photos commonly score 0.7-0.9), hence the higher default.
+    # Legacy absolute-cosine bar, kept only as the default of the (now ignored) `threshold`
+    # query parameter so old clients keep working: siglip/dino cosine scales differ per model,
+    # so the suggestions take the best SET_SUGGEST_TOPK candidates instead of a fixed cutoff.
     SET_SUGGEST_THRESHOLD = 0.75
 
-    # SigLIP 2 is the default; 'clip' (ViT-B/32) stays selectable for legacy data only.
-    SET_SUGGEST_MODELS = ('siglip', 'dino', 'clip')
+    # SigLIP 2 is the default.
+    SET_SUGGEST_MODELS = ('siglip', 'dino')
+
+    def _check_suggest_model(model, allowed=None):
+        """400 for a model outside `allowed` (default SET_SUGGEST_MODELS); a request for the
+        removed 'clip' model gets an explicit message rather than a generic 'unknown'."""
+        if model == 'clip':
+            raise HTTPException(status_code=400, detail=(
+                'The CLIP model has been removed -- use model=siglip (SigLIP 2) or model=dino (DINOv2).'))
+        if model not in (SET_SUGGEST_MODELS if allowed is None else allowed):
+            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
     SET_SUGGEST_TOPK = 400   # siglip/dino: size of the "passing" pool (no absolute threshold)
 
     def _set_member_embeddings(model, file_ids):
         """[float32 embedding bytes] of the given files in `model`'s space; files with no
-        embedding in that space are skipped. 'clip' is the original embeddings-table read."""
-        if model == 'clip':
-            return [e for _fid, e in db.get_embeddings_for_files(file_ids)]
+        embedding in that space are skipped."""
         if not file_ids:
             return []
         ids, _checksums, matrix = getattr(db, f'get_{model}_embeddings_matrix')()
@@ -8707,8 +8551,7 @@ def create_app(data_root: str) -> FastAPI:
         the ranking in blocks applying the hard exclusions (`skip_checksums` = members +
         rejected), the frame rule and `apply_filters` until `k` survive. Hidden files are
         dropped EXCEPT captured stills, which are remapped to their source video (a still
-        never surfaces on its own); trashed files are kept (the card marks them, as CLIP's
-        candidate list does)."""
+        never surfaces on its own); trashed files are kept (the card marks them)."""
         file_ids, checksums, scores = _score_space(space, centroid)
         return _topk_pool_from_scores(file_ids, checksums, scores, skip_checksums, apply_filters, k=k)
 
@@ -8833,23 +8676,21 @@ def create_app(data_root: str) -> FastAPI:
         judge a mismatch against. If the set has no confirmed people yet
         either, this is a no-op (same reason).
 
-        `model` ('siglip' default | 'dino' | legacy 'clip'): which embedding space drives
+        `model` ('siglip' default | 'dino'): which embedding space drives
         the ranking — members, rejected photos (for honor_negatives) and candidates
-        are all read from THAT space. 'clip' is the original (legacy) behavior, untouched.
-        For siglip/dino the absolute `threshold` is NOT applied (cosine scales differ
-        per model; SET_SUGGEST_THRESHOLD is tuned for CLIP-B/32): the best
+        are all read from THAT space. The absolute `threshold` is NOT applied (cosine
+        scales differ per model; the argument is accepted and ignored): the best
         SET_SUGGEST_TOPK candidates after every exclusion are the "passing" pool, and
         captured video stills are remapped to their source video (frame and video are
         one item). `info`, when a dict, receives {'model', 'coverage': {members_embedded,
         members_total}, 'model_missing', 'threshold_applied'}."""
 
-        if model not in SET_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        _check_suggest_model(model)
         member_checksums = manual.get_files_by_set(set_id, limit=1000)
         member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
         member_embeddings = _set_member_embeddings(model, member_ids)
         if info is not None:
-            info.update(model=model, threshold_applied=(model == 'clip'),
+            info.update(model=model, threshold_applied=False,
                         coverage={'members_embedded': len(member_embeddings),
                                   'members_total': len(member_checksums)},
                         model_missing=(not member_embeddings and bool(member_checksums)))
@@ -8883,19 +8724,8 @@ def create_app(data_root: str) -> FastAPI:
                 items = [item for item in items if item[0][2] not in member_checksums_anywhere]
             return items
 
-        if model == 'clip':
-            candidates = [
-                row for row in db.get_all_embeddings()
-                if row[3] not in member_checksum_set and row[3] not in excluded_checksum_set
-            ]
-            if not candidates:
-                return []
-            ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
-            passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
-            passing = apply_filters(passing)
-        else:
-            passing = _topk_pool_in_space(model, centroid, member_checksum_set | excluded_checksum_set,
-                                          apply_filters)
+        passing = _topk_pool_in_space(model, centroid, member_checksum_set | excluded_checksum_set,
+                                      apply_filters)
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -8909,8 +8739,8 @@ def create_app(data_root: str) -> FastAPI:
             card['ref'] = str(card['id'])
         return cards
 
-    # Same bar as SET_SUGGEST_THRESHOLD and for the same reason: the ranking is
-    # CLIP image-image similarity to photos already placed here, i.e. "this looks
+    # Legacy bar (see SET_SUGGEST_THRESHOLD; accepted and ignored): the ranking is
+    # image-image similarity to photos already placed here, i.e. "this looks
     # like the same place/shoot", NOT physical distance — locations carry optional
     # coordinates but most candidates have no EXIF fix at all, so geometry would
     # rank almost nothing.
@@ -8991,10 +8821,10 @@ def create_app(data_root: str) -> FastAPI:
         adjusted_centroid as _find_similar_files_for_set), so photos that merely
         LOOK like a rejected one rank lower too.
 
-        `background`: accepted for old clients and ignored (the CLIP tile-based background
-        ranking is gone; the 'place' model handles people itself).
+        `background`: accepted for old clients and ignored (the 'place' model handles
+        people itself).
 
-        `model` ('place' default | 'combined' | 'siglip' | 'dino' | legacy 'clip'): 'place' = 'combined'
+        `model` ('place' default | 'combined' | 'siglip' | 'dino'): 'place' = 'combined'
         corrected for people and co-signals (location_place.py; `why` per card), members, rejected
         photos and candidates are all read from that model's space. 'combined' = DINOv2
         (same place from another angle: layout/instance) fused with SigLIP 2 (scene
@@ -9006,14 +8836,13 @@ def create_app(data_root: str) -> FastAPI:
         'whole', 'model', 'threshold_applied', 'background_applied',
         'coverage', 'model_missing'}."""
 
-        if model not in LOCATION_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        _check_suggest_model(model, LOCATION_SUGGEST_MODELS)
         member_checksums = manual.get_checksums_for_location(location_id)
         member_ids = [r['id'] for r in db.get_files_by_checksums(list(member_checksums))]
         excluded_checksum_set = manual.get_excluded_checksums_for_location(location_id)
         set_settled_checksums = manual.get_checksums_for_sets_at_location(location_id)
         if info is not None:
-            info.update(model=model, threshold_applied=(model == 'clip'), background_applied=False)
+            info.update(model=model, threshold_applied=False, background_applied=False)
 
         if info is not None:
             info['mode'] = 'whole'
@@ -9079,22 +8908,9 @@ def create_app(data_root: str) -> FastAPI:
         # file_locations row per member, so this is what stops the rest of that shoot
         # from coming back around the stack one photo at a time.
         placed_anywhere = manual.get_checksums_with_any_location() if avoid_existing else set()
-        if model == 'clip':
-            candidates = [
-                row for row in db.get_all_embeddings()
-                if row[3] not in member_checksums and row[3] not in excluded_checksum_set
-                and row[3] not in set_settled_checksums
-            ]
-            if not candidates:
-                return []
-            ranked = rank_by_similarity(centroid, candidates, embedding_index=2)
-            passing = [((fid, path, cs), score) for (fid, path, _emb, cs), score in ranked if score >= threshold]
-            if avoid_existing and passing:
-                passing = [item for item in passing if item[0][2] not in placed_anywhere]
-        else:
-            passing = _topk_pool_in_space(
-                model, centroid, set(member_checksums) | excluded_checksum_set | set(set_settled_checksums),
-                lambda items: [i for i in items if i[0][2] not in placed_anywhere] if avoid_existing else items)
+        passing = _topk_pool_in_space(
+            model, centroid, set(member_checksums) | excluded_checksum_set | set(set_settled_checksums),
+            lambda items: [i for i in items if i[0][2] not in placed_anywhere] if avoid_existing else items)
         if exclude_ids:
             passing = [item for item in passing if item[0][0] not in exclude_ids]
             page = passing[:limit]
@@ -9124,17 +8940,11 @@ def create_app(data_root: str) -> FastAPI:
         all". Cheaper than the default path too: only the requested sets' centroids
         get computed, not every set in the library.
 
-        `model` ('siglip' default | 'dino' | legacy 'clip'): the embedding space the photo and
-        the sets' members are read from. The absolute `threshold` (tuned for CLIP-B/32) only
-        applies to 'clip'; siglip/dino return the best `limit` sets after the person filter."""
-        if model not in SET_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
-        if model == 'clip':
-            emb_bytes = db.get_embedding(file_id)
-            threshold_applied = True
-        else:
-            emb_bytes = db.get_space_embedding(model, file_id)
-            threshold_applied = False
+        `model` ('siglip' default | 'dino'): the embedding space the photo and the sets'
+        members are read from. `threshold` is accepted and ignored: the best `limit` sets after
+        the person filter are returned."""
+        _check_suggest_model(model)
+        emb_bytes = db.get_space_embedding(model, file_id)
         if emb_bytes is None:
             return []
         query_emb = np.frombuffer(emb_bytes, dtype=np.float32)
@@ -9146,7 +8956,7 @@ def create_app(data_root: str) -> FastAPI:
             candidates = [s for s in manual.list_sets() if s['id'] not in member_of]
             # When this photo has a recognized person, only suggest sets that person is
             # already in — a matching face is a far stronger "belongs here" signal than
-            # CLIP scene similarity (mirrors _find_similar_files_for_set's
+            # scene similarity (mirrors _find_similar_files_for_set's
             # exclude_non_matching_faces, the reverse direction). Applied only to the
             # auto-suggestion path (not the explicit set_ids quick-access ranking) and
             # only when the photo has a recognized person; an empty result is correct
@@ -9164,8 +8974,7 @@ def create_app(data_root: str) -> FastAPI:
         for set_row in candidates:
             member_checksums = manual.get_files_by_set(set_row['id'], limit=1000)
             member_ids = [r['id'] for r in db.get_files_by_checksums(member_checksums)]
-            member_embeddings = (db.get_embeddings_for_files(member_ids) if model == 'clip'
-                                 else db.get_space_embeddings_for_files(model, member_ids))
+            member_embeddings = db.get_space_embeddings_for_files(model, member_ids)
             if not member_embeddings:
                 continue
             vecs = np.stack([np.frombuffer(e, dtype=np.float32) for _, e in member_embeddings])
@@ -9175,11 +8984,10 @@ def create_app(data_root: str) -> FastAPI:
                 continue
             centroid = centroid / norm
             score = float(centroid.dot(query_emb))
-            if set_ids is not None or not threshold_applied or score >= threshold:
-                # Representative thumbnail = a member photo we already resolved
-                # to a file id above (no extra query).
-                thumb_id = member_ids[0] if member_ids else None
-                scored.append((set_row, score, thumb_id))
+            # Representative thumbnail = a member photo we already resolved
+            # to a file id above (no extra query).
+            thumb_id = member_ids[0] if member_ids else None
+            scored.append((set_row, score, thumb_id))
 
         scored.sort(key=lambda item: item[1], reverse=True)
         page = scored if set_ids is not None else scored[:limit]
@@ -9296,7 +9104,6 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': all_tags,
             'all_categories': _all_categories_for_nav(),
             'set_suggest_threshold': SET_SUGGEST_THRESHOLD,
-            'clip_legacy_available': db.count_indexed() > 0,
             'people_present': people_present,
             'folder_suggestions': folder_suggestions,
             'sort': sort,
@@ -9475,7 +9282,7 @@ def create_app(data_root: str) -> FastAPI:
         """Generate a morph video from every image in a folder (Wan FLF2V between
         consecutive images) on the GPU box. Mirrors api_set_generate_video but the
         source is a /files folder and the order is strictly BY FILENAME (not the
-        set's CLIP-similarity chain). Async; poll .../folder-to-video/status."""
+        set's similarity chain). Async; poll .../folder-to-video/status."""
         if folder_video_job['running']:
             return {'started': False, 'message': 'A folder video is already being generated.'}
         rows = _files_under_folder(path)
@@ -9615,8 +9422,7 @@ def create_app(data_root: str) -> FastAPI:
                                    model: str = 'siglip'):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
-        if model not in SET_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        _check_suggest_model(model)
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
@@ -9830,14 +9636,13 @@ def create_app(data_root: str) -> FastAPI:
         return {
             'library': {
                 'total_photos': db.count_files(),
-                'indexed_clip': db.count_indexed(),
                 'broken': db.count_broken_files(),
-                'tiled_files': db.count_tiled_files(),
                 'unidentified_faces': db.count_unidentified_faces(),
                 'identified_faces': manual.count_named_faces(),
                 'cities': db.count_cities(),
             },
             'embeddings': emb,
+            'legacy_clip': db.legacy_table_rows(),   # unused CLIP tables, kept not read
             'embeddings_loaded': db.loaded_matrix_bytes(),
             'embeddings_total_bytes': sum(e['bytes'] for e in emb.values()),
             'manual': manual_stats,
@@ -9990,11 +9795,10 @@ def create_app(data_root: str) -> FastAPI:
         category's centroid, interactive/one-at-a-time instead of batch-write. Returns up
         to `count` dicts, best score first: [{'ref': str, 'file_id': int, 'score': float}, ...].
 
-        `model` ('siglip' default | 'dino' | legacy 'clip'): the embedding space the examples,
-        the rejected photos (Rocchio) and the candidates are read from. Only legacy 'clip'
-        applies the category's temperature threshold (it was calibrated on CLIP-B/32 cosines);
-        siglip/dino rank the best candidates after every exclusion, captured stills folded
-        into their source video.
+        `model` ('siglip' default | 'dino'): the embedding space the examples, the rejected
+        photos (Rocchio) and the candidates are read from. No absolute threshold is applied:
+        the best candidates after every exclusion are returned, captured stills folded into
+        their source video.
 
         A file is excluded from candidacy if it already manually has THIS category,
         or has been explicitly rejected for THIS category before — categories are
@@ -10016,8 +9820,7 @@ def create_app(data_root: str) -> FastAPI:
         example_checksums = [c for c in manual.get_example_checksums_for_category(category_id)
                              if c not in ai_all]
         example_ids = [r['id'] for r in db.get_files_by_checksums(example_checksums)]
-        if model not in SET_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        _check_suggest_model(model)
         example_embeddings = _set_member_embeddings(model, example_ids)
         # Down-swiped (excluded) items don't just get hidden from the queue — they
         # steer the centroid AWAY from their look (Rocchio-style adjusted_centroid,
@@ -10034,39 +9837,12 @@ def create_app(data_root: str) -> FastAPI:
             return []
 
         already_has_this = set(example_checksums)
-        if model != 'clip':
-            pool = _topk_pool_in_space(
-                model, centroid, already_has_this | set(rejected_for_this) | set(ai_all),
-                lambda items: [i for i in items if f"file:{i[0][0]}" not in exclude_refs])
-            return _attach_file_meta([
-                {'ref': f"file:{fid}", 'file_id': fid, 'score': round(score, 3)}
-                for (fid, _path, _cs), score in pool[:count]
-            ])
-
-        # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-        all_candidates = db.get_all_embeddings()  # (file_id, path, embedding, checksum)
-
-        filtered = [
-            c for c in all_candidates
-            if c[3] not in already_has_this and c[3] not in rejected_for_this
-            and c[3] not in ai_all
-            and f"file:{c[0]}" not in exclude_refs
-        ]
-        ranked = rank_by_similarity(centroid, filtered, embedding_index=2)
-        threshold = cat['temperature']
-        qualifying = [(c, score) for c, score in ranked if score >= threshold]
-
-        # Wrapped in the shared bias-reorder helper for structural consistency with
-        # every other feature's swipe endpoint, even though bias is inert here: a
-        # single-category detail page has only one possible "key" for every
-        # candidate, so confirm/reject bias can never produce a different
-        # partition than plain score-desc order.
-        ordered = bias_reorder(qualifying, key_fn=lambda pair: category_id,
-                                bias_key=None, bias_action=None)
-
+        pool = _topk_pool_in_space(
+            model, centroid, already_has_this | set(rejected_for_this) | set(ai_all),
+            lambda items: [i for i in items if f"file:{i[0][0]}" not in exclude_refs])
         return _attach_file_meta([
-            {'ref': f"file:{c[0]}", 'file_id': c[0], 'score': round(float(score), 3)}
-            for c, score in ordered[:count]
+            {'ref': f"file:{fid}", 'file_id': fid, 'score': round(score, 3)}
+            for (fid, _path, _cs), score in pool[:count]
         ])
 
     @app.get('/categories/{category_id}', response_class=HTMLResponse)
@@ -10166,7 +9942,6 @@ def create_app(data_root: str) -> FastAPI:
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
             'location_suggest_threshold': LOCATION_SUGGEST_THRESHOLD,
-            'clip_legacy_available': db.count_indexed() > 0,
             'sort': sort,
             'order': order,
         })
@@ -10235,8 +10010,7 @@ def create_app(data_root: str) -> FastAPI:
                                         mask_wait: Optional[float] = None):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
-        if model not in LOCATION_SUGGEST_MODELS:
-            raise HTTPException(status_code=400, detail=f'Unknown model {model!r}')
+        _check_suggest_model(model, LOCATION_SUGGEST_MODELS)
         threshold = max(0.0, min(1.0, threshold))
         offset = max(0, offset)
         exclude_ids = {int(r) for r in body.exclude if r.isdigit()} or None
@@ -10391,7 +10165,6 @@ def create_app(data_root: str) -> FastAPI:
                 out.setdefault(name, []).append(np.asarray(v, dtype=np.float32))
         return out
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     def _object_search(location_id, names, exclude_ids, limit):
         """The cascade: embed the selected marked objects (positives) + the location's
         negatives, scan the DINOv2 region index, and rank/ localize candidates. Returns
@@ -10495,7 +10268,6 @@ def create_app(data_root: str) -> FastAPI:
             ]
         return cards, False
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/locations/{location_id}/object-search')
     def api_object_search(location_id: int, body: Optional[ObjectSearchBody] = None,
                           names: List[str] = Query(default=[]), limit: int = 12):
@@ -10513,7 +10285,6 @@ def create_app(data_root: str) -> FastAPI:
         cards, needs = _object_search(location_id, sel, exclude_ids, max(1, min(limit, 48)))
         return {'results': cards, 'cards': cards, 'needs_object_index': needs}
 
-    # DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
     @app.post('/api/locations/{location_id}/object-search/reject')
     def api_object_search_reject(location_id: int, body: ObjectRejectBody):
         """A rejected result's localized region(s) become location-specific NEGATIVES

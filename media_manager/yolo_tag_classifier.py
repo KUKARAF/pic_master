@@ -10,7 +10,7 @@ can take minutes and must never share the app's GIL. Run directly:
     python -m media_manager.yolo_tag_classifier --data-root /path/to/repo --tag "monstera plant"
 
 Output lands in .media/tag_classifiers/{slug}/yolo_model/ — see
-clip_tag_classifier.classifier_dir for the shared path convention and
+embedding_tag_classifier.classifier_dir for the shared path convention and
 write_status for the {running,done,failed} status contract.
 """
 import argparse
@@ -21,7 +21,7 @@ import sys
 import tempfile
 import time
 
-from media_manager.clip_tag_classifier import classifier_dir, slugify, write_status
+from media_manager.embedding_tag_classifier import classifier_dir, slugify, write_status
 from media_manager.database import Database
 from media_manager.detector import WEIGHTS_DIR
 from media_manager.manual_db import ManualDB
@@ -96,7 +96,7 @@ def train_from_dataset(data_yaml_path, out_dir, epochs=EPOCHS, progress_cb=None,
 
 def train_for_tag(data_root, tag_label, device=None):
     """Core trainable entry point. Never raises: any failure is caught and
-    recorded in metadata.json as status='failed' — see clip_tag_classifier's
+    recorded in metadata.json as status='failed' — see embedding_tag_classifier's
     train_for_tag for the identical reasoning. ``device`` is threaded down to
     train_from_dataset (None = ultralytics auto-selects)."""
     out_dir = classifier_dir(data_root, tag_label, 'yolo_model')

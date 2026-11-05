@@ -1,8 +1,6 @@
-# DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
-# (region search)
 """Instance-level region search: DINOv2 window prefilter + RootSIFT/MAGSAC geometric re-rank.
 
-The CLIP tile index answers "what kind of thing is this crop" and so returns generic
+A semantic embedding answers "what kind of thing is this crop" and so returns generic
 same-category photos. This answers "find THIS object/region again":
 
   Index (per image): DINOv2 ViT-S/14-reg dense patch tokens (long side 448) mean-pooled
@@ -16,7 +14,7 @@ same-category photos. This answers "find THIS object/region again":
   crop's own features (so the match is restricted to the query box) and a USAC_MAGSAC
   homography. Final score = dino + W_INL * log1p(max(0, inliers - MIN_INL)).
 
-Benchmark (bench/README.md): region mAP .646 (CLIP tiles) -> .720, hard-negative-above-
+Benchmark (bench/README.md): region mAP .646 (the retired CLIP-tile baseline) -> .720, hard-negative-above-
 positive 22.7% -> 9.1%.
 
 Shared by the worker (DINO + SIFT extraction) and the web (query SIFT + verification,

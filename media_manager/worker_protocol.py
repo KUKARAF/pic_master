@@ -1,7 +1,7 @@
 """Shared media-worker offload protocol.
 
 This module is the single source of truth for the wire contract between the
-media-worker *server* (which runs the heavy ML: face/body/CLIP/YOLO) and the
+media-worker *server* (which runs the heavy ML: face/body/SigLIP/DINO/YOLO) and the
 *client* that offloads work to it. Both sides import this module so the request
 paths and (de)serialization stay in lockstep.
 
@@ -23,8 +23,6 @@ PATH_EMBED_BBOX = "embed_bbox"
 # carries the existing face dicts so the worker can apply the margin guardrails
 # against the scores the host already has.
 PATH_NORMALIZE_FACES = "normalize_faces"
-PATH_EMBED_IMAGE = "embed_image"
-PATH_EMBED_TEXT = "embed_text"
 # SigLIP 2 + DINOv2 embedding pipeline (embedders.py). Batched: one request carries N
 # images, decoded ONCE on the worker and fed to both models (embedders.embed_shared).
 PATH_EMBED_BOTH_BATCH = "embed_both_batch"
@@ -65,7 +63,7 @@ PATH_TRAIN_RUN = "train_run"
 PATH_TRAIN_STATUS = "train_status"
 PATH_TRAIN_CANCEL = "train_cancel"
 PATH_TAG_DETECT = "tag_detect"
-# In-memory search index ("imdb"): the worker holds the big CLIP + face embedding
+# In-memory search index ("imdb"): the worker holds the big SigLIP 2 + face embedding
 # matrices resident in RAM and answers ranking queries, so the low-RAM host never
 # loads them (the OOM this exists to prevent). The host STREAMS the matrix in
 # bounded chunks (imdb_build_*) so neither side ever materializes the whole ~1 GB
@@ -117,8 +115,6 @@ ALL_PATHS = [
     PATH_DETECT_FACES,
     PATH_EMBED_BBOX,
     PATH_NORMALIZE_FACES,
-    PATH_EMBED_IMAGE,
-    PATH_EMBED_TEXT,
     PATH_EMBED_BOTH_BATCH,
     PATH_EMBED_SIGLIP_TEXT,
     PATH_DETECT_OBJECTS,
@@ -172,14 +168,6 @@ ALL_PATHS = [
 #                       # own DB rows positionally
 #            "error": <None|str>}
 #
-#   PATH_EMBED_IMAGE
-#     req:  {"name": <str>, "image": <bytes: encoded image>}
-#     resp: {"embedding": <bytes: float32 (D,)>|None, "error": <None|str>}
-#
-#   PATH_EMBED_TEXT
-#     req:  {"text": <str>}
-#     resp: {"embedding": <bytes: float32 (D,)>, "error": <None|str>}
-#
 #   PATH_EMBED_BOTH_BATCH
 #     req:  {"items": [{"name": <str>, "image": <bytes: encoded image>}, ...]}
 #     resp: {"results": [{"name": <str>, "siglip": <bytes float32 (D1,)>|None,
@@ -220,13 +208,12 @@ ALL_PATHS = [
 # starts it, then polls status until a terminal state. YOLO checkpoints stay on
 # the worker (served by PATH_TAG_DETECT); the embedding-classifier artifact (a small
 # weights.npz) rides back in the final status response. The embedding space is part of
-# the kind: "siglip_model" (SigLIP 2, default), "dino_model", or legacy "clip_model"
-# (DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not
-# extend). A worker that predates a kind rejects it in train_create ("unknown training
+# the kind: "siglip_model" (SigLIP 2, default) or "dino_model". A worker that predates a
+# kind (or is sent the retired "clip_model") rejects it in train_create ("unknown training
 # kind"), so a stale worker can never train in the wrong space.
 #
 #   PATH_TRAIN_CREATE
-#     req:  {"kind": "yolo_model"|"siglip_model"|"dino_model"|"clip_model", "tag": <str>, "slug": <str>,
+#     req:  {"kind": "yolo_model"|"siglip_model"|"dino_model", "tag": <str>, "slug": <str>,
 #            "epochs": <int|None>}
 #     resp: {"job_id": <str>, "error": <None|str>}
 #
@@ -265,12 +252,12 @@ ALL_PATHS = [
 # The host (remote_index_builder.py) rebuilds a matrix by streaming it in chunks:
 # begin (reset the receive buffer), many chunk (append rows), end (finalize the
 # buffer into one resident (N,D) float32 matrix + parallel id array). "kind" is
-# "clip" or "face". ids are the row's file_id (for face: the file_id per face row,
+# "siglip" or "face". ids are the row's file_id (for face: the file_id per face row,
 # so a search maps to photos). Vectors are contiguous little-endian float32,
 # count*D of them per chunk.
 #
 #   PATH_IMDB_BUILD_BEGIN
-#     req:  {"kind": "clip"|"face", "dim": <int>, "total_rows": <int|None>}
+#     req:  {"kind": "siglip"|"face", "dim": <int>, "total_rows": <int|None>}
 #     resp: {"ok": <bool>, "error": <None|str>}
 #
 #   PATH_IMDB_BUILD_CHUNK   (append one block of rows; call repeatedly)
@@ -283,7 +270,7 @@ ALL_PATHS = [
 #
 #   PATH_IMDB_STATUS
 #     req:  {}
-#     resp: {"clip": {"rows": <int>, "dim": <int>, "bytes": <int>,
+#     resp: {"siglip": {"rows": <int>, "dim": <int>, "bytes": <int>,
 #                     "built_at": <int|None>, "building": <bool>},
 #            "face": {...}, "error": <None|str>}
 #

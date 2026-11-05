@@ -12,7 +12,7 @@ keep it resident, reusing it across every request; then each call ships only the
 tiny ``[D]`` query. That is what this module does: a process-global cache maps a
 string key to ``(version, device_tensor)``. The caller passes the numpy matrix
 plus the integer version counter it already maintains for cache invalidation
-(``Database._emb_ver`` -- legacy CLIP -- ``_siglip_ver`` / ``_dino_ver`` / ``_face_ver``,
+(``Database._siglip_ver`` / ``_dino_ver`` / ``_face_ver``,
 ``ManualDB._face_ver``); when the version
 differs from what's resident we rebuild the device tensor from the given matrix
 and drop the old one (freeing its VRAM on GC). So residency is tied to exactly
@@ -33,8 +33,7 @@ hide a broken accelerator.
 
 VRAM note: each resident matrix is ~0.5 GB (233k×512×4 bytes) and lives in VRAM
 *alongside* the ML models (SigLIP 2, DINOv2, InsightFace, etc.). The resident matrices
-('siglip' / 'dino' fp16 whole-image, 'all_faces'; the legacy CLIP 'emb' one is only built when a
-legacy CLIP view asks for it) plus the models is acceptable headroom on the
+('siglip' / 'dino' fp16 whole-image, 'all_faces') plus the models is acceptable headroom on the
 16 GB Intel Arc this targets, but it is NOT free — keep the resident key set
 small and be aware new resident matrices add up against model VRAM.
 """

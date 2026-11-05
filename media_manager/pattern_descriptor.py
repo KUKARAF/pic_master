@@ -1,6 +1,6 @@
 """Classical texture + colour descriptor for find-by-pattern.
 
-CPU-only (numpy + OpenCV, both already deps). Where region-search uses CLIP to find
+CPU-only (numpy + OpenCV, both already deps). Where region-search finds
 *what* is in a crop (a leaf, a wall), this captures the *pattern/texture* of a crop —
 repeating micro-structure and colour distribution — and ignores semantics, so it can
 find "that wallpaper" or "that fabric weave". Three blocks:

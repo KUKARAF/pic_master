@@ -106,7 +106,7 @@ def _algo_params(key):
     if key == 'pattern':
         return (pattern_deep.ALGO_TAG,)
     if key == 'bodies':
-        return (body_index.model_tag(),)   # rows in another space (old CLIP) count as missing
+        return (body_index.model_tag(),)   # rows in another space count as missing
     return ()
 
 

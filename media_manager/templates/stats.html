@@ -33,7 +33,7 @@
 <div class="stats-card">
   <h2>Search index (imdb)</h2>
   <div id="imdb-status" class="stats-report" style="display:none;"></div>
-  <p class="sub">The worker's in-memory CLIP + face matrices. Build/refresh from the ⚡ menu → <strong>🧠 Load index into memory</strong> (streams the matrices to the worker over RNS and times the transfer). Manual only — reload after indexing new photos.</p>
+  <p class="sub">The worker's in-memory SigLIP 2 + face matrices. Build/refresh from the ⚡ menu → <strong>🧠 Load index into memory</strong> (streams the matrices to the worker over RNS and times the transfer). Manual only — reload after indexing new photos.</p>
 </div>
 
 {# ---- Embedding matrices (the imdb-sizing table) ---- #}
@@ -42,7 +42,7 @@
   <table class="stats-table">
     <tr class="head"><th>Kind</th><th class="num">Rows</th><th class="num">Dim</th>
         <th class="num">Est. matrix</th><th class="num">Loaded now</th></tr>
-    {% for key in ['clip', 'face', 'body', 'tile'] %}
+    {% for key in ['siglip', 'dino', 'face', 'body'] %}
     {% set e = stats.embeddings[key] %}
     <tr>
       <td>{{ key }}</td>
@@ -58,7 +58,7 @@
       <td class="num">{{ mb(stats.embeddings_loaded.values() | sum) }}</td>
     </tr>
   </table>
-  <p class="sub">Est. matrix = rows × dim × 4 bytes (float32) — the RAM a stacked search matrix needs. Tile is not held as one matrix (chunked at query time).</p>
+  <p class="sub">Est. matrix = rows × dim × 4 bytes (float32) — the RAM a stacked search matrix needs. Unused legacy CLIP tables (kept, not read): <code>embeddings</code> {{ '{:,}'.format(stats.legacy_clip.embeddings) }} rows, <code>tile_embeddings</code> {{ '{:,}'.format(stats.legacy_clip.tile_embeddings) }} rows.</p>
 </div>
 
 {# ---- Library + manual counts + db files, side by side ---- #}
@@ -67,8 +67,6 @@
     <h2>Library (media.db)</h2>
     <table class="stats-table">
       <tr><td>Photos (non-hidden)</td><td class="num">{{ '{:,}'.format(stats.library.total_photos) }}</td></tr>
-      <tr><td>CLIP-indexed (legacy)</td><td class="num">{{ '{:,}'.format(stats.library.indexed_clip) }}</td></tr>
-      <tr><td>Region-tiled files</td><td class="num">{{ '{:,}'.format(stats.library.tiled_files) }}</td></tr>
       <tr><td>Unidentified faces</td><td class="num">{{ '{:,}'.format(stats.library.unidentified_faces) }}</td></tr>
       <tr><td>Identified faces (named)</td><td class="num">{{ '{:,}'.format(stats.library.identified_faces) }}</td></tr>
       <tr><td>Cities loaded</td><td class="num">{{ '{:,}'.format(stats.library.cities) }}</td></tr>
@@ -108,7 +106,7 @@
           'Matrices loaded now:   ' + mb(d.embeddings_loaded_bytes),
           '',
         ];
-        ['clip', 'face', 'body', 'tile'].forEach(function (k) {
+        ['siglip', 'dino', 'face', 'body'].forEach(function (k) {
           var e = d.embeddings[k];
           lines.push('  ' + k.padEnd(6) + e.rows.toLocaleString() + ' × ' + (e.dim || '—') +
                      '  →  ' + mb(e.bytes) +
@@ -135,7 +133,7 @@
     if (!d.configured) { out.textContent = 'No worker configured — the imdb index lives on the worker.'; out.style.display = 'block'; return; }
     var w = d.worker || {};
     if (w.error) { lines.push('worker status error: ' + w.error); }
-    ['clip', 'face'].forEach(function (k) {
+    ['siglip', 'face'].forEach(function (k) {
       var m = (w && w[k]) || {};
       lines.push(k.padEnd(5) + ' resident: ' + (m.rows ? m.rows.toLocaleString() + ' rows / ' + mb(m.bytes) + ' · built ' + when(m.built_at) : 'not built'));
     });

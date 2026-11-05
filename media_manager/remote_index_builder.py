@@ -1,9 +1,9 @@
 """Host-side driver that (re)builds the worker's in-memory search index ("imdb").
 
-Streams the CLIP + face embedding matrices from media.db to the worker in bounded
+Streams the SigLIP 2 + face embedding matrices from media.db to the worker in bounded
 chunks, so this low-RAM host NEVER materializes the full ~1 GB matrix (that OOM is
 the whole reason the offload exists) — it reads the DB with a fetchmany cursor and
-ships each chunk as it goes (see Database.iter_clip_embeddings / iter_face_embeddings).
+ships each chunk as it goes (see Database.iter_siglip_embeddings / iter_face_embeddings).
 
 It also TIMES each kind, so we can see how long the RNS transfer of ~1 GB actually
 takes — the number this milestone exists to measure. Rebuild is manual only (per
@@ -27,7 +27,7 @@ def _client(data_root):
     return worker_client.get_client(data_root)
 
 
-def build_index(data_root, kinds=('clip', 'face'), log=print, progress=None):
+def build_index(data_root, kinds=('siglip', 'face'), log=print, progress=None):
     """Rebuild the named matrices on the worker by streaming them over RNS.
 
     Returns {kind: {'rows', 'seconds', 'mb', 'mbps'}}. `progress(kind, rows_sent,
@@ -44,7 +44,7 @@ def build_index(data_root, kinds=('clip', 'face'), log=print, progress=None):
     db = Database(os.path.join(os.path.abspath(data_root), '.media', 'media.db'))
     try:
         stats = db.embedding_stats()
-        iters = {'clip': db.iter_clip_embeddings, 'face': db.iter_face_embeddings}
+        iters = {'siglip': db.iter_siglip_embeddings, 'face': db.iter_face_embeddings}
 
         results = {}
         for kind in kinds:

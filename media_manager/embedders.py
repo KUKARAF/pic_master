@@ -4,7 +4,7 @@ GPU-ONLY: construction raises RuntimeError when no cuda/xpu device is usable (no
 fallback; MEDIA_DEVICE=cpu raises too). ``embed_shared([sig, dino], paths)`` decodes each
 file once for both models. (``_allow_cpu=True`` exists only for scripts/bench_embedders.py.)
 
-Both mirror the ``CLIPIndexer`` interface in ``indexer.py``:
+Both expose the same interface:
 
 * ``embed_images(paths) -> (np.float32 (N, D) L2-normalized, failed[(path, msg)])``
 * ``embed_pil_images(images) -> np.float32 (N, D)``

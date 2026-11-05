@@ -1,7 +1,7 @@
 """Age/gender estimation (MiVOLO) — thin client for the main app process.
 
 MiVOLO's own code hard-pins an old timm/ultralytics that conflict with this project's
-YOLO-World detector and CLIP indexer (confirmed: installing it into the main venv
+YOLO-World detector and SigLIP/DINO embedders (confirmed: installing it into the main venv
 broke `from ultralytics import YOLOWorld`). So the actual model, person detector, and
 face<->body matching all live in `age_estimator_worker.py`, run as a subprocess inside
 a separate, isolated virtualenv (`.age-venv`) — never imported here. This file just
@@ -109,7 +109,7 @@ def setup_age_venv(dest=None, force: bool = False) -> Path:
 
     print(f"Creating isolated age-estimator venv at {venv_dir}")
     print("(separate from the main environment: MiVOLO pins an old ultralytics/timm "
-          "that conflict with this app's object detector and CLIP indexer)")
+          "that conflict with this app's object detector and embedders)")
     uv = shutil.which("uv")
     if uv:
         # A compatible interpreter, not the system Python (which may be too new for

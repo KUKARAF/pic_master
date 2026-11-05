@@ -306,7 +306,7 @@ class MediaManager:
         either embedding; store them in embeddings_siglip / embeddings_dino. Powers the "find
         similar" and semantic-search features. GPU-only: with no worker configured and no local
         accelerator this raises (no silent CPU fallback). `model_name`/`pretrained` are legacy
-        CLIP arguments, accepted and ignored. Videos are embedded by the web bulk job / upload
+        arguments, accepted and ignored. Videos are embedded by the web bulk job / upload
         hook (frame sampling lives there). Returns (indexed_count, failed_count).
         """
         import numpy as np  # hook-allow: lazy — heavy
@@ -399,14 +399,14 @@ class MediaManager:
         been explicitly rejected for (see category_resolver.py), is skipped for that
         category specifically. Existing auto-matches for a scanned file are cleared and
         rebuilt each run so a category that no longer clears threshold doesn't leave a
-        stale match behind (this also supersedes that file's legacy CLIP rows; files
-        with no embedding in `model`'s space keep theirs, flagged legacy).
+        stale match behind (this also supersedes that file's rows from the removed CLIP
+        model; files with no embedding in `model`'s space keep theirs, flagged legacy).
 
-        `model` ('siglip' default | 'dino' | legacy 'clip') picks the embedding space for
+        `model` ('siglip' default | 'dino') picks the embedding space for
         examples, Rocchio negatives and candidates; the model id is stored in each match.
-        siglip/dino use a per-category threshold calibrated from the category's own
-        member-to-centroid cosines (category_resolver.calibrate_category_threshold);
-        only legacy 'clip' uses the category's CLIP-tuned `temperature`. Captured video
+        The per-category threshold is calibrated from the category's own
+        member-to-centroid cosines (category_resolver.calibrate_category_threshold); the
+        category's stored `temperature` is no longer used. Captured video
         stills (frame and video are one item) and hidden files are never auto-matched.
         Returns (matched_count, skipped_count, considered_count) — matched is a
         count of (file, category) matches, not files; skipped is files that
@@ -416,6 +416,8 @@ class MediaManager:
         from .similarity import mean_normalized_centroid, adjusted_centroid  # hook-allow: lazy — numpy
         from .category_resolver import CATEGORY_MATCH_MODEL_IDS, calibrate_category_threshold  # hook-allow: lazy
 
+        if model == 'clip':
+            raise ValueError("The CLIP model has been removed; use model 'siglip' or 'dino'")
         if model not in CATEGORY_MATCH_MODEL_IDS:
             raise ValueError(f"Unknown model {model!r}; expected one of {sorted(CATEGORY_MATCH_MODEL_IDS)}")
         model_id = CATEGORY_MATCH_MODEL_IDS[model]
@@ -426,8 +428,6 @@ class MediaManager:
 
         def embeddings_for(checksums):
             ids = [r['id'] for r in self.db.get_files_by_checksums(list(checksums))]
-            if model == 'clip':
-                return [e for _fid, e in self.db.get_embeddings_for_files(ids)]
             return [e for _fid, e in self.db.get_space_embeddings_for_files(model, ids)]
 
         # AI-generated media never trains a category or gets auto-matched (no
@@ -435,14 +435,7 @@ class MediaManager:
         ai_all = self.db.get_all_ai_generated_checksums()
 
         # Candidate pool in the chosen space: parallel (file_ids, checksums, matrix).
-        if model == 'clip':
-            rows = self.db.get_all_embeddings()  # (file_id, path, embedding, checksum)
-            cand_ids = np.array([r[0] for r in rows], dtype=np.int64)
-            cand_checksums = [r[3] for r in rows]
-            cand_matrix = (np.stack([np.frombuffer(r[2], dtype=np.float32) for r in rows])
-                           if rows else np.empty((0, 0), np.float32))
-        else:
-            cand_ids, cand_checksums, cand_matrix = getattr(self.db, f'get_{model}_embeddings_matrix')()
+        cand_ids, cand_checksums, cand_matrix = getattr(self.db, f'get_{model}_embeddings_matrix')()
         if len(cand_ids) == 0:
             return 0, 0, 0
 
@@ -464,14 +457,11 @@ class MediaManager:
                 centroid = mean_normalized_centroid(example_embeddings)
             if centroid is None or centroid.shape[0] != cand_matrix.shape[1]:
                 continue
-            if model == 'clip':
-                threshold = cat['temperature']
-            else:
-                ex = np.stack([np.frombuffer(e, dtype=np.float32) for e in example_embeddings])
-                # Background stats exclude the category's own examples (they'd inflate the floor).
-                ex_set = set(example_checksums)
-                bg = np.fromiter((c not in ex_set for c in cand_checksums), dtype=bool, count=len(cand_checksums))
-                threshold = calibrate_category_threshold(ex.dot(centroid), cand_matrix[bg].dot(centroid))
+            ex = np.stack([np.frombuffer(e, dtype=np.float32) for e in example_embeddings])
+            # Background stats exclude the category's own examples (they'd inflate the floor).
+            ex_set = set(example_checksums)
+            bg = np.fromiter((c not in ex_set for c in cand_checksums), dtype=bool, count=len(cand_checksums))
+            threshold = calibrate_category_threshold(ex.dot(centroid), cand_matrix[bg].dot(centroid))
             category_centroids.append((cat['name'], threshold, centroid))
         if not category_centroids:
             return 0, 0, 0
@@ -484,8 +474,7 @@ class MediaManager:
         scoped = path not in ('.', '', None)
         paths = {}
         if scoped:
-            paths = {r[0]: r[1] for r in (self.db.get_all_embeddings() if model == 'clip'
-                                          else getattr(self.db, f'get_all_{model}_embeddings')())}
+            paths = {r[0]: r[1] for r in getattr(self.db, f'get_all_{model}_embeddings')()}
 
         considered = matched = skipped = 0
         for i in range(len(cand_ids)):
@@ -529,7 +518,7 @@ class MediaManager:
         # hook-allow: lazy — model modules (PIL/torch/open_clip)
         from . import body_index
         from .detector import YOLOWorldDetector  # hook-allow: lazy
-        from .indexer import SUPPORTED_EXTENSIONS  # hook-allow: lazy
+        from .formats import IMAGE_EXTENSIONS as SUPPORTED_EXTENSIONS  # hook-allow: lazy
 
         client = self._worker()
         if client.is_configured():

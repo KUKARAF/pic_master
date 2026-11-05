@@ -655,8 +655,9 @@
     var OP_LABELS = {
       detect_faces: 'face match',
       embed_bbox: 'face embed',
-      embed_image: 'CLIP embed',
-      embed_text: 'text embed',
+      embed_both: 'image embed',
+      embed_masked: 'masked embed',
+      embed_siglip_text: 'text embed',
       detect_objects: 'object detect',
       normalize_faces: 'face rotation fix',
     };
@@ -1417,7 +1418,7 @@
       const extraBox = document.createElement('div');
       box.appendChild(extraBox);
 
-      // Suggested sets (only when opened from a photo, via suggestForFileId): CLIP-
+      // Suggested sets (only when opened from a photo, via suggestForFileId): embedding-
       // ranked matches. They are NOT a separate click-only block anymore — they are
       // merged into the ONE keyboard-navigable list below (see buildRows): they lead
       // the list while the box is empty, and the instant the user types, plain fuzzy
@@ -1448,7 +1449,7 @@
       }
 
       // Order the suggestion slice (only shown while the box is empty): person-chip
-      // matches first, then CLIP score.
+      // matches first, then similarity score.
       function suggestionSortKey(set) {
         const people = (set.people || []).map(function (p) { return p.name.toLowerCase(); });
         const chipMatches = personChips.filter(function (c) { return people.indexOf(c.toLowerCase()) !== -1; }).length;
@@ -1758,7 +1759,7 @@
     var extra = {};
     if (fileId != null) {
       // Right-hand panel: the sets this photo most likely belongs to, ranked by
-      // CLIP image similarity to each set's members. Click one to add it there.
+      // Image similarity to each set's members. Click one to add it there.
       extra.aside = function (panel, resolve) {
         var heading = document.createElement('div');
         heading.className = 'modal-aside-title';
@@ -3923,8 +3924,8 @@
   if (addFaceState) boxDrawStates.push(addFaceState);
 
   /* Label region (spatial tag) — positive ("this area IS X") and negative
-     ("this area is confirmed NOT X", a hard negative for CLIP training, see
-     manual_db.add_spatial_tag/clip_tag_classifier.py) share the same
+     ("this area is confirmed NOT X", a hard negative for classifier training, see
+     manual_db.add_spatial_tag/embedding_tag_classifier.py) share the same
      draw-a-box-then-pick-a-tag flow, differing only in the polarity posted. */
   const labelRegionStatus = document.getElementById('label-region-status');
 
@@ -4045,7 +4046,7 @@
   wireMarkObject('mark-object-negative-btn', 'negative');
 
   /* Label person — drag a box around a person's body, then NAME them: the crop is
-     CLIP-embedded (searchable find-by-body) AND, when a name is given, linked to
+     embedded (searchable find-by-body) AND, when a name is given, linked to
      that person as a ground-truth body label so they can be found by body on
      /find-person/{name}/body. Blank name keeps the old anonymous-crop behavior.
      Deep-linked from the find-by-body page's "Manually label person" button via
@@ -4181,13 +4182,12 @@
      the photo gets a crosshair), then drag a box around a thing. With the region
      matching index built (/bulk → Index region matching) the box is matched as an
      INSTANCE (DINOv2 windows, SIFT/homography verified — same object, not same
-     category); otherwise the crop is CLIP-embedded and ranked against
-     whole-image embeddings. Matches open in the browsable watch-queue. */
+     category); until that index is built the server answers with an "Index region
+     matching first" message (shown as a toast). Matches open in the browsable watch-queue. */
   const searchRegionBtn = document.querySelector('.find-by-region-btn');
   const searchRegionState = wireBoxDraw(searchRegionBtn, '✏️', '🔲', function (bbox) {
     openMatchesAsQueue({
       el: searchRegionBtn,
-      // DEPRECATION PLANNED: superseded by the SigLIP 2 + DINOv2 embedding pipeline; do not extend.
       url: '/api/files/' + fileId + '/region-search',
       fetchInit: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: bbox }) },
       label: 'Region matches',
@@ -4288,7 +4288,7 @@
     });
   });
 
-  /* Find pill — 📏 distance segment: whole-image CLIP similarity into the queue.
+  /* Find pill — 📏 distance segment: whole-image similarity (SigLIP 2 / DINOv2) into the queue.
      If the photo isn't embedded yet, ask to embed it now (y/n) and, on yes, embed
      then re-run the search — instead of a dead-end "no embedding" toast. */
   var findDistanceBtn = document.querySelector('.find-by-distance-btn');
@@ -4326,7 +4326,7 @@
   }
 
   /* Find pill — 🧍 body segment: draw a box around the person, then rank the library
-     by how closely each indexed body/build/outfit matches that crop (CLIP over the
+     by how closely each indexed body/build/outfit matches that crop (over the
      body index, /body-search). Same drag-a-box UX as 🔲/🧩 — you pick exactly which
      body to search by, which is what makes a multi-person photo give good results
      (the old auto-detect-the-whole-image path couldn't tell which person you meant). */

@@ -5,7 +5,7 @@ import zlib
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
 # Video containers the library tracks. Kept separate from IMAGE_EXTENSIONS so the ML
-# pipelines (object index, CLIP embed, faces, EXIF) stay image-only and skip video.
+# pipelines (object index, SigLIP/DINO embed, faces, EXIF) stay image-only and skip video.
 # Frames are decoded with cv2/ffmpeg, which reads all of these.
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.m4v', '.avi', '.mpg', '.mpeg'}
 # Containers no browser plays inline: /photo goes straight to the cached H.264

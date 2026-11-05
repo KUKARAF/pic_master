@@ -792,7 +792,7 @@ class ManualDB(ThreadLocalDB):
             'ON faces (source_face_id) WHERE source_face_id IS NOT NULL'
         )
         # Body identities — the ground-truth mirror of `faces`, for "who" a body
-        # crop is (clothing/pose/build via CLIP, not a face). Kept here in manual.db
+        # crop is (clothing/pose/build via a body embedding, not a face). Kept here in manual.db
         # keyed by checksum (not in media.db's derived, rebuildable body_embeddings)
         # for the same reason faces.identity lives here: a label a human made must
         # survive a media.db rescan. `source_body_id` points back at the media.db
@@ -966,8 +966,8 @@ class ManualDB(ThreadLocalDB):
         example. frame_index set means this region is on that specific frame of an
         animated file. polarity='negative' marks this specific region as a
         confirmed NON-example — e.g. a dog, boxed and labeled "monstera plant"
-        with polarity='negative', a hard negative for the CLIP tag classifier
-        (see clip_tag_classifier.py) — distinct from a whole-image negative
+        with polarity='negative', a hard negative for the embedding tag classifier
+        (see embedding_tag_classifier.py) — distinct from a whole-image negative
         (add_tag's polarity='negative'), which says "this photo has no X"
         rather than "this specific region here is definitely not X"."""
         tag_id = self._find_or_create_tag(label.strip())
@@ -1106,7 +1106,7 @@ class ManualDB(ThreadLocalDB):
 
     def get_whole_image_tag_polarities(self, label):
         """{checksum: polarity} for every whole-image (x1 IS NULL AND frame_index
-        IS NULL) row of this label — the CLIP tag-classifier's training source:
+        IS NULL) row of this label — the embedding tag-classifier's training source:
         'positive' rows are this tag's confirmed examples, 'negative' rows are
         confirmed non-examples (a human explicitly rejected a detection), giving
         the classifier real negatives to learn from rather than just guessing
@@ -1126,7 +1126,7 @@ class ManualDB(ThreadLocalDB):
         shape a YOLO dataset needs. YOLO has no explicit "negative box" concept
         (an unboxed region in a training image is already an implicit negative),
         so negative-polarity regions are deliberately excluded here — see
-        get_all_spatial_tags_for_label for the CLIP classifier's version, which
+        get_all_spatial_tags_for_label for the embedding classifier's version, which
         needs both polarities as explicit hard-negative crops."""
         cur = self.conn.cursor()
         cur.execute(
@@ -1138,9 +1138,9 @@ class ManualDB(ThreadLocalDB):
 
     def get_all_spatial_tags_for_label(self, label):
         """[(checksum, x1, y1, x2, y2, image_width, image_height, polarity), ...]
-        for this label's bbox rows of EITHER polarity — the CLIP tag
+        for this label's bbox rows of EITHER polarity — the embedding tag
         classifier's region-level training source (see
-        clip_tag_classifier.py): a positive region crop is "this specific area
+        embedding_tag_classifier.py): a positive region crop is "this specific area
         is X", a negative region crop is a hard negative — e.g. a dog boxed
         and labeled "monstera plant" with polarity='negative' — a much more
         precise training signal than a whole-image polarity when the same
@@ -4084,7 +4084,7 @@ class ManualDB(ThreadLocalDB):
 
     def get_stale_body_labels(self, model, identity=None):
         """[(id, checksum, [x1,y1,x2,y2]), ...] confirmed labels whose vector is NOT in
-        space `model` (e.g. old CLIP anchors) -- to be re-cropped and re-embedded."""
+        space `model` (e.g. anchors from a retired model) -- to be re-cropped and re-embedded."""
         cur = self.conn.cursor()
         sql = '''SELECT id, checksum, x1, y1, x2, y2 FROM body_identities
                   WHERE identity IS NOT NULL AND rejected = 0 AND model != ?'''

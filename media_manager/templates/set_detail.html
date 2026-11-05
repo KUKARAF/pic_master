@@ -116,7 +116,6 @@
   <select id="set-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
     <option value="siglip">SigLIP 2</option>
     <option value="dino">DINOv2</option>
-    {% if clip_legacy_available %}<option value="clip">CLIP (ViT-B/32, legacy)</option>{% endif %}
   </select>
 </label>
 <div id="set-model-notice" class="sub" style="display:none;margin-bottom:10px;color:#b45309;"></div>
@@ -735,17 +734,16 @@
   // the live one, not whichever existed when the page first loaded.
   let stackHandle = null;
 
-  /* Embedding model driving the suggestions ('siglip' default | 'dino' | legacy 'clip',
-     the last only offered while CLIP embeddings exist), remembered per browser. siglip/dino ignore the match threshold server-side
+  /* Embedding model driving the suggestions ('siglip' default | 'dino'), remembered per browser. siglip/dino ignore the match threshold server-side
      (their cosine scale differs), so the threshold slider is disabled for them. */
   const MODEL_KEY = 'mm_set_suggest_model';
-  const MODEL_LABELS = { clip: 'CLIP', siglip: 'SigLIP 2', dino: 'DINOv2' };
+  const MODEL_LABELS = { siglip: 'SigLIP 2', dino: 'DINOv2' };
   const modelSelect = document.getElementById('set-model-select');
   const modelNotice = document.getElementById('set-model-notice');
   function loadModel() {
     try {
       const m = localStorage.getItem(MODEL_KEY);
-      if (m && MODEL_LABELS[m] && (m !== 'clip' || (modelSelect && modelSelect.querySelector('option[value=clip]')))) return m;
+      if (m && MODEL_LABELS[m]) return m;   // a saved removed model ('clip') falls through to the default
     } catch (e) {}
     return 'siglip';
   }
@@ -819,8 +817,8 @@
         return null;
       },
       emptyStateHtml: function(stackEl) {
-        const topK = currentModel !== 'clip';
-        const tip = 'Not used for ' + MODEL_LABELS[currentModel] + ': its similarity scale differs from CLIP, so the best 400 candidates are shown instead of applying a threshold.';
+        const topK = true;   // siglip/dino rank a top-K pool; no absolute threshold
+        const tip = 'Not used for ' + MODEL_LABELS[currentModel] + ': its similarity scale differs per model, so the best 400 candidates are shown instead of applying a threshold.';
         stackEl.innerHTML =
           '<div class="swipe-empty">' +
             '<p style="margin-bottom:10px;">' + (topK ? 'No more suggestions from ' + MODEL_LABELS[currentModel] + '.'
@@ -1177,8 +1175,8 @@
 
   if (swipePage) {
     // A non-default saved model is fetched up front so the missing-embeddings
-    // notice can show; the legacy CLIP model keeps the original lazy first fetch.
-    if (currentModel !== 'clip') fetchAndLaunch(); else launchStack([]);
+    // notice can show.
+    fetchAndLaunch();
   }
 })();
 </script>

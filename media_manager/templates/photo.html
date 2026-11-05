@@ -270,7 +270,7 @@
         {% for c in file.categories %}
         <span class="tag-removable" data-category-id="{{ c.id or '' }}" style="margin-bottom:4px;display:inline-flex;">
           <a href="/search?category={{ c.name | urlencode }}">{{ c.name }}</a>
-          {% if c.source == 'auto' %}<span style="opacity:.7;"{% if c.legacy %} title="Matched with the retired CLIP model; rerun 'media category match' to refresh"{% endif %}>(auto{% if c.legacy %}, legacy{% endif %})</span>{% endif %}
+          {% if c.source == 'auto' %}<span style="opacity:.7;"{% if c.legacy %} title="Matched with the removed CLIP model; rerun 'media category match' to refresh"{% endif %}>(auto{% if c.legacy %}, legacy{% endif %})</span>{% endif %}
           {% if c.source == 'manual' %}<button class="rm category-remove-btn" type="button" title="Remove this category">×</button>{% endif %}
         </span>
         {% endfor %}
