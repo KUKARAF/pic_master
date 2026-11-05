@@ -8,48 +8,70 @@
   <a href="/person/{{ name | urlencode }}" class="sub">← Back to {{ name }}</a>
 </div>
 
-<p class="sub" style="margin-bottom:14px;max-width:680px;">
-  Pick a <strong>suspect face</strong> below — one that looks wrong, or was caught at an
-  odd angle and has started matching everything. We'll then show the faces it's
-  <em>holding</em>: ones that resemble the suspect more than they resemble the real
-  {{ name }}. Removing a face sends it <strong>back to the unknown pool</strong> (so it can
-  be matched to the right person) and records that it is <strong>not {{ name }}</strong>, so
-  it won't come back. Tip: if the suspect is just sideways, straighten it on
-  <a href="/find-person/{{ name | urlencode }}">Find {{ name }}</a> (press <strong>R</strong>) instead of removing things.
+<p class="sub" style="margin-bottom:14px;max-width:720px;">
+  Pick one or more <strong>clear, definitely-{{ name }}</strong> faces as anchors. Every other
+  automatically matched face is compared to them: close ones are kept, far ones can be removed in
+  one go (back to the unknown pool, and barred from {{ name }}), and the ones in between are
+  decided one by one. Faces you assigned by hand are never touched.
 </p>
 
-<div class="section-title" style="margin-bottom:10px;">1 · Pick the suspect face</div>
-<div id="cleanup-faces" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:20px;">
-  <span class="sub">Loading {{ name }}'s faces…</span>
-</div>
+<div class="section-title" style="margin-bottom:6px;">1 · Pick anchors <span class="sub" id="cl-anchor-count"></span></div>
+<p class="sub" style="margin:0 0 8px;">Sorted by how clearly visible the face is (detector confidence, size, upright). Click to select / deselect.</p>
+<div id="cl-faces" class="cl-grid"><span class="sub">Loading…</span></div>
+<button type="button" id="cl-more" class="btn-similar" style="display:none;margin:8px 0 18px;">Show more faces</button>
 
-<div id="cleanup-review" style="display:none;">
-  <div class="section-title" style="margin-bottom:6px;">2 · Remove the faces it wrongly holds</div>
-  <p class="sub" id="cleanup-suspect-line" style="margin:0 0 10px;"></p>
-  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px;">
-    <button type="button" id="cleanup-remove-suspect" class="btn-similar"
-            title="Also remove the suspect face itself from this person">🧹 Remove the suspect from {{ name }} too</button>
-    <span id="cleanup-suspect-status" class="sub"></span>
+<div id="cl-score-section" style="display:none;">
+  <div class="section-title" style="margin:14px 0 6px;">2 · Thresholds and preview</div>
+  <div class="cl-sliders">
+    <label>Keep at or above <strong id="cl-keep-val"></strong>
+      <input type="range" id="cl-keep" min="-0.2" max="1" step="0.01"></label>
+    <label>Remove below <strong id="cl-remove-val"></strong>
+      <input type="range" id="cl-remove" min="-0.2" max="1" step="0.01"></label>
+    <button type="button" id="cl-defaults" class="btn-similar">Reset defaults</button>
   </div>
-  <div class="swipe-page">
-    <div class="swipe-stack-wrap" id="cleanup-swipe-stack"></div>
+  <label class="sub" style="display:block;margin:6px 0;">
+    <input type="checkbox" id="cl-legacy"> Also include older faces whose origin wasn't recorded
+    (could include ones you confirmed before this was tracked)</label>
+  <div id="cl-hist" class="cl-hist"></div>
+  <p id="cl-counts" class="sub"></p>
+
+  <div class="section-title" style="margin:12px 0 6px;">Preview: would be removed <span class="sub">(nothing changes until you confirm)</span></div>
+  <div id="cl-remove-grid" class="cl-grid"></div>
+  <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:12px 0 20px;">
+    <button type="button" id="cl-apply" class="btn-similar" disabled>Remove 0 far faces</button>
+    <button type="button" id="cl-undo" class="btn-similar" style="display:none;">Undo last cleanup</button>
+    <span id="cl-status" class="sub"></span>
+  </div>
+
+  <div class="section-title" style="margin:14px 0 6px;">3 · Decide the uncertain ones <span class="sub" id="cl-unc-count"></span></div>
+  <button type="button" id="cl-start-swipe" class="btn-similar">Review uncertain faces</button>
+  <div class="swipe-page" id="cl-swipe" style="display:none;">
+    <div class="swipe-stack-wrap" id="cl-swipe-stack"></div>
     <div class="swipe-controls">
-      <button type="button" class="swipe-btn swipe-btn-reject" id="cleanup-keep-btn" title="Keep — really is them (↓)">✓</button>
-      <button type="button" class="swipe-btn swipe-btn-confirm" id="cleanup-remove-btn" title="Remove — not them (↑)">✕</button>
+      <button type="button" class="swipe-btn swipe-btn-reject" id="cl-remove-btn" title="Not them: remove (↓)">✕</button>
+      <button type="button" class="swipe-btn swipe-btn-confirm" id="cl-keep-btn" title="Yes, it is them: keep (↑)">✓</button>
     </div>
     <div class="swipe-hint">
-      Swipe up to <strong>remove</strong> (→ unknown, and not {{ name }}), down to <strong>keep</strong> ·
-      <strong>→</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo
+      <strong>↑</strong> keep (never asked again) · <strong>↓</strong> remove (→ unknown, not {{ name }}) ·
+      <strong>←</strong> not sure · <strong>→</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo
     </div>
   </div>
 </div>
 
 <style>
-  .cleanup-face { position: relative; cursor: pointer; border-radius: 8px; overflow: hidden;
-    border: 2px solid transparent; background: var(--input-bg, #222); }
-  .cleanup-face img { width: 84px; height: 84px; object-fit: cover; display: block; }
-  .cleanup-face.selected { border-color: var(--chip-blue, #8ab4f8); }
-  .cleanup-face:hover { border-color: var(--border, #555); }
+  .cl-grid { display:flex; flex-wrap:wrap; gap:8px; }
+  .cl-face { position:relative; cursor:pointer; border-radius:8px; overflow:hidden;
+    border:3px solid transparent; background:var(--input-bg,#222); }
+  .cl-face img { width:84px; height:84px; object-fit:cover; display:block; }
+  .cl-face.selected { border-color:var(--chip-blue,#8ab4f8); }
+  .cl-face .cl-tag { position:absolute; left:0; right:0; bottom:0; font-size:10px; padding:1px 3px;
+    background:rgba(0,0,0,.65); color:#fff; text-align:center; }
+  .cl-sliders { display:flex; flex-wrap:wrap; gap:18px; align-items:center; margin-bottom:6px; }
+  .cl-sliders label { display:flex; flex-direction:column; gap:2px; min-width:200px; }
+  .cl-hist { display:flex; align-items:flex-end; gap:1px; height:90px; max-width:640px; margin:8px 0 2px; }
+  .cl-hist div { flex:1; min-height:1px; background:#888; }
+  .cl-hist div.b-keep { background:#4caf50; } .cl-hist div.b-remove { background:#e53935; }
+  .cl-hist div.b-uncertain { background:#fbc02d; }
 </style>
 {% endblock %}
 
@@ -58,104 +80,198 @@
 <script>
 (function () {
   const personName = {{ name | tojson }};
-  const facesEl = document.getElementById('cleanup-faces');
-  const reviewEl = document.getElementById('cleanup-review');
-  const suspectLine = document.getElementById('cleanup-suspect-line');
-  if (!personName || !facesEl || !window.initSwipeStack) return;
+  const DEF = { keep: {{ default_keep }}, remove: {{ default_remove }} };
+  const $ = function (id) { return document.getElementById(id); };
+  const base = '/api/people/' + encodeURIComponent(personName) + '/cleanup';
+  const cropUrl = function (ref) { return '/face-crop/' + encodeURIComponent(ref); };
+  const PAGE = 60;
+  let anchors = new Set();
+  let offset = 0, total = 0;
+  let preview = null, stack = null, timer = null;
 
-  let stack = null;
-  let suspectRef = null;
+  function json(r) { if (!r.ok) return r.json().then(function (e) { throw new Error(e.detail || r.status); }); return r.json(); }
 
-  function base() { return '/api/person/' + encodeURIComponent(personName); }
-
-  // Load the person's own faces as the suspect picker.
-  fetch(base() + '/faces')
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      const faces = (d && d.faces) || [];
-      if (!faces.length) { facesEl.innerHTML = '<span class="sub">No confirmed faces for ' + escapeHtml(personName) + '.</span>'; return; }
-      facesEl.innerHTML = '';
-      faces.forEach(function (f) {
-        const div = document.createElement('div');
-        div.className = 'cleanup-face';
-        div.dataset.ref = f.ref;
-        div.innerHTML = '<img src="/face-crop/' + encodeURIComponent(f.ref) + '" alt="" loading="lazy">';
-        div.addEventListener('click', function () { selectSuspect(f.ref, div); });
-        facesEl.appendChild(div);
-      });
-    })
-    .catch(function () { facesEl.innerHTML = '<span class="sub">Failed to load faces.</span>'; });
-
-  function selectSuspect(ref, div) {
-    suspectRef = ref;
-    facesEl.querySelectorAll('.cleanup-face').forEach(function (el) { el.classList.toggle('selected', el === div); });
-    suspectLine.innerHTML = 'Faces held by the selected suspect — swipe up to remove each one that <strong>isn\'t</strong> ' + escapeHtml(personName) + '.';
-    document.getElementById('cleanup-suspect-status').textContent = '';
-    reviewEl.style.display = 'block';
-    if (stack) stack.reset();
-    else buildStack();
+  function setAnchorLabel() {
+    $('cl-anchor-count').textContent = anchors.size ? '(' + anchors.size + ' selected)' : '(none selected yet)';
   }
 
-  function buildStack() {
-    stack = window.initSwipeStack({
-      stackElId: 'cleanup-swipe-stack',
-      confirmBtnId: 'cleanup-remove-btn',   // ↑ = remove (it's a victim)
-      rejectBtnId: 'cleanup-keep-btn',      // ↓ = keep (really is them)
-      bufferSize: 20,
-      initialCards: [],
-      fetchMoreUrl: function (excludeSet, biasKey, biasAction, need) {
-        if (!suspectRef) return null;
-        return base() + '/broom-candidates?suspect=' + encodeURIComponent(suspectRef) + '&count=' + (need || 20);
-      },
-      renderCard: function (card) {
-        return {
-          imageUrl: '/face-crop/' + encodeURIComponent(card.ref),
-          questionHtml: 'Is this <strong>not</strong> ' + escapeHtml(personName) + '?',
-          scoreText: 'matches the suspect ' + (card.sim_suspect != null ? card.sim_suspect.toFixed(2) : '—') +
-                     ' vs real ' + (card.sim_good != null ? card.sim_good.toFixed(2) : '—'),
-          metaHtml: swipeCardMeta(card),
-          originalUrl: '/photo/' + card.file_id,
-        };
-      },
-      // ↑ confirm = remove: back to unknown + "not this person".
-      onConfirm: function (card) {
-        return { url: '/api/faces/' + encodeURIComponent(card.ref) + '/not-identity',
-                 method: 'POST', body: { name: personName } };
-      },
-      // ↓ reject = keep: no change.
-      onReject: function () { return null; },
-      onUndo: function (card, action) {
-        if (action !== 'confirm') return null;
-        // Returned-to-unknown faces are re-named via their auto source; hand-drawn
-        // ones (no source) were rejected, so undo targets the original manual ref.
-        const ref = (card.source_face_id != null) ? ('auto:' + card.source_face_id) : card.ref;
-        return { url: '/api/faces/' + encodeURIComponent(ref) + '/not-identity?name=' +
-                      encodeURIComponent(personName), method: 'DELETE' };
-      },
-      emptyStateHtml: function (el) {
-        el.innerHTML = '<div class="swipe-empty">No faces are held by this suspect ' +
-          '(nothing resembles it more than it resembles the real ' + escapeHtml(personName) +
-          '). Pick another face, or straighten/remove this one.</div>';
-      },
+  function addFaces(faces) {
+    const grid = $('cl-faces');
+    faces.forEach(function (f) {
+      const div = document.createElement('div');
+      div.className = 'cl-face' + (anchors.has(f.ref) ? ' selected' : '');
+      div.title = 'quality ' + f.quality + (f.kind === 'protected' ? ' · set by hand' : '');
+      div.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.quality.toFixed(2) + '</span>';
+      div.addEventListener('click', function () {
+        if (anchors.has(f.ref)) anchors.delete(f.ref); else anchors.add(f.ref);
+        div.classList.toggle('selected', anchors.has(f.ref));
+        saveAnchors();
+      });
+      grid.appendChild(div);
     });
   }
 
-  // Remove the suspect face itself from this person.
-  document.getElementById('cleanup-remove-suspect').addEventListener('click', function () {
-    if (!suspectRef) return;
-    const btn = this, status = document.getElementById('cleanup-suspect-status');
-    btn.disabled = true; status.textContent = 'Removing…';
-    fetch('/api/faces/' + encodeURIComponent(suspectRef) + '/not-identity', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: personName }),
-    })
-      .then(function (r) { if (!r.ok) throw new Error('Request failed'); return r.json(); })
-      .then(function () {
-        status.textContent = 'Removed. Reloading…';
-        if (window.showToast) showToast('Removed the suspect face from ' + personName + '.');
-        setTimeout(function () { location.reload(); }, 600);
-      })
-      .catch(function (e) { btn.disabled = false; status.textContent = 'Failed: ' + e.message; });
+  function loadFaces() {
+    return fetch(base + '/faces?limit=' + PAGE + '&offset=' + offset).then(json).then(function (d) {
+      total = d.total;
+      if (offset === 0) {
+        $('cl-faces').innerHTML = '';
+        anchors = new Set(d.anchor_refs);
+        if (!d.faces.length) $('cl-faces').innerHTML = '<span class="sub">' + personName + ' has no faces.</span>';
+      }
+      addFaces(d.faces);
+      offset += d.faces.length;
+      $('cl-more').style.display = offset < total ? 'inline-block' : 'none';
+      setAnchorLabel();
+      if (offset === d.faces.length) refresh();
+    }).catch(function (e) { $('cl-faces').innerHTML = '<span class="sub">Failed to load: ' + e.message + '</span>'; });
+  }
+  $('cl-more').addEventListener('click', loadFaces);
+
+  let saveTimer = null;
+  function saveAnchors() {
+    setAnchorLabel();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(function () {
+      fetch(base + '/anchors', { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refs: Array.from(anchors) }) })
+        .then(json).then(refresh)
+        .catch(function (e) { if (window.showToast) showToast('Could not save anchors: ' + e.message); });
+    }, 250);
+  }
+
+  function params() {
+    return 'keep=' + $('cl-keep').value + '&remove=' + $('cl-remove').value + '&include_legacy=' + ($('cl-legacy').checked ? 1 : 0);
+  }
+
+  function sliderLabels() {
+    $('cl-keep-val').textContent = Number($('cl-keep').value).toFixed(2);
+    $('cl-remove-val').textContent = Number($('cl-remove').value).toFixed(2);
+  }
+
+  function refresh() {
+    sliderLabels();
+    fetch(base + '/preview?' + params()).then(json).then(function (p) {
+      preview = p;
+      $('cl-score-section').style.display = p.needs_anchor ? 'none' : 'block';
+      if (p.needs_anchor) { stack = null; return; }
+      const c = p.counts;
+      $('cl-counts').textContent = c.keep + ' keep · ' + c.uncertain + ' uncertain · ' + c.remove + ' remove  (of ' +
+        c.candidates + ' scored). ' + c.protected + ' set by hand or confirmed: never touched' +
+        (c.legacy_skipped ? ' · ' + c.legacy_skipped + ' older faces excluded' : '') +
+        (c.missing_embedding ? ' · ' + c.missing_embedding + ' without a usable embedding' : '') +
+        (p.anchors_stale ? ' · ' + p.anchors_stale + ' anchor(s) no longer valid' : '');
+      $('cl-unc-count').textContent = '(' + c.uncertain + ' to review)';
+      drawHist(p);
+      const grid = $('cl-remove-grid');
+      grid.innerHTML = '';
+      p.remove_sample.forEach(function (f) {
+        const a = document.createElement('a');
+        a.className = 'cl-face'; a.href = f.file_id ? '/photo/' + f.file_id : '#'; a.target = '_blank';
+        a.innerHTML = '<img src="' + cropUrl(f.ref) + '" alt="" loading="lazy"><span class="cl-tag">' + f.score.toFixed(2) + '</span>';
+        grid.appendChild(a);
+      });
+      if (c.remove > p.remove_sample.length) {
+        const more = document.createElement('span');
+        more.className = 'sub'; more.textContent = '+ ' + (c.remove - p.remove_sample.length) + ' more (lowest scores shown)';
+        grid.appendChild(more);
+      }
+      const btn = $('cl-apply');
+      btn.textContent = 'Remove ' + c.remove + ' far faces';
+      btn.disabled = c.remove === 0;
+      $('cl-undo').style.display = p.last_batch ? 'inline-block' : 'none';
+      if (p.last_batch) $('cl-undo').textContent = 'Undo last cleanup (' + p.last_batch.count + ' faces)';
+    }).catch(function (e) { $('cl-status').textContent = 'Preview failed: ' + e.message; });
+  }
+
+  function drawHist(p) {
+    const h = $('cl-hist');
+    h.innerHTML = '';
+    const max = Math.max.apply(null, p.histogram.map(function (b) { return b.count; }).concat([1]));
+    const keep = Number($('cl-keep').value), rem = Number($('cl-remove').value);
+    p.histogram.forEach(function (b) {
+      const d = document.createElement('div');
+      const mid = (b.lo + b.hi) / 2;
+      d.className = mid >= keep ? 'b-keep' : (mid < rem ? 'b-remove' : 'b-uncertain');
+      d.style.height = Math.round(90 * b.count / max) + 'px';
+      d.title = b.lo.toFixed(2) + ' to ' + b.hi.toFixed(2) + ': ' + b.count;
+      h.appendChild(d);
+    });
+  }
+
+  function onSlider() {
+    let k = Number($('cl-keep').value), r = Number($('cl-remove').value);
+    if (r > k) { if (this && this.id === 'cl-keep') $('cl-remove').value = k; else $('cl-keep').value = r; }
+    sliderLabels();
+    clearTimeout(timer); timer = setTimeout(refresh, 200);
+  }
+  $('cl-keep').value = DEF.keep; $('cl-remove').value = DEF.remove;
+  $('cl-keep').addEventListener('input', onSlider);
+  $('cl-remove').addEventListener('input', onSlider);
+  $('cl-legacy').addEventListener('change', refresh);
+  $('cl-defaults').addEventListener('click', function () {
+    $('cl-keep').value = DEF.keep; $('cl-remove').value = DEF.remove; refresh();
   });
+
+  $('cl-apply').addEventListener('click', function () {
+    if (!preview) return;
+    const n = preview.counts.remove;
+    if (!n || !confirm('Remove ' + n + ' far faces from ' + personName + '? They go back to the unknown pool and will not be matched to ' + personName + ' again. You can undo this.')) return;
+    const btn = this; btn.disabled = true; $('cl-status').textContent = 'Removing…';
+    fetch(base + '/apply', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keep: Number($('cl-keep').value), remove: Number($('cl-remove').value),
+        include_legacy: $('cl-legacy').checked, confirm: true, expected_remove: n }) })
+      .then(json).then(function (d) {
+        $('cl-status').textContent = 'Removed ' + d.removed + ' faces.';
+        refresh();
+      }).catch(function (e) { $('cl-status').textContent = 'Failed: ' + e.message; refresh(); });
+  });
+
+  $('cl-undo').addEventListener('click', function () {
+    fetch(base + '/undo', { method: 'POST' }).then(json).then(function (d) {
+      $('cl-status').textContent = 'Restored ' + d.restored + ' faces.';
+      refresh();
+    }).catch(function (e) { $('cl-status').textContent = 'Undo failed: ' + e.message; });
+  });
+
+  function swipeParams() { return params(); }
+  $('cl-start-swipe').addEventListener('click', function () {
+    $('cl-swipe').style.display = 'block';
+    if (stack) { stack.reset(); return; }
+    stack = window.initSwipeStack({
+      stackElId: 'cl-swipe-stack',
+      confirmBtnId: 'cl-keep-btn',     // up   = keep
+      rejectBtnId: 'cl-remove-btn',    // down = remove
+      bufferSize: 10,
+      initialCards: [],
+      autoStart: true,
+      fetchMoreUrl: function (excl, bk, ba, need) { return base + '/uncertain?' + swipeParams() + '&count=' + (need || 10); },
+      renderCard: function (card) {
+        return {
+          imageUrl: cropUrl(card.ref),
+          questionHtml: 'Is this <strong>' + escapeHtml(personName) + '</strong>? ' +
+            '<img src="' + cropUrl(card.anchor_ref) + '" alt="anchor" style="height:56px;vertical-align:middle;border-radius:6px;margin-left:8px;" draggable="false">',
+          scoreText: 'similarity to anchor ' + card.score.toFixed(2),
+          metaHtml: window.swipeCardMeta ? swipeCardMeta(card) : '',
+          originalUrl: '/photo/' + card.file_id,
+        };
+      },
+      onConfirm: function (card) {
+        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'keep', include_legacy: $('cl-legacy').checked } };
+      },
+      onReject: function (card) {
+        return { url: base + '/decide', method: 'POST', body: { ref: card.ref, action: 'remove', include_legacy: $('cl-legacy').checked } };
+      },
+      onUndo: function (card) {
+        return { url: base + '/decide/' + card.face_id, method: 'DELETE' };
+      },
+      emptyStateHtml: function (el) {
+        el.innerHTML = '<div class="swipe-empty">No uncertain faces left to review.</div>';
+      },
+    });
+  });
+
+  loadFaces();
 })();
 </script>
 {% endblock %}

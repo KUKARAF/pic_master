@@ -748,10 +748,9 @@ class ManualDB(ThreadLocalDB):
             cur.execute('ALTER TABLE faces ADD COLUMN frame_index INTEGER')
         if 'favorite' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0')
-        # Backs the "cleanup low confidence matches" feature's "correct, don't
-        # ask again" action — a face marked this way is excluded from all
-        # future cleanup-queue builds regardless of how low its computed
-        # self-consistency score comes out.
+        # "A human verified this face is this person": set by the person cleanup's
+        # swipe "keep". Also set by an older, since-removed review queue, so rows
+        # carrying it are protected from any automatic removal.
         if 'reviewed_ok' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN reviewed_ok INTEGER NOT NULL DEFAULT 0')
         # Quarter-turns (0..3, clockwise) to apply to this face's crop when rendering
@@ -766,6 +765,13 @@ class ManualDB(ThreadLocalDB):
         # Lives on the face row so renames and merges carry it along.
         if 'profile_at' not in existing_face_cols2:
             cur.execute('ALTER TABLE faces ADD COLUMN profile_at INTEGER')
+        # How this face's person-assignment came to be: 'auto' (the auto-matcher promoted
+        # it, no human involved), 'human' (someone named/confirmed/assigned it), NULL
+        # (written before this column existed: unknown). The person cleanup only ever
+        # touches 'auto' rows (and NULL ones when the user opts in) -- see
+        # person_cleanup.eligibility.
+        if 'origin' not in existing_face_cols2:
+            cur.execute('ALTER TABLE faces ADD COLUMN origin TEXT')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_checksum ON file_tags (checksum)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_file_tags_tag_id ON file_tags (tag_id)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_manual_faces_checksum ON faces (checksum)')
@@ -818,7 +824,7 @@ class ManualDB(ThreadLocalDB):
         # the face out of the unknown pool): a negative keeps the face available to be
         # matched to the RIGHT person, it just bars this one identity. Keyed by
         # source_face_id (the media.db auto face id) because that survives the face
-        # being returned to the unknown pool. Powers the /person cleanup "broom".
+        # being returned to the unknown pool. Written by the /person cleanup (new anchor-based one).
         cur.execute('''
             CREATE TABLE IF NOT EXISTS face_identity_negatives (
                 source_face_id INTEGER NOT NULL,
@@ -829,6 +835,40 @@ class ManualDB(ThreadLocalDB):
         ''')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_face_neg_identity ON face_identity_negatives (identity)')
         cur.execute('CREATE INDEX IF NOT EXISTS idx_face_neg_source ON face_identity_negatives (source_face_id)')
+        # Person cleanup (anchor-based): the anchors the user picked per person, and an
+        # audit/undo log of every removal / sticky keep. A batch row is one user action
+        # (kind 'bulk' = "Remove N far faces", 'swipe_remove' / 'swipe_keep' = one card);
+        # an item row keeps the face's full pre-change row (JSON) so undo can put it back
+        # exactly. Additive only; nothing else reads these tables.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS person_cleanup_anchors (
+                identity   TEXT NOT NULL,
+                face_id    INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (identity, face_id)
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS person_cleanup_batches (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                identity   TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                params     TEXT,
+                created_at INTEGER NOT NULL,
+                undone_at  INTEGER
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS person_cleanup_items (
+                batch_id        INTEGER NOT NULL,
+                face_id         INTEGER NOT NULL,
+                source_face_id  INTEGER,
+                added_negative  INTEGER NOT NULL DEFAULT 0,
+                prev_row        TEXT NOT NULL,
+                PRIMARY KEY (batch_id, face_id)
+            )
+        ''')
+        cur.execute('CREATE INDEX IF NOT EXISTS idx_pc_batches_identity ON person_cleanup_batches (identity)')
         self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -2855,7 +2895,8 @@ class ManualDB(ThreadLocalDB):
         return cur.lastrowid
 
     def promote_auto_face(self, source_face_id, checksum, bbox, embedding_bytes, identity,
-                           image_width, image_height, frame_index=None, rotation=0):
+                           image_width, image_height, frame_index=None, rotation=0,
+                           auto_matched=False):
         """Naming an auto-detected face copies it into manual.db (upsert, keyed on source_face_id
         so renaming the same auto-detected face twice doesn't create a duplicate row). Clears
         any prior rejection — naming a face after all is a stronger, more recent signal.
@@ -2877,18 +2918,28 @@ class ManualDB(ThreadLocalDB):
         orientation — writing the two together keeps a row from ever existing with a
         rotated vector and an unrotated rotation, which is what a follow-up
         set_face_rotation UPDATE would briefly allow. The upsert branch overwrites it
-        too: re-confirming the same face at a new angle is the newer decision."""
+        too: re-confirming the same face at a new angle is the newer decision.
+
+        `auto_matched=True` is passed ONLY by the auto-matching pipeline (a face the
+        machine assigned via find_matching_identity); it records origin='auto'. Every
+        other caller is a human decision and records origin='human'. A machine
+        re-promotion never downgrades a row a human already confirmed."""
+        origin = 'auto' if auto_matched else 'human'
         x1, y1, x2, y2 = bbox
         cur = self.conn.cursor()
         cur.execute('''
             INSERT INTO faces (checksum, identity, x1,y1,x2,y2, embedding, bbox_source, source_face_id,
-                                image_width, image_height, rejected, created_at, frame_index, rotation)
-            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?, ?)
+                                image_width, image_height, rejected, created_at, frame_index, rotation,
+                                origin)
+            VALUES (?, ?, ?,?,?,?, ?, 'auto', ?, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(source_face_id) WHERE source_face_id IS NOT NULL
                 DO UPDATE SET identity=excluded.identity, rejected=0,
-                              embedding=excluded.embedding, rotation=excluded.rotation
+                              embedding=excluded.embedding, rotation=excluded.rotation,
+                              origin=CASE WHEN faces.origin = 'human' AND excluded.origin = 'auto'
+                                          THEN 'human' ELSE excluded.origin END
         ''', (checksum, identity, x1, y1, x2, y2, embedding_bytes, source_face_id,
-              image_width, image_height, int(time.time()), frame_index, int(rotation) % 4))
+              image_width, image_height, int(time.time()), frame_index, int(rotation) % 4,
+              origin))
         cur.execute('SELECT id FROM faces WHERE source_face_id = ?', (source_face_id,))
         new_id = cur.fetchone()[0]
 
@@ -2945,7 +2996,7 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
         self._face_ver += 1
 
-    # ---- Per-identity face negatives (the cleanup "broom"): bar one identity from a
+    # ---- Per-identity face negatives (written by the person cleanup): bar one identity from a
     # ---- face without removing it from the unknown pool (see the table comment).
 
     def add_face_identity_negative(self, source_face_id, identity):
@@ -2956,7 +3007,7 @@ class ManualDB(ThreadLocalDB):
         self.conn.commit()
 
     def remove_face_identity_negative(self, source_face_id, identity):
-        """Undo a face negative (the broom's Ctrl+Z)."""
+        """Undo a face negative (the cleanup's undo)."""
         cur = self.conn.cursor()
         cur.execute('DELETE FROM face_identity_negatives WHERE source_face_id = ? AND identity = ?',
                     (int(source_face_id), identity))
@@ -2976,6 +3027,203 @@ class ManualDB(ThreadLocalDB):
                     (int(source_face_id), identity))
         return cur.fetchone() is not None
 
+    # ---- Person cleanup (anchor-based; see person_cleanup.py). Every write below is ONE
+    # ---- transaction, and every removal/keep re-checks eligibility on the stored row
+    # ---- (the caller's candidate list is never trusted).
+
+    def get_identity_face_rows(self, identity):
+        """Every non-rejected face row (all columns) currently assigned to `identity`."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM faces WHERE identity = ? AND rejected = 0 ORDER BY id', (identity,))
+        return cur.fetchall()
+
+    def get_cleanup_anchor_ids(self, identity):
+        cur = self.conn.cursor()
+        cur.execute('SELECT face_id FROM person_cleanup_anchors WHERE identity = ? ORDER BY created_at, face_id',
+                    (identity,))
+        return [int(r[0]) for r in cur.fetchall()]
+
+    def set_cleanup_anchors(self, identity, face_ids):
+        """Replace the person's anchor set. Only faces currently assigned to `identity`
+        are accepted; returns the ids actually stored. Writes nothing to `faces`."""
+        valid = {int(r['id']) for r in self.get_identity_face_rows(identity)}
+        keep = []
+        for fid in face_ids:
+            fid = int(fid)
+            if fid in valid and fid not in keep:
+                keep.append(fid)
+        cur = self.conn.cursor()
+        try:
+            cur.execute('DELETE FROM person_cleanup_anchors WHERE identity = ?', (identity,))
+            now = int(time.time())
+            cur.executemany('INSERT INTO person_cleanup_anchors (identity, face_id, created_at) VALUES (?,?,?)',
+                            [(identity, fid, now) for fid in keep])
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        return keep
+
+    @staticmethod
+    def _row_to_json(row):
+        import base64
+        out = {}
+        for k in row.keys():
+            v = row[k]
+            out[k] = {'b64': base64.b64encode(v).decode('ascii')} if isinstance(v, (bytes, bytearray)) else v
+        return json.dumps(out)
+
+    @staticmethod
+    def _row_from_json(text):
+        import base64
+        d = json.loads(text)
+        return {k: (base64.b64decode(v['b64']) if isinstance(v, dict) and 'b64' in v else v)
+                for k, v in d.items()}
+
+    def _cleanup_batch(self, cur, identity, kind, params):
+        cur.execute('INSERT INTO person_cleanup_batches (identity, kind, params, created_at) VALUES (?,?,?,?)',
+                    (identity, kind, json.dumps(params or {}), int(time.time())))
+        return cur.lastrowid
+
+    def cleanup_remove_faces(self, identity, face_ids, include_legacy=False, kind='bulk', params=None):
+        """Un-assign `face_ids` from `identity` exactly like the old broom did: the manual
+        row is deleted (the media.db face falls back into the unknown pool) and a
+        per-identity negative is written so it is never re-matched to this person. The
+        pre-change row is logged for undo. Faces that are not currently this person's,
+        are not machine-assigned (person_cleanup.eligibility), or are anchors are
+        SKIPPED, never removed. Returns {batch_id, removed: [{face_id, source_face_id}],
+        skipped: [{face_id, reason}]}; batch_id is None if nothing was removed. Caller
+        must then call media.db mark_faces_handled(source ids, 0)."""
+        from media_manager import person_cleanup as pc
+        anchors = set(self.get_cleanup_anchor_ids(identity))
+        cur = self.conn.cursor()
+        removed, skipped = [], []
+        batch_id = None
+        try:
+            for fid in dict.fromkeys(int(f) for f in face_ids):
+                cur.execute('SELECT * FROM faces WHERE id = ?', (fid,))
+                row = cur.fetchone()
+                if row is None or row['identity'] != identity or row['rejected']:
+                    skipped.append({'face_id': fid, 'reason': 'not_assigned'})
+                    continue
+                if fid in anchors:
+                    skipped.append({'face_id': fid, 'reason': 'anchor'})
+                    continue
+                elig = pc.eligibility(row)
+                if elig == 'protected' or (elig == 'legacy' and not include_legacy):
+                    skipped.append({'face_id': fid, 'reason': 'protected' if elig == 'protected' else 'legacy'})
+                    continue
+                if batch_id is None:
+                    batch_id = self._cleanup_batch(cur, identity, kind, params)
+                src = int(row['source_face_id'])
+                cur.execute('INSERT OR IGNORE INTO face_identity_negatives (source_face_id, identity, created_at) '
+                            'VALUES (?,?,?)', (src, identity, int(time.time())))
+                added = cur.rowcount
+                cur.execute('INSERT INTO person_cleanup_items (batch_id, face_id, source_face_id, added_negative, prev_row) '
+                            'VALUES (?,?,?,?,?)', (batch_id, fid, src, added, self._row_to_json(row)))
+                cur.execute('DELETE FROM faces WHERE id = ?', (fid,))
+                removed.append({'face_id': fid, 'source_face_id': src})
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        if removed:
+            self._face_ver += 1
+        return {'batch_id': batch_id, 'removed': removed, 'skipped': skipped}
+
+    def cleanup_keep_faces(self, identity, face_ids, include_legacy=False):
+        """Sticky keep for swipe-right: a machine-assigned face the user vouched for is
+        marked human-confirmed (origin='human', reviewed_ok=1) so it is never a cleanup
+        candidate again. Rows that are not eligible (in particular anything a human
+        already set) are NOT rewritten. Returns {batch_id, kept, skipped}."""
+        from media_manager import person_cleanup as pc
+        cur = self.conn.cursor()
+        kept, skipped = [], []
+        batch_id = None
+        try:
+            for fid in dict.fromkeys(int(f) for f in face_ids):
+                cur.execute('SELECT * FROM faces WHERE id = ?', (fid,))
+                row = cur.fetchone()
+                if row is None or row['identity'] != identity or row['rejected']:
+                    skipped.append({'face_id': fid, 'reason': 'not_assigned'})
+                    continue
+                elig = pc.eligibility(row)
+                if elig == 'protected' or (elig == 'legacy' and not include_legacy):
+                    skipped.append({'face_id': fid, 'reason': 'protected' if elig == 'protected' else 'legacy'})
+                    continue
+                if batch_id is None:
+                    batch_id = self._cleanup_batch(cur, identity, 'swipe_keep', None)
+                cur.execute('INSERT INTO person_cleanup_items (batch_id, face_id, source_face_id, added_negative, prev_row) '
+                            'VALUES (?,?,?,0,?)', (batch_id, fid, row['source_face_id'], self._row_to_json(row)))
+                cur.execute("UPDATE faces SET origin = 'human', reviewed_ok = 1 WHERE id = ?", (fid,))
+                kept.append(fid)
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        if kept:
+            self._face_ver += 1
+        return {'batch_id': batch_id, 'kept': kept, 'skipped': skipped}
+
+    def get_last_cleanup_batch(self, identity, kinds=('bulk',)):
+        cur = self.conn.cursor()
+        q = ','.join('?' * len(kinds))
+        cur.execute(f'SELECT * FROM person_cleanup_batches WHERE identity = ? AND undone_at IS NULL '
+                    f'AND kind IN ({q}) ORDER BY id DESC LIMIT 1', (identity, *kinds))
+        return cur.fetchone()
+
+    def get_last_swipe_batch_for_face(self, identity, face_id):
+        cur = self.conn.cursor()
+        cur.execute('SELECT b.* FROM person_cleanup_batches b JOIN person_cleanup_items i ON i.batch_id = b.id '
+                    "WHERE b.identity = ? AND b.undone_at IS NULL AND b.kind IN ('swipe_keep','swipe_remove') "
+                    'AND i.face_id = ? ORDER BY b.id DESC LIMIT 1', (identity, int(face_id)))
+        return cur.fetchone()
+
+    def undo_cleanup_batch(self, batch_id):
+        """Undo one logged batch: removed faces get their row back (same id, same
+        identity/embedding/flags) and the negative this batch added is dropped; kept
+        faces get their old origin/reviewed_ok back. A removed face whose source was
+        meanwhile assigned elsewhere is not resurrected (reported in `skipped`).
+        Returns {restored: [{face_id, source_face_id}], skipped: [...]} or None if the
+        batch is unknown / already undone."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT * FROM person_cleanup_batches WHERE id = ? AND undone_at IS NULL', (int(batch_id),))
+        batch = cur.fetchone()
+        if batch is None:
+            return None
+        identity = batch['identity']
+        restored, skipped = [], []
+        try:
+            cur.execute('SELECT * FROM person_cleanup_items WHERE batch_id = ?', (batch['id'],))
+            for item in cur.fetchall():
+                prev = self._row_from_json(item['prev_row'])
+                fid = int(item['face_id'])
+                if batch['kind'] == 'swipe_keep':
+                    cur.execute('UPDATE faces SET origin = ?, reviewed_ok = ? WHERE id = ? AND identity = ?',
+                                (prev.get('origin'), prev.get('reviewed_ok') or 0, fid, identity))
+                    restored.append({'face_id': fid, 'source_face_id': item['source_face_id']})
+                    continue
+                src = item['source_face_id']
+                cur.execute('SELECT 1 FROM faces WHERE id = ? OR source_face_id = ?', (fid, src))
+                if cur.fetchone() is not None:
+                    skipped.append({'face_id': fid, 'reason': 'source_reassigned'})
+                    continue
+                cols = list(prev.keys())
+                cur.execute(f'INSERT INTO faces ({",".join(cols)}) VALUES ({",".join("?" * len(cols))})',
+                            [prev[c] for c in cols])
+                if item['added_negative']:
+                    cur.execute('DELETE FROM face_identity_negatives WHERE source_face_id = ? AND identity = ?',
+                                (src, identity))
+                restored.append({'face_id': fid, 'source_face_id': src})
+            cur.execute('UPDATE person_cleanup_batches SET undone_at = ? WHERE id = ?', (int(time.time()), batch['id']))
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        self._face_ver += 1
+        return {'restored': restored, 'skipped': skipped, 'kind': batch['kind'], 'identity': identity}
+
+
     def set_face_rotation(self, manual_face_id, rotation, embedding_bytes=None):
         """Persist a manual 90° rotation (0..3 quarter-turns, clockwise) on a face so
         its crop renders upright everywhere. When `embedding_bytes` is given, replace
@@ -2993,16 +3241,8 @@ class ManualDB(ThreadLocalDB):
 
     def assign_identity(self, manual_face_id, name):
         cur = self.conn.cursor()
-        cur.execute('UPDATE faces SET identity = ?, rejected = 0 WHERE id = ?', (name.strip(), manual_face_id))
-        self.conn.commit()
-        self._face_ver += 1
-
-    def mark_face_reviewed_ok(self, manual_face_id):
-        """"Correct, don't ask again" from the cleanup-low-confidence-matches
-        review — excludes this face from all future cleanup-queue builds
-        regardless of its computed self-consistency score."""
-        cur = self.conn.cursor()
-        cur.execute('UPDATE faces SET reviewed_ok = 1 WHERE id = ?', (manual_face_id,))
+        cur.execute("UPDATE faces SET identity = ?, rejected = 0, origin = 'human' WHERE id = ?",
+                    (name.strip(), manual_face_id))
         self.conn.commit()
         self._face_ver += 1
 
@@ -3033,6 +3273,8 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE faces SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE body_identities SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE face_identity_negatives SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE person_cleanup_anchors SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE person_cleanup_batches SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))
@@ -3285,25 +3527,6 @@ class ManualDB(ThreadLocalDB):
         manual.db face."""
         cur = self.conn.cursor()
         cur.execute('SELECT id, checksum, identity, embedding FROM faces WHERE rejected = 0')
-        return cur.fetchall()
-
-    def get_confirmed_faces_for_cleanup(self):
-        """Return [(id, checksum, identity, embedding_bytes, reviewed_ok), ...],
-        deduplicated to one row per (checksum, identity) pair (see
-        list_confirmed_faces for why duplicates happen) — the
-        cleanup-low-confidence-matches feature needs ALL of an identity's
-        (unique) faces, including already-reviewed ones, to build that
-        identity's comparison pool, then filters to reviewed_ok = 0 for which
-        faces actually become review candidates. Without deduping here, a
-        duplicate confirmation of the exact same face would inflate its
-        identity's comparison pool and, being near-identical to itself, would
-        never look like the outlier it might actually be hiding."""
-        cur = self.conn.cursor()
-        cur.execute('''
-            SELECT MAX(id) AS id, checksum, identity, embedding, reviewed_ok FROM faces
-            WHERE identity IS NOT NULL AND rejected = 0
-            GROUP BY checksum, identity
-        ''')
         return cur.fetchall()
 
     @staticmethod
