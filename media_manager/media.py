@@ -4,6 +4,8 @@ import shutil
 import subprocess
 import sys
 import os
+import threading
+import time
 from media_manager import MediaManager
 from media_manager import geonames
 from media_manager import worker_config
@@ -69,6 +71,77 @@ def _spawn_colocated_worker(port, preload=False):
     print(f"[web] spawned co-located worker (pid {child.pid}) at {url}; "
           f"offloading enabled.", flush=True)
     return child
+
+
+class _WorkerSupervisor:
+    """Keeps the co-located worker child alive for `media web --with-worker`.
+
+    A daemon thread polls the child; when it exits unexpectedly it logs the exit
+    code and respawns with exponential backoff. Crash-loop cap: at most
+    ``max_restarts`` respawns inside ``window`` seconds, after which it gives up
+    (logged loudly) rather than hammering a broken install. ``spawn`` returns a
+    Popen-like object (poll/terminate/wait/kill/pid)."""
+
+    def __init__(self, spawn, child, *, poll_interval=2.0, backoff_initial=1.0,
+                 backoff_max=30.0, max_restarts=5, window=300.0,
+                 clock=time.monotonic, sleep=None):
+        self._spawn = spawn
+        self.child = child
+        self._poll = poll_interval
+        self._backoff_initial = backoff_initial
+        self._backoff_max = backoff_max
+        self._max_restarts = max_restarts
+        self._window = window
+        self._clock = clock
+        self._stop = threading.Event()
+        self._sleep = sleep or (lambda secs: self._stop.wait(secs))
+        self._restarts = []
+        self.gave_up = False
+        self._thread = threading.Thread(target=self._run, name='worker-supervisor', daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def _run(self):
+        backoff = self._backoff_initial
+        while not self._stop.is_set():
+            code = self.child.poll()
+            if code is None:
+                self._sleep(self._poll)
+                continue
+            if self._stop.is_set():
+                return
+            now = self._clock()
+            self._restarts = [t for t in self._restarts if now - t < self._window]
+            print(f"[web] co-located worker (pid {self.child.pid}) exited with code {code}", file=sys.stderr, flush=True)
+            if len(self._restarts) >= self._max_restarts:
+                self.gave_up = True
+                print(f"[web] worker crashed {self._max_restarts}x within {int(self._window)}s; "
+                      f"giving up respawning. Restart `media web --with-worker` after fixing it.",
+                      file=sys.stderr, flush=True)
+                return
+            print(f"[web] respawning worker in {backoff:.0f}s...", file=sys.stderr, flush=True)
+            self._sleep(backoff)
+            if self._stop.is_set():
+                return
+            self._restarts.append(self._clock())
+            try:
+                self.child = self._spawn()
+            except OSError as exc:
+                print(f"[web] worker respawn failed: {exc}", file=sys.stderr, flush=True)
+                backoff = min(backoff * 2, self._backoff_max)
+                continue
+            if self._clock() - now > 60:
+                backoff = self._backoff_initial
+            else:
+                backoff = min(backoff * 2, self._backoff_max)
+
+    def stop(self):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=5)
+        _stop_colocated_worker(self.child)
 
 
 def _stop_colocated_worker(child):
@@ -972,12 +1045,15 @@ def main():
         # window could build a local model instead of offloading.
         worker_child = None
         if args.with_worker:
-            worker_child = _spawn_colocated_worker(args.worker_port, preload=args.preload_worker)
+            worker_child = _WorkerSupervisor(
+                lambda: _spawn_colocated_worker(args.worker_port, preload=args.preload_worker),
+                _spawn_colocated_worker(args.worker_port, preload=args.preload_worker)).start()
         try:
             app = create_app(data_root)
         except RuntimeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
-            _stop_colocated_worker(worker_child)
+            if worker_child is not None:
+                worker_child.stop()
             return 1
         host = args.host_pos or args.host
         ssl_kwargs = {}
@@ -1010,7 +1086,8 @@ def main():
         finally:
             # uvicorn.run returns when the server stops (Ctrl-C / SIGTERM), so this
             # is the natural place to tear the co-located worker down with it.
-            _stop_colocated_worker(worker_child)
+            if worker_child is not None:
+                worker_child.stop()
         return 0
 
     elif args.cmd == 'worker':

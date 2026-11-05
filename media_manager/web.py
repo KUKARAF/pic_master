@@ -8220,10 +8220,13 @@ def create_app(data_root: str) -> FastAPI:
             progress = ''
             if status.get('current_epoch') and status.get('total_epochs'):
                 progress = f' — epoch {status["current_epoch"]}/{status["total_epochs"]}'
+            wait_note = status.get('worker_wait')
+            if wait_note:
+                progress = ' — waiting for worker'
             return {
                 'kind': kind, 'label': label, 'disabled': True, 'href': None,
                 'text': f'{noun}: training…{progress} ({elapsed_min}m)',
-                'title': 'Cancel to stop, or check the log for detail.',
+                'title': wait_note or 'Cancel to stop, or check the log for detail.',
                 'cancel_url': f'/api/tags/{quote(label)}/train-cancel?kind={kind}', 'log_url': log_url,
             }
         if status and status.get('status') == 'needs_retrain':

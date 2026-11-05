@@ -45,7 +45,26 @@ _YOLO_UPLOAD_BATCH = 16       # images per train_add — keeps each RNS request 
 _CLIP_UPLOAD_BATCH = 64   # (embedding-classifier batches; name kept)
 _KIND_TO_SPACE = {v['dir_kind']: k for k, v in SPACES.items()}
 _POLL_INTERVAL = 3.0
-_MAX_POLL_ERRORS = 5          # consecutive status-poll failures before giving up
+_MAX_POLL_ERRORS = 5          # consecutive status-poll failures before giving up (worker up but erroring)
+_MAX_JOB_RESTARTS = 2         # re-create + re-upload attempts if the worker lost the job (restart)
+_BACKOFF_INITIAL = 2.0
+_BACKOFF_MAX = 30.0
+_NOT_RUNNING_MSG = ('worker not running — start it or restart `media web --with-worker`')
+
+
+def _reconnect_window():
+    """Seconds to keep retrying an unreachable worker (env MEDIA_TRAIN_WORKER_RECONNECT_SECS, default 180)."""
+    try:
+        return float(os.environ.get('MEDIA_TRAIN_WORKER_RECONNECT_SECS', '180'))
+    except ValueError:
+        return 180.0
+
+
+_sleep = time.sleep  # indirection so tests can run without real waiting
+
+
+class JobLost(Exception):
+    """The worker is back but has no record of our job (it restarted; state lost)."""
 
 # Set once the remote job exists, so the SIGTERM handler (web.py's cancel path
 # kills this driver) can cancel the worker-side job.
@@ -97,10 +116,7 @@ def train_for_tag(data_root, tag_label, kind):
     started_at = int(time.time())
     write_status(out_dir, status='running', pid=pid, started_at=started_at)
     try:
-        if kind == 'yolo_model':
-            _drive_yolo(data_root, tag_label, out_dir, pid, started_at)
-        else:
-            _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind)
+        _drive_with_recovery(data_root, tag_label, out_dir, pid, started_at, kind)
     except Exception as exc:  # hook-allow: broad — top-level boundary records failure then re-raises
         write_status(out_dir, status='failed', pid=pid, started_at=started_at,
                      error=str(exc), failed_at=int(time.time()))
@@ -108,11 +124,69 @@ def train_for_tag(data_root, tag_label, kind):
         raise
 
 
+def _drive_with_recovery(data_root, tag_label, out_dir, pid, started_at, kind):
+    """Run the driver; if the worker vanished or lost our job mid-run (web
+    restart, crash) wait for it and redo create + upload + run from scratch."""
+    from media_manager.worker_client import WorkerUnavailable  # hook-allow: lazy — worker_client pulls cv2/requests
+    restarts = 0
+    while True:
+        try:
+            if kind == 'yolo_model':
+                _drive_yolo(data_root, tag_label, out_dir, pid, started_at)
+            else:
+                _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind)
+            return
+        except (JobLost, WorkerUnavailable) as exc:
+            restarts += 1
+            if restarts > _MAX_JOB_RESTARTS:
+                raise RuntimeError(
+                    f'Remote training kept losing its worker job ({restarts} restarts): {exc}. '
+                    f'Check that the worker stays up ({_NOT_RUNNING_MSG}), then retry.')
+            _active.update(client=None, job_id=None)
+            _log(out_dir, f'worker job lost or worker unreachable ({exc}); waiting, then restarting upload '
+                          f'[restart {restarts}/{_MAX_JOB_RESTARTS}]')
+            _wait_for_worker(_client(data_root), out_dir, pid, started_at, str(exc))
+
+
 def _require_worker(client, out_dir):
     if not client.is_available():
         raise RuntimeError(
-            'Worker unavailable — start/configure the media worker to train '
+            f'Worker unavailable: {_NOT_RUNNING_MSG} '
             '(this build offloads training to the worker with no local fallback).')
+
+
+def _wait_for_worker(client, out_dir, pid, started_at, why):
+    """Block with exponential backoff until the worker answers again, for at most
+    the reconnect window. Publishes a visible 'waiting for worker' note in the
+    status + log meanwhile. Probes with a status call for a nonexistent job: any
+    reply at all (even 'unknown job') means the HTTP service is back."""
+    from media_manager.worker_client import WorkerUnavailable  # hook-allow: lazy — worker_client pulls cv2/requests
+    window = _reconnect_window()
+    waited, delay, first = 0.0, _BACKOFF_INITIAL, True
+    while True:
+        try:
+            client.train_status('__probe__')
+        except WorkerUnavailable:
+            pass
+        except Exception:  # hook-allow: broad — worker answered (with an error), so it is reachable
+            break
+        else:
+            break
+        if waited >= window:
+            msg = f'{_NOT_RUNNING_MSG} (gave up after {int(window)}s; {why})'
+            raise RuntimeError(msg)
+        if first:
+            first = False
+            _log(out_dir, f'WARNING: {_NOT_RUNNING_MSG}; {why}. Retrying for up to {int(window)}s...')
+        write_status(out_dir, status='running', pid=pid, started_at=started_at,
+                     worker_wait=f'{_NOT_RUNNING_MSG} (waiting {int(waited)}s/{int(window)}s)')
+        step = min(delay, max(window - waited, 0.0)) or delay
+        _sleep(step)
+        waited += step
+        delay = min(delay * 2, _BACKOFF_MAX)
+    if not first:
+        _log(out_dir, f'worker reachable again after ~{int(waited)}s')
+    write_status(out_dir, status='running', pid=pid, started_at=started_at)
 
 
 def _drive_yolo(data_root, tag_label, out_dir, pid, started_at):
@@ -266,12 +340,35 @@ def _drive_clip(data_root, tag_label, out_dir, pid, started_at, kind='siglip_mod
 
 
 def _poll_until_done(client, job_id, out_dir, pid, started_at, kind, done_extra):
+    from media_manager.worker_client import WorkerUnavailable  # hook-allow: lazy — worker_client pulls cv2/requests
     consecutive_errors = 0
+    down_since = None
     while True:
-        time.sleep(_POLL_INTERVAL)
+        _sleep(_POLL_INTERVAL)
         try:
             st = client.train_status(job_id)
             consecutive_errors = 0
+            if down_since is not None:
+                _log(out_dir, 'worker reachable again; resuming status polling')
+                write_status(out_dir, status='running', pid=pid, started_at=started_at)
+                down_since = None
+        except WorkerUnavailable as exc:
+            # Worker down (web restarting / crashed + being respawned): back off
+            # for the reconnect window instead of failing on the first refusal.
+            now = time.monotonic()
+            if down_since is None:
+                down_since = now
+                _log(out_dir, f'WARNING: {_NOT_RUNNING_MSG} ({exc}). Waiting up to '
+                              f'{int(_reconnect_window())}s for it to come back...')
+            elapsed = now - down_since
+            if elapsed >= _reconnect_window():
+                raise RuntimeError(f'Lost contact with the worker during training: {_NOT_RUNNING_MSG} '
+                                   f'(unreachable for {int(elapsed)}s)')
+            write_status(out_dir, status='running', pid=pid, started_at=started_at,
+                         worker_wait=f'{_NOT_RUNNING_MSG} (unreachable {int(elapsed)}s)')
+            _sleep(min(_BACKOFF_MAX, _POLL_INTERVAL * 2 ** min(consecutive_errors, 4)))
+            consecutive_errors += 1
+            continue
         except Exception as exc:  # hook-allow: broad — transient poll errors counted, then raised
             consecutive_errors += 1
             _log(out_dir, f'status poll error ({exc}) [{consecutive_errors}/{_MAX_POLL_ERRORS}]')
@@ -279,6 +376,8 @@ def _poll_until_done(client, job_id, out_dir, pid, started_at, kind, done_extra)
                 raise RuntimeError(f'Lost contact with the worker during training: {exc}')
             continue
 
+        if st.get('status') == 'failed' and st.get('error') == 'unknown job':
+            raise JobLost('worker no longer knows this job (it was restarted)')
         _worker_tail[0] = st.get('log_tail') or ''
         _flush_log(out_dir)
         status = st.get('status')
