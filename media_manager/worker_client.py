@@ -990,6 +990,93 @@ def embed_both(client, items, batch_size: int = 16, workers: int = 3, on_batch=N
 
 
 # ---------------------------------------------------------------------------
+# Person-masked SigLIP 2 + DINOv2 embedding (location_mask.py / the 'place' location model).
+# Same transports as embed_both (shared-disk paths when the worker sees data_root, else upload)
+# and the same containment checks; an old worker raises WorkerError("... needs redeploy").
+# ---------------------------------------------------------------------------
+
+class MaskedResult:
+    """Aligned with the input items: vectors (np.float32) or None + error / coverage per item."""
+
+    def __init__(self, n):
+        self.siglip = [None] * n
+        self.dino = [None] * n
+        self.errors = [None] * n
+        self.coverage = [None] * n
+        self.siglip_model = None
+        self.dino_model = None
+        self.mode = "upload"
+
+
+def _masked_request(client, path, req, timeout):
+    try:
+        resp = client.request(path, req, timeout=timeout, retries=0, concurrent=True)
+    except WorkerError as exc:
+        if "no handler" in str(exc):
+            raise WorkerError(f"embed_masked: worker needs redeploy (does not know {path!r})") from exc
+        raise
+    if resp.get("masked_proto") != worker_protocol.MASKED_PROTOCOL_VERSION:
+        raise WorkerError(f"embed_masked: worker masked protocol {resp.get('masked_proto')!r} != expected "
+                          f"{worker_protocol.MASKED_PROTOCOL_VERSION} -- worker needs redeploy")
+    _check_embed_proto(resp, "embed_masked")
+    if resp.get("error"):
+        raise WorkerError(resp["error"])
+    return resp
+
+
+def embed_masked(client, items, data_root=None, timeout=60, max_coverage=0.5) -> MaskedResult:
+    """SigLIP 2 + DINOv2 vectors of person-masked images. ``items`` = [(path, boxes)], boxes =
+    normalised [x1,y1,x2,y2] regions to fill. Items inside ``data_root`` go by relative path when
+    the worker can see it (no bytes); the rest are uploaded. Per-item failures give None + an error;
+    transport failures raise WorkerUnavailable / WorkerError (stale worker: "needs redeploy")."""
+    items = list(items)
+    n = len(items)
+    out = MaskedResult(n)
+    rels = [None] * n
+    if data_root and n and _worker_sees_data_root(client, data_root):
+        root_real = os.path.realpath(data_root)
+        rels = [_rel_under_root(p, root_real) for p, _b in items]
+    p_idx = [k for k in range(n) if rels[k] is not None]
+    u_idx = [k for k in range(n) if rels[k] is None]
+    out.mode = "paths" if len(p_idx) == n and n else ("mixed" if p_idx else "upload")
+    replies = []
+    if p_idx:
+        client.record("embed_masked", f"{len(p_idx)} paths")
+        replies.append((p_idx, _masked_request(
+            client, worker_protocol.PATH_EMBED_MASKED_PATHS,
+            {"data_root": data_root, "paths": [rels[k] for k in p_idx],
+             "boxes": [items[k][1] for k in p_idx], "max_coverage": max_coverage}, timeout)))
+    if u_idx:
+        payload, ks = [], []
+        for k in u_idx:
+            try:
+                name, data = _item_to_named_bytes(items[k][0], k)
+            except (OSError, ValueError) as exc:
+                out.errors[k] = f"read failed: {exc}"
+                continue
+            payload.append({"name": name, "image": data, "boxes": items[k][1]})
+            ks.append(k)
+        if payload:
+            client.record("embed_masked", f"{len(payload)} items")
+            replies.append((ks, _masked_request(client, worker_protocol.PATH_EMBED_MASKED_BATCH,
+                                                {"items": payload, "max_coverage": max_coverage}, timeout)))
+    for ks, resp in replies:
+        results = resp.get("results") or []
+        if len(results) != len(ks):
+            raise WorkerError(f"embed_masked: worker returned {len(results)} results for {len(ks)} items")
+        if resp.get("siglip_model"):
+            out.siglip_model, out.dino_model = resp.get("siglip_model"), resp.get("dino_model")
+        for k, r in zip(ks, results):
+            out.coverage[k] = r.get("coverage")
+            if r.get("error") or r.get("siglip") is None or r.get("dino") is None:
+                out.errors[k] = r.get("error") or "no embedding returned"
+                continue
+            out.siglip[k] = np.frombuffer(r["siglip"], dtype=np.float32).copy()
+            out.dino[k] = np.frombuffer(r["dino"], dtype=np.float32).copy()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Find-by-pattern, DINOv2-L dense cells (pattern_dino.py) on the worker.
 # Same two transports as embed_both (shared-disk paths when the worker can see data_root, else
 # upload), same "worker needs redeploy" contract: an old worker (HTTP 404), a different protocol

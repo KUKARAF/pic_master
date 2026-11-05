@@ -74,6 +74,11 @@
   <input type="checkbox" id="location-honor-negatives-toggle" checked>
   Honor negatives (steer ranking away from rejected photos, not just hide them)
 </label>
+<label class="sub" id="location-mask-label" style="display:flex;align-items:center;gap:6px;margin-bottom:6px;"
+       title="Place model only: re-checks the top candidates with the people painted out (needs the ML worker; results are cached, so the first look can take a few seconds).">
+  <input type="checkbox" id="location-mask-toggle" checked>
+  Re-check top matches with people masked out (background only)
+</label>
 <label class="sub" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap;">
   Suggest using
   <select id="location-model-select" title="Which embedding model ranks the suggestions. SigLIP 2 / DINOv2 need Index SigLIP 2 + DINOv2 on /bulk.">
@@ -391,7 +396,8 @@
       '&avoid_existing=' + String(!avoidToggle || avoidToggle.checked) +
       '&honor_negatives=' + String(!!honorNegativesToggle && honorNegativesToggle.checked) +
       '&background=' + String(!bgToggle || bgToggle.checked) +
-      '&model=' + encodeURIComponent(currentModel);
+      '&model=' + encodeURIComponent(currentModel) +
+      '&mask=' + String(!maskToggle || maskToggle.checked);
   }
 
   /* Embedding model driving the suggestions ('place' = combined + people/geo correction, default | 'combined' = DINOv2 + SigLIP 2 | 'siglip' | 'dino' | legacy 'clip',
@@ -402,6 +408,7 @@
   const BG_TIP = 'background matching uses the CLIP tile index; not available for SigLIP/DINOv2';
   const modelSelect = document.getElementById('location-model-select');
   const modelNotice = document.getElementById('location-model-notice');
+  const maskToggle = document.getElementById('location-mask-toggle');
   function loadModel() {
     try {
       const m = localStorage.getItem(MODEL_KEY);
@@ -431,6 +438,15 @@
       modelNotice.textContent = cov.members_embedded + ' of ' + cov.members_total + ' photos here have no ' +
         MODEL_LABELS[currentModel] + ' embedding yet \u2014 run Index SigLIP 2 + DINOv2 on /bulk';
       modelNotice.style.display = '';
+    } else if (data && data.stage2 && (data.stage2.state === 'worker_outdated' || data.stage2.state === 'worker_unavailable')) {
+      modelNotice.textContent = (data.stage2.state === 'worker_outdated'
+        ? 'The ML worker is out of date (no people-masking support) \u2014 redeploy it. '
+        : 'The ML worker is unreachable. ') + 'Showing the people-aware ranking without the background-only re-check.';
+      modelNotice.style.display = '';
+    } else if (data && data.stage2 && data.stage2.state === 'partial') {
+      modelNotice.textContent = 'Background-only re-check in progress: ' + data.stage2.pending +
+        ' more photos are being processed and will improve the order on the next refill.';
+      modelNotice.style.display = '';
     } else if (psc && psc.pool_total && psc.unscanned_pct >= 20) {
       modelNotice.textContent = psc.unscanned_pct + '% of the candidate photos are not yet person-scanned, so people ' +
         'cannot be discounted for them \u2014 run the object index / face scan for better place matches.';
@@ -452,10 +468,11 @@
     if (w.people_penalty) tips.push('same people (' + (w.people || []).join(', ') + ') ' + sg(w.people_penalty));
     if (w.geo) tips.push('GPS ' + sg(w.geo) + (w.geo_km != null ? ' (' + w.geo_km + ' km)' : ''));
     if (w.co) tips.push('same shoot / set / folder ' + sg(w.co));
-    if (w.masked != null) tips.push('background-only (masked) similarity ' + w.masked);
+    if (w.masked != null) tips.push('background-only (masked) similarity ' + w.masked + (w.final != null ? ', final ' + w.final : ''));
+    else if (w.stage2) tips.push('background re-check: ' + w.stage2);
     const tag = w.total ? sg(w.total) : '\u00b10';
     return ' <span class="sub" style="cursor:help;border-bottom:1px dotted;" title="' + escapeHtml(tips.join('\n')).replace(/"/g, '&quot;') +
-      '">place ' + tag + (w.people ? ' \u00b7 same people' : '') + (w.scanned ? '' : ' \u00b7 unscanned') + '</span>';
+      '">place ' + tag + (w.people ? ' \u00b7 same people' : '') + (w.scanned ? '' : ' \u00b7 unscanned') + (w.masked != null ? ' \u00b7 bg-checked' : '') + '</span>';
   }
 
   // Background matching runs on the (optional) Tiles index — say how much of it exists.
@@ -667,6 +684,9 @@
       fetchAndLaunch();
     });
   }
+  if (maskToggle) maskToggle.addEventListener('change', function() {
+    if (currentModel === 'place') fetchAndLaunch();
+  });
 
   // A non-default saved model is fetched up front so the missing-embeddings
   // notice can show; the legacy CLIP model keeps the original lazy first fetch.

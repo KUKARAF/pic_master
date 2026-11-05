@@ -428,6 +428,63 @@ def _coverage(store, scanned_pool, pool_n):
             'unscanned_pct': round(100.0 * (1 - pool_scanned / pool_n), 1) if pool_n else 0.0}
 
 
+def file_regions(db, file_ids):
+    """{file_id: {'scanned': bool, 'regions': [[x1,y1,x2,y2] px], 'wh': (w, h)}} for the given
+    files, from the same tables and rules as PersonStore (person-like + crowd boxes, faces
+    expanded to body-ish boxes). `scanned` False = never scanned for persons (no detections row
+    or faces row) or boxes whose frame size is unknown: callers must not treat it as person-free."""
+    from media_manager import body_index  # hook-allow: lazy -- PIL/compute imports
+    classes = tuple(body_index.PERSON_LIKE_CLASSES) + EXTRA_PERSON_CLASSES
+    cq = ','.join('?' * len(classes))
+    ids = [int(i) for i in file_ids]
+    out = {}
+    conn = db.conn
+    for s in range(0, len(ids), 400):
+        chunk = ids[s:s + 400]
+        q = ','.join('?' * len(chunk))
+        dims = {}
+        for fid, w, h in conn.execute(f'SELECT id, width, height FROM files WHERE id IN ({q}) '
+                                      'AND width > 0 AND height > 0', chunk):
+            dims[fid] = (w, h)
+        for fid, w, h in conn.execute(f'SELECT file_id, width, height FROM phashes WHERE file_id IN ({q}) '
+                                      'AND width > 0 AND height > 0', chunk):
+            dims.setdefault(fid, (w, h))
+        persons, faces = defaultdict(list), defaultdict(list)
+        scanned = set()
+        for fid, x1, y1, x2, y2 in conn.execute(
+                f'SELECT file_id, x1, y1, x2, y2 FROM detections WHERE file_id IN ({q}) '
+                f'AND class_name IN ({cq}) AND confidence >= ? AND frame_index IS NULL AND x1 IS NOT NULL',
+                (*chunk, *classes, PERSON_BOX_MIN_CONF)):
+            persons[fid].append([x1, y1, x2, y2])
+        for (fid,) in conn.execute(f'SELECT DISTINCT file_id FROM detections WHERE file_id IN ({q}) '
+                                   'AND frame_index IS NULL', chunk):
+            scanned.add(fid)
+        for (fid,) in conn.execute(f'SELECT DISTINCT file_id FROM faces WHERE file_id IN ({q})', chunk):
+            scanned.add(fid)
+        for fid, bbox in conn.execute(
+                f"SELECT file_id, bbox FROM faces WHERE file_id IN ({q}) AND frame_index IS NULL "
+                "AND det_score >= ? AND (identity IS NULL OR identity != '__indexed__')",
+                (*chunk, FACE_MIN_SCORE)):
+            try:
+                b = json.loads(bbox)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(b, list) and len(b) == 4:
+                faces[fid].append([float(v) for v in b])
+        for fid in chunk:
+            wh = dims.get(fid)
+            has_boxes = bool(persons.get(fid) or faces.get(fid))
+            if fid not in scanned or (has_boxes and wh is None):
+                out[fid] = {'scanned': False, 'regions': [], 'wh': wh or (0, 0)}
+                continue
+            if not has_boxes:
+                out[fid] = {'scanned': True, 'regions': [], 'wh': wh or (0, 0)}
+                continue
+            regions, wh2 = person_regions(faces.get(fid, ()), persons.get(fid, ()), *wh)
+            out[fid] = {'scanned': True, 'regions': regions, 'wh': wh2}
+    return out
+
+
 # ============================================================================ offline use
 
 def fused_rank_numpy(db, member_ids, negative_ids=None, weights=None):

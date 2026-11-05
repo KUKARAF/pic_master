@@ -445,6 +445,25 @@ class Database(ThreadLocalDB):
             )
         ''')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_tile_file ON tile_embeddings(file_id)')
+        # Lazy person-masked SigLIP 2 + DINOv2 vectors (location_mask.py, stage 2 of the
+        # 'place' location model): the photo with its person regions filled by the mean
+        # colour, embedded on demand for the candidates a user is actually reviewing.
+        # Derived + rebuildable, additive. Keyed by (file, hash of the mask boxes, recipe) so
+        # a changed person detection or a new masking recipe simply misses and recomputes.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS place_masked_embeddings (
+                file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                box_hash     TEXT NOT NULL,
+                recipe       TEXT NOT NULL,
+                siglip       BLOB NOT NULL,
+                dino         BLOB NOT NULL,
+                siglip_model TEXT,
+                dino_model   TEXT,
+                coverage     REAL,
+                created_at   INTEGER NOT NULL,
+                PRIMARY KEY (file_id, box_hash, recipe)
+            )
+        ''')
         # DINOv2 region descriptors (overlapping grid crops) for instance-level object
         # search; box (x1,y1,x2,y2) in ORIGINAL pixels; embedding is raw float32
         # .tobytes(); wholesale-replaced per file (see insert_object_regions). This is
@@ -1405,6 +1424,42 @@ class Database(ThreadLocalDB):
         self.conn.commit()
         setattr(self, f'_{space}_ver', getattr(self, f'_{space}_ver') + 1)
 
+    def get_masked_embeddings(self, file_ids, recipe):
+        """{(file_id, box_hash): (siglip float32, dino float32, siglip_model, dino_model)} cached
+        person-masked vectors of the given files for `recipe` (see place_masked_embeddings)."""
+        import numpy as np  # hook-allow: lazy — heavy
+        out = {}
+        for chunk in self._chunked(list(file_ids)):
+            q = ','.join('?' * len(chunk))
+            for r in self.conn.execute(
+                    'SELECT file_id, box_hash, siglip, dino, siglip_model, dino_model '
+                    f'FROM place_masked_embeddings WHERE recipe = ? AND file_id IN ({q})', (recipe, *chunk)):
+                out[(int(r[0]), r[1])] = (np.frombuffer(r[2], np.float32).copy(),
+                                          np.frombuffer(r[3], np.float32).copy(), r[4], r[5])
+        return out
+
+    def put_masked_embeddings(self, rows, recipe):
+        """Upsert [(file_id, box_hash, siglip float32, dino float32, siglip_model, dino_model,
+        coverage)] in one transaction."""
+        import numpy as np  # hook-allow: lazy — heavy
+        now = int(time.time())
+        self.conn.executemany(
+            'INSERT OR REPLACE INTO place_masked_embeddings '
+            '(file_id, box_hash, recipe, siglip, dino, siglip_model, dino_model, coverage, created_at) '
+            'VALUES (?,?,?,?,?,?,?,?,?)',
+            [(f, h, recipe, np.asarray(s_, np.float32).tobytes(), np.asarray(d_, np.float32).tobytes(),
+              sm, dm, cov, now) for f, h, s_, d_, sm, dm, cov in rows])
+        self.conn.commit()
+
+    def current_space_models(self):
+        """(siglip_model, dino_model) of the stored library embeddings (any primary row), or
+        None for a space with none -- the tags masked vectors must match to be comparable."""
+        out = []
+        for table in ('embeddings_siglip', 'embeddings_dino'):
+            r = self.conn.execute(f'SELECT model FROM {table} WHERE frame_index = 0 LIMIT 1').fetchone()
+            out.append(r[0] if r else None)
+        return tuple(out)
+
     def insert_pair_embeddings_batch(self, siglip_rows=(), dino_rows=(), frame_index=0):
         """Upsert many SigLIP / DINO rows in ONE transaction with ONE commit (the per-row
         commit of insert_*_embedding is an fsync'd WAL commit each -- hundreds per second
@@ -2357,7 +2412,7 @@ class Database(ThreadLocalDB):
             for table in ('embeddings', 'embeddings_siglip', 'embeddings_dino',
                           'tags', 'detections', 'faces', 'body_embeddings',
                           'tile_embeddings', 'object_region_embeddings',
-                          'place_embeddings', 'place_keypoints',
+                          'place_embeddings', 'place_keypoints', 'place_masked_embeddings',
                           'file_category_matches'):
                 cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))
             cursor.execute('DELETE FROM files WHERE id = ?', (file_id,))
@@ -2393,7 +2448,7 @@ class Database(ThreadLocalDB):
         for table in ('file_paths', 'embeddings', 'embeddings_siglip', 'embeddings_dino', 'phashes', 'dup_group_members', 'tags',
                       'detections', 'faces', 'body_embeddings', 'tile_embeddings',
                       'object_region_embeddings',
-                      'place_embeddings', 'place_keypoints',
+                      'place_embeddings', 'place_keypoints', 'place_masked_embeddings',
                       'pattern_tiles', 'pattern_windows', 'pattern_dino_cells', 'region_windows', 'region_sift',
                       'file_category_matches'):
             cursor.execute(f'DELETE FROM {table} WHERE file_id = ?', (file_id,))

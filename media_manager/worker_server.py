@@ -654,13 +654,13 @@ def handle_embed_text(path, data, request_id, link_id, remote_identity, requeste
         return worker_protocol.pack({"embedding": None, "error": str(e)})
 
 
-def _embed_shared(embedders_, sources, stats=None):
+def _embed_shared(embedders_, sources, stats=None, labels=None):
     """Indirection so the torch-importing embedders module loads lazily (and tests can fake it)."""
     from .embedders import embed_shared  # hook-allow: lazy — pulls torch
-    return embed_shared(embedders_, sources, stats=stats)
+    return embed_shared(embedders_, sources, labels=labels, stats=stats)
 
 
-def _embed_items_reply(path_name, results, idx_of):
+def _embed_items_reply(path_name, results, idx_of, images=None):
     """Run SigLIP+DINO over the files in ``idx_of`` (file path -> [result indices]) and fill
     ``results`` in place; returns the packed reply shared by embed_both_batch / _paths.
 
@@ -676,7 +676,9 @@ def _embed_items_reply(path_name, results, idx_of):
             models.get_dino_embedder()
     sig, dino = models.get_siglip_embedder(), models.get_dino_embedder()
     order = list(idx_of)
-    if order:
+    if order and images is not None:   # in-memory PIL images keyed by a string label (masked path)
+        (sig_e, dino_e), failed = _embed_shared([sig, dino], [images[k] for k in order], stats, labels=order)
+    elif order:
         (sig_e, dino_e), failed = _embed_shared([sig, dino], order, stats)
     else:
         sig_e = dino_e = None
@@ -811,6 +813,113 @@ def handle_embed_both_batch(path, data, request_id, link_id, remote_identity, re
         return worker_protocol.pack({
             "results": [], "siglip_model": None, "dino_model": None, "gpu_seconds": 0.0,
             "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": str(e)})
+    finally:
+        for t in tmps:
+            _cleanup(t)
+
+
+def _mask_sources(sources, boxes_list, max_coverage, results, idx):
+    """Decode + mask each source (a path or a temp file) in a thread pool; returns ({label:
+    [result index]}, {label: PIL image}) for the ones that worked (PIL images are unhashable, so
+    they travel under a string label). Failures / over-coverage go to results[i]["error"]."""
+    from concurrent.futures import ThreadPoolExecutor
+    from . import location_mask  # hook-allow: lazy -- PIL/numpy only
+    out, images = {}, {}
+
+    def one(k):
+        return location_mask.decode_masked(sources[k], boxes_list[k])
+
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(sources)))) as pool:
+        futs = [pool.submit(one, k) for k in range(len(sources))]
+        for k, f in enumerate(futs):
+            i = idx[k]
+            try:
+                img, cov = f.result()
+            except Exception as e:  # hook-allow: broad -- per-item isolation
+                results[i]["error"] = f"decode failed: {e}"
+                continue
+            results[i]["coverage"] = round(float(cov), 4)
+            if cov > max_coverage:
+                results[i]["error"] = f"mask covers {cov:.0%} of the frame (> {max_coverage:.0%})"
+                continue
+            out[f"mask:{i}"] = [i]
+            images[f"mask:{i}"] = img
+    return out, images
+
+
+def _masked_reply(path_name, results, masked):
+    imgs, images = masked
+    reply = worker_protocol.unpack(_embed_items_reply(path_name, results, imgs, images)) if imgs else {
+        "results": results, "siglip_model": None, "dino_model": None, "gpu_seconds": 0.0,
+        "proto": worker_protocol.EMBED_PROTOCOL_VERSION, "error": None}
+    reply["masked_proto"] = worker_protocol.MASKED_PROTOCOL_VERSION
+    return worker_protocol.pack(reply)
+
+
+def _masked_error(path_name, e):
+    traceback.print_exc()
+    print(f"[worker] handled {path_name} -> ERROR {e}", flush=True)
+    return worker_protocol.pack({
+        "results": [], "siglip_model": None, "dino_model": None, "gpu_seconds": 0.0,
+        "proto": worker_protocol.EMBED_PROTOCOL_VERSION,
+        "masked_proto": worker_protocol.MASKED_PROTOCOL_VERSION, "error": str(e)})
+
+
+def handle_embed_masked_paths(path, data, request_id, link_id, remote_identity, requested_at):
+    """Person-masked SigLIP 2 + DINOv2 over shared-disk files. Same data_root / containment rules
+    as handle_embed_both_paths: whole request refused unless data_root has a .media dir; each file
+    must realpath-resolve inside it or that item errors and is never opened."""
+    try:
+        req = worker_protocol.unpack(data)
+        data_root = req.get("data_root")
+        problem = _data_root_problem(data_root)
+        if problem:
+            raise ValueError(problem)
+        root_real = os.path.realpath(data_root)
+        rels, boxes = req["paths"], req["boxes"]
+        if len(boxes) != len(rels):
+            raise ValueError("boxes/paths length mismatch")
+        max_cov = float(req.get("max_coverage", 0.5))
+        results = [{"name": r, "siglip": None, "dino": None, "error": None, "coverage": None} for r in rels]
+        srcs, bx, idx = [], [], []
+        for i, rel in enumerate(rels):
+            try:
+                srcs.append(resolve_under_root(root_real, rel))
+            except (ValueError, OSError) as e:
+                results[i]["error"] = f"rejected: {e}"
+                continue
+            bx.append(boxes[i])
+            idx.append(i)
+        return _masked_reply(worker_protocol.PATH_EMBED_MASKED_PATHS, results,
+                             _mask_sources(srcs, bx, max_cov, results, idx))
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        return _masked_error(worker_protocol.PATH_EMBED_MASKED_PATHS, e)
+
+
+def handle_embed_masked_batch(path, data, request_id, link_id, remote_identity, requested_at):
+    """Upload variant of handle_embed_masked_paths: items carry the image bytes."""
+    tmps = []
+    try:
+        req = worker_protocol.unpack(data)
+        items = req["items"]
+        max_cov = float(req.get("max_coverage", 0.5))
+        results = [{"name": it.get("name"), "siglip": None, "dino": None, "error": None, "coverage": None}
+                   for it in items]
+        srcs, bx, idx = [], [], []
+        for i, it in enumerate(items):
+            try:
+                tmp = _write_temp(it["image"], it.get("name"))
+            except Exception as e:  # hook-allow: broad — per-item isolation
+                results[i]["error"] = f"write failed: {e}"
+                continue
+            tmps.append(tmp)
+            srcs.append(tmp)
+            bx.append(it.get("boxes") or [])
+            idx.append(i)
+        return _masked_reply(worker_protocol.PATH_EMBED_MASKED_BATCH, results,
+                             _mask_sources(srcs, bx, max_cov, results, idx))
+    except Exception as e:  # hook-allow: broad — report error to caller/job
+        return _masked_error(worker_protocol.PATH_EMBED_MASKED_BATCH, e)
     finally:
         for t in tmps:
             _cleanup(t)
@@ -1434,6 +1543,8 @@ HANDLERS = {
     worker_protocol.PATH_EMBED_BOTH_BATCH: handle_embed_both_batch,
     worker_protocol.PATH_EMBED_BOTH_PATHS: handle_embed_both_paths,
     worker_protocol.PATH_PROBE_DATA_ROOT: handle_probe_data_root,
+    worker_protocol.PATH_EMBED_MASKED_PATHS: handle_embed_masked_paths,
+    worker_protocol.PATH_EMBED_MASKED_BATCH: handle_embed_masked_batch,
     worker_protocol.PATH_EMBED_SIGLIP_TEXT: handle_embed_siglip_text,
     worker_protocol.PATH_DETECT_OBJECTS: handle_detect_objects,
     worker_protocol.PATH_ESTIMATE_AGE: handle_estimate_age,

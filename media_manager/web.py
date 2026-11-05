@@ -43,7 +43,7 @@ from pydantic import BaseModel
 
 from media_manager import (
     background_tiles, body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
-    location_place, near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
+    location_mask, location_place, near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, tile_index, video_decode, worker_client,
     worker_config,
 )
@@ -721,6 +721,54 @@ def _speedtest_breakdown(wall, transport_mode, gpu_s, timing):
         out['verdict'] = (f'neither decode nor GPU saturated (GPU busy {gpu_busy * 100:.0f}%, '
                           f'~{dec / wall:.1f} decode threads): look at disk IO / transport / request ramp-up')
     return out
+
+
+def _masked_embed_chunk(items):
+    """SigLIP 2 + DINOv2 vectors of person-masked images for location_mask's stage 2:
+    items = [(abs_path, normalised boxes)] -> (pairs, errors, models) aligned with `items`
+    (pairs[i] = (siglip, dino) | None). Worker (shared-disk paths or upload) when configured,
+    else the local GPU embedders. Raises location_mask.MaskUnavailable for an unreachable or
+    un-redeployed worker / a machine with no accelerator -- never falls back to CPU."""
+    items = list(items)
+    if _worker_client is not None and _worker_client.is_configured():
+        try:
+            res = worker_client.embed_masked(_worker_client, items, data_root=_embed_data_root)
+        except worker_client.WorkerUnavailable as exc:
+            raise location_mask.MaskUnavailable('worker_unavailable', str(exc)) from exc
+        except worker_client.WorkerError as exc:
+            kind = 'worker_outdated' if 'needs redeploy' in str(exc) else 'worker_unavailable'
+            raise location_mask.MaskUnavailable(kind, str(exc)) from exc
+        pairs = [(res.siglip[i], res.dino[i]) if res.siglip[i] is not None and res.dino[i] is not None
+                 else None for i in range(len(items))]
+        models = (res.siglip_model, res.dino_model) if res.siglip_model else None
+        return pairs, list(res.errors), models
+    pairs, errs, imgs, where = [None] * len(items), [None] * len(items), [], []
+    for i, (path, boxes) in enumerate(items):
+        try:
+            img, cov = location_mask.decode_masked(path, boxes)
+        except (OSError, ValueError) as exc:
+            errs[i] = f'decode failed: {exc}'
+            continue
+        if cov > location_mask.MASK_MAX_COVERAGE:
+            errs[i] = f'mask covers {cov:.0%} of the frame'
+            continue
+        imgs.append(img)
+        where.append(i)
+    if imgs:
+        try:
+            sig, dino = _get_siglip_embedder(), _get_dino_embedder()
+            (sm, dm), failed = _local_embed_shared([sig, dino], imgs)
+        except RuntimeError as exc:
+            raise location_mask.MaskUnavailable('worker_unavailable', f'no accelerator for local embedding: {exc}') from exc
+        bad = {id(lbl): msg for lbl, msg in failed}
+        k = 0
+        for img, i in zip(imgs, where):
+            if id(img) in bad:
+                errs[i] = bad[id(img)]
+            else:
+                pairs[i] = (sm[k], dm[k])
+                k += 1
+    return pairs, errs, None
 
 
 def _embed_pair_chunk(sig, dino, paths):
@@ -9000,9 +9048,39 @@ def create_app(data_root: str) -> FastAPI:
             bg_rank_cache[key] = ranked
         return ranked
 
+    # Stage 2 of the 'place' model (location_mask.py): person-masked re-embedding of the top
+    # candidates, lazily and cached. MEDIA_LOC_MASK=0 switches it off; MEDIA_LOC_MASK_TOPK /
+    # MEDIA_LOC_MASK_BUDGET_S size the window and the per-request time budget.
+    LOCATION_MASK_ENABLED = os.environ.get('MEDIA_LOC_MASK', '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    mask_service = location_mask.MaskService(db, lambda items: _masked_embed_chunk(items))
+
+    def _place_stage2(passing, fids, rank, member_ids, excluded_ids, why_by_cs, info, mask_wait=None):
+        """Re-order the first MASK_TOPK of the stage-1 `passing` pool by blending in the
+        person-masked similarity (location_mask.run_stage2). Falls back to `passing` unchanged,
+        with info['stage2'] saying why, when the worker is old / unreachable."""
+        window = passing[:location_mask.MASK_TOPK]
+        pos = np.searchsorted(fids, [it[0][0] for it in window])
+        s1, last = {}, float(rank.max()) if rank.shape[0] else 0.0
+        for (item, _s), p in zip(window, pos):      # remapped videos have no rank of their own
+            fid = item[0]
+            if p < len(fids) and int(fids[p]) == fid:
+                last = float(rank[p])
+            s1[fid] = last
+        final, detail, st2 = location_mask.run_stage2(
+            db, mask_service, [(it[0][0], it[0][1]) for it in window], member_ids, excluded_ids, s1,
+            data_root, budget_s=mask_wait,
+            is_image=lambda path: os.path.splitext(path)[1].lower() in IMAGE_EXTENSIONS)
+        if info is not None:
+            info['stage2'] = st2
+        for (fid, _p, cs), _s in window:
+            if cs in why_by_cs and fid in detail:
+                why_by_cs[cs] = dict(why_by_cs[cs], **detail[fid], final=round(final.get(fid, s1[fid]), 2))
+        order = sorted(range(len(window)), key=lambda i: -final.get(window[i][0][0], s1[window[i][0][0]]))
+        return [window[i] for i in order] + passing[len(window):]
+
     def _find_similar_files_for_location(location_id, threshold, limit=12, offset=0, exclude_ids=None,
                                           avoid_existing=True, honor_negatives=False, background=True,
-                                          model='place', info=None):
+                                          model='place', info=None, mask=True, mask_wait=None):
         """Images not yet at this location whose embedding is close to the
         centroid of the ones that are — "photos probably taken at this place".
         Deliberately the same centroid math as _find_similar_files_for_set (see
@@ -9101,6 +9179,12 @@ def create_app(data_root: str) -> FastAPI:
                 set(member_checksums) | excluded_checksum_set | set(set_settled_checksums),
                 lambda items: [i for i in items if i[0][2] not in placed_anywhere] if avoid_existing else items,
                 display_scores=display)
+            why_by_cs = {cks[i]: w for i, w in place_why.items()}
+            for still_cs, video_cs in manual.get_all_frame_capture_parents().items():
+                if still_cs in why_by_cs:      # a still surfaces as its video: it carries the still's why
+                    why_by_cs.setdefault(video_cs, why_by_cs[still_cs])
+            if model == 'place' and mask and passing and LOCATION_MASK_ENABLED:
+                passing = _place_stage2(passing, fids, rank, member_ids, excluded_ids, why_by_cs, info, mask_wait)
             if exclude_ids:
                 passing = [item for item in passing if item[0][0] not in exclude_ids]
                 page = passing[:limit]
@@ -9108,10 +9192,6 @@ def create_app(data_root: str) -> FastAPI:
                 page = passing[offset:offset + limit]
             cards = _enrich_rows([(fid, path, True, cs) for (fid, path, cs), _score in page],
                                  scores={fid: round(score, 3) for (fid, _p, _cs), score in page})
-            why_by_cs = {cks[i]: w for i, w in place_why.items()}
-            for still_cs, video_cs in manual.get_all_frame_capture_parents().items():
-                if still_cs in why_by_cs:      # a still surfaces as its video: it carries the still's why
-                    why_by_cs.setdefault(video_cs, why_by_cs[still_cs])
             for card in cards:
                 card['ref'] = str(card['id'])
                 if place_why and card.get('checksum') in why_by_cs:
@@ -10291,7 +10371,8 @@ def create_app(data_root: str) -> FastAPI:
                                         threshold: float = LOCATION_SUGGEST_THRESHOLD,
                                         limit: int = 12, offset: int = 0, avoid_existing: bool = True,
                                         honor_negatives: bool = False, background: bool = True,
-                                        model: str = 'place'):
+                                        model: str = 'place', mask: bool = True,
+                                        mask_wait: Optional[float] = None):
         if manual.get_location(location_id) is None:
             raise HTTPException(status_code=404, detail='Location not found')
         if model not in LOCATION_SUGGEST_MODELS:
@@ -10303,7 +10384,8 @@ def create_app(data_root: str) -> FastAPI:
         results = _find_similar_files_for_location(location_id, threshold, limit=limit, offset=offset,
                                                     exclude_ids=exclude_ids, avoid_existing=avoid_existing,
                                                     honor_negatives=honor_negatives, background=background,
-                                                    model=model, info=info)
+                                                    model=model, info=info, mask=mask,
+                                                    mask_wait=None if mask_wait is None else max(0.0, min(60.0, mask_wait)))
         # Dual key for the same reason api_similar_files_for_set has one: 'cards'
         # is what swipe-core.js's fetchMoreUrl contract reads. `mode` says whether the
         # background-tile ranking ran or it fell back to whole images.

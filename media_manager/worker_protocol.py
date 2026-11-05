@@ -87,7 +87,22 @@ PATH_REGION = "region_descriptor"
 PATH_PATTERN_DINO = "pattern_dino"
 PATTERN_DINO_PROTOCOL_VERSION = 1
 
+# Person-masked embedding (location_mask.py, 'place' location model stage 2). Same two transports
+# as embed_both: shared-disk {"data_root", "paths": [rel...], "boxes": [[[x1,y1,x2,y2]...]...],
+# "max_coverage"} (same data_root / realpath containment checks as embed_both_paths) and upload
+# {"items": [{"name", "image", "boxes"}...], "max_coverage"}. boxes are NORMALISED (0..1) person
+# regions of the upright image; the worker fills them with the mean colour of the rest of the frame
+# and embeds the result with SigLIP 2 + DINOv2. Reply = embed_both's, each result also carrying
+# "coverage" (masked fraction; an item over max_coverage gets an error instead of a vector), plus
+# "masked_proto": MASKED_PROTOCOL_VERSION. An old worker answers HTTP 404 -> the client reports
+# "worker needs redeploy" and the host serves stage 1 only, with a visible notice.
+PATH_EMBED_MASKED_PATHS = "embed_masked_paths"
+PATH_EMBED_MASKED_BATCH = "embed_masked_batch"
+MASKED_PROTOCOL_VERSION = 1
+
 ALL_PATHS = [
+    PATH_EMBED_MASKED_PATHS,
+    PATH_EMBED_MASKED_BATCH,
     PATH_PING,
     PATH_PATTERN,
     PATH_PATTERN_DINO,
