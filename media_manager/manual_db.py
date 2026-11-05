@@ -3390,6 +3390,7 @@ class ManualDB(ThreadLocalDB):
         cur.execute('UPDATE person_cleanup_batches SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_photo_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_set_assignments SET identity = ? WHERE identity = ?', (new_name, old_name))
+        cur.execute('UPDATE OR IGNORE identity_set_exclusions SET identity = ? WHERE identity = ?', (new_name, old_name))
         cur.execute('UPDATE identity_aliases SET identity = ? WHERE identity = ?', (new_name, old_name))
         self.conn.commit()
         self._face_ver += 1

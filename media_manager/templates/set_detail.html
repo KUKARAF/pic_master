@@ -860,6 +860,14 @@
       .catch(function() { launchStack([]); });
   }
 
+  // Flipping any suggestion toggle invalidates the cards already buffered in the stack
+  // (they were filtered/ranked under the old setting), so refetch and relaunch.
+  ['set-avoid-existing-toggle', 'set-honor-negatives-toggle', 'set-exclude-non-matching-faces-toggle']
+    .forEach(function(id) {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener('change', function() { fetchAndLaunch(); });
+    });
+
   // Changing the model resets the swipe buffer: refetch from scratch and relaunch
   // the stack so no card ranked by the previous model lingers.
   if (modelSelect) {

@@ -8915,6 +8915,49 @@ def create_app(data_root: str) -> FastAPI:
                 break
         return pool[:k]
 
+    def _recognized_people_by_checksum(checksums):
+        """{checksum: set(identity)} — who is recognized in each photo/video: named,
+        non-rejected faces (any trust tier; frame faces of a video carry the video's
+        checksum) UNION faceless whole-photo assignments, UNION the same for the
+        captured stills of a video (a still is the video: see the frame rule). The one
+        definition of "recognized" shared by every exclude-non-matching-faces path."""
+        checksums = list(dict.fromkeys(checksums))
+        children = {}
+        for child, parent in manual.get_all_frame_capture_parents().items():
+            children.setdefault(parent, []).append(child)
+        lookup = list(checksums)
+        for cs in checksums:
+            lookup.extend(children.get(cs, ()))
+        ident = manual.get_identities_for_checksums(lookup)
+        assigned = manual.get_photo_assignments_for_checksums(lookup)
+        out = {}
+        for cs in checksums:
+            people = set()
+            for c in [cs, *children.get(cs, ())]:
+                people.update(ident.get(c, ()))
+                people.update(assigned.get(c, ()))
+            out[cs] = people
+        return out
+
+    def _people_confirmed_in_set(set_id, member_checksums):
+        """Identities confirmed in the set (get_people_present_in_set: set links, whole-
+        photo assignments and named faces on its photos, minus per-set exclusions),
+        counting the captured stills of member videos as part of the video."""
+        member_checksums = list(member_checksums)
+        member_set = set(member_checksums)
+        extra = [child for child, parent in manual.get_all_frame_capture_parents().items()
+                 if parent in member_set]
+        return set(manual.get_people_present_in_set(set_id, member_checksums + extra).keys())
+
+    def _drop_unconfirmed_people(items, set_people):
+        """Filter [((file_id, path, checksum), score)]: drop an item showing any
+        recognized identity not in `set_people` (empty set_people therefore drops every
+        recognized photo); unrecognized-only items stay."""
+        if not items:
+            return items
+        people = _recognized_people_by_checksum([item[0][2] for item in items])
+        return [item for item in items if not (people.get(item[0][2], set()) - set_people)]
+
     def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
                                      honor_negatives=True, exclude_non_matching_faces=True,
                                      model='siglip', info=None):
@@ -8993,21 +9036,10 @@ def create_app(data_root: str) -> FastAPI:
         # per-candidate filters below are shared by every model.
         face_ok = None
         if exclude_non_matching_faces:
-            set_people = set(manual.get_people_present_in_set(set_id, member_checksums).keys())
-            if set_people:
-                def face_ok(items):
-                    cand_checksums = [item[0][2] for item in items]
-                    # A candidate's recognized people come from BOTH named faces AND
-                    # faceless whole-photo assignments — mirror get_people_present_in_set,
-                    # which counts both on the set side. Using faces alone here let a photo
-                    # whose only non-member person was assigned without a face slip through.
-                    identities_map = manual.get_identities_for_checksums(cand_checksums)
-                    assigned_map = manual.get_photo_assignments_for_checksums(cand_checksums)
-                    return [
-                        item for item in items
-                        if not ((set(identities_map.get(item[0][2], []))
-                                 | set(assigned_map.get(item[0][2], []))) - set_people)
-                    ]
+            set_people = _people_confirmed_in_set(set_id, member_checksums)
+
+            def face_ok(items):
+                return _drop_unconfirmed_people(items, set_people)
         member_checksums_anywhere = manual.get_all_set_member_checksums() if avoid_existing else None
 
         def apply_filters(items):

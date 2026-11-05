@@ -165,6 +165,61 @@ def test_faces_filter_shared(env):
         assert _order(_get(client, sid, model, honor_negatives='false'), ids) == on
 
 
+def test_faces_filter_set_without_people_still_excludes(env):
+    """A set with nobody confirmed yet: a candidate showing a recognized person is NOT
+    confirmed in the set, so it is excluded (only unrecognized candidates remain)."""
+    _app, _db, manual, ids, sid, client = env
+    manual.assign_identity_to_photo(ids['x'][1], 'Bob')
+    for model in ('clip', 'siglip', 'dino'):
+        off = _order(_get(client, sid, model, exclude_non_matching_faces='false', honor_negatives='false'), ids)
+        on = _order(_get(client, sid, model, exclude_non_matching_faces='true', honor_negatives='false'), ids)
+        assert 'x' in off and 'x' not in on and 'y' in on
+
+
+def test_faces_filter_sees_people_on_remapped_video_stills(env):
+    """A recognized person on a captured still counts for the video the still maps to."""
+    app, db, manual, ids, sid, client = env
+    manual.assign_identity_to_photo(ids['m1'][1], 'Alice')
+    vid = db.upsert_file_path('clip.mp4', 'v' * 40, size=1)
+    still = db.upsert_file_path('captured_frames/clip_1.jpg', 's' * 40, size=1)
+    for sp in ('siglip', 'dino'):
+        _put(db, sp, still, _vec(DIMS[sp], e0=1, e1=0.05))
+    db.set_file_hidden(still)
+    manual.add_frame_capture('s' * 40, 'v' * 40, 1000)
+    manual.assign_identity_to_photo('s' * 40, 'Bob')
+    db.conn.commit()
+    for model in ('siglip', 'dino'):
+        assert vid in [c['id'] for c in _get(client, sid, model, exclude_non_matching_faces='false')['cards']]
+        assert vid not in [c['id'] for c in _get(client, sid, model, exclude_non_matching_faces='true')['cards']]
+    # ...and Alice (confirmed in the set) on the still keeps the video
+    manual.remove_identity_photo_assignment('s' * 40, 'Bob')
+    manual.assign_identity_to_photo('s' * 40, 'Alice')
+    for model in ('siglip', 'dino'):
+        assert vid in [c['id'] for c in _get(client, sid, model, exclude_non_matching_faces='true')['cards']]
+
+
+def test_faces_filter_member_video_still_people_are_confirmed(env):
+    """People seen on a member video's captured stills are confirmed in the set."""
+    app, db, manual, ids, sid, client = env
+    mv = db.upsert_file_path('mem.mp4', 'w' * 40, size=1)
+    manual.assign_file_to_set('w' * 40, sid)
+    manual.add_frame_capture('t' * 40, 'w' * 40, 500)
+    manual.assign_identity_to_photo('t' * 40, 'Bob')
+    manual.assign_identity_to_photo(ids['x'][1], 'Bob')
+    db.conn.commit()
+    for model in ('clip', 'siglip', 'dino'):
+        assert 'x' in _order(_get(client, sid, model, exclude_non_matching_faces='true', honor_negatives='false'), ids)
+
+
+def test_rename_identity_keeps_set_exclusion(env):
+    _app, _db, manual, ids, sid, _client = env
+    manual.exclude_identity_from_set(sid, 'Bob')
+    manual.rename_identity('Bob', 'Robert')
+    cur = manual.conn.cursor()
+    cur.execute('SELECT identity FROM identity_set_exclusions WHERE set_id = ?', (sid,))
+    assert [r[0] for r in cur.fetchall()] == ['Robert']
+
+
 @pytest.mark.parametrize('model', ['siglip', 'dino'])
 def test_model_missing_signal(env, model):
     app, db, manual, ids, sid, client = env
