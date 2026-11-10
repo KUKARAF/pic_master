@@ -2752,16 +2752,31 @@ def create_app(data_root: str) -> FastAPI:
                 _ensure_file_embedding(file_id, abs_path)   # images and videos; best-effort, logs
         threading.Thread(target=_run, daemon=True, name='upload-index').start()
 
+    def _clean_upload_subdir(raw):
+        """Sanitize a client-supplied relative folder ('a/b/c') to safe path parts, or
+        None. Drops empty, '.', '..' and dot-prefixed parts so it can't escape uploads/."""
+        parts = []
+        for part in (raw or '').replace('\\', '/').split('/'):
+            part = part.strip()
+            if not part or part.startswith('.'):
+                continue
+            parts.append(part.replace('\0', ''))
+        return parts or None
+
     @app.post('/api/files/upload')
     def api_upload_files(files: Optional[List[UploadFile]] = File(None),
-                         file: Optional[List[UploadFile]] = File(None)):
+                         file: Optional[List[UploadFile]] = File(None),
+                         subdir: Optional[str] = Form(None)):
         """Upload media into uploads/<bucket>/ (see UPLOADS_DIR) — from the Files tab's
         ⬆ Upload, or straight from a shell:
 
             curl -F file=@photo.jpg  http://host:port/api/files/upload
             curl -F file=@a.jpg -F file=@b.mp4 http://host:port/api/files/upload
+            curl -F subdir=trip/day1 -F file=@a.jpg http://host:port/api/files/upload
 
-        (`files` works as the field name too.) Each file is hashed with the same
+        With the optional `subdir` field, files are stored under uploads/<subdir>/
+        (created as needed, folder structure preserved) instead of a hash bucket; it
+        applies to every file in that request. (`files` works as the field name too.) Each file is hashed with the same
         full-file xxh64 a scan uses; content ALREADY in the library is rejected (not
         saved), as is a repeat within the same request. New files are tracked at once
         and EXIF/SigLIP 2+DINOv2-indexed in the background; non-media files are skipped.
@@ -2774,6 +2789,7 @@ def create_app(data_root: str) -> FastAPI:
         if not uploads:
             raise HTTPException(status_code=400, detail="No files — send them as -F file=@path")
         uploads_root = os.path.join(data_root, UPLOADS_DIR)
+        subdir_parts = _clean_upload_subdir(subdir)
         incoming = os.path.join(uploads_root, '.incoming')
         os.makedirs(incoming, exist_ok=True)
         saved, duplicates, skipped, to_index = [], [], [], []
@@ -2808,7 +2824,7 @@ def create_app(data_root: str) -> FastAPI:
                     duplicates.append({'name': name, 'existing_id': existing['id'],
                                        'existing_path': existing['path']})
                     continue
-                bucket = checksum[:2]
+                bucket = '/'.join(subdir_parts) if subdir_parts else checksum[:2]
                 target_dir = os.path.join(uploads_root, bucket)
                 try:
                     os.makedirs(target_dir, exist_ok=True)

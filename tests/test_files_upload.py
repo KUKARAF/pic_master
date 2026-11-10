@@ -97,3 +97,14 @@ def test_files_upload():
 
 if __name__ == '__main__':
     run()
+
+
+def test_subdir_preserves_folder_structure():
+    root = tempfile.mkdtemp()
+    os.makedirs(os.path.join(root, '.media'), exist_ok=True)
+    client = TestClient(create_app(root))
+    r = client.post('/api/files/upload', data={'subdir': 'trip/../day1//.hidden/x'},
+                    files=[('file', ('a.mp4', b'sub-video', 'application/octet-stream'))])
+    assert r.status_code == 200, r.text
+    assert r.json()['saved'][0]['path'] == 'uploads/trip/day1/x/a.mp4'
+    assert open(os.path.join(root, 'uploads/trip/day1/x/a.mp4'), 'rb').read() == b'sub-video'
