@@ -11840,37 +11840,91 @@ def create_app(data_root: str) -> FastAPI:
             return None
         return {'name': identities[j], 'score': round(float(scores[j]), 3)}
 
+    FACE_NEAR_NAMED_RANGE = (0.2, 0.9)
+
+    def _fg_near_named_scores(entry):
+        """{group id: best cosine of the group's centroid to ANY named face}, cached on
+        the entry and keyed by manual._face_ver (the named-face matrix version), so it
+        is rebuilt only after a name was added/removed/changed. One chunked G x D @ D x K
+        matmul over all groups (never per face, never O(N^2)); the comparison against the
+        user's near_named threshold happens at request time, so changing it is free.
+        Groups whose centroid dimension differs from the named matrix score 0."""
+        ver = manual._face_ver
+        cached = entry.get('nn')
+        if cached is not None and cached[0] == ver:
+            return cached[1]
+        identities, matrix = manual.get_named_face_matrix()
+        out = {}
+        gids = [gid for gid, g in entry['groups'].items() if not g['dead'] and not g['dismissed']]
+        if not identities or matrix.size == 0:
+            out = {gid: 0.0 for gid in gids}
+        else:
+            dim = matrix.shape[1]
+            ok = [gid for gid in gids if entry['groups'][gid]['centroid'].shape[0] == dim]
+            out = {gid: 0.0 for gid in gids}
+            step = max(1, min(256, 20_000_000 // max(1, matrix.shape[0])))
+            for i in range(0, len(ok), step):
+                part = ok[i:i + step]
+                cents = np.stack([np.asarray(entry['groups'][gid]['centroid'], dtype=np.float32)
+                                  for gid in part])
+                best = (cents @ matrix.T).max(axis=1)
+                for gid, b in zip(part, best):
+                    out[gid] = float(b)
+        entry['nn'] = (ver, out)
+        return out
+
     @app.get('/api/face-groups/next')
-    def api_face_groups_next(threshold: float = FACE_GROUP_DEFAULT_THRESHOLD, skip: int = 0):
+    def api_face_groups_next(threshold: float = FACE_GROUP_DEFAULT_THRESHOLD, skip: int = 0,
+                             include_approved: bool = False,
+                             near_named: float = SUGGEST_THRESHOLD):
         """The biggest remaining group (after `skip` valid ones), or {group: null}.
         Faces named/decided since the compute are dropped live; a group that falls under
         min_size disappears. Counts for groups AFTER the returned one come from the cache
         (minus approvals/rejections made through this API); they are re-validated when
-        reached."""
+        reached.
+
+        include_approved=false (default) hides every group whose centroid is >= `near_named`
+        (default SUGGEST_THRESHOLD, clamped 0.2-0.9) similar to ANY named face: those look
+        like people already in the library. The filter is group-level only (a per-face
+        drop would silently reshuffle the faces of a group the user is judging as a unit).
+        `skip` indexes the FILTERED sequence, and remaining_groups/remaining_faces count
+        only the groups that pass; `near_named_hidden` is how many alive groups were hidden.
+        include_approved=true behaves as before (near_named_hidden is 0)."""
         skip = max(0, int(skip))
+        lo, hi = FACE_NEAR_NAMED_RANGE
+        near_named = max(lo, min(hi, float(near_named)))
         with face_group_lock:
             entry = face_group_cache.get(_fg_clamp(threshold))
             computing = bool(face_group_job['running'])
             if entry is None:
                 return {'group': None, 'remaining_groups': 0, 'remaining_faces': 0,
-                        'computing': computing}
+                        'near_named_hidden': 0, 'computing': computing}
             rejected = manual.get_face_group_rejected_ids()
             trashed = _trashed_file_ids()
+            nn = None if include_approved else _fg_near_named_scores(entry)
+
+            def hidden(g):
+                return nn is not None and nn.get(g['id'], 0.0) >= near_named
+
             chosen, skipped = None, 0
             for gid in entry['order']:
                 g = entry['groups'][gid]
                 if not _fg_live_members(g, entry, rejected, trashed):
+                    continue
+                if hidden(g):
                     continue
                 if skipped < skip:
                     skipped += 1
                     continue
                 chosen = g
                 break
-            # remaining_* = every alive group (chosen and skipped included); the ones after
-            # the chosen group are cache-sized until reached and re-validated.
+            # remaining_* = every alive visible group (chosen and skipped included); the
+            # ones after the chosen group are cache-sized until reached and re-validated.
             alive = [g for g in entry['groups'].values() if not g['dead'] and not g['dismissed']]
-            remaining = {'remaining_groups': len(alive),
-                         'remaining_faces': sum(len(g['face_ids']) for g in alive),
+            shown_groups = [g for g in alive if not hidden(g)]
+            remaining = {'remaining_groups': len(shown_groups),
+                         'remaining_faces': sum(len(g['face_ids']) for g in shown_groups),
+                         'near_named_hidden': len(alive) - len(shown_groups),
                          'computing': computing}
             if chosen is None:
                 return {'group': None, **remaining}

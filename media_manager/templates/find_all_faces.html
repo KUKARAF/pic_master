@@ -19,7 +19,13 @@
     <input type="range" id="fg-threshold" min="0.30" max="0.95" step="0.01" value="0.55">
     <strong id="fg-threshold-val">0.55</strong>
   </label>
+  <label class="fg-approved" title="Show groups that already look like a named person">
+    <input type="checkbox" id="fg-approved">
+    <span>already approved</span>
+    <span class="sub fg-hint">show groups that already look like a named person</span>
+  </label>
   <span id="fg-counts" class="sub"></span>
+  <span id="fg-hidden" class="sub"></span>
   <span id="fg-progress" class="sub fg-progress" style="display:none;"></span>
 </div>
 
@@ -64,6 +70,8 @@
   .fg-header { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
   .fg-threshold { display: flex; align-items: center; gap: 8px; }
   .fg-threshold input[type="range"] { width: 200px; max-width: 45vw; }
+  .fg-approved { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .fg-hint { font-size: .8em; opacity: .75; }
   .fg-progress { color: var(--accent); }
   .fg-empty { padding: 28px 12px; text-align: center; color: var(--text-muted); }
   .fg-empty .btn-similar { margin-top: 10px; }
@@ -115,6 +123,7 @@
   var POLL_MS = 1500, DEBOUNCE_MS = 700, MIN_SIZE = 3;
 
   var els = {
+    approved: $('fg-approved'), hidden: $('fg-hidden'),
     thr: $('fg-threshold'), thrVal: $('fg-threshold-val'), counts: $('fg-counts'),
     progress: $('fg-progress'), empty: $('fg-empty'), card: $('fg-card'),
     title: $('fg-title'), trunc: $('fg-trunc'), grid: $('fg-grid'),
@@ -125,6 +134,10 @@
   };
 
   var threshold = 0.55;
+  var includeApproved = false;
+  var hiddenNear = 0;
+  try { includeApproved = localStorage.getItem('fgIncludeApproved') === '1'; } catch (e) {}
+  els.approved.checked = includeApproved;
   var skip = 0;
   var group = null;
   var removed = {};        // face_id -> true
@@ -193,6 +206,12 @@
     els.counts.textContent = plural(groups, 'group', 'groups') + ' · ' + plural(faces || 0, 'face', 'faces') + ' left';
   }
 
+  function setHidden(n) {
+    hiddenNear = n || 0;
+    els.hidden.textContent = (!includeApproved && hiddenNear > 0)
+      ? plural(hiddenNear, 'group', 'groups') + ' hidden (look like existing people)' : '';
+  }
+
   function setProgress(text) {
     if (!text) { els.progress.style.display = 'none'; els.progress.textContent = ''; return; }
     els.progress.textContent = text;
@@ -244,10 +263,12 @@
   function loadNext() {
     var seq = ++loadSeq;
     busy = true;
-    api('GET', '/api/face-groups/next?threshold=' + encodeURIComponent(threshold) + '&skip=' + skip)
+    api('GET', '/api/face-groups/next?threshold=' + encodeURIComponent(threshold) + '&skip=' + skip +
+        (includeApproved ? '&include_approved=1' : ''))
       .then(function (d) {
         if (seq !== loadSeq) return;
         busy = false;
+        setHidden(num(d.near_named_hidden, 0));
         setCounts(num(d.remaining_groups, 0), num(d.remaining_faces, 0));
         if (d.computing) {
           setProgress('recomputing…');
@@ -264,6 +285,10 @@
             return;
           }
           group = null;
+          if (!includeApproved && num(d.near_named_hidden, 0) > 0) {
+            showEmpty('Only groups that look like existing people remain \u2014 tick \u201calready approved\u201d to see them.');
+            return;
+          }
           showEmpty('No groups above this threshold — lower the slider, or recompute.',
             'Recompute', function () { startCompute(true); });
           return;
@@ -452,6 +477,14 @@
   els.restoreBtn.addEventListener('click', function () {
     if (group) renderGroup(Object.assign({}, group, { suggested: group.suggested }));
     // renderGroup resets `removed`; keep the typed name (it only prefills when empty).
+  });
+
+  els.approved.addEventListener('change', function () {
+    includeApproved = els.approved.checked;
+    try { localStorage.setItem('fgIncludeApproved', includeApproved ? '1' : '0'); } catch (e) {}
+    skip = 0;
+    els.name.value = '';
+    loadNext();
   });
 
   els.thr.addEventListener('input', function () {

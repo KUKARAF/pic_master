@@ -208,7 +208,7 @@ def test_suggested_known_person(env):
     _compute(client, force=1)
     groups = []
     for skip in range(3):
-        g = client.get('/api/face-groups/next?threshold=0.55&skip=%d' % skip).json()['group']
+        g = client.get('/api/face-groups/next?threshold=0.55&include_approved=1&skip=%d' % skip).json()['group']
         if g:
             groups.append(g)
     sug = [g['suggested'] for g in groups if g['suggested']]
@@ -252,3 +252,83 @@ def test_status_reports_device(env):
     _app, client, _f, _ = env
     st = _compute(client, threshold=0.55, min_size=3)
     assert st['error'] is None and st['device'] == 'cpu'     # the hook device, reported
+
+
+def _near_dana_group(env_tuple):
+    """Name cluster 2 'Dana', add a 4-face group right next to her, recompute."""
+    _app, client, faces, (db, _manual) = env_tuple
+    _compute(client)
+    for f in faces[2]:
+        client.post('/api/faces/auto:%d/identity' % f, json={'name': 'Dana'})
+    ref = np.frombuffer(db.conn.execute('SELECT embedding FROM faces WHERE id = ?',
+                                        (faces[2][0],)).fetchone()[0], dtype=np.float32)
+    rng = np.random.default_rng(9)
+    for i in range(4):
+        fid = db.upsert_file_path('q%d.jpg' % i, 'ffff%04x' % i, size=10)
+        db.conn.commit()
+        db.add_manual_face(fid, [1, 1, 60, 60], _unit(ref + 0.03 * rng.standard_normal(D)).tobytes(), 0.9)
+    db.conn.commit()
+    _compute(client, force=1)
+
+
+def _sizes(client, **extra):
+    out, skip = [], 0
+    while True:
+        q = 'threshold=0.55&skip=%d' % skip + ''.join('&%s=%s' % kv for kv in extra.items())
+        g = client.get('/api/face-groups/next?' + q).json()['group']
+        if not g:
+            return out
+        out.append(g['size'])
+        skip += 1
+
+
+def test_near_named_groups_hidden_by_default(env):
+    _app, client, faces, _ = env
+    _near_dana_group(env)
+    r = client.get('/api/face-groups/next?threshold=0.55').json()
+    assert r['group']['size'] == 6 and r['group']['suggested'] is None
+    assert r['remaining_groups'] == 2 and r['remaining_faces'] == 10
+    assert r['near_named_hidden'] == 1
+    assert _sizes(client) == [6, 4]                       # skip indexes the filtered sequence
+    assert client.get('/api/face-groups/next?threshold=0.55&skip=2').json()['group'] is None
+    full = client.get('/api/face-groups/next?threshold=0.55&include_approved=1').json()
+    assert full['remaining_groups'] == 3 and full['remaining_faces'] == 14
+    assert full['near_named_hidden'] == 0
+    assert sorted(_sizes(client, include_approved=1)) == [4, 4, 6]
+    # tail skips: the hidden group is shown last-or-between only when included
+    assert _sizes(client, include_approved=0) == [6, 4]
+
+
+def test_near_named_param_clamped_and_threshold(env):
+    _app, client, _f, _ = env
+    _near_dana_group(env)
+    base = '/api/face-groups/next?threshold=0.55&near_named='
+    assert client.get(base + '0.6').json()['near_named_hidden'] == 1
+    # absurd values clamp to 0.9 / 0.2 instead of erroring
+    assert client.get(base + '5').json() == client.get(base + '0.9').json()
+    assert client.get(base + '-3').json() == client.get(base + '0.2').json()
+
+
+def test_far_groups_shown_when_nobody_named(env):
+    _app, client, _f, _ = env
+    _compute(client)
+    r = client.get('/api/face-groups/next?threshold=0.55').json()
+    assert r['near_named_hidden'] == 0 and r['remaining_groups'] == 2
+    assert _sizes(client) == _sizes(client, include_approved=1) == [6, 4]
+
+
+def test_approving_person_hides_similar_group_and_invalidates_cache(env):
+    _app, client, faces, _ = env
+    _compute(client)
+    assert client.get('/api/face-groups/next?threshold=0.55').json()['remaining_groups'] == 2
+    # approve the 4-group as Eve (via the group API): the 6-group stays far from her
+    g = client.get('/api/face-groups/next?threshold=0.55&skip=1').json()['group']
+    assert g['size'] == 4
+    # name the 6-group's faces partially elsewhere so a group stays; instead name 1 face
+    # of cluster 0 as Frank: that face is a named reference right inside the 6-group
+    r = client.post('/api/faces/auto:%d/identity' % faces[0][0], json={'name': 'Frank'})
+    assert r.status_code == 200
+    now = client.get('/api/face-groups/next?threshold=0.55').json()
+    assert now['near_named_hidden'] == 1 and now['remaining_groups'] == 1
+    assert now['group']['size'] == 4
+    assert client.get('/api/face-groups/next?threshold=0.55&include_approved=1').json()['remaining_groups'] == 2
