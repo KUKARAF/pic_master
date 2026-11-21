@@ -15,6 +15,7 @@ import json
 import math
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -11649,7 +11650,9 @@ def create_app(data_root: str) -> FastAPI:
 
     FACE_GROUP_DEFAULT_THRESHOLD = 0.55
     FACE_GROUP_DEFAULT_MIN_SIZE = 3
-    FACE_GROUP_MAX_FACES = 200          # faces per /next response (and per approve round)
+    # Backstop only (payload/DOM size), not a product limit: a group is served whole unless it
+    # exceeds this. The page lazy-loads crops, so thousands are fine.
+    FACE_GROUP_MAX_FACES = 5000         # faces per /next response (and per approve round)
     FACE_GROUP_REJECT_OVERLAP = 0.5     # a recomputed group is hidden when this share was rejected
     FACE_GROUP_CACHE_KEEP = 3           # thresholds kept in memory
 
@@ -11937,9 +11940,23 @@ def create_app(data_root: str) -> FastAPI:
             return {
                 'group': {'id': chosen['id'], 'size': size, 'faces': cards,
                           'truncated': size > len(cards),
-                          'suggested': _fg_suggestion(chosen['centroid'])},
+                          'suggested': _fg_suggestion(chosen['centroid']),
+                          'default_name': _fg_default_name()},
                 **remaining,
             }
+
+    _UNKNOWN_NAME_RE = re.compile(r'^Unknown (\d+)$')
+
+    def _fg_default_name():
+        """Prefill for the name box: the next free 'Unknown N' (one past the highest
+        existing 'Unknown <n>' person), so an unnamed new group is saved under a
+        placeholder that can be renamed later."""
+        top = 0
+        for row in manual.get_all_identities():
+            m = _UNKNOWN_NAME_RE.match(row[0] or '')
+            if m:
+                top = max(top, int(m.group(1)))
+        return 'Unknown %d' % (top + 1)
 
     def _fg_find(group_id):
         for entry in face_group_cache.values():

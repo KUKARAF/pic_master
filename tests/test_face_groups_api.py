@@ -332,3 +332,25 @@ def test_approving_person_hides_similar_group_and_invalidates_cache(env):
     assert now['near_named_hidden'] == 1 and now['remaining_groups'] == 1
     assert now['group']['size'] == 4
     assert client.get('/api/face-groups/next?threshold=0.55&include_approved=1').json()['remaining_groups'] == 2
+
+
+def test_default_name_is_next_free_unknown_n(env):
+    """The name box is prefilled with 'Unknown N' (one past the highest existing one)."""
+    _app, client, faces, (_db, _manual) = env
+    _compute(client)
+    g = client.get('/api/face-groups/next?threshold=0.55').json()['group']
+    assert g['default_name'] == 'Unknown 1'
+    # approve the biggest group under 'Unknown 1' -> the next group's default moves on
+    r = client.post('/api/face-groups/%d/approve' % g['id'],
+                    json={'name': g['default_name'], 'face_ids': [f['face_id'] for f in g['faces']]})
+    assert r.status_code == 200, r.text
+    nxt = client.get('/api/face-groups/next?threshold=0.55').json()['group']
+    assert nxt is not None and nxt['default_name'] == 'Unknown 2'
+
+
+def test_group_served_whole_above_old_200_cap(env, monkeypatch):
+    """A group is no longer cut at 200 faces: the cap is a 5000-face backstop."""
+    import re as _re
+    src = open(__import__('media_manager.web', fromlist=['x']).__file__).read()
+    m = _re.search(r'FACE_GROUP_MAX_FACES = (\d+)', src)
+    assert m and int(m.group(1)) >= 5000

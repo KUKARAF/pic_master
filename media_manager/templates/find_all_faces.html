@@ -406,8 +406,13 @@
     els.belowVal.textContent = fmt(els.below.value);
 
     renderSuggestion(g.suggested);
-    // Offer the suggestion pre-filled, but never clobber what the user already typed.
-    if (g.suggested && g.suggested.name && !els.name.value.trim()) els.name.value = g.suggested.name;
+    // Pre-fill the name: a matching known person if there is one, else the next free
+    // 'Unknown N'. Never clobber what the user typed themselves — only an earlier auto-fill.
+    var auto = (g.suggested && g.suggested.name) || g.default_name || '';
+    if (auto && (!els.name.value.trim() || els.name.dataset.auto === '1')) {
+      els.name.value = auto;
+      els.name.dataset.auto = '1';
+    }
     els.card.style.display = '';
     updateApprove();
   }
@@ -429,7 +434,7 @@
     api('POST', '/api/face-groups/' + encodeURIComponent(group.id) + '/approve', { name: name, face_ids: ids })
       .then(function (d) {
         var n = num(d.approved, ids.length), sk = num(d.skipped, 0);
-        els.name.value = '';
+        els.name.value = ""; els.name.dataset.auto = "";
         afterDecision('Approved ' + plural(n, 'face', 'faces') + ' as ' + name +
           (sk ? ' (' + sk + ' skipped)' : ''));
       })
@@ -443,7 +448,7 @@
     updateApprove();
     api('POST', '/api/face-groups/' + encodeURIComponent(group.id) + '/reject', { face_ids: ids })
       .then(function () {
-        els.name.value = '';
+        els.name.value = ""; els.name.dataset.auto = "";
         afterDecision('Rejected ' + plural(ids.length, 'face', 'faces'));
       })
       .catch(function (e) { busy = false; updateApprove(); toast('Reject failed: ' + e.message, 'error'); });
@@ -452,7 +457,7 @@
   function doSkip() {
     if (!group || busy) return;
     skip += 1;
-    els.name.value = '';
+    els.name.value = ""; els.name.dataset.auto = "";
     loadNext();
   }
 
@@ -474,6 +479,7 @@
     });
     updateApprove();
   });
+  els.name.addEventListener('input', function () { els.name.dataset.auto = ''; });
   els.restoreBtn.addEventListener('click', function () {
     if (group) renderGroup(Object.assign({}, group, { suggested: group.suggested }));
     // renderGroup resets `removed`; keep the typed name (it only prefills when empty).
@@ -483,7 +489,7 @@
     includeApproved = els.approved.checked;
     try { localStorage.setItem('fgIncludeApproved', includeApproved ? '1' : '0'); } catch (e) {}
     skip = 0;
-    els.name.value = '';
+    els.name.value = ""; els.name.dataset.auto = "";
     loadNext();
   });
 
