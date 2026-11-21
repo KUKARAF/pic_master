@@ -235,15 +235,25 @@ def _parse_nvidia_smi(text):
     return {"util_pct": best[0], "vram_used_mb": best[1], "vram_total_mb": best[2]}
 
 
+_intel_probe = None  # lazy IntelXpuProbe (subprocess only; the worker stays torch-free)
+
+
 def _read_gpu():
-    """GPU stats via nvidia-smi (2 s timeout), or None if absent/failing."""
+    """GPU stats: nvidia-smi (2 s timeout), else Intel xpu-smi / intel_gpu_top, else None.
+    Result is {util_pct, vram_used_mb, vram_total_mb, vendor} ('nvidia' | 'intel')."""
+    global _intel_probe
     try:
         out = subprocess.run(_NVSMI_CMD, capture_output=True, text=True, timeout=2)
+        if out.returncode == 0:
+            gpu = _parse_nvidia_smi(out.stdout)
+            if gpu is not None:
+                return {**gpu, "vendor": "nvidia"}
     except (OSError, subprocess.SubprocessError):
-        return None
-    if out.returncode != 0:
-        return None
-    return _parse_nvidia_smi(out.stdout)
+        pass
+    if _intel_probe is None:
+        from media_manager import job_queue  # stdlib-only module; parsers shared with the web host
+        _intel_probe = job_queue.IntelXpuProbe(timeout_s=1.4)
+    return _intel_probe()
 
 
 def _read_proc_stat():

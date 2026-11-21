@@ -457,7 +457,7 @@ _clients_lock = threading.Lock()
 def fetch_stats(client, timeout=3):
     """Worker machine load, or None — NEVER raises.
 
-    Returns {"gpu": {"util_pct","vram_used_mb","vram_total_mb"}|None, "cpu_pct": float|None,
+    Returns {"gpu": {"util_pct","vram_used_mb","vram_total_mb","vendor"}|None, "cpu_pct": float|None,
     "ram_total_mb": float|None, "ram_available_mb": float|None}. None when the worker is
     unconfigured/unreachable, errors, or is an OLD worker without the ``stats`` op (HTTP 404).
     Sent ``concurrent=True`` so it never queues behind a long in-flight request."""

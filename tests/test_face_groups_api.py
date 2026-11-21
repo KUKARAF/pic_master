@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from media_manager import compute, face_clusters
 from media_manager.web import create_app
 
 D = 64
@@ -19,7 +20,14 @@ def _unit(v):
 
 
 @pytest.fixture
-def env():
+def cpu_device(monkeypatch):
+    """Test hook: there is no XPU/CUDA in CI, so route the (GPU-only) grouping to the
+    torch-on-CPU device through its single choke point. Production never does this."""
+    monkeypatch.setattr(face_clusters, 'resolve_device', lambda device=None: device or 'cpu')
+
+
+@pytest.fixture
+def env(cpu_device):
     root = tempfile.mkdtemp()
     os.makedirs(os.path.join(root, '.media'))
     app = create_app(root)
@@ -228,3 +236,19 @@ def test_compute_excludes_trashed_and_damaged(env):
     db.conn.commit()
     st = _compute(client)
     assert st['groups'] == 1 and st['faces_in_groups'] == 6
+
+
+def test_compute_without_gpu_ends_in_clear_error(env, monkeypatch):
+    _app, client, _f, _ = env
+    monkeypatch.undo()                                   # drop the cpu hook: real resolution
+    monkeypatch.setattr(compute, 'torch_device', lambda: 'cpu')
+    st = _compute(client, threshold=0.55, min_size=3)
+    assert 'needs a GPU' in (st['error'] or '') and 'MEDIA_DEVICE' in st['error']
+    assert st['groups'] == 0 and st['computed_at'] is None and st['running'] is False
+    assert st['device'] is None
+
+
+def test_status_reports_device(env):
+    _app, client, _f, _ = env
+    st = _compute(client, threshold=0.55, min_size=3)
+    assert st['error'] is None and st['device'] == 'cpu'     # the hook device, reported

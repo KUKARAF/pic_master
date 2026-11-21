@@ -42,6 +42,49 @@ def test_read_gpu_failure_paths(monkeypatch):
     assert worker_server._read_gpu()["util_pct"] == 5.0
 
 
+def _fake_run(outputs):
+    """subprocess.run stand-in: outputs maps argv[0] -> stdout (absent -> FileNotFoundError)."""
+    def run(cmd, *a, **k):
+        if cmd[0] not in outputs:
+            raise FileNotFoundError(cmd[0])
+        return subprocess.CompletedProcess(cmd, 0, outputs[cmd[0]], "")
+    return run
+
+
+def test_read_gpu_nvidia_has_vendor(monkeypatch):
+    monkeypatch.setattr(worker_server.subprocess, "run", _fake_run({"nvidia-smi": "5, 1, 2\n"}))
+    assert worker_server._read_gpu() == {"util_pct": 5.0, "vram_used_mb": 1.0,
+                                         "vram_total_mb": 2.0, "vendor": "nvidia"}
+
+
+def test_read_gpu_intel_xpu_smi_when_no_nvidia(monkeypatch):
+    monkeypatch.setattr(worker_server, "_intel_probe", None)
+    out = ('{"memory_physical_size_byte": "34359738368", "device_level": ['
+           '{"metrics_type": "XPUM_STATS_GPU_UTILIZATION", "value": 88},'
+           '{"metrics_type": "XPUM_STATS_MEMORY_USED", "value": 2048}]}')
+    monkeypatch.setattr(worker_server.subprocess, "run", _fake_run({"xpu-smi": out}))
+    assert worker_server._read_gpu() == {"util_pct": 88.0, "vram_used_mb": 2048.0,
+                                         "vram_total_mb": 32768.0, "vendor": "intel"}
+
+
+def test_read_gpu_intel_gpu_top_fallback_and_cached_failure(monkeypatch):
+    monkeypatch.setattr(worker_server, "_intel_probe", None)
+    igt = '[{"engines": {"Compute/0": {"busy": 0}}}, {"engines": {"Compute/0": {"busy": 42.0}}}]'
+    monkeypatch.setattr(worker_server.subprocess, "run", _fake_run({"intel_gpu_top": igt}))
+    g = worker_server._read_gpu()
+    assert g["util_pct"] == 42.0 and g["vendor"] == "intel" and g["vram_total_mb"] is None
+    # nothing installed at all: None, and the Intel probe caches the failure
+    monkeypatch.setattr(worker_server, "_intel_probe", None)
+    calls = []
+    def none_run(cmd, *a, **k):
+        calls.append(cmd[0]); raise FileNotFoundError(cmd[0])
+    monkeypatch.setattr(worker_server.subprocess, "run", none_run)
+    assert worker_server._read_gpu() is None
+    n = len(calls)
+    assert worker_server._read_gpu() is None
+    assert calls[n:] == ["nvidia-smi"]            # xpu-smi / intel_gpu_top not re-forked
+
+
 def test_cpu_pct_delta(monkeypatch):
     monkeypatch.setattr(worker_server, "_cpu_prev", None)
     samples = iter([(100, 1000), (150, 1100), (150, 1100)])

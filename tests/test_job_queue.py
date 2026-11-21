@@ -1,7 +1,10 @@
+import pytest
 """Tests for media_manager.job_queue (fake clock / probes / starter; synchronous tick)."""
 import time
 from media_manager.job_queue import (DEFAULT_WEIGHT, JOB_WEIGHTS, JobQueue, JobWeight,
                                      NvidiaSmiProbe, ResourceSampler, weight_for)
+from media_manager import job_queue
+from media_manager.job_queue import IntelXpuProbe, LocalGpuProbe
 
 
 class Clock:
@@ -457,3 +460,78 @@ def test_deferred_start_stays_queued_not_error():
     h.q._starter = lambda it: {'started': True, 'total': 1}
     h.q.tick()
     assert a.state == 'running'
+
+
+# ---- Intel GPU probe ---------------------------------------------------------
+
+XPU_SMI_JSON = """{"device_id": 0, "memory_physical_size_byte": "33689878528",
+ "device_level": [{"metrics_type": "XPUM_STATS_GPU_UTILIZATION", "value": 63.5},
+  {"metrics_type": "XPUM_STATS_POWER", "value": 120.0},
+  {"metrics_type": "XPUM_STATS_MEMORY_USED", "value": 4096.25}]}"""
+XPU_SMI_FLAT = '{"GPU Utilization (%)": 12, "GPU Memory Used (MiB)": 512, "memory_physical_size_byte": 1073741824}'
+IGT = """[
+{"period": {"duration": 0.0}, "engines": {"Render/3D/0": {"busy": 0.0}}},
+{"period": {"duration": 500.1}, "engines": {"Render/3D/0": {"busy": 20.5, "unit": "%"},
+  "Compute/0": {"busy": 71.0, "unit": "%"}}}
+]"""
+
+
+def test_parse_xpu_smi_json_layouts_and_misses():
+    r = job_queue.parse_xpu_smi_json(XPU_SMI_JSON)
+    assert r['util_pct'] == 63.5 and r['vram_used_mb'] == 4096.25
+    assert r['vram_total_mb'] == pytest.approx(33689878528 / 2 ** 20)
+    f = job_queue.parse_xpu_smi_json(XPU_SMI_FLAT)
+    assert f == {'util_pct': 12.0, 'vram_used_mb': 512.0, 'vram_total_mb': 1024.0}
+    for bad in ('', 'nope', '{}', '[]', '{"device_level": [{"metrics_type": "X", "value": 1}]}', None):
+        assert job_queue.parse_xpu_smi_json(bad) is None
+
+
+def test_parse_intel_gpu_top_uses_last_sample_busiest_engine():
+    assert job_queue.parse_intel_gpu_top(IGT) == {'util_pct': 71.0, 'vram_used_mb': None,
+                                                  'vram_total_mb': None}
+    assert job_queue.parse_intel_gpu_top('{"engines": {"a": {"busy": 5}}}\n{"engines": {"a": {"busy": 9}}}')['util_pct'] == 9.0
+    for bad in ('', 'junk', '[{"x": 1}]', '{"engines": {}}'):
+        assert job_queue.parse_intel_gpu_top(bad) is None
+
+
+def test_intel_probe_xpu_smi_then_igt_fallback_and_cached_failure():
+    c = Clock(); seen = []
+
+    def runner(cmd):
+        seen.append(cmd[0])
+        if cmd[0] == 'xpu-smi':
+            raise FileNotFoundError('xpu-smi')
+        return IGT
+    p = IntelXpuProbe(clock=c, runner=runner)
+    r = p()
+    assert r['util_pct'] == 71.0 and r['vendor'] == 'intel' and seen == ['xpu-smi', 'intel_gpu_top']
+
+    seen.clear()
+    ok = IntelXpuProbe(runner=lambda cmd: (seen.append(cmd) or XPU_SMI_JSON))
+    r = ok()
+    assert r['util_pct'] == 63.5 and r['vendor'] == 'intel'
+    assert seen == [['xpu-smi', 'stats', '-d', '0', '-j']]        # igt not touched
+
+    calls = []
+    def dead(cmd):
+        calls.append(cmd[0]); raise FileNotFoundError(cmd[0])
+    p = IntelXpuProbe(clock=c, runner=dead, retry_after_s=100)
+    assert p() is None and p() is None and len(calls) == 2         # both tried once, then cached
+    c.advance(101); p()
+    assert len(calls) == 4
+    assert IntelXpuProbe(runner=lambda cmd: 'garbage')() is None
+
+
+def test_local_probe_chain_and_default_sampler():
+    nv = lambda: None
+    intel = lambda: {'util_pct': 33.0, 'vram_used_mb': None, 'vram_total_mb': None, 'vendor': 'intel'}
+    assert LocalGpuProbe([nv, intel])()['util_pct'] == 33.0
+    assert LocalGpuProbe([lambda: {'util_pct': 1.0}, intel])()['util_pct'] == 1.0
+    assert LocalGpuProbe([nv, nv])() is None
+    assert [type(p) for p in ResourceSampler().gpu_probe.probes] == [NvidiaSmiProbe, IntelXpuProbe]
+
+
+def test_face_groups_weight_is_gpu_heavy_and_shares_embed_group():
+    w = weight_for('/api/face-groups/compute/start')
+    assert w.gpu >= 80 and w.cpu <= 20 and w.ram_mb >= 2000 and w.exclusive_group == 'embed'
+    assert w.exclusive_group == weight_for('/api/siglip-dino/start').exclusive_group

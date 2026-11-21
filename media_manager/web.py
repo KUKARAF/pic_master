@@ -11653,9 +11653,16 @@ def create_app(data_root: str) -> FastAPI:
     FACE_GROUP_REJECT_OVERLAP = 0.5     # a recomputed group is hidden when this share was rejected
     FACE_GROUP_CACHE_KEEP = 3           # thresholds kept in memory
 
+    # GPU ONLY (face_clusters.find_face_groups raises GpuUnavailableError on cpu/no torch;
+    # the text lands in `error`). Runs in THIS (web) process through compute.torch_device():
+    # the torch-free bigboy worker cannot host it. `device` reports where it ran/will run.
+    # Cost (N faces, D=512): host RAM ~N*D*4 once while loading (1M -> 2 GiB) then the matrix
+    # lives in VRAM only for the job (same size, freed at the end; tiles <= 1.3 GiB); GPU time
+    # ~N^2*D flops (1M -> 5e14, tens of seconds on a B70). The per-group `next` work below is
+    # one K x D matvec (K = named faces), never O(N^2).
     face_group_job = {'running': False, 'done': 0, 'total': 0, 'error': None,
                       'cancel_requested': False, 'threshold': None, 'min_size': None,
-                      'cancelled': False}
+                      'cancelled': False, 'device': None}
     # round(threshold, 3) -> {'threshold','min_size','computed_at','ver','groups': {id: g},
     # 'order': [ids biggest first]}. A group g: {id, face_ids, scores, centroid,
     # dead, dismissed}; face_ids/scores shrink in place as faces get decided elsewhere.
@@ -11708,6 +11715,8 @@ def create_app(data_root: str) -> FastAPI:
         try:
             # Same reconcile the old full-library scoring did: the pool must never
             # contain a face manual.db already decided.
+            # Fail fast (before streaming N embeddings out of SQL) when there is no GPU.
+            job['device'] = face_clusters.resolve_device()
             db.sync_handled(manual.get_promoted_source_ids())
             ver = _fg_versions()
             trashed = _trashed_file_ids()
@@ -11724,7 +11733,7 @@ def create_app(data_root: str) -> FastAPI:
 
             found = face_clusters.find_face_groups(
                 ids, mat, threshold=threshold, min_size=min_size,
-                gemm=gpu_search.gemm, progress=_progress, should_stop=stop)
+                progress=_progress, should_stop=stop)
             del mat
             with face_group_lock:
                 groups, order = {}, []
@@ -11744,6 +11753,8 @@ def create_app(data_root: str) -> FastAPI:
                     del face_group_cache[oldest]
         except face_clusters.GroupSearchCancelled:
             job['cancelled'] = True
+        except face_clusters.GpuUnavailableError as exc:
+            job['error'] = str(exc)          # clear "needs a GPU" text, no CPU fallback
         except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
             job['error'] = compute.job_error_text(exc)
         finally:
@@ -11765,7 +11776,7 @@ def create_app(data_root: str) -> FastAPI:
             if cached is not None and cached['min_size'] == min_size and not force:
                 return {'started': False, 'message': 'Already computed for this threshold.'}
             face_group_job.update(running=True, done=0, total=0, error=None, cancelled=False,
-                                  cancel_requested=False, threshold=threshold, min_size=min_size)
+                                  cancel_requested=False, device=None, threshold=threshold, min_size=min_size)
         _spawn_job(lambda: _fg_run(threshold, min_size))
         return {'started': True}
 
@@ -11789,7 +11800,7 @@ def create_app(data_root: str) -> FastAPI:
             return {
                 'running': job['running'], 'done': job['done'], 'total': job['total'],
                 'error': job['error'], 'cancelled': job['cancelled'], 'threshold': key,
-                'groups': len(alive),
+                'device': job['device'], 'groups': len(alive),
                 'faces_in_groups': sum(len(g['face_ids']) for g in alive),
                 'computed_at': entry['computed_at'] if entry else None,
                 'stale': entry is None or entry['ver'] != _fg_versions(),

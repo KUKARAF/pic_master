@@ -17,6 +17,8 @@ exposes a synchronous `tick()`; the background threads are thin loops around
 """
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 import threading
 import time
@@ -100,12 +102,151 @@ class NvidiaSmiProbe:
             return None
 
 
+_XPU_SMI_CMD = ['xpu-smi', 'stats', '-d', '0', '-j']
+_INTEL_GPU_TOP_CMD = ['intel_gpu_top', '-J', '-s', '500', '-n', '2']
+
+
+def _norm_key(k) -> str:
+    return re.sub(r'[^a-z0-9]+', '_', str(k).lower()).strip('_')
+
+
+def _num(v) -> Optional[float]:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None
+
+
+def _metric_pairs(node):
+    """Yield (normalised name, value) for every metric in an xpu-smi JSON tree. Handles
+    both layouts: [{"metrics_type": "XPUM_STATS_GPU_UTILIZATION", "value": 3}, ...] and
+    plain {"GPU Utilization (%)": 3, ...} / {"gpu_utilization": {"value": 3}}."""
+    if isinstance(node, dict):
+        name = next((node[k] for k in ('metrics_type', 'metric', 'name', 'type') if k in node), None)
+        if name is not None and 'value' in node:
+            yield _norm_key(name), node['value']
+        for k, v in node.items():
+            if isinstance(v, dict) and 'value' in v and not isinstance(v['value'], (dict, list)):
+                yield _norm_key(k), v['value']
+            elif not isinstance(v, (dict, list)):
+                yield _norm_key(k), v
+            else:
+                yield from _metric_pairs(v)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _metric_pairs(item)
+
+
+def parse_xpu_smi_json(text) -> Optional[dict]:
+    """``xpu-smi stats -d 0 -j`` -> {util_pct, vram_used_mb, vram_total_mb} (memory may be
+    None when only utilization is reported); None on any parse miss."""
+    try:
+        data = json.loads(text)
+        util = used = total = None
+        for name, val in _metric_pairs(data):
+            f = _num(val)
+            if f is None:
+                continue
+            if 'gpu_utilization' in name and util is None:
+                util = f
+            elif 'memory_used' in name and 'percent' not in name and used is None:
+                used = f                                   # xpu-smi reports MiB
+            elif ('memory_physical_size_byte' in name or name == 'memory_size_byte') and total is None:
+                total = f / 2 ** 20
+            elif name in ('memory_total', 'gpu_memory_total_mib', 'memory_size') and total is None:
+                total = f
+        if util is None:
+            return None
+        return {'util_pct': util, 'vram_used_mb': used, 'vram_total_mb': total}
+    except Exception:  # hook-allow: broad - any unexpected shape is a parse miss
+        return None
+
+
+def parse_intel_gpu_top(text) -> Optional[dict]:
+    """``intel_gpu_top -J`` (a stream of JSON sample objects, possibly wrapped in [ ])
+    -> {util_pct: busiest engine of the LAST sample, vram_*: None} (no VRAM in this
+    tool); None on a parse miss."""
+    try:
+        dec, i, samples = json.JSONDecoder(), 0, []
+        text = text or ''
+        while i < len(text):
+            if text[i] in ' \t\r\n,[]':
+                i += 1
+                continue
+            obj, i = dec.raw_decode(text, i)
+            if isinstance(obj, dict):
+                samples.append(obj)
+        for obj in reversed(samples):        # first sample is "since boot" / zero: prefer the last
+            engines = obj.get('engines')
+            busy = [_num(e.get('busy')) for e in engines.values() if isinstance(e, dict)] \
+                if isinstance(engines, dict) else []
+            busy = [b for b in busy if b is not None]
+            if busy:
+                return {'util_pct': max(busy), 'vram_used_mb': None, 'vram_total_mb': None}
+        return None
+    except Exception:  # hook-allow: broad - any unexpected shape is a parse miss
+        return None
+
+
+class IntelXpuProbe:
+    """Intel GPU (Arc/B-series) load probe: ``xpu-smi stats -d 0 -j``, then (if that
+    yields nothing) ``intel_gpu_top -J -s 500 -n 2``. Same cached-failure behaviour as
+    NvidiaSmiProbe. `runner(cmd) -> stdout` is injectable; it must raise when the binary
+    is missing or fails. Result carries 'vendor': 'intel'."""
+
+    def __init__(self, timeout_s: float = 3.0, retry_after_s: float = 120.0,
+                 clock: Callable[[], float] = time.monotonic,
+                 runner: Optional[Callable[[list], str]] = None):
+        self.timeout_s = timeout_s
+        self.retry_after_s = retry_after_s
+        self._clock = clock
+        self._runner = runner or self._run
+        self._failed_at: Optional[float] = None
+
+    def _run(self, cmd) -> str:
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=self.timeout_s, check=True).stdout
+
+    def __call__(self) -> Optional[dict]:
+        now = self._clock()
+        if self._failed_at is not None and now - self._failed_at < self.retry_after_s:
+            return None
+        for cmd, parse in ((_XPU_SMI_CMD, parse_xpu_smi_json),
+                           (_INTEL_GPU_TOP_CMD, parse_intel_gpu_top)):
+            try:
+                r = parse(self._runner(cmd))
+            except Exception:  # hook-allow: broad - missing binary / timeout / permission
+                r = None
+            if r is not None:
+                self._failed_at = None
+                return {**r, 'vendor': 'intel'}
+        self._failed_at = now
+        return None
+
+
+class LocalGpuProbe:
+    """First probe that answers wins: nvidia-smi, then Intel xpu-smi / intel_gpu_top.
+    Each member caches its own failures, so a host without either never forks twice
+    per retry window."""
+
+    def __init__(self, probes=None):
+        self.probes = list(probes) if probes is not None else [NvidiaSmiProbe(), IntelXpuProbe()]
+
+    def __call__(self) -> Optional[dict]:
+        for p in self.probes:
+            r = p()
+            if r:
+                return r
+        return None
+
+
 class ResourceSampler:
     """Samples CPU / RAM / GPU every `interval_s` into a rolling `window_s` window.
 
     GPU sources, tried in order each sample: `worker_probe` (the web layer fills this
     with a call to the remote ML worker's stats - the GPU is usually REMOTE), then
-    `gpu_probe` (default: local nvidia-smi). Fallback when neither yields anything:
+    `gpu_probe` (default: LocalGpuProbe = nvidia-smi, then Intel xpu-smi/intel_gpu_top). Fallback when neither yields anything:
     running jobs that report `gpu_busy_pct` call `note_job_gpu(pct)`.
     """
 
@@ -117,7 +258,7 @@ class ResourceSampler:
                  mem_reader: Callable[[], Optional[tuple[float, float]]] = read_meminfo):
         self.window_s = float(window_s)
         self.interval_s = float(interval_s)
-        self.gpu_probe = gpu_probe if gpu_probe is not None else NvidiaSmiProbe()
+        self.gpu_probe = gpu_probe if gpu_probe is not None else LocalGpuProbe()
         self.worker_probe = worker_probe  # slot, assigned later by the web layer
         self._clock = clock
         self._cpu_reader = cpu_reader
@@ -263,6 +404,10 @@ DEFAULT_WEIGHT = JobWeight(gpu=40, cpu=40, ram_mb=1500)
 #    face scan and indexers consume - serial with scan-video-faces.
 #  * imdb/rebuild streams the whole SigLIP+face matrices to the worker over RNS: RAM and
 #    network heavy, tiny GPU; its own group (the worker's in-memory index swap).
+#  * face-groups/compute: the tiled all-pairs search runs ON THE WEB HOST's GPU (torch xpu/
+#    cuda, GPU-only, no CPU fallback), saturating it for tens of seconds (gpu 90, tiny cpu).
+#    Host RAM ~ matrix size (N*512*4 B, 2 GiB at 1M faces) while loading, then the matrix
+#    sits in VRAM. Group 'embed' so it never overlaps the embedding jobs for VRAM.
 #  * metadata / cities / matching jobs are light (EXIF reads, HTTP, numpy dot products).
 JOB_WEIGHTS: dict[str, JobWeight] = {
     '/api/siglip-dino/start':        JobWeight(gpu=70, cpu=30, ram_mb=2000, exclusive_group='embed'),
@@ -280,7 +425,7 @@ JOB_WEIGHTS: dict[str, JobWeight] = {
     '/api/near-dup/compute/start':   JobWeight(gpu=0,  cpu=75, ram_mb=3000, exclusive_group='czkawka'),
     '/api/broken/scan/start':        JobWeight(gpu=0,  cpu=65, ram_mb=1500, exclusive_group='czkawka'),
     '/api/imdb/rebuild':             JobWeight(gpu=5,  cpu=20, ram_mb=3500, exclusive_group='imdb'),
-    '/api/face-groups/compute/start': JobWeight(gpu=40, cpu=60, ram_mb=2500, exclusive_group='facegroups'),
+    '/api/face-groups/compute/start': JobWeight(gpu=90, cpu=10, ram_mb=3000, exclusive_group='embed'),
     '/api/metadata/start':           JobWeight(gpu=0,  cpu=20, ram_mb=300),
     '/api/fetch-cities/start':       JobWeight(gpu=0,  cpu=5,  ram_mb=100),
     '/api/match-cities/start':       JobWeight(gpu=0,  cpu=10, ram_mb=200),
