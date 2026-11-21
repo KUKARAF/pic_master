@@ -55,7 +55,7 @@ from media_manager.embedding_tag_classifier import (
     classifier_dir, current_embedding_model, score_matrix, slugify, space_kind,
     weights_state, write_status,
 )
-from media_manager.database import FACE_NORM_VERSION, Database
+from media_manager.database import FACE_NORM_VERSION, Database, ThreadLocalDB
 from media_manager.detector import DEFAULT_VOCAB, YOLOWorldDetector, load_vocab_from_file, merge_vocab
 from media_manager.error_log import ErrorLog
 from media_manager.face_detector import FaceDetector, _norm_angle
@@ -77,6 +77,7 @@ from media_manager.object_matcher import ObjectMatcher
 from media_manager.remote_tag_trainer import _downscale_jpeg
 from media_manager.similarity import adjusted_centroid, fuse_zscores, mean_normalized_centroid, top_k_indices
 from media_manager.swipe_support import bias_reorder
+from media_manager import job_queue
 from media_manager.worker_client import WorkerError
 from media_manager.yolo_tag_classifier import MIN_BOXES
 from media_manager.category_resolver import (
@@ -224,6 +225,13 @@ class TrashBody(BaseModel):
     reason: Optional[str] = None
     kept_checksum: Optional[str] = None
     note: Optional[str] = None
+
+class BulkQueueBody(BaseModel):
+    key: str
+    label: str
+    start_url: str
+    status_url: Optional[str] = None
+
 
 class DupScanBody(BaseModel):
     # Similar-duplicate czkawka scan options. tolerance: strict | normal | loose.
@@ -512,6 +520,12 @@ def _never():
     """Default should_stop for the per-file stage functions the /bulk jobs and the file
     manager's folder ML job share: never stop early."""
     return False
+
+
+def _cancel_check(job):
+    """should_stop hook for a bulk job's state dict: True once /bulk queue (or anything
+    else) set job['cancel_requested']; reset to False by each job's start."""
+    return lambda: bool(job.get('cancel_requested'))
 
 
 def _split_age_results(results):
@@ -4194,13 +4208,15 @@ def create_app(data_root: str) -> FastAPI:
         candidates = _drop_trashed([
             (fid, os.path.join(data_root, rel)) for fid, rel in _region_pending_files()
         ], include_trashed)
-        region_index_job.update(running=True, done=0, total=len(candidates), error=None)
+        region_index_job.update(running=True, done=0, total=len(candidates), error=None,
+                                cancel_requested=False)
         if (busy := _folder_ml_holds('region', region_index_job)):
             return {'started': False, 'message': busy}
 
         def _run():
             try:
-                _process_region_index(candidates, lambda d, _f: region_index_job.update(done=d))
+                _process_region_index(candidates, lambda d, _f: region_index_job.update(done=d),
+                                      should_stop=_cancel_check(region_index_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 region_index_job['error'] = compute.job_error_text(exc)
             finally:
@@ -4327,13 +4343,15 @@ def create_app(data_root: str) -> FastAPI:
         candidates = _drop_trashed([
             (fid, os.path.join(data_root, rel)) for fid, rel in _pattern_pending_files()
         ], include_trashed)
-        pattern_index_job.update(running=True, done=0, total=len(candidates), error=None)
+        pattern_index_job.update(running=True, done=0, total=len(candidates), error=None,
+                                 cancel_requested=False)
         if (busy := _folder_ml_holds('pattern', pattern_index_job)):
             return {'started': False, 'message': busy}
 
         def _run():
             try:
-                _process_pattern_index(candidates, lambda d, _f: pattern_index_job.update(done=d))
+                _process_pattern_index(candidates, lambda d, _f: pattern_index_job.update(done=d),
+                                       should_stop=_cancel_check(pattern_index_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 pattern_index_job['error'] = compute.job_error_text(exc)
             finally:
@@ -4493,11 +4511,13 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'total': 0, 'message': 'Nothing to index -- every photo already has the current DINOv2 pattern index.'}
         pattern_dino_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
                                 img_per_sec=0.0, eta_seconds=None, transport_mode=None,
-                                gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)
+                                gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None,
+                                cancel_requested=False)
 
         def _run():
             try:
-                _run_pattern_dino_index(candidates, pattern_dino_job)
+                _run_pattern_dino_index(candidates, pattern_dino_job,
+                                        should_stop=_cancel_check(pattern_dino_job))
             except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
                 pattern_dino_job['error'] = compute.job_error_text(exc)
             finally:
@@ -5214,12 +5234,15 @@ def create_app(data_root: str) -> FastAPI:
         if face_body_link_job['running']:
             return {'started': False, 'message': 'Face→body linking already running.'}
         faces = manual.get_named_face_boxes()
-        face_body_link_job.update(running=True, done=0, total=len(faces), linked=0, error=None)
+        face_body_link_job.update(running=True, done=0, total=len(faces), linked=0, error=None,
+                                  cancel_requested=False)
 
         def _run():
             try:
                 linked = 0
                 for i, (checksum, identity, bbox) in enumerate(faces, 1):
+                    if face_body_link_job.get('cancel_requested'):
+                        break
                     try:
                         if _link_body_for_named_face(checksum, identity, bbox) is not None:
                             linked += 1
@@ -5257,7 +5280,7 @@ def create_app(data_root: str) -> FastAPI:
         cleared = db.clear_body_sentinels() if retry_empty else 0
         body_index_job.update(
             running=True, done=0, total=len(db.get_unbody_indexed_files(body_index.model_tag())),
-            error=None)
+            error=None, cancel_requested=False)
         # 'tags' too: both drive the shared YOLO-World detector's vocab.
         if (busy := _folder_ml_holds(('bodies', 'tags'), body_index_job)):
             return {'started': False, 'message': busy}
@@ -5270,7 +5293,8 @@ def create_app(data_root: str) -> FastAPI:
                 body_index.build_body_index(
                     db, errors, _get_body_embedder(), _get_object_detector(), data_root,
                     on_progress=_progress, manual=manual,
-                    exclude_ids=(None if include_trashed else _trashed_file_ids()))
+                    exclude_ids=(None if include_trashed else _trashed_file_ids()),
+                    should_stop=_cancel_check(body_index_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 body_index_job['error'] = compute.job_error_text(exc)
             finally:
@@ -5506,13 +5530,15 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'total': 0, 'message': 'Nothing to index — all photos already have SigLIP 2 + DINOv2 embeddings.'}
         pair_job.update(running=True, done=0, total=len(candidates), failed=0, error=None,
                         img_per_sec=0.0, eta_seconds=None, transport_mode=None,
-                        gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None)
+                        gpu_busy_pct=None, db_write_pct=None, decode_threads_avg=None,
+                        cancel_requested=False)
         if (busy := _folder_ml_holds('embed', pair_job)):
             return {'started': False, 'message': busy}
 
         def _run():
             try:
-                _run_pair_embedding(candidates, sig, dino, pair_job)
+                _run_pair_embedding(candidates, sig, dino, pair_job,
+                                    should_stop=_cancel_check(pair_job))
             except Exception as exc:  # hook-allow: broad -- background job; error surfaced in job status
                 pair_job['error'] = f'{exc.__class__.__name__}: {exc}'
             finally:
@@ -5904,14 +5930,16 @@ def create_app(data_root: str) -> FastAPI:
         if capture_frames_job['running']:
             return {'started': False, 'message': 'Frame capture already running.'}
         candidates = _drop_trashed(_videos_needing_frames(), include_trashed)
-        capture_frames_job.update(running=True, done=0, total=len(candidates), error=None)
+        capture_frames_job.update(running=True, done=0, total=len(candidates), error=None,
+                                  cancel_requested=False)
         if (busy := _folder_ml_holds('stills', capture_frames_job)):
             return {'started': False, 'message': busy}
 
         def _run():
             try:
                 _process_capture_frames([(fid, rel) for fid, rel, _cs in candidates],
-                                        lambda d, _f: capture_frames_job.update(done=d))
+                                        lambda d, _f: capture_frames_job.update(done=d),
+                                        should_stop=_cancel_check(capture_frames_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 capture_frames_job['error'] = compute.job_error_text(exc)
             finally:
@@ -6105,7 +6133,7 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Video face scan already running.'}
         candidates = _drop_trashed(_videos_needing_face_scan(), include_trashed)
         video_face_scan_job.update(running=True, done=0, total=len(candidates),
-                                   matched=0, captured=0, error=None)
+                                   matched=0, captured=0, error=None, cancel_requested=False)
         if (busy := _folder_ml_holds('video_faces', video_face_scan_job)):
             return {'started': False, 'message': busy}
 
@@ -6114,7 +6142,8 @@ def create_app(data_root: str) -> FastAPI:
                 _process_video_face_scan(
                     candidates, _get_face_detector(), video_face_scan_job,
                     lambda d, _f: video_face_scan_job.update(done=d),
-                    capture_unmatched=capture_unmatched, threshold=threshold)
+                    capture_unmatched=capture_unmatched, threshold=threshold,
+                    should_stop=_cancel_check(video_face_scan_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 video_face_scan_job['error'] = compute.job_error_text(exc)
             finally:
@@ -6152,7 +6181,8 @@ def create_app(data_root: str) -> FastAPI:
         if not include_trashed:
             trashed = manual.get_trashed_checksums()
             candidates = [cs for cs in candidates if cs not in trashed]
-        estimate_age_job.update(running=True, done=0, total=len(candidates), error=None, failed=0)
+        estimate_age_job.update(running=True, done=0, total=len(candidates), error=None, failed=0,
+                                cancel_requested=False)
 
         def _run():
             try:
@@ -6160,6 +6190,8 @@ def create_app(data_root: str) -> FastAPI:
                 done = 0
                 consecutive_failures = 0
                 for checksum in candidates:
+                    if estimate_age_job.get('cancel_requested'):
+                        break
                     row = db.get_file_by_checksum(checksum)
                     if row is None:
                         done += 1; estimate_age_job['done'] = done; continue
@@ -6413,7 +6445,7 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False, 'message': 'Face detection already running.'}
         candidates = _drop_trashed(_faceless_images(), include_trashed)
         detect_faces_job.update(running=True, done=0, total=len(candidates), matched=0, error=None,
-                                **face_timing.JOB_STAT_DEFAULTS)
+                                cancel_requested=False, **face_timing.JOB_STAT_DEFAULTS)
         if (busy := _folder_ml_holds('faces', detect_faces_job)):
             return {'started': False, 'message': busy}
 
@@ -6421,7 +6453,8 @@ def create_app(data_root: str) -> FastAPI:
             try:
                 _process_detect_faces(candidates, _get_face_detector(), detect_faces_job,
                                       lambda d, _f: detect_faces_job.update(done=d),
-                                      threshold=threshold)
+                                      threshold=threshold,
+                                      should_stop=_cancel_check(detect_faces_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 detect_faces_job['error'] = compute.job_error_text(exc)
             finally:
@@ -6957,13 +6990,15 @@ def create_app(data_root: str) -> FastAPI:
         if metadata_job['running']:
             return {'started': False, 'message': 'Metadata extraction already running.'}
         candidates = db.get_files_without_metadata()  # [(id, path), ...]
-        metadata_job.update(running=True, done=0, total=len(candidates), error=None)
+        metadata_job.update(running=True, done=0, total=len(candidates), error=None,
+                            cancel_requested=False)
         if (busy := _folder_ml_holds('exif', metadata_job)):
             return {'started': False, 'message': busy}
 
         def _run():
             try:
-                _process_metadata(candidates, lambda d, _f: metadata_job.update(done=d))
+                _process_metadata(candidates, lambda d, _f: metadata_job.update(done=d),
+                                  should_stop=_cancel_check(metadata_job))
             except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
                 metadata_job['error'] = compute.job_error_text(exc)
             finally:
@@ -6995,12 +7030,15 @@ def create_app(data_root: str) -> FastAPI:
             return {'started': False,
                     'message': 'No cities loaded — run `media geo fetch-cities` first.'}
         candidates = db.get_geotagged_files_without_city()  # [(id, lat, lon), ...]
-        cities_job.update(running=True, done=0, total=len(candidates), error=None)
+        cities_job.update(running=True, done=0, total=len(candidates), error=None,
+                          cancel_requested=False)
 
         def _run():
             try:
                 done = 0
                 for fid, lat, lon in candidates:
+                    if cities_job.get('cancel_requested'):
+                        break
                     city = db.nearest_city(lat, lon)
                     if city is not None:
                         db.set_file_city(fid, city['id'])
@@ -7163,7 +7201,8 @@ def create_app(data_root: str) -> FastAPI:
         if match_faces_job['running']:
             return {'started': False, 'message': 'Face matching already running.'}
         pool = _drop_trashed(_unpromoted_auto_faces(limit=None), include_trashed, fid_pos=1)
-        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, rotated=0, error=None)
+        match_faces_job.update(running=True, done=0, total=len(pool), matched=0, rotated=0, error=None,
+                               cancel_requested=False)
 
         def _run():
             try:
@@ -7172,6 +7211,8 @@ def create_app(data_root: str) -> FastAPI:
                 done = 0
                 matched = 0
                 for face_id, file_id, _path, bbox, emb_bytes in pool:
+                    if match_faces_job.get('cancel_requested'):
+                        break
                     done += 1
                     match_faces_job['done'] = done
                     if not emb_bytes:
@@ -11682,6 +11723,8 @@ def create_app(data_root: str) -> FastAPI:
         refreshed_refs = 0
         consecutive_unexpected = 0
         for chunk in db.iter_unnormalized_faces(chunk=200):
+            if renormalize_job.get('cancel_requested'):
+                break
             # Hard rule: a face set by hand (manual.db trust 3) is never altered by a
             # background job. Those rows are stamped done WITHOUT being examined or
             # rewritten (neither the media.db vector nor the promoted manual.db
@@ -11697,6 +11740,8 @@ def create_app(data_root: str) -> FastAPI:
             for row in chunk:
                 by_file.setdefault(row[1], []).append(row)
             for file_id, group in by_file.items():
+                if renormalize_job.get('cancel_requested'):
+                    break
                 face_ids = [r[0] for r in group]
                 rel_path = group[0][2]
                 abs_path = _live_abs_path(file_id, rel_path)
@@ -11800,7 +11845,8 @@ def create_app(data_root: str) -> FastAPI:
             # which is what makes both the normal and the full pass resumable.
             db.bump_face_norm_version(None, 0)
         renormalize_job.update(running=True, done=0, total=db.count_unnormalized_faces(),
-                               error=None, changed=0, skipped_manual=0)
+                               error=None, changed=0, skipped_manual=0,
+                               cancel_requested=False)
 
         def _run():
             try:
@@ -12408,8 +12454,249 @@ def create_app(data_root: str) -> FastAPI:
             'recent': client.recent(since_id=since),
         }
 
+    # ------------------------------------------------------------------
+    # /bulk smart job queue (job_queue.py): queue many bulk jobs; a scheduler starts
+    # them as CPU/RAM/GPU averages allow. Jobs are started / polled IN-PROCESS by
+    # calling the registered route function directly (no loopback HTTP, so no port
+    # discovery, no self-SSRF surface, no auth/proxy hops). Only catalogued start paths
+    # (job_queue.JOB_WEIGHTS) are accepted; the status path is derived, never trusted.
+    # Cancel is cooperative: a per-job 'cancel_requested' flag in the job's state dict,
+    # checked by each job's should_stop hook / loop head, reset on every (re)start.
+    # ------------------------------------------------------------------
+    import inspect as _inspect
+    import typing as _typing
+    from urllib.parse import parse_qsl as _parse_qsl, urlsplit as _urlsplit
+
+    def _bulk_cancel_jobs():
+        """start path -> job state dict, for the jobs that honour 'cancel_requested'.
+        NOT cancellable (no cooperative hook): /api/near-dup/compute/start and
+        /api/broken/scan/start (blocking czkawka subprocess.run), /api/fetch-cities/start
+        (single blocking download), /api/imdb/rebuild (one streaming RNS transfer)."""
+        return {
+            '/api/siglip-dino/start': pair_job,
+            '/api/pattern-dino-index/start': pattern_dino_job,
+            '/api/pattern-index/start': pattern_index_job,
+            '/api/region-index/start': region_index_job,
+            '/api/detect-faces/start': detect_faces_job,
+            '/api/scan-video-faces/start': video_face_scan_job,
+            '/api/estimate-age/start': estimate_age_job,
+            '/api/faces/renormalize/start': renormalize_job,
+            '/api/body-index/start': body_index_job,
+            '/api/link-faces-to-bodies/start': face_body_link_job,
+            '/api/match-faces/start': match_faces_job,
+            '/api/capture-frames/start': capture_frames_job,
+            '/api/metadata/start': metadata_job,
+            '/api/match-cities/start': cities_job,
+        }
+
+    def _cancel_bulk_job(start_path: str) -> bool:
+        """Ask the bulk job started by `start_path` to stop after the file/batch in hand.
+        True when a running job was flagged; False if unknown, not cancellable or idle."""
+        job = _bulk_cancel_jobs().get(start_path)
+        if job is None or not job.get('running'):
+            return False
+        job['cancel_requested'] = True
+        return True
+
+    def _bulk_status_path(start_path: str) -> str:
+        if start_path == '/api/imdb/rebuild':
+            return '/api/imdb/status'
+        return start_path[:-len('/start')] + '/status'
+
+    def _bulk_route(path: str, method: str):
+        for r in app.router.routes:
+            if getattr(r, 'path', None) == path and method in (getattr(r, 'methods', None) or ()):
+                return r.endpoint
+        return None
+
+    def _bulk_parse_start(start_url: str):
+        """Validate a queued start_url -> (path, endpoint_fn, kwargs). HTTPException 400
+        for anything off-catalog or absolute, or an invalid value for a DECLARED query
+        param. Query params the start function does not declare are dropped."""
+        if not isinstance(start_url, str) or not start_url.startswith('/') or start_url.startswith('//'):
+            raise HTTPException(status_code=400, detail='start_url must be a site-relative path')
+        parts = _urlsplit(start_url)
+        if parts.scheme or parts.netloc or parts.fragment:
+            raise HTTPException(status_code=400, detail='start_url must be a site-relative path')
+        path = parts.path
+        if path not in job_queue.JOB_WEIGHTS:
+            raise HTTPException(status_code=400, detail=f'unknown bulk job {path!r}')
+        fn = _bulk_route(path, 'POST')
+        if fn is None:
+            raise HTTPException(status_code=400, detail=f'unknown bulk job {path!r}')
+        try:
+            hints = _typing.get_type_hints(fn)
+        except Exception:  # hook-allow: broad -- unresolvable hint: fall back to raw annotations
+            hints = {}
+        scalar = {}
+        for name in _inspect.signature(fn).parameters:
+            t = hints.get(name)
+            if _typing.get_origin(t) is _typing.Union:
+                args = [a for a in _typing.get_args(t) if a is not type(None)]
+                t = args[0] if len(args) == 1 else None
+            if t in (bool, int, float, str):
+                scalar[name] = t
+        kwargs = {}
+        for k, v in _parse_qsl(parts.query, keep_blank_values=True):
+            t = scalar.get(k)
+            if t is None:
+                # Not declared by the start function (e.g. the page's blanket
+                # include_trashed=1): silently dropped, like the direct Start button does.
+                continue
+            try:
+                if t is bool:
+                    low = v.strip().lower()
+                    if low in ('1', 'true', 'yes', 'on'):
+                        kwargs[k] = True
+                    elif low in ('0', 'false', 'no', 'off', ''):
+                        kwargs[k] = False
+                    else:
+                        raise ValueError(v)
+                else:
+                    kwargs[k] = t(v)
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f'invalid value for {k!r}: {v!r}')
+        return path, fn, kwargs
+
+    def _bulk_close_thread_dbs():
+        # The queue thread is long-lived; don't let its per-thread sqlite connections pile up.
+        # ThreadLocalDB.close explicitly: Database.close() closes the connection but leaves
+        # it cached in the thread-local, which would break the next use on this thread.
+        for _d in (db, manual, errors):
+            ThreadLocalDB.close(_d)
+
+    def _bulk_serialize_starts():
+        """Make each catalogued start endpoint's check-and-claim atomic: a per-path RLock
+        around the whole call, so a direct Start click and a queued start can't both pass
+        the `if job['running']` check (candidate scans run before `running=True` is set).
+        The lock is released as soon as the endpoint returns (it has claimed by then)."""
+        import functools
+        for r in app.router.routes:
+            path = getattr(r, 'path', None)
+            if path not in job_queue.JOB_WEIGHTS or 'POST' not in (getattr(r, 'methods', None) or ()):
+                continue
+            orig = r.endpoint
+            if _inspect.iscoroutinefunction(orig) or getattr(orig, '_bulk_serialized', False):
+                continue
+            lock = threading.RLock()
+
+            @functools.wraps(orig)
+            def wrapper(*a, _o=orig, _l=lock, **kw):
+                with _l:
+                    return _o(*a, **kw)
+            wrapper._bulk_serialized = True
+            r.endpoint = wrapper
+            dep = getattr(r, 'dependant', None)
+            if dep is not None and getattr(dep, 'call', None) is orig:
+                dep.call = wrapper
+
+    _bulk_serialize_starts()
+
+    def _bulk_starter(item) -> dict:
+        path, fn, kwargs = _bulk_parse_start(item.start_url)
+        try:
+            resp = fn(**kwargs)
+        except HTTPException as exc:
+            return {'started': False, 'message': str(exc.detail)}
+        finally:
+            _bulk_close_thread_dbs()
+        resp = dict(resp) if isinstance(resp, dict) else {}
+        if resp.get('started') is False and 'already running' in str(resp.get('message') or '').lower():
+            # The job is busy (typically a manual Start click): keep the item queued.
+            return {'started': False, 'deferred': True,
+                    'message': 'already running (started manually)'}
+        if resp.get('started') is False and resp.get('total') == 0:
+            # "Nothing to index": not a failure. Let the first poll report done / nothing to do.
+            item.nothing_to_do = True
+            return {'started': True, 'total': 0, 'message': resp.get('message')}
+        return resp
+
+    def _bulk_status(item) -> dict:
+        if getattr(item, 'nothing_to_do', False):
+            return {'running': False, 'done': 0, 'total': 0}
+        path = _urlsplit(item.start_url).path
+        fn = _bulk_route(_bulk_status_path(path), 'GET')
+        if fn is None:
+            raise RuntimeError('status endpoint not found')
+        try:
+            st = dict(fn())
+        finally:
+            _bulk_close_thread_dbs()
+        job = _bulk_cancel_jobs().get(path)
+        if job is not None and not st.get('running') and job.get('cancel_requested'):
+            st['cancelled'] = True
+        return st
+
+    def _bulk_canceller(item) -> bool:
+        return _cancel_bulk_job(_urlsplit(item.start_url).path)
+
+    def _bulk_worker_gpu():
+        """Remote worker GPU stats for the sampler; None when no worker / old worker."""
+        if not _bulk_wc.is_configured():
+            return None
+        stats = worker_client.fetch_stats(_bulk_wc)
+        return (stats or {}).get('gpu')
+
+    _bulk_wc = worker_client.get_client(data_root)
+    bulk_sampler = job_queue.ResourceSampler(worker_probe=_bulk_worker_gpu)
+    bulk_queue = job_queue.JobQueue(_bulk_starter, _bulk_status, canceller=_bulk_canceller,
+                                    sampler=bulk_sampler)
+    app.state.bulk_queue = bulk_queue
+    app.state.bulk_queue_autostart = True   # tests set False and drive bulk_queue.tick() by hand
+
+    def _bulk_ensure_started():
+        if app.state.bulk_queue_autostart:
+            bulk_queue.start()   # idempotent; threads are daemons, stopped on shutdown
+
+    def _bulk_item_json(item: dict) -> dict:
+        # JobQueue marks every running item cancellable; only some jobs have a stop hook.
+        # (Finished items stay cancellable=True: DELETE removes them.)
+        if item.get('state') == 'running' and _urlsplit(item['start_url']).path not in _bulk_cancel_jobs():
+            item['cancellable'] = False
+        return item
+
+    @app.get('/api/bulk-queue')
+    def api_bulk_queue():
+        _bulk_ensure_started()
+        snap = bulk_queue.snapshot()
+        snap['items'] = [_bulk_item_json(i) for i in snap['items']]
+        return snap
+
+    @app.post('/api/bulk-queue')
+    def api_bulk_queue_add(body: BulkQueueBody):
+        if not body.key.strip() or not body.label.strip():
+            raise HTTPException(status_code=400, detail='key and label are required')
+        path, _fn, _kw = _bulk_parse_start(body.start_url)
+        status_path = _bulk_status_path(path)
+        if body.status_url:
+            if _urlsplit(body.status_url).path != status_path:
+                raise HTTPException(status_code=400, detail=f'status_url must be {status_path}')
+        _bulk_ensure_started()
+        item = bulk_queue.enqueue(body.key.strip(), body.label.strip(), start_url=body.start_url,
+                                  status_url=status_path)
+        return _bulk_item_json(bulk_queue._item_json(item))
+
+    @app.post('/api/bulk-queue/clear-finished')
+    def api_bulk_queue_clear_finished():
+        return {'ok': True, 'removed': bulk_queue.clear_finished()}
+
+    @app.delete('/api/bulk-queue/{item_id}')
+    def api_bulk_queue_cancel(item_id: str):
+        before = next((i for i in bulk_queue.snapshot()['items'] if i['id'] == item_id), None)
+        if before is None:
+            raise HTTPException(status_code=404, detail='unknown queue item')
+        if before['state'] in job_queue.FINISHED_STATES:
+            bulk_queue.remove(item_id)          # finished: DELETE just removes it
+            return {'ok': True, 'item': _bulk_item_json(before), 'removed': True}
+        if not bulk_queue.cancel(item_id):
+            raise HTTPException(status_code=409, detail=before.get('message') if before['state'] == 'running'
+                                and before.get('message') else 'this item cannot be cancelled')
+        after = next((i for i in bulk_queue.snapshot()['items'] if i['id'] == item_id), before)
+        return {'ok': True, 'item': _bulk_item_json(after)}
+
     @app.on_event('shutdown')
     def _close_databases():
+        bulk_queue.stop()
         db.close()
         errors.close()
         manual.close()

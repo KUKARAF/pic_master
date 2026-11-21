@@ -27,6 +27,7 @@ import random
 import shutil
 import signal
 import threading
+import subprocess
 import tempfile
 import traceback
 import collections
@@ -202,6 +203,107 @@ def _cleanup(path):
 # `data` is the raw bytes the client packed with worker_protocol.pack().
 # Each returns worker_protocol.pack(resp_dict) (bytes).
 # ---------------------------------------------------------------------------
+
+# -- stats op: lightweight, lock-free machine load ---------------------------------------
+
+_NVSMI_CMD = ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+              "--format=csv,noheader,nounits"]
+_cpu_prev = None            # (busy_jiffies, total_jiffies) from the previous call
+_cpu_lock = threading.Lock()  # guards only _cpu_prev (never the GPU/model locks)
+
+
+def _parse_nvidia_smi(text):
+    """Parse ``nvidia-smi --format=csv,noheader,nounits`` output into
+    {util_pct, vram_used_mb, vram_total_mb}, or None if nothing parses.
+
+    Multi-GPU choice: the work runs on one device, so we report the BUSIEST GPU
+    (max util) rather than an average that would hide a saturated card; VRAM is
+    taken from that same GPU so used/total stay consistent."""
+    best = None
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        try:
+            util, used, total = float(parts[0]), float(parts[1]), float(parts[2])
+        except ValueError:  # e.g. "[N/A]"
+            continue
+        if best is None or util > best[0]:
+            best = (util, used, total)
+    if best is None:
+        return None
+    return {"util_pct": best[0], "vram_used_mb": best[1], "vram_total_mb": best[2]}
+
+
+def _read_gpu():
+    """GPU stats via nvidia-smi (2 s timeout), or None if absent/failing."""
+    try:
+        out = subprocess.run(_NVSMI_CMD, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return _parse_nvidia_smi(out.stdout)
+
+
+def _read_proc_stat():
+    """(busy, total) jiffies from the aggregate ``cpu`` line of /proc/stat, or None."""
+    try:
+        with open("/proc/stat") as f:
+            line = f.readline()
+        vals = [int(x) for x in line.split()[1:]]
+    except (OSError, ValueError):
+        return None
+    if not line.startswith("cpu") or len(vals) < 4:
+        return None
+    total = sum(vals[:8])            # user nice system idle iowait irq softirq steal
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    return total - idle, total
+
+
+def _read_cpu_pct():
+    """CPU busy % since the previous call (delta of /proc/stat, cached in a module
+    global). The first call returns None; so does a zero-length interval."""
+    global _cpu_prev
+    cur = _read_proc_stat()
+    if cur is None:
+        return None
+    with _cpu_lock:
+        prev, _cpu_prev = _cpu_prev, cur
+    if prev is None:
+        return None
+    dtotal = cur[1] - prev[1]
+    if dtotal <= 0:
+        return None
+    return round(max(0.0, min(100.0, 100.0 * (cur[0] - prev[0]) / dtotal)), 1)
+
+
+def _read_meminfo():
+    """(ram_total_mb, ram_available_mb) from /proc/meminfo; (None, None) on failure."""
+    try:
+        kb = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    kb[k] = int(v.split()[0])
+        return round(kb["MemTotal"] / 1024.0, 1), round(kb["MemAvailable"] / 1024.0, 1)
+    except (OSError, ValueError, KeyError, IndexError):
+        return None, None
+
+
+def handle_stats(path, data, request_id, link_id, remote_identity, requested_at):
+    """Read-only load snapshot. Takes NO GPU/model lock; safe to poll every few seconds."""
+    try:
+        total, avail = _read_meminfo()
+        return worker_protocol.pack({"ok": True, "gpu": _read_gpu(), "cpu_pct": _read_cpu_pct(),
+                                     "ram_total_mb": total, "ram_available_mb": avail,
+                                     "error": None})
+    except Exception as e:  # hook-allow: broad — report error to caller
+        return worker_protocol.pack({"ok": False, "gpu": None, "cpu_pct": None,
+                                     "ram_total_mb": None, "ram_available_mb": None,
+                                     "error": str(e)})
+
 
 def handle_ping(path, data, request_id, link_id, remote_identity, requested_at):
     try:
@@ -1477,6 +1579,7 @@ def handle_imdb_status(path, data, request_id, link_id, remote_identity, request
 # Map of request path -> handler, used both by run() and the loopback test.
 HANDLERS = {
     worker_protocol.PATH_PING: handle_ping,
+    worker_protocol.PATH_STATS: handle_stats,
     worker_protocol.PATH_PATTERN: handle_pattern,
     worker_protocol.PATH_PATTERN_DINO: handle_pattern_dino,
     worker_protocol.PATH_REGION: handle_region,

@@ -9,6 +9,16 @@
     Each job runs in the background — start it and close the tab if you like; come back and
     this page reattaches to anything still running (or shows how many items are pending).
   </p>
+  <section id="bq-panel" class="bq-panel" aria-label="Job queue">
+    <div class="bq-head">
+      <h2>🗂 Job queue</h2>
+      <a href="#" id="bq-clear" class="bq-clear" role="button">Clear finished</a>
+    </div>
+    <div id="bq-resources" class="bq-resources" aria-label="Resource usage (recent average)"></div>
+    <ul id="bq-list" class="bq-list"></ul>
+    <p id="bq-empty" class="sub bq-empty">No jobs queued — use <strong>＋ Queue</strong> next to a job to line it up.</p>
+  </section>
+
   <label class="sub" style="display:flex;align-items:center;gap:8px;margin:0 0 20px;">
     <input type="checkbox" id="include-trashed"> Include trashed items
     <span style="opacity:.7;">(off by default — trashed content is skipped)</span>
@@ -220,6 +230,54 @@
   .bulk-threshold { display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
     margin: 0 0 12px; }
   .bulk-threshold label { display: flex; align-items: center; gap: 8px; }
+  .bulk-page .bulk-queue-btn { padding: 2px 8px; white-space: nowrap; font-size: 0.9em; }
+  .bulk-page .bulk-queue-btn[disabled] { opacity: .45; cursor: not-allowed; }
+  .bulk-page .bulk-action-row { flex-wrap: wrap; }
+  .bulk-section h2 .bulk-queue-all { float: right; font-size: 0.8em; font-weight: normal; }
+  .bq-panel { position: sticky; top: 0; z-index: 5; background: var(--bg, #070B07);
+    border: 1px solid var(--border, #243024); border-radius: var(--radius-card, 3px);
+    padding: 8px 12px 10px; margin: 0 0 20px; max-height: 50vh; overflow-y: auto; }
+  .bq-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .bq-head h2 { font-size: 1.05em; margin: 0 0 6px; }
+  .bq-clear { font-size: 0.85em; color: var(--text-muted, #728C72); }
+  .bq-clear.bq-off { visibility: hidden; }
+  .bq-resources { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 0 0 8px; font-size: 0.8em;
+    color: var(--text-muted, #728C72); }
+  .bq-res { display: flex; align-items: center; gap: 6px; }
+  .bq-res .bq-val { min-width: 4.5em; font-variant-numeric: tabular-nums; color: var(--text-mid, #B9C7B9); }
+  .bq-meter { position: relative; width: 90px; height: 6px; background: var(--input-bg, #070D07);
+    border: 1px solid var(--border, #243024); }
+  .bq-meter > i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent, #79F279); }
+  .bq-meter > i.hot { background: var(--orange, #FFB13D); }
+  .bq-meter > b { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--danger, #FF6B6B); }
+  .bq-list { list-style: none; margin: 0; padding: 0; }
+  .bq-item { display: grid; grid-template-columns: 1fr auto; gap: 2px 10px; align-items: center;
+    padding: 6px 0; border-top: 1px solid var(--divider, #141a14); }
+  .bq-main { min-width: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+  .bq-label { font-weight: bold; overflow-wrap: anywhere; }
+  .bq-badge { font-size: 0.75em; padding: 0 6px; border: 1px solid var(--border, #243024);
+    border-radius: var(--radius, 2px); text-transform: uppercase; letter-spacing: .03em;
+    color: var(--text-muted, #728C72); }
+  .bq-badge.running { color: var(--accent, #79F279); border-color: var(--border-accent, rgba(121,242,121,.55)); }
+  .bq-badge.cancelling, .bq-badge.cancelled { color: var(--orange, #FFB13D); }
+  .bq-badge.error { color: var(--danger, #FF6B6B); border-color: var(--danger, #FF6B6B); }
+  .bq-badge.done { color: var(--text-mid, #B9C7B9); }
+  .bq-trash { background: none; border: 1px solid transparent; padding: 3px 5px; cursor: pointer;
+    color: var(--text-muted, #728C72); line-height: 0; grid-row: 1 / span 3; grid-column: 2; }
+  .bq-trash:hover:not([disabled]) { color: var(--danger, #FF6B6B); border-color: var(--danger, #FF6B6B); }
+  .bq-trash[disabled] { opacity: .3; cursor: not-allowed; }
+  .bq-trash svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8;
+    stroke-linecap: round; stroke-linejoin: round; }
+  .bq-prog { display: flex; align-items: center; gap: 8px; font-size: 0.85em; color: var(--text-muted, #728C72); }
+  .bq-prog .bq-bar { flex: 0 1 220px; width: 220px; height: 6px; background: var(--input-bg, #070D07);
+    border: 1px solid var(--border, #243024); }
+  .bq-prog .bq-bar > i { display: block; height: 100%; background: var(--accent, #79F279); }
+  .bq-sub { font-size: 0.8em; color: var(--text-muted, #728C72); display: flex; flex-wrap: wrap; gap: 2px 8px; }
+  .bq-chip { border: 1px solid var(--divider, #141a14); padding: 0 5px; border-radius: var(--radius, 2px); }
+  @media (max-width: 560px) {
+    .bulk-page .bulk-action-btn { min-width: 0; flex: 1 1 100%; }
+    .bq-prog .bq-bar { flex: 1 1 auto; width: auto; }
+  }
   #match-threshold-val { font-variant-numeric: tabular-nums; min-width: 2.5em; }
 </style>
 {% endblock %}
@@ -254,6 +312,208 @@
   if (capCb) capCb.addEventListener('change', sync);
   if (rotCb) rotCb.addEventListener('change', sync);
   sync();
+})();
+/* Job queue: queue buttons + the top "Job queue" panel (server-side state, GET /api/bulk-queue). */
+(function () {
+  var page = document.querySelector('.bulk-page');
+  if (!page) return;
+  var listEl = document.getElementById('bq-list'), emptyEl = document.getElementById('bq-empty');
+  var resEl = document.getElementById('bq-resources'), clearEl = document.getElementById('bq-clear');
+  var timer = null, busy = false, lastActive = false;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function humanDur(sec) {
+    var e = Math.max(0, Math.round(sec));
+    if (e < 90) return e + 's';
+    if (e < 5400) return Math.floor(e / 60) + 'm ' + (e % 60) + 's';
+    return Math.floor(e / 3600) + 'h ' + (Math.floor(e / 60) % 60) + 'm';
+  }
+  function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+
+  /* ---- resource strip ---- */
+  function meter(label, frac, valText, limitFrac, hotWhenHigh) {
+    var w = el('span', 'bq-res');
+    w.appendChild(el('span', null, label));
+    var m = el('span', 'bq-meter');
+    var f = frac == null ? 0 : Math.max(0, Math.min(1, frac));
+    var fill = el('i');
+    fill.style.width = (f * 100) + '%';
+    if (frac != null && limitFrac != null && (hotWhenHigh ? f >= limitFrac : f <= limitFrac)) fill.className = 'hot';
+    m.appendChild(fill);
+    if (limitFrac != null) {
+      var mark = el('b');
+      mark.style.left = (Math.max(0, Math.min(1, limitFrac)) * 100) + '%';
+      mark.title = 'limit';
+      m.appendChild(mark);
+    }
+    w.appendChild(m);
+    w.appendChild(el('span', 'bq-val', valText));
+    return w;
+  }
+  function renderResources(r, lim) {
+    resEl.textContent = '';
+    r = r || {}; lim = lim || {};
+    var gpu = num(r.gpu_pct), cpu = num(r.cpu_pct), free = num(r.ram_free_mb), tot = num(r.ram_total_mb);
+    var gl = num(lim.gpu_limit), cl = num(lim.cpu_limit), rf = num(lim.ram_floor_mb);
+    resEl.appendChild(meter('GPU', gpu == null ? null : gpu / 100, gpu == null ? '—' : Math.round(gpu) + '%', gl == null ? null : gl / 100, true));
+    resEl.appendChild(meter('CPU', cpu == null ? null : cpu / 100, cpu == null ? '—' : Math.round(cpu) + '%', cl == null ? null : cl / 100, true));
+    resEl.appendChild(meter('RAM free', (free != null && tot) ? free / tot : null,
+      free == null ? '—' : (free / 1024).toFixed(1) + ' GB', (rf != null && tot) ? rf / tot : null, false));
+    var note = [];
+    if (num(r.window_s)) note.push('avg ' + humanDur(r.window_s));
+    if (lim.max_parallel != null) note.push('max ' + lim.max_parallel + ' parallel');
+    if (note.length) resEl.appendChild(el('span', 'bq-res', note.join(' · ')));
+  }
+
+  /* ---- job list ---- */
+  var TRASH = 'M3 6h18 M8 6V4h8v2 M6 6l1 14h10l1-14 M10 10v7 M14 10v7';
+  function trashBtn(it) {
+    var b = el('button', 'bq-trash');
+    b.type = 'button';
+    var label = it.state === 'queued' ? 'Remove' : 'Cancel';
+    var finished = it.state === 'done' || it.state === 'error' || it.state === 'cancelled';
+    if (finished) label = 'Remove';
+    b.setAttribute('aria-label', label); b.title = label;
+    var ns = 'http://www.w3.org/2000/svg';
+    var svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('aria-hidden', 'true');
+    var path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', TRASH);
+    svg.appendChild(path); b.appendChild(svg);
+    b.disabled = !it.cancellable;
+    b.addEventListener('click', function () {
+      b.disabled = true;
+      fetch('/api/bulk-queue/' + encodeURIComponent(it.id), { method: 'DELETE' })
+        .catch(function () {}).then(refresh);
+    });
+    return b;
+  }
+  function renderItem(it, now) {
+    var li = el('li', 'bq-item');
+    var main = el('div', 'bq-main');
+    main.appendChild(el('span', 'bq-label', it.label || it.key || '(job)'));
+    main.appendChild(el('span', 'bq-badge ' + it.state, it.state));
+    li.appendChild(main);
+    li.appendChild(trashBtn(it));
+
+    var prog = el('div', 'bq-prog');
+    var doneN = num(it.done) || 0, total = num(it.total) || 0;
+    var bar = el('span', 'bq-bar'), fill = el('i');
+    var pct = total > 0 ? Math.min(100, doneN / total * 100) : (it.state === 'done' ? 100 : 0);
+    fill.style.width = pct + '%';
+    bar.appendChild(fill); prog.appendChild(bar);
+    var txt = total > 0 ? (doneN.toLocaleString() + '/' + total.toLocaleString()) : (it.state === 'queued' ? '' : doneN.toLocaleString());
+    var t = num(it.started_at), enq = num(it.enqueued_at), fin = num(it.finished_at);
+    if (it.state === 'running' || it.state === 'cancelling') {
+      if (t != null) {
+        var el_s = now - t;
+        txt += ' · ' + humanDur(el_s);
+        if (doneN > 0 && total > doneN && el_s > 0) txt += ' · ~' + humanDur((total - doneN) / (doneN / el_s)) + ' left';
+      }
+    } else if (it.state === 'queued') {
+      if (enq != null) txt += (txt ? ' · ' : '') + 'waiting ' + humanDur(now - enq);
+    } else if (t != null && fin != null) {
+      txt += ' · took ' + humanDur(fin - t);
+    }
+    prog.appendChild(el('span', null, txt));
+    li.appendChild(prog);
+
+    var sub = el('div', 'bq-sub');
+    if (it.message) sub.appendChild(el('span', null, it.message));
+    if (it.state === 'queued' && it.blocked_reason) sub.appendChild(el('span', null, it.blocked_reason));
+    var w = it.weights || {};
+    if (num(w.gpu) != null) sub.appendChild(el('span', 'bq-chip', 'GPU ~' + w.gpu + '%'));
+    if (num(w.cpu) != null) sub.appendChild(el('span', 'bq-chip', 'CPU ~' + w.cpu + '%'));
+    if (num(w.ram_mb) != null) sub.appendChild(el('span', 'bq-chip', 'RAM ~' + (w.ram_mb >= 1024 ? (w.ram_mb / 1024).toFixed(1) + ' GB' : w.ram_mb + ' MB')));
+    if (sub.childNodes.length) li.appendChild(sub);
+    return li;
+  }
+  function render(d) {
+    var items = (d && d.items) || [];
+    renderResources(d && d.resources, d && d.limits);
+    listEl.textContent = '';
+    var now = Date.now() / 1000, anyFinished = false;
+    items.forEach(function (it) {
+      if (it.state === 'done' || it.state === 'error' || it.state === 'cancelled') anyFinished = true;
+      listEl.appendChild(renderItem(it, now));
+    });
+    emptyEl.style.display = items.length ? 'none' : '';
+    clearEl.classList.toggle('bq-off', !anyFinished);
+    lastActive = items.some(function (it) { return it.state === 'queued' || it.state === 'running' || it.state === 'cancelling'; });
+  }
+
+  /* ---- polling (2s active, 10s idle, paused while hidden) ---- */
+  function schedule() {
+    clearTimeout(timer);
+    if (document.hidden) return;
+    timer = setTimeout(refresh, lastActive ? 2000 : 10000);
+  }
+  function refresh() {
+    clearTimeout(timer);
+    if (busy) return;
+    busy = true;
+    fetch('/api/bulk-queue').then(function (r) { return r.json(); }).then(render)
+      .catch(function () { /* keep last render; retry on schedule */ })
+      .then(function () { busy = false; schedule(); });
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(); else clearTimeout(timer); });
+  clearEl.addEventListener('click', function (e) {
+    e.preventDefault();
+    fetch('/api/bulk-queue/clear-finished', { method: 'POST' }).catch(function () {}).then(refresh);
+  });
+
+  /* ---- ＋ Queue buttons (added next to each page .bulk-action-btn; ⚡ navbar menu untouched) ---- */
+  function enqueue(btn, qb) {
+    var row = btn.parentElement, st = row.querySelector('[data-role="status"]');
+    var body = {
+      key: btn.dataset.startBase || btn.dataset.start,
+      label: btn.textContent.replace(/\s+/g, ' ').trim(),
+      start_url: btn.dataset.start,
+      status_url: btn.dataset.status
+    };
+    return fetch('/api/bulk-queue', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    }).then(function (r) { return r.json().then(function (d) { return [r.ok, d]; }); })
+      .then(function (res) {
+        if (!res[0]) throw new Error((res[1] && res[1].detail) || 'error');
+        if (st && !btn.dataset.busy) st.textContent = 'queued';
+        refresh();
+      })
+      .catch(function (err) { if (st) st.textContent = 'queue failed: ' + err.message; });
+  }
+  page.querySelectorAll('.bulk-action-btn').forEach(function (btn) {
+    var qb = el('button', 'bulk-queue-btn', '＋ Queue');
+    qb.type = 'button';
+    qb.title = 'Add this job to the queue (runs when resources allow)';
+    var noQueue = btn.disabled;   // statically disabled (e.g. czkawka missing); runtime busy-disable comes later
+    if (noQueue) btn.dataset.noQueue = '1';
+    qb.disabled = noQueue;
+    qb.addEventListener('click', function () { qb.disabled = true; enqueue(btn, qb).then(function () { qb.disabled = noQueue; }); });
+    btn.insertAdjacentElement('afterend', qb);
+  });
+  page.querySelectorAll('.bulk-section').forEach(function (sec) {
+    var btns = sec.querySelectorAll('.bulk-action-btn');
+    if (btns.length < 2 || !sec.querySelector('h2')) return;
+    var h = sec.querySelector('h2');
+    var all = el('button', 'bulk-queue-btn bulk-queue-all', '＋ Queue all in section');
+    all.type = 'button';
+    all.addEventListener('click', function () {
+      all.disabled = true;
+      var chain = Promise.resolve();
+      btns.forEach(function (b) {
+        if (b.dataset.noQueue) return;
+        chain = chain.then(function () { return enqueue(b); });
+      });
+      chain.then(function () { all.disabled = false; });
+    });
+    h.appendChild(all);
+  });
+  refresh();
 })();
 /* Embedding stats + speed test (SigLIP 2 + DINOv2). */
 (function () {

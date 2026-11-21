@@ -130,6 +130,11 @@ class WorkerClient:
         """Lazily create the shared ``requests.Session`` (connection pooling +
         keep-alive). One outstanding request at a time is guaranteed by
         ``self._lock`` in :meth:`_request_once`, so a single session is fine."""
+        # Fast path WITHOUT the lock: self._lock is held for the whole of a long request,
+        # so a concurrent caller (fetch_stats(concurrent=True)) must not queue behind it.
+        sess = self._session
+        if sess is not None:
+            return sess
         with self._lock:
             if self._session is None:
                 self._session = requests.Session()
@@ -447,6 +452,25 @@ class WorkerClient:
 # Process-global singleton registry keyed by data_root.
 _clients = {}
 _clients_lock = threading.Lock()
+
+
+def fetch_stats(client, timeout=3):
+    """Worker machine load, or None — NEVER raises.
+
+    Returns {"gpu": {"util_pct","vram_used_mb","vram_total_mb"}|None, "cpu_pct": float|None,
+    "ram_total_mb": float|None, "ram_available_mb": float|None}. None when the worker is
+    unconfigured/unreachable, errors, or is an OLD worker without the ``stats`` op (HTTP 404).
+    Sent ``concurrent=True`` so it never queues behind a long in-flight request."""
+    try:
+        if client is None or not client.is_configured():
+            return None
+        resp = client.request(worker_protocol.PATH_STATS, {}, timeout=timeout,
+                              retries=0, concurrent=True)
+    except Exception:  # hook-allow: broad — stats are best-effort; unknown op/unreachable -> None
+        return None
+    if not isinstance(resp, dict) or resp.get("error") or resp.get("ok") is False:
+        return None
+    return {k: resp.get(k) for k in ("gpu", "cpu_pct", "ram_total_mb", "ram_available_mb")}
 
 
 def get_client(data_root: str) -> WorkerClient:

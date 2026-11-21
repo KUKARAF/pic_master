@@ -16,6 +16,9 @@ import msgpack
 
 # Request handler paths (HTTP route names).
 PATH_PING = "ping"
+# Read-only machine load (GPU/CPU/RAM) for the web side's job scheduler. Takes no lock; an old
+# worker answers HTTP 404 and the client treats that as "no stats".
+PATH_STATS = "stats"
 PATH_DETECT_FACES = "detect_faces"
 PATH_EMBED_BBOX = "embed_bbox"
 # Re-run in-plane rotation normalization on faces ALREADY stored in the host's DB
@@ -109,6 +112,7 @@ ALL_PATHS = [
     PATH_EMBED_MASKED_PATHS,
     PATH_EMBED_MASKED_BATCH,
     PATH_PING,
+    PATH_STATS,
     PATH_PATTERN,
     PATH_PATTERN_DINO,
     PATH_REGION,
@@ -142,6 +146,12 @@ ALL_PATHS = [
 #   PATH_PING
 #     req:  {}
 #     resp: {"ok": True, "models": [<str>, ...], "error": None}
+#
+#   PATH_STATS   (read-only, takes neither models.lock nor the load lock)
+#     req:  {}
+#     resp: {"ok": True, "gpu": {"util_pct": float, "vram_used_mb": float, "vram_total_mb": float}|None,
+#            "cpu_pct": float|None, "ram_total_mb": float|None, "ram_available_mb": float|None,
+#            "error": None}
 #
 #   PATH_DETECT_FACES
 #     req:  {"name": <str basename>, "image": <bytes: encoded image>}
