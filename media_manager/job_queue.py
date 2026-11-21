@@ -280,6 +280,7 @@ JOB_WEIGHTS: dict[str, JobWeight] = {
     '/api/near-dup/compute/start':   JobWeight(gpu=0,  cpu=75, ram_mb=3000, exclusive_group='czkawka'),
     '/api/broken/scan/start':        JobWeight(gpu=0,  cpu=65, ram_mb=1500, exclusive_group='czkawka'),
     '/api/imdb/rebuild':             JobWeight(gpu=5,  cpu=20, ram_mb=3500, exclusive_group='imdb'),
+    '/api/face-groups/compute/start': JobWeight(gpu=40, cpu=60, ram_mb=2500, exclusive_group='facegroups'),
     '/api/metadata/start':           JobWeight(gpu=0,  cpu=20, ram_mb=300),
     '/api/fetch-cities/start':       JobWeight(gpu=0,  cpu=5,  ram_mb=100),
     '/api/match-cities/start':       JobWeight(gpu=0,  cpu=10, ram_mb=200),

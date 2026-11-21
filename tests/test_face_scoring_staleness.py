@@ -4,10 +4,12 @@
                         against the unknown pool. Self-sufficient: it is computed
                         live, per request, and must never wait on (or trigger) the
                         library-wide pass.
-  /find_all_faces       "for each unknown face, who is it?" -> every unknown face
+  /faces (global swipe) "for each unknown face, who is it?" -> every unknown face
                         against every known person. This one IS the precomputed
-                        ranking, so an unscored library has an empty pool and the
-                        stream has to say so and get a run going.
+                        ranking (/api/face-suggestions/next with no `identity`), so
+                        an unscored library has an empty pool and the stream has to
+                        say so and get a run going. (/find_all_faces is now the face
+                        GROUP review and no longer reads this ranking.)
 
 Collapsing the first onto the second is what made opening a person's search sit
 behind a multi-minute job; this pins the split so it cannot come back.
@@ -60,13 +62,14 @@ def _person_stream(client, name='Ross'):
 
 
 def _global_stream(client):
-    return client.post('/api/face-review/next?count=10', json={'exclude': []}).json()
+    return client.post('/api/face-suggestions/next?count=10', json={'exclude': []}).json()
 
 
 def _settle(client, limit=400):
+    """Poll the global stream's own `scoring` block until the pass has landed."""
     st = {}
     for _ in range(limit):
-        st = client.get('/api/face-scoring/status').json()
+        st = _global_stream(client)['scoring']
         if not st['running'] and not st['pending']:
             return st
         time.sleep(0.05)
@@ -118,8 +121,8 @@ def run():
     check('once it lands the global review has the face', len(after['cards']) == 1,
           '%d cards' % len(after['cards']))
     if after['cards']:
-        names = [c['name'] for c in after['cards'][0]['candidates']]
-        check('with a ranked candidate list to arrow through', 'Ross' in names, str(names))
+        check('naming the right person', after['cards'][0]['identity'] == 'Ross',
+              after['cards'][0]['identity'])
 
     # --- handled: the permanently-empty bug --------------------------------------
     # Deciding a face must remove it from the pool. Before faces.handled existed this

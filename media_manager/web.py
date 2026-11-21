@@ -42,7 +42,7 @@ from PIL import UnidentifiedImageError
 from pydantic import BaseModel
 
 from media_manager import (
-    body_index, broken_finder, compute, czkawka, exif_reader, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
+    body_index, broken_finder, compute, czkawka, exif_reader, face_clusters, face_timing, file_inventory, folder_ml, frames, geonames, gpu_search,
     location_mask, location_place, near_dup, object_index, person_cleanup, pattern_deep, pattern_dino, phasher, region_index, remote_index_builder,
     scan_status, set_image, set_render, set_video, video_decode, worker_client,
     worker_config,
@@ -145,6 +145,15 @@ class FmMLBody(BaseModel):
 
 class ReorderBody(BaseModel):
     file_ids: List[int]
+
+class FaceGroupApproveBody(BaseModel):
+    name: str
+    face_ids: List[int] = []
+
+
+class FaceGroupRejectBody(BaseModel):
+    face_ids: List[int] = []
+
 
 class IdentityBody(BaseModel):
     name: Optional[str] = None
@@ -3578,9 +3587,9 @@ def create_app(data_root: str) -> FastAPI:
 
     @app.get('/find_all_faces', response_class=HTMLResponse)
     def find_all_faces_page(request: Request):
-        """Global unidentified-face review: for every unnamed face, WHO is this —
-        an A/B pick between the people that face actually resembles (see
-        /api/face-review/next), not a yes/no on a single guess."""
+        """Face group review: the biggest groups of mutually similar, still-unnamed
+        faces, biggest first — name a whole group at once, dismiss it, or drop single
+        faces from it first (see /api/face-groups/*)."""
         return templates.TemplateResponse(request, 'find_all_faces.html', {
             'all_tags': manual.list_all_tags(),
             'all_categories': _all_categories_for_nav(),
@@ -11476,24 +11485,6 @@ def create_app(data_root: str) -> FastAPI:
                 card['rival'], card['rival_score'] = str(names[j]), round(best, 3)
         return cards
 
-    def _attach_candidate_lists(cards, limit):
-        """Give each card its own ranked [{name, score, ref}] — the choices the A/B
-        review UI steps through with the arrow keys — out of the same one matmul, plus
-        one representative-face lookup for the whole buffer rather than per card."""
-        for card in cards:
-            card['candidates'] = []
-        pairs, identities = _score_cards_against_named(cards)
-        if not pairs:
-            return cards
-        reps = manual.get_identity_reference_faces()
-        for card, row in pairs:
-            card['candidates'] = [
-                {'name': name, 'score': score,
-                 'ref': None if reps.get(name) is None else 'manual:%d' % reps[name]}
-                for name, score in _rank_identities(row, identities, limit)
-            ]
-        return cards
-
     def _next_face_suggestions(count, exclude_refs, bias_identity=None, bias=None,
                                 identity_filter=None, avoid_existing=True, hide_rivals=True):
         """Up to `count` review cards that clear SUGGEST_THRESHOLD, best score first.
@@ -11606,37 +11597,6 @@ def create_app(data_root: str) -> FastAPI:
         # empty, and a library-wide pass would not add a single card to it.
         return {'cards': cards, 'scoring': _suggest_state(not cards, start=not identity)}
 
-    @app.post('/api/face-review/next')
-    def api_face_review_next(body: SwipeExcludeBody, count: int = 5, avoid_existing: bool = True,
-                              candidates: int = 8):
-        """Buffer for /find_all_faces' A/B identity review: the best-scoring faces in
-        the global pool, each with its OWN ranked candidate list (the arrow-key
-        choices) and a representative crop ref per candidate — so the reviewer picks a
-        person instead of answering yes/no to one guess. The pool's ORDER comes from
-        the precompute; each shown card's list is computed live for just that card
-        (see _attach_candidate_lists). `remaining` is the true pool size, straight
-        from SQL, so the page reports progress instead of guessing."""
-        exclude_refs = set(body.exclude)
-        fetch = min(5000, max(count * 20, len(exclude_refs) + count + 100))
-        cards = []
-        for face_id_, file_id_, _path, _bbox, _identity, _score in \
-                db.get_suggested_unidentified_faces(SUGGEST_THRESHOLD, fetch):
-            ref = 'auto:%d' % face_id_
-            if ref in exclude_refs:
-                continue
-            cards.append({'ref': ref, 'face_id': face_id_, 'file_id': file_id_,
-                          'rotation': 0})
-        if avoid_existing:
-            cards = _deprioritize_files_with_named_face(cards, 'file_id')
-        cards = cards[:count]
-        _attach_candidate_lists(cards, max(1, min(candidates, CANDIDATE_LIST_MAX)))
-        cards = _attach_file_meta(_collapse_face_cards_to_video(cards))
-        return {
-            'cards': cards,
-            'remaining': db.count_suggested_unidentified_faces(SUGGEST_THRESHOLD),
-            'scoring': _suggest_state(not cards),
-        }
-
     def _start_face_suggestions(full=False):
         """Kick the background precompute. Returns False when one is already going, so
         callers never stack two library-wide passes on top of each other."""
@@ -11681,29 +11641,317 @@ def create_app(data_root: str) -> FastAPI:
             'error': face_suggest_job['error'],
         }
 
-    @app.post('/api/face-scoring/start')
-    def api_face_scoring_start(full: bool = False):
-        """Precompute the closest known person for every not-yet-scored unidentified
-        face (populates faces.suggested_*), so /find_all_faces can serve instantly.
-        Background job. `full=1` clears + recomputes everyone (use after naming new
-        people); default only scores faces that have no suggestion yet."""
-        _start_face_suggestions(full=full)
+    # ------------------------------------------------------------------
+    # Face group review (/find_all_faces): biggest groups of mutually similar,
+    # still-unnamed faces -> approve (name them all), reject (dismiss, remembered)
+    # or drop single faces client-side first. Grouping itself: face_clusters.py.
+    # ------------------------------------------------------------------
+
+    FACE_GROUP_DEFAULT_THRESHOLD = 0.55
+    FACE_GROUP_DEFAULT_MIN_SIZE = 3
+    FACE_GROUP_MAX_FACES = 200          # faces per /next response (and per approve round)
+    FACE_GROUP_REJECT_OVERLAP = 0.5     # a recomputed group is hidden when this share was rejected
+    FACE_GROUP_CACHE_KEEP = 3           # thresholds kept in memory
+
+    face_group_job = {'running': False, 'done': 0, 'total': 0, 'error': None,
+                      'cancel_requested': False, 'threshold': None, 'min_size': None,
+                      'cancelled': False}
+    # round(threshold, 3) -> {'threshold','min_size','computed_at','ver','groups': {id: g},
+    # 'order': [ids biggest first]}. A group g: {id, face_ids, scores, centroid,
+    # dead, dismissed}; face_ids/scores shrink in place as faces get decided elsewhere.
+    face_group_cache = {}
+    face_group_state = {'next_id': 1, 'last_key': None}
+    face_group_lock = threading.RLock()
+
+    def _fg_clamp(threshold):
+        return round(max(0.3, min(0.95, float(threshold))), 3)
+
+    def _fg_versions():
+        return (db._face_ver, manual._face_ver)
+
+    def _fg_load_matrix(candidates, should_stop, progress):
+        """(ids, N×D float32 unit rows) for the candidate faces, streamed from SQL in
+        blocks straight into one preallocated matrix (no list-of-blobs doubling)."""
+        n = len(candidates)
+        mat, dim, k, ids = None, None, 0, []
+        for start in range(0, n, 4000):
+            if should_stop():
+                raise face_clusters.GroupSearchCancelled()
+            block = [c[0] for c in candidates[start:start + 4000]]
+            blobs = db.get_embeddings_for_faces(block)
+            for fid in block:
+                blob = blobs.get(fid)
+                if not blob or len(blob) % 4:
+                    continue
+                if dim is None:
+                    dim = len(blob) // 4
+                    mat = np.empty((n, dim), dtype=np.float32)
+                elif len(blob) != dim * 4:
+                    continue          # another model's vector: cannot be compared
+                mat[k] = np.frombuffer(blob, dtype=np.float32)
+                ids.append(fid)
+                k += 1
+            progress(start + len(block))
+        if mat is None:
+            return [], np.empty((0, 0), dtype=np.float32)
+        mat = mat[:k]
+        norms = np.linalg.norm(mat, axis=1)
+        keep = norms > 0
+        if not keep.all():
+            mat, ids = mat[keep], [i for i, ok in zip(ids, keep) if ok]
+            norms = norms[keep]
+        mat /= norms[:, None]
+        return ids, mat
+
+    def _fg_run(threshold, min_size):
+        job = face_group_job
+        try:
+            # Same reconcile the old full-library scoring did: the pool must never
+            # contain a face manual.db already decided.
+            db.sync_handled(manual.get_promoted_source_ids())
+            ver = _fg_versions()
+            trashed = _trashed_file_ids()
+            candidates = [c for c in db.list_face_group_candidates() if c[1] not in trashed]
+            job['total'] = len(candidates)
+            stop = _cancel_check(job)
+            ids, mat = _fg_load_matrix(candidates, stop,
+                                       lambda d: job.__setitem__('done', d))
+            job['done'] = 0
+            job['total'] = 1
+
+            def _progress(done, total):
+                job['done'], job['total'] = done, total
+
+            found = face_clusters.find_face_groups(
+                ids, mat, threshold=threshold, min_size=min_size,
+                gemm=gpu_search.gemm, progress=_progress, should_stop=stop)
+            del mat
+            with face_group_lock:
+                groups, order = {}, []
+                for g in found:
+                    gid = face_group_state['next_id']
+                    face_group_state['next_id'] += 1
+                    groups[gid] = {'id': gid, 'face_ids': g['face_ids'], 'scores': g['scores'],
+                                   'centroid': g['centroid'], 'dead': False, 'dismissed': False}
+                    order.append(gid)
+                face_group_cache[threshold] = {
+                    'threshold': threshold, 'min_size': min_size, 'computed_at': time.time(),
+                    'ver': ver, 'groups': groups, 'order': order}
+                face_group_state['last_key'] = threshold
+                while len(face_group_cache) > FACE_GROUP_CACHE_KEEP:
+                    oldest = min((k for k in face_group_cache if k != threshold),
+                                 key=lambda k: face_group_cache[k]['computed_at'])
+                    del face_group_cache[oldest]
+        except face_clusters.GroupSearchCancelled:
+            job['cancelled'] = True
+        except Exception as exc:  # hook-allow: broad — background job; error surfaced in job status
+            job['error'] = compute.job_error_text(exc)
+        finally:
+            job['running'] = False
+
+    @app.post('/api/face-groups/compute')
+    @app.post('/api/face-groups/compute/start')
+    def api_face_groups_compute(threshold: float = FACE_GROUP_DEFAULT_THRESHOLD,
+                                min_size: int = FACE_GROUP_DEFAULT_MIN_SIZE, force: bool = False):
+        """Start (in the background) the search for groups of similar unnamed faces.
+        No-op ({started: false}) while one is running, or when this threshold + min_size
+        is already cached and `force` is off. Also the bulk queue's start endpoint."""
+        threshold = _fg_clamp(threshold)
+        min_size = max(2, min(50, int(min_size)))
+        with face_group_lock:
+            if face_group_job['running']:
+                return {'started': False, 'message': 'Face group search already running.'}
+            cached = face_group_cache.get(threshold)
+            if cached is not None and cached['min_size'] == min_size and not force:
+                return {'started': False, 'message': 'Already computed for this threshold.'}
+            face_group_job.update(running=True, done=0, total=0, error=None, cancelled=False,
+                                  cancel_requested=False, threshold=threshold, min_size=min_size)
+        _spawn_job(lambda: _fg_run(threshold, min_size))
         return {'started': True}
 
-    @app.get('/api/face-scoring/status')
-    def api_face_scoring_status():
-        """`pending` is live and independent of the job: how many faces the NEXT run
-        would score. It's the only way a review page can tell "the precompute never
-        ran" apart from "everything is reviewed" — done/total/scored describe the run
-        in THIS process and are all zero after a restart."""
-        return {
-            'running': face_suggest_job['running'],
-            'done': face_suggest_job['done'],
-            'total': face_suggest_job['total'],
-            'error': face_suggest_job['error'],
-            'scored': face_suggest_job['scored'],
-            'pending': db.count_unsuggested_faces(),
-        }
+    def _fg_entry(threshold=None):
+        key = _fg_clamp(threshold) if threshold is not None else face_group_state['last_key']
+        return face_group_cache.get(key) if key is not None else None
+
+    @app.get('/api/face-groups/status')
+    @app.get('/api/face-groups/compute/status')
+    def api_face_groups_status(threshold: Optional[float] = None):
+        """Job progress + a summary of the cached result for `threshold` (default: the
+        last one computed/started). `stale`: nothing cached for it, or faces were
+        named/detected elsewhere since (the groups are then still served, filtered live)."""
+        job = face_group_job
+        with face_group_lock:
+            key = _fg_clamp(threshold) if threshold is not None else (
+                job['threshold'] if job['threshold'] is not None else face_group_state['last_key'])
+            entry = face_group_cache.get(key) if key is not None else None
+            alive = [g for g in entry['groups'].values()
+                     if not g['dead'] and not g['dismissed']] if entry else []
+            return {
+                'running': job['running'], 'done': job['done'], 'total': job['total'],
+                'error': job['error'], 'cancelled': job['cancelled'], 'threshold': key,
+                'groups': len(alive),
+                'faces_in_groups': sum(len(g['face_ids']) for g in alive),
+                'computed_at': entry['computed_at'] if entry else None,
+                'stale': entry is None or entry['ver'] != _fg_versions(),
+            }
+
+    def _fg_live_members(g, entry, rejected, trashed):
+        """Re-validate a cached group against the DB (faces named/decided/trashed since
+        the compute). Shrinks g in place; returns False when it is no longer a group
+        (dead, dismissed, or mostly in a previously rejected group)."""
+        if g['dead'] or g['dismissed']:
+            return False
+        if rejected:
+            hit = sum(1 for f in g['face_ids'] if f in rejected)
+            if hit >= FACE_GROUP_REJECT_OVERLAP * len(g['face_ids']):
+                g['dismissed'] = True
+                return False
+        open_faces = db.filter_open_faces(g['face_ids'])
+        keep = [i for i, f in enumerate(g['face_ids'])
+                if f in open_faces and open_faces[f] not in trashed]
+        if len(keep) != len(g['face_ids']):
+            g['face_ids'] = [g['face_ids'][i] for i in keep]
+            g['scores'] = [g['scores'][i] for i in keep]
+        if len(g['face_ids']) < entry['min_size']:
+            g['dead'] = True
+            return False
+        return True
+
+    def _fg_suggestion(centroid):
+        """Best known person for the group's centroid (max over their reference faces),
+        or None when nobody is named / nothing clears SUGGEST_THRESHOLD."""
+        identities, matrix = manual.get_named_face_matrix()
+        if not identities or matrix.size == 0 or matrix.shape[1] != centroid.shape[0]:
+            return None
+        scores = manual.score_named_faces(centroid)
+        j = int(np.argmax(scores))
+        if float(scores[j]) < SUGGEST_THRESHOLD:
+            return None
+        return {'name': identities[j], 'score': round(float(scores[j]), 3)}
+
+    @app.get('/api/face-groups/next')
+    def api_face_groups_next(threshold: float = FACE_GROUP_DEFAULT_THRESHOLD, skip: int = 0):
+        """The biggest remaining group (after `skip` valid ones), or {group: null}.
+        Faces named/decided since the compute are dropped live; a group that falls under
+        min_size disappears. Counts for groups AFTER the returned one come from the cache
+        (minus approvals/rejections made through this API); they are re-validated when
+        reached."""
+        skip = max(0, int(skip))
+        with face_group_lock:
+            entry = face_group_cache.get(_fg_clamp(threshold))
+            computing = bool(face_group_job['running'])
+            if entry is None:
+                return {'group': None, 'remaining_groups': 0, 'remaining_faces': 0,
+                        'computing': computing}
+            rejected = manual.get_face_group_rejected_ids()
+            trashed = _trashed_file_ids()
+            chosen, skipped = None, 0
+            for gid in entry['order']:
+                g = entry['groups'][gid]
+                if not _fg_live_members(g, entry, rejected, trashed):
+                    continue
+                if skipped < skip:
+                    skipped += 1
+                    continue
+                chosen = g
+                break
+            # remaining_* = every alive group (chosen and skipped included); the ones after
+            # the chosen group are cache-sized until reached and re-validated.
+            alive = [g for g in entry['groups'].values() if not g['dead'] and not g['dismissed']]
+            remaining = {'remaining_groups': len(alive),
+                         'remaining_faces': sum(len(g['face_ids']) for g in alive),
+                         'computing': computing}
+            if chosen is None:
+                return {'group': None, **remaining}
+            shown = list(zip(chosen['face_ids'], chosen['scores']))[:FACE_GROUP_MAX_FACES]
+            size = len(chosen['face_ids'])
+            open_faces = db.filter_open_faces([f for f, _ in shown])
+            cards = [{'ref': 'auto:%d' % f, 'face_id': f, 'file_id': open_faces[f],
+                      'score': round(float(sc), 3)} for f, sc in shown if f in open_faces]
+            _collapse_face_cards_to_video(cards)   # a frame's face belongs to its video
+            return {
+                'group': {'id': chosen['id'], 'size': size, 'faces': cards,
+                          'truncated': size > len(cards),
+                          'suggested': _fg_suggestion(chosen['centroid'])},
+                **remaining,
+            }
+
+    def _fg_find(group_id):
+        for entry in face_group_cache.values():
+            g = entry['groups'].get(group_id)
+            if g is not None:
+                return g, entry
+        raise HTTPException(status_code=404, detail='Unknown face group (recomputed or expired)')
+
+    def _fg_valid_ids(values):
+        if not isinstance(values, list) or len(values) > 100000:
+            raise HTTPException(status_code=400, detail='face_ids must be a list of face ids')
+        out = []
+        for v in values:
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise HTTPException(status_code=400, detail='face_ids must be positive integers')
+            out.append(v)
+        return list(dict.fromkeys(out))
+
+    @app.post('/api/face-groups/{group_id}/approve')
+    def api_face_group_approve(group_id: int, body: FaceGroupApproveBody):
+        """Name every listed face of a group `name`, as a semi-automatic confirm
+        (trust 2) through _confirm_auto_face — the same path the bulk confirm uses, so
+        the handled mirror, named-face caches and the video credit for captured stills
+        all stay consistent. A new name creates the person. The first
+        FACE_GROUP_MAX_FACES faces the user was shown leave the group whether approved
+        or removed (removed ones simply stay unnamed); only faces beyond that cap remain
+        as the rest of the group."""
+        name = (body.name or '').strip()
+        if not name or len(name) > 200 or any(ord(ch) < 32 for ch in name) or name.startswith('__'):
+            raise HTTPException(status_code=400, detail='A valid person name is required')
+        wanted = _fg_valid_ids(body.face_ids)
+        with face_group_lock:
+            g, entry = _fg_find(group_id)
+            if g['dead'] or g['dismissed']:
+                raise HTTPException(status_code=404, detail='Unknown face group (already handled)')
+            was_fresh = entry['ver'] == _fg_versions()
+            _fg_live_members(g, entry, set(), _trashed_file_ids())
+            members = set(g['face_ids'])
+            served = set(g['face_ids'][:FACE_GROUP_MAX_FACES])
+            name = manual.resolve_identity_name(name)
+            approved = skipped = 0
+            open_faces = db.filter_open_faces([f for f in wanted if f in members])
+            for fid in wanted:
+                if fid not in members or fid not in open_faces:
+                    skipped += 1
+                    continue
+                new_id = _confirm_auto_face(fid, name, trust=2)   # bulk approval = semi-automatic
+                if new_id is None:
+                    skipped += 1
+                    continue
+                approved += 1
+                row = manual.get_face(new_id)
+                if row is not None:
+                    _link_body_for_named_face(row['checksum'], name,
+                                              [row['x1'], row['y1'], row['x2'], row['y2']])
+            drop = served | set(wanted)
+            keep = [i for i, f in enumerate(g['face_ids']) if f not in drop]
+            g['face_ids'] = [g['face_ids'][i] for i in keep]
+            g['scores'] = [g['scores'][i] for i in keep]
+            if len(g['face_ids']) < entry['min_size']:
+                g['dead'] = True
+            if was_fresh:
+                entry['ver'] = _fg_versions()   # our own writes are not "the library changed"
+            return {'approved': approved, 'skipped': skipped}
+
+    @app.post('/api/face-groups/{group_id}/reject')
+    def api_face_group_reject(group_id: int, body: FaceGroupRejectBody):
+        """Dismiss a group as 'not one person'. Remembered in manual.db: every face of the
+        group (plus any extra ids listed) counts as rejected-as-a-unit, so a recompute
+        that yields mostly the same faces stays hidden. The faces themselves stay unnamed."""
+        extra = _fg_valid_ids(body.face_ids)
+        with face_group_lock:
+            g, _entry = _fg_find(group_id)
+            ids = list(dict.fromkeys(list(g['face_ids']) + extra))
+            manual.add_face_group_rejection(ids, uuid.uuid4().hex[:12])
+            g['dismissed'] = True
+            return {'rejected': len(ids)}
 
     def _renormalize_faces():
         """Body of the re-normalization backfill: re-run in-plane rotation
@@ -12487,6 +12735,7 @@ def create_app(data_root: str) -> FastAPI:
             '/api/capture-frames/start': capture_frames_job,
             '/api/metadata/start': metadata_job,
             '/api/match-cities/start': cities_job,
+            '/api/face-groups/compute/start': face_group_job,
         }
 
     def _cancel_bulk_job(start_path: str) -> bool:

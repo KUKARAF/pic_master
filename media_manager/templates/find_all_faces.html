@@ -1,113 +1,506 @@
 {% extends "base.html" %}
 
-{% block title %}Review faces — media{% endblock %}
+{% block title %}Face groups — media{% endblock %}
 
 {% block content %}
 <div class="page-heading">
-  <h1>Review faces</h1>
+  <h1>Face groups</h1>
   <a href="/faces" class="sub">← Back to Faces</a>
 </div>
 
 <p class="sub" style="margin-bottom:10px;">
-  One unknown face at a time, side by side with the people it matches best. Cycle the candidates
-  with ← / →, confirm the highlighted one with Enter.
+  Groups of unnamed faces that look alike, biggest first. Remove any that do not belong
+  (✕), name the rest in one go, or reject the whole group.
 </p>
 
-<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:12px;">
-  <label class="sub" style="display:flex;align-items:center;gap:6px;">
-    <input type="checkbox" id="faces-avoid-existing-toggle" checked>
-    Deprioritize photos that already have an identified face
+<div class="fg-header">
+  <label class="fg-threshold">
+    <span class="sub">Similarity</span>
+    <input type="range" id="fg-threshold" min="0.30" max="0.95" step="0.01" value="0.55">
+    <strong id="fg-threshold-val">0.55</strong>
   </label>
+  <span id="fg-counts" class="sub"></span>
+  <span id="fg-progress" class="sub fg-progress" style="display:none;"></span>
 </div>
 
-<!-- face-review.js owns everything inside here: it fills the two panels, the
-     ranked candidate list, and the empty-state slot. The markup stays in the
-     template (same split every other page here uses) so the module only ever
-     does content, never layout. -->
-<div id="face-review">
-  <div class="sub review-status" style="margin-bottom:10px;"></div>
-  <div class="review-ab" style="display:none;">
-    <div class="review-side">
-      <div class="review-side-title">Unknown face</div>
-      <a class="review-unknown-link review-crop" target="_blank" rel="noopener" title="Open the full photo (F)">
-        <img class="review-unknown-img" alt="unknown face">
-      </a>
-      <div class="review-unknown-meta sub"></div>
-    </div>
+<div id="fg-empty" class="fg-empty" style="display:none;"></div>
 
-    <div class="review-vs">≟</div>
-
-    <div class="review-side">
-      <div class="review-side-title">Closest known person</div>
-      <div class="review-crop">
-        <img class="review-candidate-img" alt="candidate person">
-      </div>
-      <div class="review-candidate-name"></div>
-      <div class="review-candidate-score sub"></div>
-      <div class="review-candidate-list"></div>
-    </div>
+<div id="fg-card" class="fg-card" style="display:none;">
+  <div class="fg-card-head">
+    <strong id="fg-title"></strong>
+    <span id="fg-trunc" class="sub"></span>
   </div>
 
-  <div class="review-controls" style="display:none;">
-    <button type="button" class="btn-similar" data-review-action="confirm" title="Confirm the highlighted person (Enter)">✓ Same person</button>
-    <button type="button" class="btn-similar" data-review-action="reject" title="None of these (↓ / X)">✕ None of these</button>
-    <button type="button" class="btn-similar" data-review-action="skip" title="Decide later (↑)">↷ Skip</button>
-    <button type="button" class="btn-similar" data-review-action="new" title="Save as a new person (N)">＋ New person</button>
-    <button type="button" class="btn-similar" data-review-action="rotate" title="Rotate 90° and re-rank (R)">↻ Rotate</button>
-    <button type="button" class="btn-similar" data-review-action="full" title="Show the whole photo (F)">⛶ Photo</button>
-    <button type="button" class="btn-similar" data-review-action="undo" title="Undo the last decision (Ctrl/⌘+Z)">↶ Undo</button>
+  <div class="fg-tools">
+    <label class="sub fg-below">
+      Remove all below
+      <input type="range" id="fg-below" min="0.30" max="0.99" step="0.01" value="0.60">
+      <strong id="fg-below-val">0.60</strong>
+    </label>
+    <button type="button" class="btn-similar" id="fg-below-btn">Remove</button>
+    <button type="button" class="btn-similar" id="fg-restore-btn">Restore all</button>
   </div>
 
-  <div class="swipe-hint review-hint" style="display:none;">
-    <strong>← →</strong> cycle candidates · <strong>Enter</strong> confirm · <strong>↓ / X</strong> none of these ·
-    <strong>↑</strong> skip · <strong>N</strong> save as new person · <strong>R</strong> rotate 90° &amp; re-rank ·
-    <strong>F</strong> full photo · <strong>Ctrl/⌘+Z</strong> undo
-  </div>
+  <div id="fg-grid" class="fg-grid"></div>
 
-  <div class="review-empty-slot"></div>
+  <div class="fg-name-row">
+    <input type="text" id="fg-name" list="fg-people" placeholder="Who is this?" autocomplete="off">
+    <datalist id="fg-people"></datalist>
+  </div>
+  <div id="fg-suggest" class="sub" style="display:none;margin:6px 0;"></div>
+
+  <div class="fg-actions">
+    <button type="button" class="fg-approve" id="fg-approve" disabled>Approve</button>
+    <button type="button" class="btn-similar" id="fg-reject" title="Reject the whole group (R)">✕ Reject group</button>
+    <button type="button" class="btn-similar" id="fg-skip" title="Decide later (S)">↷ Skip</button>
+  </div>
+  <div class="swipe-hint">
+    <strong>Enter</strong> approve · <strong>R</strong> reject group · <strong>S</strong> skip
+    (R / S are ignored while typing a name)
+  </div>
 </div>
 
 <style>
-  /* Local to this page: the A/B review is the only screen with this layout, so
-     it stays here rather than growing style.css for a single consumer. */
-  .review-ab { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
-  .review-side { flex: 1 1 320px; min-width: 280px; }
-  .review-side-title { font-size: 13px; color: var(--text-faint); text-transform: uppercase;
-    letter-spacing: .06em; margin-bottom: 6px; }
-  .review-vs { align-self: center; font-size: 28px; color: var(--text-faint); padding: 0 4px; }
-  .review-crop { display: block; background: var(--input-bg); border: 1px solid var(--border);
-    border-radius: var(--radius); overflow: hidden; line-height: 0; text-align: center; }
-  .review-crop img { max-width: 100%; max-height: 46vh; object-fit: contain;
-    /* Transitioned because R turns the face in place — an instant jump makes it
-       hard to tell which way it just went. */
-    transition: transform .15s ease; }
-  .review-unknown-meta { margin-top: 8px; word-break: break-word; }
-  .review-candidate-name { font-size: 1.15em; font-weight: 600; margin-top: 8px; }
-  .review-candidate-score { margin-bottom: 10px; }
-  .review-candidate-list { display: flex; flex-direction: column; gap: 4px; max-height: 34vh;
-    overflow-y: auto; }
-  .review-cand { display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 8px;
-    background: transparent; border: 1px solid transparent; border-radius: var(--radius);
-    color: inherit; cursor: pointer; text-align: left; font: inherit; }
-  .review-cand:hover { border-color: var(--divider); }
-  .review-cand.is-selected { border-color: var(--accent); background: var(--input-bg); }
-  .review-cand-img { border-radius: 4px; object-fit: cover; flex: 0 0 auto; }
-  .review-cand-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .review-cand-score { font-variant-numeric: tabular-nums; color: var(--text-muted); }
-  .review-controls { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0 10px; }
+  .fg-header { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .fg-threshold { display: flex; align-items: center; gap: 8px; }
+  .fg-threshold input[type="range"] { width: 200px; max-width: 45vw; }
+  .fg-progress { color: var(--accent); }
+  .fg-empty { padding: 28px 12px; text-align: center; color: var(--text-muted); }
+  .fg-empty .btn-similar { margin-top: 10px; }
+  .fg-card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-card); padding: 12px; }
+  .fg-card-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 8px; }
+  .fg-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+  .fg-below { display: flex; align-items: center; gap: 6px; }
+  .fg-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px;
+    max-height: 58vh; overflow-y: auto; padding: 2px; }
+  .fg-tile { position: relative; background: var(--input-bg); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; aspect-ratio: 1 / 1; }
+  .fg-tile a { display: block; width: 100%; height: 100%; }
+  .fg-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .fg-tile.is-low img { opacity: .6; }
+  .fg-tile.is-removed img { opacity: .15; filter: grayscale(1); }
+  .fg-tile.is-removed { border-style: dashed; }
+  .fg-x { position: absolute; top: 3px; right: 3px; width: 24px; height: 24px; padding: 0;
+    line-height: 22px; text-align: center; font-size: 14px; cursor: pointer;
+    background: rgba(0,0,0,.7); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--radius); }
+  .fg-x:hover { color: var(--danger); border-color: var(--danger); }
+  .fg-tile.is-removed .fg-x { color: var(--accent); }
+  .fg-score { position: absolute; left: 0; bottom: 0; right: 0; padding: 1px 4px; font-size: 11px;
+    background: rgba(0,0,0,.65); color: var(--text-muted); opacity: 0; transition: opacity .1s;
+    font-variant-numeric: tabular-nums; pointer-events: none; }
+  .fg-tile:hover .fg-score, .fg-tile:focus-within .fg-score { opacity: 1; }
+  .fg-name-row { margin-top: 12px; }
+  .fg-name-row input { width: 100%; font-size: 1.2rem; padding: 10px 12px; box-sizing: border-box; }
+  .fg-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+  .fg-approve { flex: 1 1 240px; padding: 14px 18px; font-size: 1.05rem; font-weight: 700; cursor: pointer;
+    background: var(--accent); color: var(--accent-ink); border: 1px solid var(--accent);
+    border-radius: var(--radius); }
+  .fg-approve:hover:not(:disabled) { background: var(--accent-hover); }
+  .fg-approve:disabled { opacity: .35; cursor: not-allowed; }
+  .fg-suggest-use { margin-left: 6px; }
+  @media (max-width: 600px) {
+    .fg-grid { grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); max-height: 50vh; }
+    .fg-threshold { width: 100%; }
+    .fg-threshold input[type="range"] { flex: 1 1 auto; max-width: none; }
+  }
 </style>
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/face-review.js"></script>
 <script>
-/* The review stream is entirely server-ranked — this page asks "who is each unknown
-   face?", which is the one question that needs every face compared against every
-   known person, so the ordering comes from the precomputed suggestion pass. No
-   ranking logic here; this just mounts the module against the markup above. */
-window.initFaceReview({
-  rootId: 'face-review',
-  avoidToggleId: 'faces-avoid-existing-toggle',
-});
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var POLL_MS = 1500, DEBOUNCE_MS = 700, MIN_SIZE = 3;
+
+  var els = {
+    thr: $('fg-threshold'), thrVal: $('fg-threshold-val'), counts: $('fg-counts'),
+    progress: $('fg-progress'), empty: $('fg-empty'), card: $('fg-card'),
+    title: $('fg-title'), trunc: $('fg-trunc'), grid: $('fg-grid'),
+    below: $('fg-below'), belowVal: $('fg-below-val'),
+    belowBtn: $('fg-below-btn'), restoreBtn: $('fg-restore-btn'),
+    name: $('fg-name'), people: $('fg-people'), suggest: $('fg-suggest'),
+    approve: $('fg-approve'), reject: $('fg-reject'), skip: $('fg-skip')
+  };
+
+  var threshold = 0.55;
+  var skip = 0;
+  var group = null;
+  var removed = {};        // face_id -> true
+  var busy = false;        // an approve/reject/load request is in flight
+  var pollTimer = null, debounceTimer = null;
+  var loadSeq = 0;         // drops stale /next responses
+
+  function toast(msg, type) {
+    if (window.showToast) window.showToast(msg, type); else if (type === 'error') console.error(msg);
+  }
+
+  function api(method, url, body) {
+    var opts = { method: method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) {
+        if (!r.ok) {
+          var detail = d && d.detail;
+          if (detail && typeof detail !== 'string') detail = JSON.stringify(detail);
+          throw new Error(detail || ('HTTP ' + r.status));
+        }
+        return d;
+      });
+    });
+  }
+
+  function num(v, d) { return (typeof v === 'number' && isFinite(v)) ? v : d; }
+  function plural(n, one, many) { return n.toLocaleString() + ' ' + (n === 1 ? one : many); }
+  function fmt(n) { return Number(n).toFixed(2); }
+
+  /* ---------- people autocomplete ---------- */
+  fetch('/api/identities').then(function (r) { return r.json(); }).then(function (items) {
+    (items || []).forEach(function (i) {
+      if (!i || !i.name) return;
+      var o = document.createElement('option');
+      o.value = i.name;
+      els.people.appendChild(o);
+    });
+  }).catch(function () {});
+
+  /* ---------- empty / progress states ---------- */
+  function clearEmpty() { els.empty.style.display = 'none'; els.empty.textContent = ''; }
+
+  function showEmpty(text, buttonLabel, onClick) {
+    els.card.style.display = 'none';
+    els.empty.textContent = '';
+    var p = document.createElement('div');
+    p.textContent = text;
+    els.empty.appendChild(p);
+    if (buttonLabel) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn-similar';
+      b.textContent = buttonLabel;
+      b.addEventListener('click', onClick);
+      els.empty.appendChild(b);
+    }
+    els.empty.style.display = '';
+  }
+
+  function setCounts(groups, faces) {
+    if (groups == null) { els.counts.textContent = ''; return; }
+    els.counts.textContent = plural(groups, 'group', 'groups') + ' · ' + plural(faces || 0, 'face', 'faces') + ' left';
+  }
+
+  function setProgress(text) {
+    if (!text) { els.progress.style.display = 'none'; els.progress.textContent = ''; return; }
+    els.progress.textContent = text;
+    els.progress.style.display = '';
+  }
+
+  /* ---------- compute + status polling ---------- */
+  function stopPolling() { if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
+
+  function pollStatus() {
+    stopPolling();
+    api('GET', '/api/face-groups/status').then(function (s) {
+      if (s.running) {
+        var t = num(s.total, 0), d = num(s.done, 0);
+        setProgress('recomputing…' + (t > 0 ? ' ' + Math.min(100, Math.round(100 * d / t)) + '%' : ''));
+        showEmpty('Computing groups…');
+        pollTimer = setTimeout(pollStatus, POLL_MS);
+        return;
+      }
+      setProgress('');
+      if (s.error) {
+        showEmpty('Computing failed: ' + s.error, 'Retry', function () { startCompute(true); });
+        return;
+      }
+      skip = 0;
+      loadNext();
+    }).catch(function (e) {
+      // Transient (e.g. server restarting) — keep trying rather than strand the page.
+      setProgress('recomputing… (status unavailable)');
+      pollTimer = setTimeout(pollStatus, POLL_MS * 2);
+    });
+  }
+
+  function startCompute(force) {
+    stopPolling();
+    group = null;
+    setCounts(null);
+    setProgress('recomputing…');
+    showEmpty('Computing groups…');
+    var url = '/api/face-groups/compute?threshold=' + encodeURIComponent(threshold) +
+      '&min_size=' + MIN_SIZE + (force ? '&force=1' : '');
+    api('POST', url).then(pollStatus).catch(function (e) {
+      setProgress('');
+      showEmpty('Could not start computing: ' + e.message, 'Retry', function () { startCompute(true); });
+    });
+  }
+
+  /* ---------- load + render a group ---------- */
+  function loadNext() {
+    var seq = ++loadSeq;
+    busy = true;
+    api('GET', '/api/face-groups/next?threshold=' + encodeURIComponent(threshold) + '&skip=' + skip)
+      .then(function (d) {
+        if (seq !== loadSeq) return;
+        busy = false;
+        setCounts(num(d.remaining_groups, 0), num(d.remaining_faces, 0));
+        if (d.computing) {
+          setProgress('recomputing…');
+          showEmpty('Computing groups…');
+          pollTimer = setTimeout(pollStatus, POLL_MS);
+          return;
+        }
+        setProgress('');
+        if (!d.group) {
+          if (skip > 0 && num(d.remaining_groups, 0) > 0) {
+            // Skipped past the end — wrap around to the biggest remaining group.
+            skip = 0;
+            loadNext();
+            return;
+          }
+          group = null;
+          showEmpty('No groups above this threshold — lower the slider, or recompute.',
+            'Recompute', function () { startCompute(true); });
+          return;
+        }
+        renderGroup(d.group);
+      })
+      .catch(function (e) {
+        if (seq !== loadSeq) return;
+        busy = false;
+        showEmpty('Failed to load: ' + e.message, 'Retry', loadNext);
+      });
+  }
+
+  function keptIds() {
+    if (!group) return [];
+    return group.faces.filter(function (f) { return !removed[f.face_id]; })
+      .map(function (f) { return f.face_id; });
+  }
+
+  function updateApprove() {
+    var n = keptIds().length;
+    var name = els.name.value.trim();
+    els.approve.disabled = busy || !name || n === 0;
+    els.approve.textContent = name
+      ? 'Approve ' + plural(n, 'face', 'faces') + ' as ' + name
+      : 'Approve ' + plural(n, 'face', 'faces');
+    els.reject.disabled = busy;
+    els.skip.disabled = busy;
+  }
+
+  function renderTile(f) {
+    var tile = document.createElement('div');
+    tile.className = 'fg-tile';
+    tile.dataset.faceId = String(f.face_id);
+    var low = f.score != null && f.score < threshold + 0.05;
+    if (low) tile.classList.add('is-low');
+    if (removed[f.face_id]) tile.classList.add('is-removed');
+
+    var a = document.createElement('a');
+    a.target = '_blank';
+    a.rel = 'noopener';
+    if (f.file_id != null) a.href = '/photo/' + encodeURIComponent(f.file_id);
+    a.title = 'Open the photo';
+    var img = document.createElement('img');
+    img.loading = 'lazy';
+    img.alt = 'face';
+    img.src = '/face-crop/' + encodeURIComponent(f.ref || ('auto:' + f.face_id));
+    a.appendChild(img);
+    tile.appendChild(a);
+
+    var x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'fg-x';
+    function syncX() {
+      var r = !!removed[f.face_id];
+      x.textContent = r ? '↶' : '✕';
+      x.title = r ? 'Undo remove' : 'Remove from this group';
+      x.setAttribute('aria-label', x.title);
+    }
+    syncX();
+    x.addEventListener('click', function (ev) {
+      ev.preventDefault();
+      if (removed[f.face_id]) delete removed[f.face_id]; else removed[f.face_id] = true;
+      tile.classList.toggle('is-removed', !!removed[f.face_id]);
+      syncX();
+      updateApprove();
+    });
+    tile.appendChild(x);
+
+    if (f.score != null) {
+      var sc = document.createElement('div');
+      sc.className = 'fg-score';
+      sc.textContent = fmt(f.score);
+      tile.appendChild(sc);
+    }
+    return tile;
+  }
+
+  function renderSuggestion(sg) {
+    els.suggest.textContent = '';
+    if (!sg || !sg.name) { els.suggest.style.display = 'none'; return; }
+    els.suggest.appendChild(document.createTextNode('Looks like '));
+    var s = document.createElement('strong');
+    s.textContent = sg.name;
+    els.suggest.appendChild(s);
+    if (sg.score != null) els.suggest.appendChild(document.createTextNode(' ' + fmt(sg.score)));
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'btn-similar fg-suggest-use';
+    b.textContent = 'use';
+    b.addEventListener('click', function () {
+      els.name.value = sg.name;
+      updateApprove();
+      els.name.focus();
+    });
+    els.suggest.appendChild(b);
+    els.suggest.style.display = '';
+  }
+
+  function renderGroup(g) {
+    g.faces = (g.faces || []).slice().sort(function (a, b) { return num(b.score, 0) - num(a.score, 0); });
+    group = g;
+    removed = {};
+    clearEmpty();
+    els.title.textContent = plural(g.faces.length, 'face', 'faces') + ' that look alike';
+    els.trunc.textContent = g.truncated ? '(showing the first ' + g.faces.length + '; the group is larger)' : '';
+    els.grid.textContent = '';
+    g.faces.forEach(function (f) { els.grid.appendChild(renderTile(f)); });
+    els.grid.scrollTop = 0;
+
+    var scores = g.faces.map(function (f) { return num(f.score, 1); });
+    var lo = Math.min.apply(null, scores);
+    var def = Math.min(0.99, Math.max(0.30, Math.round((lo + 0.1) * 100) / 100));
+    els.below.value = def;
+    els.belowVal.textContent = fmt(els.below.value);
+
+    renderSuggestion(g.suggested);
+    // Offer the suggestion pre-filled, but never clobber what the user already typed.
+    if (g.suggested && g.suggested.name && !els.name.value.trim()) els.name.value = g.suggested.name;
+    els.card.style.display = '';
+    updateApprove();
+  }
+
+  /* ---------- actions ---------- */
+  function afterDecision(msg) {
+    toast(msg, 'success');
+    busy = false;
+    loadNext();
+  }
+
+  function approve() {
+    if (!group || busy) return;
+    var name = els.name.value.trim();
+    var ids = keptIds();
+    if (!name || !ids.length) return;
+    busy = true;
+    updateApprove();
+    api('POST', '/api/face-groups/' + encodeURIComponent(group.id) + '/approve', { name: name, face_ids: ids })
+      .then(function (d) {
+        var n = num(d.approved, ids.length), sk = num(d.skipped, 0);
+        els.name.value = '';
+        afterDecision('Approved ' + plural(n, 'face', 'faces') + ' as ' + name +
+          (sk ? ' (' + sk + ' skipped)' : ''));
+      })
+      .catch(function (e) { busy = false; updateApprove(); toast('Approve failed: ' + e.message, 'error'); });
+  }
+
+  function reject() {
+    if (!group || busy) return;
+    var ids = group.faces.map(function (f) { return f.face_id; });
+    busy = true;
+    updateApprove();
+    api('POST', '/api/face-groups/' + encodeURIComponent(group.id) + '/reject', { face_ids: ids })
+      .then(function () {
+        els.name.value = '';
+        afterDecision('Rejected ' + plural(ids.length, 'face', 'faces'));
+      })
+      .catch(function (e) { busy = false; updateApprove(); toast('Reject failed: ' + e.message, 'error'); });
+  }
+
+  function doSkip() {
+    if (!group || busy) return;
+    skip += 1;
+    els.name.value = '';
+    loadNext();
+  }
+
+  els.approve.addEventListener('click', approve);
+  els.reject.addEventListener('click', reject);
+  els.skip.addEventListener('click', doSkip);
+  els.name.addEventListener('input', updateApprove);
+
+  els.below.addEventListener('input', function () { els.belowVal.textContent = fmt(els.below.value); });
+  els.belowBtn.addEventListener('click', function () {
+    if (!group) return;
+    var cut = parseFloat(els.below.value);
+    group.faces.forEach(function (f) { if (num(f.score, 1) < cut) removed[f.face_id] = true; });
+    Array.prototype.forEach.call(els.grid.children, function (tile) {
+      var rm = !!removed[tile.dataset.faceId];
+      tile.classList.toggle('is-removed', rm);
+      var x = tile.querySelector('.fg-x');
+      if (x) { x.textContent = rm ? '↶' : '✕'; x.title = rm ? 'Undo remove' : 'Remove from this group'; }
+    });
+    updateApprove();
+  });
+  els.restoreBtn.addEventListener('click', function () {
+    if (group) renderGroup(Object.assign({}, group, { suggested: group.suggested }));
+    // renderGroup resets `removed`; keep the typed name (it only prefills when empty).
+  });
+
+  els.thr.addEventListener('input', function () {
+    threshold = parseFloat(els.thr.value);
+    els.thrVal.textContent = fmt(threshold);
+    if (debounceTimer) clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(function () { skip = 0; startCompute(false); }, DEBOUNCE_MS);
+  });
+
+  document.addEventListener('keydown', function (ev) {
+    if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+    var t = ev.target;
+    var typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+    var modal = $('modal-overlay');
+    if (modal && modal.style.display && modal.style.display !== 'none') return;
+    if (!group || els.card.style.display === 'none') return;
+    if (ev.key === 'Enter') {
+      // Enter inside the range sliders or on a focused button keeps its native meaning.
+      if (t && (t.tagName === 'BUTTON' || (t.tagName === 'INPUT' && t.type !== 'text'))) return;
+      ev.preventDefault();
+      approve();
+    } else if (!typing && (ev.key === 'r' || ev.key === 'R')) {
+      ev.preventDefault();
+      reject();
+    } else if (!typing && (ev.key === 's' || ev.key === 'S')) {
+      ev.preventDefault();
+      doSkip();
+    }
+  });
+
+  /* ---------- init ---------- */
+  els.thrVal.textContent = fmt(threshold);
+  api('GET', '/api/face-groups/status').then(function (s) {
+    var t = num(s.threshold, null);
+    if (t != null && (s.computed_at || s.running)) {
+      threshold = Math.min(0.95, Math.max(0.30, t));
+      els.thr.value = threshold;
+      els.thrVal.textContent = fmt(threshold);
+    }
+    if (s.running) { pollStatus(); return; }
+    if (!s.computed_at) {
+      showEmpty('Nothing computed yet.', 'Compute', function () { startCompute(false); });
+      return;
+    }
+    if (s.stale) setProgress('results may be out of date');
+    loadNext();
+  }).catch(function (e) {
+    showEmpty('Could not reach the server: ' + e.message, 'Retry', function () { location.reload(); });
+  });
+})();
 </script>
 {% endblock %}

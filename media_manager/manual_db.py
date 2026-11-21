@@ -888,10 +888,42 @@ class ManualDB(ThreadLocalDB):
         for col, ddl in (('prev_trust', 'INTEGER'), ('prev_origin', 'TEXT')):
             if col not in anchor_cols:
                 cur.execute(f'ALTER TABLE person_cleanup_anchors ADD COLUMN {col} {ddl}')
+        # Face group review (/find_all_faces): auto-face ids of groups the user dismissed
+        # as "not one person". Keyed by the media.db face id (same durable-enough key as
+        # face_identity_negatives.source_face_id). A recomputed group whose members are
+        # mostly in here stays hidden. Additive (CREATE IF NOT EXISTS), so no migration.
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS face_group_rejections (
+                source_face_id INTEGER PRIMARY KEY,
+                batch_id       TEXT NOT NULL,
+                created_at     INTEGER NOT NULL
+            )
+        ''')
         cur.execute('''CREATE TABLE IF NOT EXISTS schema_flags (
                           name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)''')
         self._migrate_face_trust(cur)
         self.conn.commit()
+
+    def add_face_group_rejection(self, source_face_ids, batch_id):
+        """Remember a dismissed face group: its auto-face ids stay 'rejected as a unit'."""
+        now = int(time.time())
+        cur = self.conn.cursor()
+        cur.executemany('INSERT OR REPLACE INTO face_group_rejections '
+                        '(source_face_id, batch_id, created_at) VALUES (?, ?, ?)',
+                        [(int(i), str(batch_id), now) for i in source_face_ids])
+        self.conn.commit()
+
+    def get_face_group_rejected_ids(self):
+        """Set of auto-face ids belonging to any dismissed group."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT source_face_id FROM face_group_rejections')
+        return {r[0] for r in cur.fetchall()}
+
+    def clear_face_group_rejections(self):
+        cur = self.conn.cursor()
+        cur.execute('DELETE FROM face_group_rejections')
+        self.conn.commit()
+        return cur.rowcount
 
     def _migrate_face_trust(self, cur):
         """One-time, additive backfill of faces.origin/trust for rows that predate the

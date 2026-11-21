@@ -2662,6 +2662,40 @@ class Database(ThreadLocalDB):
                     (threshold,))
         return cur.fetchone()[0]
 
+    # --- Face group review (see face_clusters.py / web.py face_group_job) ----------
+
+    def list_face_group_candidates(self):
+        """[(face_id, file_id)] for every face the group review may offer: a real
+        detection (non-empty bbox + embedding), not decided in manual.db (handled = 0),
+        and on a file not flagged damaged. Trashed files are filtered by the caller
+        (trash lives in manual.db). Captured video stills are INCLUDED on purpose; the
+        web layer collapses their cards to the source video."""
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT fa.id, fa.file_id FROM faces fa
+            JOIN files f ON f.id = fa.file_id
+            WHERE fa.identity IS NULL AND fa.handled = 0
+              AND fa.embedding != x'' AND fa.bbox != '[]'
+              AND f.broken IS NULL
+            ORDER BY fa.id
+        """)
+        return [(r[0], r[1]) for r in cur.fetchall()]
+
+    def filter_open_faces(self, face_ids):
+        """{face_id: file_id} for those of `face_ids` that are still undecided and
+        unnamed (identity NULL, handled 0) -- the live re-check a cached face group
+        needs before it is shown, since faces get named elsewhere after a compute."""
+        out = {}
+        ids = [int(i) for i in face_ids]
+        cur = self.conn.cursor()
+        for chunk in self._chunked(ids):
+            placeholders = ','.join('?' for _ in chunk)
+            cur.execute(f'SELECT id, file_id FROM faces WHERE id IN ({placeholders}) '
+                        'AND identity IS NULL AND handled = 0', tuple(chunk))
+            for face_id, file_id in cur.fetchall():
+                out[face_id] = file_id
+        return out
+
     # --- The handled mirror -------------------------------------------------------
 
     def mark_faces_handled(self, face_ids, handled=1) -> int:
