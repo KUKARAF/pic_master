@@ -57,8 +57,14 @@
 
   <div class="fg-actions">
     <button type="button" class="fg-approve" id="fg-approve" disabled>Approve</button>
+    <button type="button" class="btn-similar" id="fg-auto"
+            title="Approve each group automatically after 5 s with the name shown. Touch anything to pause that group; Esc or Stop ends auto mode.">⏱ Auto approve (5s)</button>
     <button type="button" class="btn-similar" id="fg-reject" title="Reject the whole group (R)">✕ Reject group</button>
     <button type="button" class="btn-similar" id="fg-skip" title="Decide later (S)">↷ Skip</button>
+  </div>
+  <div id="fg-auto-status" class="sub fg-auto-status" style="display:none;" aria-live="polite">
+    <span id="fg-auto-text"></span>
+    <div class="fg-auto-bar"><div id="fg-auto-fill"></div></div>
   </div>
   <div class="swipe-hint">
     <strong>Enter</strong> approve · <strong>R</strong> reject group · <strong>S</strong> skip
@@ -71,6 +77,10 @@
   .fg-threshold { display: flex; align-items: center; gap: 8px; }
   .fg-threshold input[type="range"] { width: 200px; max-width: 45vw; }
   .fg-approved { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .fg-auto-status { margin: 8px 0 0; }
+  .fg-auto-bar { height: 4px; background: var(--border, #333); border-radius: 2px; margin-top: 4px; overflow: hidden; }
+  #fg-auto-fill { height: 100%; width: 0; background: var(--accent, #4a9); }
+  #fg-auto.is-on { border-color: var(--accent, #4a9); color: var(--accent, #4a9); font-weight: 600; }
   .fg-hint { font-size: .8em; opacity: .75; }
   .fg-progress { color: var(--accent); }
   .fg-empty { padding: 28px 12px; text-align: center; color: var(--text-muted); }
@@ -130,7 +140,9 @@
     below: $('fg-below'), belowVal: $('fg-below-val'),
     belowBtn: $('fg-below-btn'), restoreBtn: $('fg-restore-btn'),
     name: $('fg-name'), people: $('fg-people'), suggest: $('fg-suggest'),
-    approve: $('fg-approve'), reject: $('fg-reject'), skip: $('fg-skip')
+    approve: $('fg-approve'), reject: $('fg-reject'), skip: $('fg-skip'),
+    auto: $('fg-auto'), autoStatus: $('fg-auto-status'), autoText: $('fg-auto-text'),
+    autoFill: $('fg-auto-fill')
   };
 
   var threshold = 0.55;
@@ -185,6 +197,7 @@
   function clearEmpty() { els.empty.style.display = 'none'; els.empty.textContent = ''; }
 
   function showEmpty(text, buttonLabel, onClick) {
+    setAuto(false);                    // nothing left to auto-approve (the card, with its Stop button, is hidden)
     els.card.style.display = 'none';
     els.empty.textContent = '';
     var p = document.createElement('div');
@@ -415,7 +428,70 @@
     }
     els.card.style.display = '';
     updateApprove();
+    armAuto();
   }
+
+  /* ---------- auto approve ---------- */
+  // Auto mode: each group shown gets a 5 s countdown, then is approved under the name in
+  // the box (matched person or 'Unknown N') with the faces still kept. Touching the card
+  // (typing, removing a face, any click) pauses THAT group only; Reject/Skip/Esc/Stop or an
+  // error end auto mode; a hidden tab pauses it so nothing is approved unattended.
+  var AUTO_MS = 5000, TICK_MS = 100;
+  var autoOn = false, autoTimer = null, autoStart = 0;
+
+  function autoStatus(text, pct) {
+    els.autoStatus.style.display = text ? '' : 'none';
+    els.autoText.textContent = text || '';
+    els.autoFill.style.width = (pct || 0) + '%';
+  }
+  function clearAutoTimer() {
+    if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+  }
+  function setAuto(on) {
+    autoOn = on;
+    els.auto.classList.toggle('is-on', on);
+    els.auto.textContent = on ? '■ Stop auto approve' : '⏱ Auto approve (5s)';
+    if (!on) { clearAutoTimer(); autoStatus('', 0); } else { armAuto(); }
+  }
+  function pauseAuto() {            // this group only; auto mode stays on for the next one
+    if (!autoOn || !autoTimer) return;
+    clearAutoTimer();
+    autoStatus('Auto approve paused for this group — approve it yourself, or it resumes on the next group.', 0);
+  }
+  function armAuto() {
+    clearAutoTimer();
+    if (!autoOn) return;
+    if (!group || busy || document.hidden || !els.name.value.trim() || !keptIds().length) {
+      autoStatus(group && !els.name.value.trim() ? 'Auto approve waiting for a name.' : '', 0);
+      return;
+    }
+    autoStart = Date.now();
+    autoTimer = setInterval(function () {
+      var el = Date.now() - autoStart;
+      if (el >= AUTO_MS) {
+        clearAutoTimer();
+        autoStatus('Approving…', 100);
+        approve();
+        return;
+      }
+      autoStatus('Approving as “' + els.name.value.trim() + '” in ' + Math.ceil((AUTO_MS - el) / 1000) + 's…',
+                 (el / AUTO_MS) * 100);
+    }, TICK_MS);
+  }
+
+  els.auto.addEventListener('click', function () { setAuto(!autoOn); });
+  // Any interaction with the card except the Stop button itself pauses this group's timer.
+  ['pointerdown', 'input', 'wheel'].forEach(function (evn) {
+    els.card.addEventListener(evn, function (ev) {
+      if (ev.target === els.auto) return;
+      if (ev.target === els.approve || ev.target === els.skip || ev.target === els.reject) return;
+      pauseAuto();
+    }, true);
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { if (autoTimer) { clearAutoTimer(); autoStatus('Auto approve paused (tab hidden).', 0); } }
+    else armAuto();
+  });
 
   /* ---------- actions ---------- */
   function afterDecision(msg) {
@@ -429,6 +505,7 @@
     var name = els.name.value.trim();
     var ids = keptIds();
     if (!name || !ids.length) return;
+    clearAutoTimer();
     busy = true;
     updateApprove();
     api('POST', '/api/face-groups/' + encodeURIComponent(group.id) + '/approve', { name: name, face_ids: ids })
@@ -438,11 +515,12 @@
         afterDecision('Approved ' + plural(n, 'face', 'faces') + ' as ' + name +
           (sk ? ' (' + sk + ' skipped)' : ''));
       })
-      .catch(function (e) { busy = false; updateApprove(); toast('Approve failed: ' + e.message, 'error'); });
+      .catch(function (e) { busy = false; setAuto(false); updateApprove(); toast('Approve failed: ' + e.message, 'error'); });
   }
 
   function reject() {
     if (!group || busy) return;
+    setAuto(false);
     var ids = group.faces.map(function (f) { return f.face_id; });
     busy = true;
     updateApprove();
@@ -456,6 +534,7 @@
 
   function doSkip() {
     if (!group || busy) return;
+    setAuto(false);
     skip += 1;
     els.name.value = ""; els.name.dataset.auto = "";
     loadNext();
@@ -507,6 +586,7 @@
     var modal = $('modal-overlay');
     if (modal && modal.style.display && modal.style.display !== 'none') return;
     if (!group || els.card.style.display === 'none') return;
+    if (ev.key === 'Escape' && autoOn) { setAuto(false); return; }
     if (ev.key === 'Enter') {
       // Enter inside the range sliders or on a focused button keeps its native meaning.
       if (t && (t.tagName === 'BUTTON' || (t.tagName === 'INPUT' && t.type !== 'text'))) return;
