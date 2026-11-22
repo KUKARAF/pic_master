@@ -57,6 +57,23 @@ def trust_matching_enabled():
     return os.environ.get('MEDIA_FACE_TRUST_MATCHING', '1').strip().lower() not in ('0', 'false', 'no', 'off')
 
 
+AI_CATEGORY_NAME = 'ai'
+
+
+def include_ai_enabled():
+    """Photos in the `ai` category are normally kept out of face matching (their faces are
+    never a reference an auto-match scores against) and out of set suggestions.
+    MEDIA_INCLUDE_AI=1 puts them back in everywhere (read once per process, like the other
+    MEDIA_* switches; the per-request `include_ai` param on the set-search endpoints
+    overrides it for that call)."""
+    return os.environ.get('MEDIA_INCLUDE_AI', '0').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# SQL fragment: a faces row whose photo is in the `ai` category (case-insensitive).
+_NOT_AI_FACE_SQL = (" AND checksum NOT IN (SELECT fc.checksum FROM file_categories fc "
+                    "JOIN categories c ON c.id = fc.category_id WHERE LOWER(c.name) = 'ai')")
+
+
 def run_migrations(db_path, apply=False):
     """Checks/applies every pending schema migration in media_manager/migrations/
     against a raw manual.db connection — never through ManualDB, whose
@@ -2494,9 +2511,11 @@ class ManualDB(ThreadLocalDB):
         return cur.fetchall()
 
     def rename_category(self, category_id, name):
+        self._bump_if_ai_category(category_id)   # renaming AWAY from "ai"
         cur = self.conn.cursor()
         cur.execute('UPDATE categories SET name = ? WHERE id = ?', (name.strip(), category_id))
         self.conn.commit()
+        self._bump_if_ai_category(category_id)   # renaming TO "ai"
 
     def set_category_temperature(self, category_id, temperature):
         cur = self.conn.cursor()
@@ -2512,6 +2531,7 @@ class ManualDB(ThreadLocalDB):
         lose this one category (they may still have others) rather than being
         pushed into "explicitly no categories" (file_category_excluded is a
         separate, unrelated decision — see its own docstring)."""
+        self._bump_if_ai_category(category_id)
         cur = self.conn.cursor()
         cur.execute('DELETE FROM categories WHERE id = ?', (category_id,))
         self.conn.commit()
@@ -2525,6 +2545,21 @@ class ManualDB(ThreadLocalDB):
             VALUES (?, ?, ?)
         ''', (checksum, category_id, int(time.time())))
         self.conn.commit()
+        self._bump_if_ai_category(category_id)
+
+    def _bump_if_ai_category(self, category_id):
+        """The `ai` category's membership feeds the face-match reference matrices, so a
+        change to it must invalidate their caches (other categories don't)."""
+        row = self.get_category(category_id)
+        if row is not None and (row['name'] or '').strip().lower() == AI_CATEGORY_NAME:
+            self._face_ver += 1
+
+    def get_ai_checksums(self):
+        """Checksums of every photo in the `ai` category, as a set()."""
+        cur = self.conn.cursor()
+        cur.execute('SELECT fc.checksum FROM file_categories fc JOIN categories c '
+                    'ON c.id = fc.category_id WHERE LOWER(c.name) = ?', (AI_CATEGORY_NAME,))
+        return {r[0] for r in cur.fetchall()}
 
     def remove_file_category(self, checksum, category_id):
         """Remove just this one category from the file — any other categories it
@@ -2532,6 +2567,7 @@ class ManualDB(ThreadLocalDB):
         cur = self.conn.cursor()
         cur.execute('DELETE FROM file_categories WHERE checksum = ? AND category_id = ?', (checksum, category_id))
         self.conn.commit()
+        self._bump_if_ai_category(category_id)
 
     def get_categories_for_checksum(self, checksum):
         """Every category manually assigned to this file — {'id', 'name'} per row."""
@@ -3858,6 +3894,7 @@ class ManualDB(ThreadLocalDB):
             cur.execute(
                 "SELECT identity, embedding FROM faces "
                 "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''"
+                + ('' if include_ai_enabled() else _NOT_AI_FACE_SQL)
             )
             rows, dim = self._usable_embedding_rows(cur.fetchall(), 'get_named_face_matrix')
 
@@ -3982,7 +4019,8 @@ class ManualDB(ThreadLocalDB):
         else:
             cur = self.conn.cursor()
             cur.execute("SELECT identity, embedding, trust FROM faces "
-                        "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''")
+                        "WHERE identity IS NOT NULL AND rejected = 0 AND embedding != x''"
+                        + ('' if include_ai_enabled() else _NOT_AI_FACE_SQL))
             rows, dim = self._usable_embedding_rows(cur.fetchall(), 'get_trusted_face_matrix')
             if not rows:
                 result = ([], np.empty((0, 0), dtype=np.float32), np.empty(0, dtype=np.float32))

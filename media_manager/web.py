@@ -71,7 +71,7 @@ from media_manager.formats import (
 from media_manager.gen_service import ComfyUIClient
 from media_manager.hasher import FileHasher
 from media_manager.ignore import IgnoreRules
-from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou
+from media_manager.manual_db import AUTO_MATCH_THRESHOLD, FACE_SAME_BOX_IOU, ManualDB, _bbox_iou, include_ai_enabled
 from media_manager.media_manager import MediaManager, _parse_query, scan_folder
 from media_manager.object_encoder import ObjectEncoder
 from media_manager.object_matcher import ObjectMatcher
@@ -8704,7 +8704,7 @@ def create_app(data_root: str) -> FastAPI:
 
     def _find_similar_files_for_set(set_id, threshold, limit=12, offset=0, exclude_ids=None, avoid_existing=True,
                                      honor_negatives=True, exclude_non_matching_faces=True,
-                                     model='siglip', info=None):
+                                     model='siglip', info=None, include_ai=None):
         """Images not yet in the set whose embedding is close to the set's
         centroid (mean of its members' embeddings) — "images that might belong
         here". `offset` skips that many already-threshold-passing candidates
@@ -8742,6 +8742,9 @@ def create_app(data_root: str) -> FastAPI:
         recognized face at all is never dropped by this — there's nothing to
         judge a mismatch against. If the set has no confirmed people yet
         either, this is a no-op (same reason).
+
+        `include_ai` (default None -> MEDIA_INCLUDE_AI, off): photos in the `ai` category are
+        hard-excluded from the candidate pool unless this is True.
 
         `model` ('siglip' default | 'dino'): which embedding space drives
         the ranking — members, rejected photos (for honor_negatives) and candidates
@@ -8783,8 +8786,12 @@ def create_app(data_root: str) -> FastAPI:
             def face_ok(items):
                 return _drop_unconfirmed_people(items, set_people)
         member_checksums_anywhere = manual.get_all_set_member_checksums() if avoid_existing else None
+        ai_checksums = None if (include_ai if include_ai is not None else include_ai_enabled()) \
+            else manual.get_ai_checksums()
 
         def apply_filters(items):
+            if ai_checksums and items:
+                items = [item for item in items if item[0][2] not in ai_checksums]
             if face_ok is not None and items:
                 items = face_ok(items)
             if avoid_existing and items:
@@ -9486,7 +9493,7 @@ def create_app(data_root: str) -> FastAPI:
     def api_similar_files_for_set(set_id: int, body: SwipeExcludeBody, threshold: float = SET_SUGGEST_THRESHOLD,
                                    limit: int = 12, offset: int = 0, avoid_existing: bool = True,
                                    honor_negatives: bool = True, exclude_non_matching_faces: bool = True,
-                                   model: str = 'siglip'):
+                                   model: str = 'siglip', include_ai: Optional[bool] = None):
         if manual.get_set(set_id) is None:
             raise HTTPException(status_code=404, detail='Set not found')
         _check_suggest_model(model)
@@ -9497,7 +9504,7 @@ def create_app(data_root: str) -> FastAPI:
         results = _find_similar_files_for_set(set_id, threshold, limit=limit, offset=offset, exclude_ids=exclude_ids,
                                                 avoid_existing=avoid_existing, honor_negatives=honor_negatives,
                                                 exclude_non_matching_faces=exclude_non_matching_faces,
-                                                model=model, info=info)
+                                                model=model, info=info, include_ai=include_ai)
         # 'cards' is the same list under the key swipe-core.js's fetchMoreUrl
         # response contract expects; 'results' stays for the pre-existing grid
         # (offset-based load-more + threshold-expand) callers, unchanged.
