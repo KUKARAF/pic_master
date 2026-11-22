@@ -12396,10 +12396,11 @@ def create_app(data_root: str) -> FastAPI:
                 'angle': round(angle, 2)}
 
     @app.post('/api/files/{file_id}/detect-faces')
-    def api_detect_faces(file_id: int):
+    def api_detect_faces(file_id: int, threshold: float = None):
         """Run InsightFace on just this one image (the GUI equivalent of the batch
         `media faces` CLI command), then auto-promote any high-confidence match against
-        an existing identity — see manual_db.AUTO_MATCH_THRESHOLD."""
+        an existing identity — see manual_db.AUTO_MATCH_THRESHOLD (`threshold` overrides it,
+        e.g. upload.sh passes 0.55)."""
         row = _file_or_404(file_id)
         abs_path = os.path.join(data_root, row['path'])
         if not os.path.isfile(abs_path):
@@ -12439,7 +12440,7 @@ def create_app(data_root: str) -> FastAPI:
             emb_bytes = db.get_face_embedding(face_db_id)
             if not emb_bytes:
                 continue
-            name, score = manual.find_matching_identity(emb_bytes)
+            name, score = manual.find_matching_identity(emb_bytes, threshold=threshold)
             if name is None:
                 continue
             manual.promote_auto_face(face_db_id, row['checksum'], bbox, emb_bytes, name, None, None,

@@ -15,6 +15,8 @@
 #   -n, --no-recursive       only FOLDER itself, not its subfolders
 #       --strict-tls         verify the server certificate (default: accept the
 #                            self-signed cert `media web` generates)
+#       --no-face-match      skip face detection + auto-match after each image upload
+#       --face-threshold N   cosine threshold for naming a face as a known person (default 0.55)
 #       --dry-run            list what would be uploaded, upload nothing
 #   -h, --help               show this help
 set -euo pipefail
@@ -26,6 +28,8 @@ RECURSIVE=1
 FLAT=0
 INSECURE=1
 DRY_RUN=0
+FACE_MATCH=1
+FACE_THRESHOLD=0.55
 FOLDER=""
 
 usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
@@ -38,6 +42,8 @@ while [ $# -gt 0 ]; do
         -f|--flat) FLAT=1; shift ;;
         -n|--no-recursive) RECURSIVE=0; shift ;;
         --strict-tls) INSECURE=0; shift ;;
+        --no-face-match) FACE_MATCH=0; shift ;;
+        --face-threshold) FACE_THRESHOLD="${2:?--face-threshold needs a value}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; FOLDER="${1:-}"; break ;;
@@ -93,6 +99,19 @@ while IFS= read -r -d '' f; do
         200)
             saved=$((saved + 1))
             echo "saved      $f"
+            # Detect faces and map them onto known people (images only; best-effort —
+            # a failure here never blocks the upload or the --delete-uploaded below).
+            if [ "$FACE_MATCH" -eq 1 ]; then
+                case "${f,,}" in
+                    *.jpg|*.jpeg|*.png|*.gif|*.bmp|*.webp|*.tif|*.tiff)
+                        fid="$(sed -n 's/.*"saved":\[{"id":\([0-9]*\).*/\1/p' "$RESP")"
+                        if [ -n "$fid" ]; then
+                            fm="$(curl "${CURL_OPTS[@]}" -X POST "${URL%/}/api/files/$fid/detect-faces?threshold=$FACE_THRESHOLD" 2>&1)" || fm=""
+                            echo "           faces: $(printf '%s' "$fm" | sed -n 's/.*"faces_found":\([0-9]*\).*/\1 found/p') $(printf '%s' "$fm" | grep -o '"name":"[^"]*","score":[0-9.]*' | sed 's/"name":"\([^"]*\)","score":\(.*\)/→ \1 (\2)/' | paste -sd' ')"
+                        fi
+                        ;;
+                esac
+            fi
             if [ "$DELETE" -eq 1 ]; then rm -f -- "$f" && deleted=$((deleted + 1)); fi
             ;;
         409)
